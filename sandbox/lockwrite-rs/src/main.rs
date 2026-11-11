@@ -4,7 +4,8 @@
 //   1. a private user + mount + PID namespace, in which
 //        every mount outside the writable directories is remounted read-only (so chmod, utime
 //        and setxattr fail there too, which Landlock does not mediate),
-//        AUTOMODE_RO paths (e.g. .git/hooks, .git/config) are bind-mounted read-only and
+//        AUTOMODE_RO paths (e.g. .git/hooks, .git/config) are bind-mounted read-only, with
+//        every mount beneath them, and
 //        AUTOMODE_HIDE paths (local sockets, credential files) are covered up;
 //   2. Landlock ABI >= 5 (Linux >= 6.10) confining every filesystem write, truncate and rename
 //      to AUTOMODE_RW and denying ioctl on device files (no TIOCSTI), and on ABI >= 6
@@ -66,6 +67,9 @@ const FS_TRUNCATE: u64 = 1 << 14;
 const FS_IOCTL_DEV: u64 = 1 << 15;
 const SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
 const SCOPE_SIGNAL: u64 = 1 << 1;
+// mount_setattr(2): make a mount and every mount below it read-only.
+const AT_RECURSIVE: libc::c_uint = 0x8000;
+const MOUNT_ATTR_RDONLY: u64 = 0x1;
 const WRITE_RIGHTS: u64 = FS_WRITE_FILE | FS_REMOVE_DIR | FS_REMOVE_FILE | FS_MAKE_CHAR | FS_MAKE_DIR | FS_MAKE_REG | FS_MAKE_SOCK | FS_MAKE_FIFO | FS_MAKE_BLOCK | FS_MAKE_SYM | FS_REFER | FS_TRUNCATE;
 
 // Below this ABI truncate(2) (ABI < 3) and device ioctls (ABI < 5) are not confined.
@@ -77,6 +81,14 @@ struct RulesetAttr {
     handled_access_fs: u64,
     handled_access_net: u64,
     scoped: u64,
+}
+
+#[repr(C)]
+struct MountAttr {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
 }
 
 #[repr(C, packed)]
@@ -170,6 +182,18 @@ fn remount_readonly(target: &[u8]) {
     }
 }
 
+// Read-only for the mount at `target` and for every mount below it. A recursive bind carries
+// along the mounts made earlier beneath the path (the pins, which are writable binds), and a
+// plain remount would change the top one only.
+fn remount_readonly_tree(target: &[u8]) {
+    let c = cstr(target);
+    let attr = MountAttr { attr_set: MOUNT_ATTR_RDONLY, attr_clr: 0, propagation: 0, userns_fd: 0 };
+    // SAFETY: `c` is NUL-terminated; `attr` has the kernel's mount_attr layout and outlives the call.
+    if unsafe { libc::syscall(libc::SYS_mount_setattr, libc::AT_FDCWD, c.as_ptr(), AT_RECURSIVE, &attr as *const MountAttr, mem::size_of::<MountAttr>()) } != 0 {
+        die(target);
+    }
+}
+
 fn make_readonly(target: &[u8]) {
     let Some(kind) = kind(target) else { return }; // nothing there to protect; the caller creates what must exist
     if kind.is_symlink() {
@@ -179,7 +203,7 @@ fn make_readonly(target: &[u8]) {
     if !sys_mount(Some(target), target, None, libc::MS_BIND | libc::MS_REC, None) {
         die(target);
     }
-    remount_readonly(target);
+    remount_readonly_tree(target);
 }
 
 fn hide(target: &[u8], cover: &[u8]) {
@@ -205,8 +229,14 @@ fn hide(target: &[u8], cover: &[u8]) {
 
 // Binds a directory onto itself: it cannot be renamed or replaced, and as a mount of its own it
 // stays writable when the mount it lives on is remounted read-only.
+// Something that is there and is not a directory (a symbolic link put in its place since the
+// plan was made) cannot be pinned, and what lies behind it would be left unprotected: no run.
 fn pin(target: &[u8]) {
-    if kind(target).is_some_and(|k| k.is_dir()) && !sys_mount(Some(target), target, None, libc::MS_BIND | libc::MS_REC, None) {
+    let Some(kind) = kind(target) else { return };
+    if !kind.is_dir() {
+        fail(&format!("{}: must be a directory to be kept in place", String::from_utf8_lossy(target)));
+    }
+    if !sys_mount(Some(target), target, None, libc::MS_BIND | libc::MS_REC, None) {
         die(target);
     }
 }
@@ -416,7 +446,13 @@ fn main() {
         Some(file) => format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(file)).into_bytes(),
         None => b"/dev/null".to_vec(),
     };
-    for target in writable.iter().chain(&pinned) {
+    for target in &writable {
+        // Device files are writable too (/dev/null); only directories are bound in place.
+        if kind(target).is_some_and(|k| k.is_dir()) {
+            pin(target);
+        }
+    }
+    for target in &pinned {
         pin(target); // before the read-only binds, so those stack on top
     }
     for target in &readonly {

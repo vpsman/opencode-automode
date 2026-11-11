@@ -29,13 +29,16 @@ import {
   type Scope,
   type SessionFiles,
   type UserRules,
+  type Simple,
   type Verdict,
 } from "./rules.ts";
 import { scoreCommand, type ClassifierConfig } from "./kev.ts";
-import { findGitEntries, gitArgs, gitEnv, gitRun, OPENCODE_PROJECT_FILES, protectedPaths, realpath, safeGit } from "./sandbox.ts";
-import { abbreviates, alsoByName, gitCall, gitProblem, observer, single, strict, textGuards, tilde, unmodelled, type Single } from "./guard.ts";
+import { findGitEntries, gitArgs, gitEnv, gitRun, HOOK_MANAGER_FILES, OPENCODE_CONFIG_NAMES, OPENCODE_PROJECT_FILES, opencodeDirs, protectedPaths, realpath, safeGit } from "./sandbox.ts";
+import { abbreviates, allCommands, alsoByName, argvGuards, gitCall, gitProblem, landing, observer, single, strict, strictCommands, textGuards, tilde, unmodelled, writtenBy, type Single } from "./guard.ts";
 
 export type Effect = "allow" | "ask" | "deny";
+
+const literal = (names: string[]) => names.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
 
 // Ask rules added on top of upstream's, from the bench's rule-allowed risky rows and this
 // deployment's needs. Pi user rules: a glob over one simple command (`*` any text, trailing ` *`
@@ -46,7 +49,7 @@ export const DEFAULT_ASK = [
   "re:.*opencode-automode.*",
   // opencode loads project-level config, plugins and commands with no prompt; hook managers run
   // these files from git hooks. Both are read-only inside the sandbox, so a change must ask.
-  "re:(^|.*[ /=@])(\\.opencode|opencode\\.jsonc?|\\.husky|\\.lefthook|\\.?lefthook(-local)?\\.(ya?ml|toml|json)|\\.pre-commit-config\\.ya?ml|\\.overcommit\\.yml)( |/|$).*",
+  `re:(^|.*[ /=@])(${literal([...OPENCODE_CONFIG_NAMES, ...HOOK_MANAGER_FILES])})( |/|$).*`,
   // Dumping the environment prints every secret in it.
   "printenv *",
   "env",
@@ -153,25 +156,36 @@ export interface Guard {
 export class SessionState {
   readonly project: string;
   files: SessionFiles = new Map();
+  // Files a command of this session wrote, appended to or edited in place. The rules' own list
+  // (`files`) leaves an appended file's origin alone and does not follow `sed -i`.
+  touched = new Set<string>();
   roots: string[] | undefined;
   // The project's git layout as first seen (outside any sandbox), and its remote URLs.
   snapshot: GitSnapshot | undefined;
   // Set once the layout changed in a way git never does itself; auto-allow stops until the user
   // resumes it.
   tampered: { reason: string; at: number } | undefined;
-  // A `git init`, `clone`, `worktree` or `submodule` command this session asked about (and so
-  // ran outside the sandbox if approved): new repositories and worktrees are then expected.
-  expectNewRepo = false;
+  // Repositories and worktrees the user approved: a `git init`, `clone`, `worktree add` or
+  // `submodule` command this session asked about, once it was approved and while it runs. Only
+  // what appears inside the directories that command named is expected.
+  expecting: Expected[] = [];
   constructor(project: string) {
     this.project = realpath(project);
   }
+}
+
+export interface Expected {
+  dirs: string[];
+  at: number;
+  // Set when the approved command has finished: the next check is the last this covers.
+  done?: boolean;
 }
 
 type RemoteUrls = Map<string, { fetch: string[]; push: string[] }>;
 
 interface GitSnapshot {
   // Per checkout root: what `.git` is (directory inode, or pointer file contents).
-  entries: { root: string; kind: "dir" | "file" | "none"; ino?: number; text?: string }[];
+  entries: { root: string; kind: "dir" | "file" | "link" | "none"; ino?: number; text?: string }[];
   // Nested repositories and pointer files found below the roots: they must not change either.
   nested: { path: string; ino?: number; text?: string }[];
   // Every git directory and pointer file known when the snapshot was taken.
@@ -181,7 +195,8 @@ interface GitSnapshot {
   commonDir: string | undefined;
   // Undefined when git could not tell: nothing is then trusted about remotes.
   remotes: RemoteUrls | undefined;
-  // Which of opencode's project-level files existed in the session directory.
+  // Which of opencode's project-level files existed, in the session directory and the writable
+  // directories above it (full paths).
   opencodeFiles: Set<string>;
 }
 
@@ -191,6 +206,8 @@ function gitEntry(root: string): GitSnapshot["entries"][number] {
     const st = fs.lstatSync(p);
     if (st.isDirectory()) return { root, kind: "dir", ino: st.ino };
     if (st.isFile()) return { root, kind: "file", text: fs.readFileSync(p, "utf8") };
+    // A link named `.git` is a repository too, wherever it points.
+    if (st.isSymbolicLink()) return { root, kind: "link", text: fs.readlinkSync(p) };
   } catch {
     // no .git
   }
@@ -234,19 +251,41 @@ function takeSnapshot(roots: string[], project: string): GitSnapshot {
   const mainGitDirs = entries.filter((e) => e.kind === "dir").map((e) => realpath(path.join(e.root, ".git")));
   const common = git(project, "rev-parse", "--git-common-dir")?.trim();
   const found = findGitEntries(roots);
+  const atRoot = (p: string) => roots.some((r) => p === path.join(r, ".git"));
   const nested = [
     ...[...found.gitDirs].filter((d) => !mainGitDirs.includes(d)).map((d) => ({ path: d, ino: statIno(d) })),
-    ...[...found.pointers].filter((p) => !roots.some((r) => p === path.join(r, ".git"))).map((p) => ({ path: p, text: readText(p) })),
+    ...[...found.pointers].filter((p) => !atRoot(p)).map((p) => ({ path: p, text: readText(p) })),
+    ...[...found.links].filter((p) => !atRoot(p)).map((p) => ({ path: p, text: readLink(p) })),
   ];
   return {
     entries,
     nested,
-    known: new Set([...found.gitDirs, ...found.pointers]),
+    known: new Set([...found.gitDirs, ...found.pointers, ...found.links]),
     inside: new Map([...found.gitDirs].map((d) => [d, insideOf(d)])),
     commonDir: common ? realpath(path.resolve(project, common)) : undefined,
     remotes: readRemotes(project),
-    opencodeFiles: new Set(OPENCODE_PROJECT_FILES.filter((f) => fs.existsSync(path.join(project, f)))),
+    opencodeFiles: new Set(opencodeFiles(project, roots).filter(lexists)),
   };
+}
+
+const lexists = (p: string) => {
+  try {
+    fs.lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+};
+// Every place opencode would load a project-level file from: the session directory and each
+// writable directory above it (a session can start in a subdirectory of the checkout).
+const opencodeFiles = (project: string, roots: string[]) => opencodeDirs(project, roots.map(realpath)).flatMap((dir) => OPENCODE_PROJECT_FILES.map((f) => path.join(dir, f)));
+
+function readLink(p: string): string | undefined {
+  try {
+    return fs.readlinkSync(p);
+  } catch {
+    return undefined;
+  }
 }
 
 function statIno(p: string): number | undefined {
@@ -266,16 +305,22 @@ function readText(p: string): string | undefined {
 }
 
 // What changed in the project's git layout since the snapshot. `replaced` lists changes git never
-// makes on its own; `appeared` lists new repositories, worktrees and config files, which are
-// fine right after a command the user approved and tampering otherwise.
-function layoutChanges(session: SessionState): { replaced: string[]; appeared: string[] } {
+// makes on its own; `appeared` lists new repositories, worktrees and config files with where
+// they are: fine inside a directory an approved command named, tampering anywhere else.
+interface Appeared {
+  path: string;
+  text: string;
+  // opencode's own files are never explained by a git command.
+  opencode?: boolean;
+}
+function layoutChanges(session: SessionState): { replaced: string[]; appeared: Appeared[] } {
   const snap = session.snapshot!;
   const replaced: string[] = [];
-  const appeared: string[] = [];
+  const appeared: Appeared[] = [];
   for (const before of snap.entries) {
     const now = gitEntry(before.root);
     const p = path.join(before.root, ".git");
-    if (before.kind === "none" && now.kind !== "none") appeared.push(`${p} appeared`);
+    if (before.kind === "none" && now.kind !== "none") appeared.push({ path: p, text: `${p} appeared${now.kind === "link" ? " (a symbolic link)" : ""}` });
     else if (now.kind !== before.kind || now.ino !== before.ino || now.text !== before.text) replaced.push(`${p} was replaced or rewritten`);
     // A main checkout's git directory never has a `commondir`, whenever it got there.
     if (now.kind === "dir" && fs.existsSync(path.join(p, "commondir"))) replaced.push(`${path.join(p, "commondir")} appeared`);
@@ -283,25 +328,27 @@ function layoutChanges(session: SessionState): { replaced: string[]; appeared: s
   // A nested repository that is gone was deleted, which plants nothing: forget it. One that is
   // there but different was swapped.
   snap.nested = snap.nested.filter((before) => {
-    if (!fs.existsSync(before.path)) return snap.known.delete(before.path), false;
-    if (before.ino !== undefined ? statIno(before.path) !== before.ino : readText(before.path) !== before.text) replaced.push(`${before.path} was replaced, moved or rewritten`);
+    if (!lexists(before.path)) return snap.known.delete(before.path), false;
+    const same = before.ino !== undefined ? statIno(before.path) === before.ino : (readText(before.path) ?? readLink(before.path)) === before.text;
+    if (!same) replaced.push(`${before.path} was replaced, moved or rewritten`);
     return true;
   });
   const roots = session.roots ?? [];
   const found = findGitEntries(roots);
-  for (const p of [...found.gitDirs, ...found.pointers]) {
-    if (!snap.known.has(p) && !roots.some((r) => p === path.join(r, ".git") || p === realpath(path.join(r, ".git")))) appeared.push(`${p} appeared`);
+  for (const p of [...found.gitDirs, ...found.pointers, ...found.links]) {
+    if (!snap.known.has(p) && !roots.some((r) => p === path.join(r, ".git") || p === realpath(path.join(r, ".git")))) appeared.push({ path: p, text: `${p} appeared${found.links.has(p) ? " (a symbolic link named .git)" : ""}` });
   }
   for (const [dir, before] of snap.inside) {
     if (!fs.existsSync(dir)) continue;
     const now = insideOf(dir);
     if (now.commondir && !before.commondir) replaced.push(`${path.join(dir, "commondir")} appeared`);
     if (now.configWorktree && !before.configWorktree) replaced.push(`${path.join(dir, "config.worktree")} appeared`);
-    for (const wt of now.worktrees) if (!before.worktrees.includes(wt)) appeared.push(`${path.join(dir, "worktrees", wt)} appeared (a new linked worktree)`);
+    for (const wt of now.worktrees) if (!before.worktrees.includes(wt)) appeared.push({ path: path.join(dir, "worktrees", wt), text: `${path.join(dir, "worktrees", wt)} appeared (a new linked worktree)` });
   }
-  // `.opencode` is left out: the plugin creates it empty so that it can be made read-only.
-  for (const f of OPENCODE_PROJECT_FILES) {
-    if (f !== ".opencode" && !snap.opencodeFiles.has(f) && fs.existsSync(path.join(session.project, f))) appeared.push(`${path.join(session.project, f)} appeared (opencode loads it without asking)`);
+  // `.opencode` in the session directory is left out: the plugin creates it empty so that it
+  // can be made read-only.
+  for (const p of opencodeFiles(session.project, roots)) {
+    if (p !== path.join(session.project, ".opencode") && !snap.opencodeFiles.has(p) && lexists(p)) appeared.push({ path: p, text: `${p} appeared (opencode loads it without asking)`, opencode: true });
   }
   return { replaced, appeared };
 }
@@ -326,31 +373,70 @@ export function gitTampered(session: SessionState, resumeFile?: string): string 
   }
   if (!session.snapshot) return undefined;
   const { replaced, appeared } = layoutChanges(session);
-  const expected = session.expectNewRepo;
-  // An expected repository must appear by the next decision (the approved command has run by
-  // then); a rejected `git init` must not leave the door open.
-  session.expectNewRepo = false;
-  const found = expected ? replaced : [...replaced, ...appeared];
+  // What an approved command named is expected while that command runs, and at the first check
+  // after it has finished. An approval lasts ten minutes at most.
+  const expecting = session.expecting.filter((e) => Date.now() - e.at < EXPECT_MS);
+  session.expecting = expecting.filter((e) => !e.done);
+  const expected = (a: Appeared) => !a.opencode && expecting.some((e) => e.dirs.some((dir) => within(a.path, dir)));
+  const found = [...replaced, ...appeared.filter((a) => !expected(a)).map((a) => a.text)];
   if (found.length) {
     const shown = found.slice(0, 5).join("; ") + (found.length > 5 ? `; and ${found.length - 5} more` : "");
     session.tampered = { reason: shown, at: Date.now() };
     return shown;
   }
   if (appeared.length) {
-    // New worktrees of the project, inside the folder that holds the main checkout, join it.
+    // A new worktree of the project joins it when the approved command named its directory and
+    // it lies inside the folder that holds the main checkout.
     const now = checkouts(session.project);
     const parent = path.dirname(now[0] ?? "/");
-    for (const dir of now) if (session.roots && !session.roots.includes(dir) && !isRootLike(parent) && within(dir, parent)) session.roots.push(dir);
+    for (const dir of now) {
+      if (session.roots && !session.roots.includes(dir) && !isRootLike(parent) && within(dir, parent) && expecting.some((e) => e.dirs.some((d) => within(dir, d)))) session.roots.push(dir);
+    }
     session.snapshot = takeSnapshot(session.roots ?? [], session.project);
   }
   return undefined;
 }
+const EXPECT_MS = 600_000;
 
 const pauseReason = (found: string, resumeFile?: string) =>
   `auto-allow paused for this session: ${found}. Check what is there; approving this prompt does not resume.${resumeFile ? ` To resume, run \`touch ${resumeFile}\` in your own terminal.` : ""}`;
 
-// A command the user is asked about that creates repositories or worktrees when approved.
-export const expectsNewRepo = (command: string) => /\bgit\b[^;&|\n]*\b(init|clone|worktree|submodule)\b/.test(command);
+// Where a command the user is asked about would create repositories or worktrees: the
+// directories its `git init`, `clone`, `worktree add` and `submodule` calls name, read from
+// plain words only. Undefined when it creates none, or is not written in plain words (what then
+// appears pauses the session, and the user resumes it).
+export function expectedRepos(command: string, cwd: string): string[] | undefined {
+  const cmds = strictCommands(command, { nullRedirects: true });
+  if (!cmds) return undefined;
+  const dirs: string[] = [];
+  let dir = cwd;
+  for (const { argv } of cmds) {
+    if (argv[0] === "cd" && argv.length === 2) dir = path.resolve(dir, tilde(argv[1]));
+    if (argv[0] !== "git") continue;
+    const call = gitCall(argv.slice(1));
+    if (typeof call === "string") continue;
+    const base = call.dirs.reduce((at, d) => path.resolve(at, tilde(d)), dir);
+    const words = call.rest.filter((w) => !w.startsWith("-"));
+    // The repository's own git directory gets `worktrees/<name>` and `modules/<name>`.
+    const common = () => {
+      const out = safeGit(["-C", base, "rev-parse", "--git-common-dir"])?.trim();
+      return out ? [realish(path.resolve(base, out))] : [];
+    };
+    const named = (p: string) => realish(path.resolve(base, tilde(p)));
+    if (call.sub === "init") dirs.push(named(words[0] ?? "."));
+    else if (call.sub === "clone" && words.length) dirs.push(named(words[1] ?? path.basename(words[0].replace(/\/+$/, "")).replace(/\.git$/, "")));
+    else if (call.sub === "worktree" && words[0] === "add" && words[1]) dirs.push(named(words[1]), ...common());
+    else if (call.sub === "submodule" && words[0] === "add" && words[1]) dirs.push(named(words[2] ?? path.basename(words[1].replace(/\/+$/, "")).replace(/\.git$/, "")), ...common());
+    else if (call.sub === "submodule" && (words[0] === "update" || words[0] === "init")) {
+      // The places are the ones .gitmodules declares.
+      const top = safeGit(["-C", base, "rev-parse", "--show-toplevel"])?.trim();
+      const listed = top ? safeGit(["config", "--file", path.join(top, ".gitmodules"), "--get-regexp", "^submodule\\..*\\.path$"]) : undefined;
+      for (const line of lines(listed ?? "")) dirs.push(realish(path.resolve(top!, line.slice(line.indexOf(" ") + 1).trim())));
+      if (listed) dirs.push(...common());
+    }
+  }
+  return dirs.length ? dirs : undefined;
+}
 
 // Every git call from this process goes through gitRun: fsmonitor, hooks and askpass off, no prompts.
 const git = (cwd: string, ...args: string[]) => safeGit(["-C", cwd, ...args]);
@@ -427,7 +513,7 @@ interface Remote {
   valued?: string[];
   // `-5` style counts.
   numeric?: boolean;
-  // Any words at all (echo, test).
+  // Any words at all (true, false).
   free?: boolean;
   check?: (operands: string[], argv: string[]) => boolean;
 }
@@ -437,12 +523,17 @@ const FIND_FLAGS = new Set("-print -print0 -ls -empty -not -o -a -and -or -L -H 
 const IP_OBJECTS = new Set(["addr", "address", "a", "route", "r", "link", "l", "neigh", "neighbor", "n", "rule"]);
 const IP_SHOW = new Set(["show", "list", "ls", "lst"]);
 const numbers = (ops: string[]) => ops.every((w) => /^\d+(\.\d+)?[smhd]?$/.test(w));
+const plainWords = (argv: string[]) => argv.slice(1).every((w) => !/[$`[]/.test(w));
+const TEST_OPERATORS = new Set("-e -f -d -s -r -w -x -L -h -p -S -b -c -n -z -eq -ne -gt -ge -lt -le -nt -ot -ef -a -o".split(" "));
 const REMOTE: Record<string, Remote> = {
   cat: { flags: "AbeEnstTuv" },
   head: { flags: "qv", valued: ["-n", "-c", "--lines", "--bytes"], numeric: true },
   tail: { flags: "qvfF", valued: ["-n", "-c", "--lines", "--bytes"], numeric: true },
-  grep: { flags: "EFGPiwxvcnHhlLoqsrRIaz", valued: ["-e", "-m", "-A", "-B", "-C", "--include", "--exclude", "--exclude-dir", "--max-count", "--color"], numeric: true },
-  rg: { flags: "iwvcnlFSsNHUxo", long: ["--hidden", "--no-ignore", "--files"], valued: ["-e", "-g", "-t", "-T", "-m", "-A", "-B", "-C", "--glob", "--type", "--max-count"] },
+  // No -r/-R: a recursive read prints every file below a directory, credentials included, and
+  // the rules only see the directory's name. rg is recursive by itself, so it may only list
+  // file names (--files).
+  grep: { flags: "EFGPiwxvcnHhlLoqsIaz", valued: ["-e", "-m", "-A", "-B", "-C", "--max-count", "--color"], numeric: true },
+  rg: { flags: "iwvcnlFSsNHUxo", long: ["--files"], valued: ["-g", "-t", "-T", "--glob", "--type"], check: (_ops, argv) => argv.includes("--files") },
   ls: { flags: "aAlhtrSRd1FiLnsgGoXUcukp", long: ["--all", "--human-readable"], valued: ["--color", "--sort", "--time"] },
   stat: { flags: "Lft", valued: ["-c", "--format", "--printf"] },
   file: { flags: "bLiz" },
@@ -455,19 +546,22 @@ const REMOTE: Record<string, Remote> = {
   hostname: { flags: "afdisAIy", long: ["--fqdn", "--short", "--domain", "--all-fqdns", "--ip-address", "--all-ip-addresses"], check: (ops) => !ops.length },
   id: { flags: "ugGnrzZ" },
   whoami: { check: (ops) => !ops.length },
-  ps: { flags: "eAfFlwHjTLMyZaxu", long: ["--forest", "--no-headers"], valued: ["-o", "-p", "-u", "-U", "-C", "--sort", "--pid", "--ppid"], check: (ops) => ops.every((w) => /^[aAxuefwlHjTLmc]+$/.test(w)) },
+  // Without a dash, `e` shows every process's environment.
+  ps: { flags: "eAfFlwHjTLMyZaxu", long: ["--forest", "--no-headers"], valued: ["-o", "-p", "-u", "-U", "-C", "--sort", "--pid", "--ppid"], check: (ops) => ops.every((w) => /^[aAxufwlHjTLmc]+$/.test(w)) },
   pgrep: { flags: "lafxnovc", valued: ["-u", "-U", "-P", "-g", "-t", "-d"] },
   date: { flags: "uRI", long: ["--utc", "--universal", "--rfc-email"], valued: ["-d", "--date", "-r", "--reference", "--iso-8601", "--rfc-3339"], check: (ops) => ops.every((w) => w.startsWith("+")) },
   sort: { flags: "bdfgiMhnRrVcCmuzs", valued: ["-k", "-t", "--key", "--field-separator"] },
   uniq: { flags: "cdDiuz", valued: ["-f", "-s", "-w"], check: (ops) => ops.length <= 1 }, // a second operand is the output file
   cut: { flags: "sz", long: ["--complement"], valued: ["-d", "-f", "-c", "-b", "--delimiter", "--fields"] },
   tr: { flags: "cdst" },
-  echo: { free: true },
-  printf: { free: true },
+  // bash evaluates the name after `printf -v` and `test -v` as arithmetic, subscripts included:
+  // no -v, and no word that could hold a substitution or a subscript.
+  echo: { flags: "neE", check: (_ops, argv) => plainWords(argv) },
+  printf: { check: (_ops, argv) => plainWords(argv) && !argv.slice(1).some((w) => w.startsWith("-")) },
   true: { free: true },
   false: { free: true },
-  test: { free: true },
-  "[": { free: true },
+  test: { check: (_ops, argv) => plainWords(argv) && argv.slice(1).every((w) => !w.startsWith("-") || TEST_OPERATORS.has(w)) },
+  "[": { check: (_ops, argv) => plainWords(argv.slice(0, -1)) && argv.at(-1) === "]" && argv.slice(1).every((w) => !w.startsWith("-") || TEST_OPERATORS.has(w)) },
   findmnt: { flags: "lnrAkmse", valued: ["-o", "-t", "-T", "-S"] },
   lsblk: { flags: "afilmnpSt", valued: ["-o"] },
   lscpu: { flags: "e" },
@@ -522,6 +616,7 @@ function remoteProgramOk(argv: string[]): boolean {
     else if (w.startsWith("--")) {
       if (!w.includes("=") || !spec.valued?.includes(w.slice(0, w.indexOf("=")))) return false;
     } else if (spec.numeric && /^-\d+$/.test(w)) continue;
+    else if (argv[0] === "test" || argv[0] === "[") continue; // operators, checked by the program's own check
     else if (![...w.slice(1)].every((ch) => spec.flags?.includes(ch))) return false;
   }
   return spec.check ? spec.check(operands, argv) : true;
@@ -592,17 +687,27 @@ const REPO_CONFIG_OK =
   /^(core\.(repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode|symlinks|autocrlf|eol|safecrlf|quotepath|abbrev|compression|bigfilethreshold|preloadindex|commitgraph|multipackindex|sparsecheckout|sparsecheckoutcone|longpaths|untrackedcache|splitindex)|remote\..+\.(url|fetch|tagopt|prune|prunetags|promisor|partialclonefilter|skipdefaultupdate)|branch\..+\.(remote|merge|rebase|description)|user\.(name|email)|init\.defaultbranch|pull\.(rebase|ff)|fetch\.(prune|prunetags)|gc\.[\w.]+|pack\.[\w.]+|index\.[\w.]+|feature\.[\w.]+|maintenance\.[\w.]+|extensions\.(objectformat|refstorage|worktreeconfig|partialclone|preciousobjects)|submodule\..+\.(url|active|branch)|commit\.gpgsign|tag\.gpgsign|merge\.(ff|conflictstyle)|diff\.(renames|algorithm)|color\.[\w.]+|advice\.[\w.]+|rerere\.enabled|include\.path|includeif\..+\.path)$/;
 
 // The effective config as `[scope, key, value]`, or undefined when it could not be read in full
-// (git failed, the output was cut off, a value spans lines): the caller must then ask.
+// (git failed, the output was cut off): the caller must then ask. Read with -z, so a value that
+// spans lines is one value.
 function readConfig(dir: string): [string, string, string][] | undefined {
-  const r = gitRun(["-C", dir, "config", "--show-scope", "--includes", "--list"]);
+  const r = gitRun(["-C", dir, "config", "--show-scope", "--includes", "--list", "-z"]);
   if (r.status !== 0) return undefined;
+  const fields = r.out.split("\0");
+  if (fields.pop() !== "" || fields.length % 2) return undefined;
   const out: [string, string, string][] = [];
-  for (const line of lines(r.out)) {
-    const m = /^(\w+)\t([^=\s]+)(?:=(.*))?$/.exec(line);
-    if (!m) return undefined;
-    out.push([m[1], m[2].toLowerCase(), m[3] ?? ""]);
+  for (let i = 0; i < fields.length; i += 2) {
+    const entry = fields[i + 1];
+    const nl = entry.indexOf("\n");
+    // A key with no value at all (`[push] followTags`) is true for git.
+    out.push([fields[i], (nl < 0 ? entry : entry.slice(0, nl)).toLowerCase(), nl < 0 ? "true" : entry.slice(nl + 1)]);
   }
   return out;
+}
+
+// A boolean as git reads it, in any scope: undefined when unset, null when git could not say.
+function configBool(dir: string, key: string): boolean | undefined | null {
+  const r = gitRun(["-C", dir, "config", "--type=bool", "--get", key]);
+  return r.status === 0 ? r.out.trim() === "true" : r.status === 1 ? undefined : null;
 }
 
 const repoConfigOk = (config: [string, string, string][]) => config.every(([scope, key]) => (scope !== "local" && scope !== "worktree") || REPO_CONFIG_OK.test(key));
@@ -627,58 +732,107 @@ const run = (args: string[], timeout: number) =>
     execFile("git", gitArgs(args), { encoding: "utf8", timeout, maxBuffer: 1 << 20, env: gitEnv() }, (error, stdout) => resolve(error ? undefined : stdout));
   });
 
+// The project's own checkout, at its top: the directory is a mount of its own in every sandbox,
+// so no other command can swap it for something else between this check and the command.
+const atRoot = (dir: string, session: SessionState) => projectRoots(session).includes(realpath(dir));
+
+// Hooks git would run for the command, with the ssh agent in reach. A hook is the user's own, but
+// it often runs the project's scripts, which a sandboxed command can edit.
+const HOOKS_RUN: Record<string, string[] | "any"> = { fetch: ["reference-transaction"], "ls-remote": [], push: ["pre-push", "reference-transaction"], pull: "any" };
+function hookWouldRun(dir: string, sub: string, config: [string, string, string][]): boolean {
+  const configured = config.filter(([scope, key]) => scope !== "command" && key === "core.hookspath").at(-1)?.[2];
+  const base = configured ? safeGit(["-C", dir, "rev-parse", "--show-toplevel"])?.trim() : safeGit(["-C", dir, "rev-parse", "--git-common-dir"])?.trim();
+  if (!base) return true; // cannot tell
+  const hooks = configured ? path.resolve(base, tilde(configured)) : path.resolve(dir, base, "hooks");
+  const wanted = HOOKS_RUN[sub] ?? "any";
+  let names: string[];
+  try {
+    names = fs.readdirSync(hooks);
+  } catch {
+    return false; // no hooks directory
+  }
+  return names.some((name) => {
+    if (name.endsWith(".sample") || (wanted !== "any" && !wanted.includes(name))) return false;
+    try {
+      fs.accessSync(path.join(hooks, name), fs.constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+
+// The remote a command with no remote operand uses, by git's own order of precedence.
+function defaultRemote(dir: string, sub: string): string | null {
+  const head = gitRun(["-C", dir, "symbolic-ref", "--quiet", "--short", "HEAD"]);
+  if (head.status === undefined) return null;
+  const current = head.status === 0 ? head.out.trim() : undefined;
+  const keys = [...(sub === "push" ? [...(current ? [`branch.${current}.pushRemote`] : []), "remote.pushDefault"] : []), ...(current ? [`branch.${current}.remote`] : [])];
+  for (const key of keys) {
+    const value = configValue(dir, key);
+    if (value === null) return null;
+    if (value) return value;
+  }
+  return "origin";
+}
+
+// What `git push <words>` would do, asked of git itself (`--dry-run --porcelain`): which URL it
+// connects to and which ref goes where. Git applies its own precedence (branch.*.pushRemote,
+// remote.pushDefault, remote.*.push, push.default, followTags); reading the config here and
+// guessing would miss one of them. Hooks, askpass and prompts are off for the plugin's git.
+async function dryRunPush(dir: string, words: string[]): Promise<{ urls: string[]; refs: { flag: string; from: string; to: string }[] } | undefined> {
+  const out = await run(["-C", dir, "push", "--dry-run", "--porcelain", ...words.filter((w) => w !== "--porcelain" && w !== "-n" && w !== "--dry-run")], 8000);
+  if (out === undefined) return undefined;
+  const urls: string[] = [];
+  const refs: { flag: string; from: string; to: string }[] = [];
+  for (const line of lines(out)) {
+    const to = /^To (.+)$/.exec(line);
+    const ref = /^(.)\t([^\t:]*):([^\t]*)\t/.exec(line);
+    if (to) urls.push(to[1]);
+    else if (ref) refs.push({ flag: ref[1], from: ref[2], to: ref[3] });
+    else if (line !== "Done") return undefined;
+  }
+  return { urls, refs };
+}
+
 async function pushIsSafe(dir: string, words: string[], session: SessionState): Promise<boolean> {
-  // Only the project's own repository: not a copy the agent built elsewhere.
+  // Only the project's own repository, at the top of a checkout: not a copy the agent built
+  // elsewhere, and not a directory another command could swap.
   const snap = session.snapshot;
   const config = ownRepository(dir, session);
-  if (!snap || !config) return false;
+  if (!snap?.remotes || !config || !atRoot(dir, session)) return false;
   const flags = words.filter((w) => w.startsWith("-"));
   if (!flags.every((f) => PUSH_SAFE_FLAGS.has(f))) return false;
   const [remote, ...refspecs] = words.filter((w) => !w.startsWith("-"));
-  // A URL or an unknown name could send the code anywhere; so could a remote whose URLs (all of
-  // them: git pushes to each) changed since the session started. Without a remote argument git
-  // uses the branch's remote.
-  const head = gitRun(["-C", dir, "symbolic-ref", "--quiet", "--short", "HEAD"]);
-  if (head.status === undefined) return false;
-  const current = head.status === 0 ? head.out.trim() : undefined;
-  const branchRemote = current ? configValue(dir, `branch.${current}.remote`) : undefined;
-  if (branchRemote === null) return false;
-  const viaRemote = remote ?? branchRemote ?? "origin";
-  if (!sameUrls(snap.remotes, readRemotes(dir), viaRemote)) return false;
-  const value = (key: string) => config.filter(([, k]) => k === key).at(-1)?.[2];
-  const pushDefault = value("push.default")?.toLowerCase();
-  if (pushDefault && pushDefault !== "simple" && pushDefault !== "current") return false;
+  // A URL or an unknown name could send the code anywhere.
+  if (remote !== undefined && !snap.remotes.has(remote)) return false;
   // In any scope: a plain push would then send more than the branch.
-  if (/^(true|yes|on|1)$/i.test(value("push.followtags") ?? "") || config.some(([, k]) => /^remote\..+\.mirror$/.test(k))) return false;
+  if (configBool(dir, "push.followTags") !== undefined || config.some(([, k]) => /^remote\..+\.mirror$/.test(k))) return false;
+  if (hookWouldRun(dir, "push", config)) return false;
+  // `+x` forces, `:x` deletes, wildcards, tags and other ref namespaces are out of scope.
+  if (refspecs.some((spec) => !spec || spec.startsWith("+") || spec.startsWith(":") || spec.includes("*") || spec.split(":").length > 2 || /^refs\/(?!heads\/)/.test(spec))) return false;
+  const would = await dryRunPush(dir, words);
+  if (!would || !would.urls.length || !would.refs.length) return false;
+  // Every URL git would connect to belongs to a remote the session started with, unchanged
+  // since (all of its URLs: git pushes to each).
+  const now = readRemotes(dir);
+  const names = [...snap.remotes.keys()].filter((name) => sameUrls(snap.remotes, now, name) && would.urls.some((url) => snap.remotes!.get(name)!.push.includes(url)));
+  if (!names.length || !would.urls.every((url) => names.some((name) => snap.remotes!.get(name)!.push.includes(url)))) return false;
   // The remote's default branch, asked of the remote itself (the local refs/remotes/<r>/HEAD can be
   // rewritten). Repository config that could change how git connects was rejected above, and no
   // askpass program runs.
-  const symref = await run(["-C", dir, "ls-remote", "--symref", viaRemote, "HEAD"], 8000);
-  const remoteDefault = /^ref: refs\/heads\/(\S+)\s+HEAD$/m.exec(symref ?? "")?.[1];
-  if (!remoteDefault) return false;
-  const isProtected = (branch: string | undefined) => !branch || branch === "HEAD" || PROTECTED_BRANCH.test(branch) || branch === remoteDefault;
-  if (!refspecs.length) {
-    // Without a refspec git pushes the current branch to its upstream (simple) or the same name
-    // (current). The upstream must be the same-named branch, or unset.
-    if (!current) return false;
-    for (const [, key, merge] of config) {
-      if (key === `branch.${current.toLowerCase()}.merge` && merge.trim().replace(/^refs\/heads\//, "") !== current) return false;
-    }
-    return !isProtected(current);
+  const defaults = new Set<string>();
+  for (const name of names) {
+    const symref = await run(["-C", dir, "ls-remote", "--symref", name, "HEAD"], 8000);
+    const remoteDefault = /^ref: refs\/heads\/(\S+)\s+HEAD$/m.exec(symref ?? "")?.[1];
+    if (!remoteDefault) return false;
+    defaults.add(remoteDefault);
   }
-  return refspecs.every((spec) => {
-    // `+x` forces, `:x` deletes, wildcards, tags and other ref namespaces are out of scope.
-    if (!spec || spec.startsWith("+") || spec.startsWith(":") || spec.includes("*") || /^refs\/(?!heads\/)/.test(spec)) return false;
-    const [src, dst = src] = spec.split(":");
-    if (spec.split(":").length > 2) return false;
-    // Resolve the destination as git does: `@` and `HEAD` are the current branch; `refs/heads/x`
-    // is x; any other qualified form (`heads/x`, `refs/...`, `remotes/...`) is out of scope,
-    // because git would expand it to a ref the protected-branch check never saw.
-    const branch = dst === "HEAD" || dst === "@" ? current : dst.startsWith("refs/heads/") ? dst.slice("refs/heads/".length) : /^(refs|heads|tags|remotes)\//.test(dst) ? undefined : dst;
-    // The source must be a branch (not a tag or other ref), or the current branch.
-    const srcRef = src === "HEAD" || src === "@" ? (current ? `refs/heads/${current}` : undefined) : git(dir, "rev-parse", "--symbolic-full-name", src)?.trim();
-    if (!srcRef?.startsWith("refs/heads/")) return false;
-    return src.length > 0 && !isProtected(branch);
+  // What goes where: a branch, to a branch that is not protected, without force or delete.
+  return would.refs.every(({ flag, from, to }) => {
+    if (!" *=".includes(flag) || !(from === "HEAD" || from.startsWith("refs/heads/")) || !to.startsWith("refs/heads/")) return false;
+    const branch = to.slice("refs/heads/".length);
+    return !PROTECTED_BRANCH.test(branch) && !defaults.has(branch);
   });
 }
 
@@ -688,8 +842,10 @@ function plainGit(s: Single, subcommands: RegExp): { dir: string; sub: string; w
   let dir = s.dir;
   let i = 1;
   for (; s.argv[i] === "-C" && i + 1 < s.argv.length; i += 2) {
-    if (/^~[^/]/.test(s.argv[i + 1])) return undefined;
-    dir = path.resolve(dir, tilde(s.argv[i + 1]));
+    // The directory git changes to must be the one that is checked.
+    const to = /^~[^/]/.test(s.argv[i + 1]) ? undefined : landing(dir, tilde(s.argv[i + 1]));
+    if (!to) return undefined;
+    dir = to;
   }
   const sub = s.argv[i] ?? "";
   return subcommands.test(sub) ? { dir, sub, words: s.argv.slice(i + 1) } : undefined;
@@ -718,23 +874,31 @@ function rulesFor(guard: Guard, watch: Matcher, s: Single | undefined, pushOk: b
 }
 
 // Git subcommands that may write inside git directories when they make up the whole tool call.
-const GIT_WRITERS = new Set(["add", "commit", "checkout", "switch", "restore", "stash", "reset", "merge", "cherry-pick", "revert", "tag", "branch", "fetch", "pull", "mv", "rm", "status", "log", "diff", "show", "notes", "gc", "prune", "pack-refs", "update-index", "rev-parse", "ls-files", "describe", "blame", "shortlog", "reflog"]);
-const GIT_FILE_OPTIONS = ["--output", "--output-directory", "--exec", "--template", "--file", "--upload-pack", "--receive-pack"];
+const GIT_WRITERS = new Set(["add", "commit", "checkout", "switch", "restore", "stash", "reset", "merge", "cherry-pick", "revert", "rebase", "tag", "branch", "fetch", "pull", "push", "mv", "rm", "status", "log", "diff", "show", "notes", "gc", "prune", "pack-refs", "update-index", "rev-parse", "ls-files", "describe", "blame", "shortlog", "reflog"]);
+const GIT_FILE_OPTIONS = ["--output", "--output-directory", "--exec", "--template", "--upload-pack", "--receive-pack", "--interactive", "--patch"];
+// Short options that name a program or open an editor, by subcommand. Elsewhere `-u`, `-F` and
+// `-o` are harmless (`add -u`, `stash -u`, `commit -F msg`, `commit -o`).
+const GIT_SHORT_REFUSED: Record<string, RegExp> = { fetch: /^-[a-zA-Z]*u/, pull: /^-[a-zA-Z]*u/, rebase: /^-[a-zA-Z]*[xi]/, add: /^-[a-zA-Z]*[ipe]/, commit: /^-[a-zA-Z]*[pe]/, checkout: /^-[a-zA-Z]*p/, restore: /^-[a-zA-Z]*p/, reset: /^-[a-zA-Z]*p/, stash: /^-[a-zA-Z]*p/ };
+// The commit message most agents write: `-m "$(cat <<'EOF' ... EOF)"`. The delimiter is quoted,
+// so the body is text and nothing in it is expanded; it reads as one plain word.
+const HEREDOC_MESSAGE = /"\$\(cat <<'([A-Za-z_][A-Za-z0-9_]*)'\n(?:(?!\1\n)[^\n]*\n)*\1\n[ \t]*\)"/g;
 
-// A tool call made only of `git <writer>` commands (and `cd`), in plain words: no redirects,
-// substitutions, variables or options that write files or run programs. Only such calls get
-// write access inside git directories (minus hooks and config); for everything else git
-// directories are read-only.
+// A tool call made only of `git <writer>` commands (and `cd`), in plain words: no substitutions,
+// variables or options that write files or run programs; output may go to /dev/null or be
+// merged (`2>&1`). Only such calls get write access inside git directories (minus hooks and
+// config); for everything else git directories are read-only.
 export function gitOnly(command: string): boolean {
-  const cmds = strict(command);
+  const cmds = strict(command.replace(HEREDOC_MESSAGE, "MESSAGE"), { nullRedirects: true });
   if (!cmds) return false;
-  return cmds.every((argv) => {
-    if (argv[0] === "cd") return argv.length <= 2;
+  return cmds.every((full) => {
+    if (full[0] === "cd") return full.length <= 2;
+    const argv = full[0] === "timeout" && /^\d+(\.\d+)?[smhd]?$/.test(full[1] ?? "") ? full.slice(2) : full;
     if (argv[0] !== "git") return false;
     const call = gitCall(argv.slice(1));
     if (typeof call === "string" || !GIT_WRITERS.has(call.sub ?? "")) return false;
-    return !call.rest.some((w) => /^(-o|-x|-F|-u)$/.test(w) || abbreviates(w, GIT_FILE_OPTIONS));
-  }) && cmds.some((argv) => argv[0] === "git");
+    const refused = GIT_SHORT_REFUSED[call.sub ?? ""];
+    return !call.rest.some((w) => (refused?.test(w) && !w.startsWith("--")) || abbreviates(w, GIT_FILE_OPTIONS));
+  }) && cmds.some((argv) => argv.includes("git"));
 }
 
 const FETCH_FLAGS = new Set([
@@ -743,11 +907,12 @@ const FETCH_FLAGS = new Set([
 ]);
 
 // Whether a tool call gets the ssh agent and ~/.ssh's known_hosts/config (never private keys):
-// only a single plain `git fetch/pull/push/ls-remote` of the project's own repository, naming a
-// remote that was configured when the session started, with options from a short list; or a
-// single `ssh`/`scp` command (which the rules only allow for sshHosts).
+// only a single plain `git fetch/pull/push/ls-remote` at the top of the project's own checkout,
+// to a remote that was configured when the session started, with options from a short list and
+// no hook that would run; or a single `ssh`/`scp` command (which the rules only allow for
+// sshHosts).
 export function usesSsh(command: string, cwd: string, session: SessionState): boolean {
-  const roots = projectRoots(session);
+  projectRoots(session);
   const s = single(command, cwd);
   if (!s) return false;
   if (s.argv[0] === "ssh" || s.argv[0] === "scp") return true;
@@ -756,28 +921,91 @@ export function usesSsh(command: string, cwd: string, session: SessionState): bo
   const flags = call.words.filter((w) => w.startsWith("-"));
   const allowed = call.sub === "push" ? PUSH_SAFE_FLAGS : FETCH_FLAGS;
   if (!flags.every((f) => allowed.has(f) || /^--depth=\d+$/.test(f))) return false;
-  const real = realpath(call.dir);
-  if (!roots.some((r) => real === r || real.startsWith(r + "/"))) return false;
-  // The project's own repository, not one nested inside it or pointed elsewhere; its config must
-  // not change how git connects; and the remote must be one it had from the start, by name (a
-  // path or URL such as `ext::cmd` would make git run a program).
-  if (!ownRepository(call.dir, session)) return false;
+  // The top of a checkout of the project: not a directory below it, which another command
+  // running at the same time could replace with a link to a repository of its own.
+  if (!atRoot(call.dir, session)) return false;
+  // The project's own repository, not one pointed elsewhere; its config must not change how
+  // git connects; and the remote must be one it had from the start, by name (a path or URL
+  // such as `ext::cmd` would make git run a program).
+  const config = ownRepository(call.dir, session);
+  const known = session.snapshot?.remotes;
+  if (!config || !known?.size || hookWouldRun(call.dir, call.sub, config)) return false;
   const [remote, ...refs] = call.words.filter((w) => !w.startsWith("-"));
+  // With no remote named, git picks one: every remote for --all, else the branch's or `origin`.
+  const picked = remote ?? (flags.includes("--all") ? undefined : defaultRemote(call.dir, call.sub));
+  if (picked === null) return false;
+  const names = picked === undefined ? [...known.keys()] : [picked];
   const now = readRemotes(call.dir);
-  const names = remote === undefined ? [...(session.snapshot?.remotes?.keys() ?? [])] : [remote];
-  if (remote !== undefined && !session.snapshot?.remotes?.has(remote)) return false;
-  return names.every((n) => sameUrls(session.snapshot?.remotes, now, n)) && refs.every((r) => /^[\w.\/@:+^~-]+$/.test(r));
+  if (picked === undefined && now?.size !== known.size) return false;
+  return names.every((n) => known.has(n) && sameUrls(known, now, n)) && refs.every((r) => /^[\w.\/@:+^~-]+$/.test(r));
 }
 
-// A redirect into opencode's project config or a hook manager's files. The rules' Matchers see
-// a command's words, not its redirect targets.
-function redirectProblem(command: string, depth = 0): string | undefined {
-  for (const cmd of depth > 3 ? [] : parse(command).cmds) {
-    const target = cmd.out.find((t) => t.split("/").some((part) => OPENCODE_NAME.test(part) || HOOK_MANAGER_NAME.test(part)));
-    if (target) return `writes ${target}, which opencode or a git hook loads and runs`;
-    for (const word of cmd.argv) {
-      const inner = /\s/.test(word) && word.includes(">") ? redirectProblem(word, depth + 1) : undefined;
-      if (inner) return inner;
+const SSH_URL = /^(ssh:\/\/|git\+ssh:\/\/|ssh\+git:\/\/|[\w.-]+@[\w.-]+:|[\w.-]+:(?!\/\/))/;
+const NETWORK = new Set(["fetch", "pull", "push", "ls-remote"]);
+// Whether the subcommand writes inside the git directory. `branch`, `tag`, `stash` and `notes`
+// only list when they are given no name.
+const WRITES_GIT = new Set(["add", "commit", "checkout", "switch", "restore", "stash", "reset", "merge", "cherry-pick", "revert", "rebase", "am", "tag", "branch", "fetch", "pull", "push", "mv", "rm", "notes", "gc", "prune", "pack-refs", "update-index"]);
+function writesGit(sub: string, rest: string[]): boolean {
+  if (!WRITES_GIT.has(sub)) return false;
+  const words = rest.filter((w) => !w.startsWith("-"));
+  if (sub === "stash") return !["list", "show"].includes(words[0] ?? "");
+  if (sub === "branch" || sub === "tag") return words.length > 0 && !rest.some((w) => /^(-l|--list|-a|--all|-r|--remotes|--contains|--merged|--no-merged|--show-current|--points-at)$/.test(w));
+  if (sub === "notes") return !["list", "show", undefined].includes(words[0]);
+  return true;
+}
+
+// "Allowed" must mean the command can work. These are allowed by the rules and then fail in
+// the sandbox, with an error the agent cannot do anything about: git writing its own directory
+// from a call that is not made only of plain git commands, git signing with a key the sandbox
+// hides, git logging in over ssh without the agent or over https through a credential helper.
+// Each asks instead, so that an approved run happens outside the sandbox.
+export function sandboxBreaks(command: string, cwd: string, session: SessionState): string | undefined {
+  const calls: { sub: string; rest: string[] }[] = [];
+  for (const { argv } of allCommands(command)) {
+    argv.forEach((word, at) => {
+      if (path.basename(word) !== "git") return;
+      const call = gitCall(argv.slice(at + 1));
+      if (typeof call !== "string" && call.sub) calls.push({ sub: call.sub, rest: call.rest });
+    });
+  }
+  if (!calls.length) return undefined;
+  const writer = calls.find((c) => writesGit(c.sub, c.rest));
+  if (writer && !gitOnly(command)) return `git ${writer.sub} writes inside .git, which is read-only unless the tool call is made only of plain git commands`;
+  const dir = session.project;
+  if (calls.some((c) => ["commit", "merge", "rebase", "cherry-pick", "revert", "am", "pull"].includes(c.sub)) && configBool(dir, "commit.gpgsign") !== false && configBool(dir, "commit.gpgsign") !== undefined) return "git signs commits here, and the sandbox hides the keys and the agents that hold them";
+  if (calls.some((c) => (c.sub === "commit" && c.rest.some((w) => /^(-[a-zA-Z]*S|--gpg-sign)/.test(w))) || (c.sub === "tag" && c.rest.some((w) => /^(-[a-zA-Z]*[su]|--sign|--local-user)/.test(w))))) return "git signs here, and the sandbox hides the keys and the agents that hold them";
+  if (!calls.some((c) => NETWORK.has(c.sub))) return undefined;
+  const urls = [...(session.snapshot?.remotes?.values() ?? [])].flatMap((r) => [...r.fetch, ...r.push]);
+  if (urls.some((url) => SSH_URL.test(url)) && !usesSsh(command, cwd, session)) return "git would need your ssh agent, which only a single plain git fetch, pull, push or ls-remote at the top of the project gets (and only when no hook would run)";
+  const helper = configValue(dir, "credential.helper");
+  if (urls.some((url) => /^https?:\/\//.test(url)) && helper !== undefined) return "git would log in through a credential helper, and the sandbox hides what credential helpers use";
+  return undefined;
+}
+
+// Programs whose operands are written to: every one of them, or only the last.
+const WRITER_OPERANDS: Record<string, "all" | "last"> = {
+  cp: "last", ln: "last", install: "last", rsync: "last",
+  mv: "all", tee: "all", truncate: "all", touch: "all", mkdir: "all", rmdir: "all", chmod: "all", chown: "all", chgrp: "all", setfacl: "all", shred: "all", unlink: "all", patch: "all", rm: "all", sed: "all",
+};
+
+// A write the rules' Matchers do not see as one: into a path with a `.git` component (a new
+// repository, or a link named `.git`), opencode's project files or a hook manager's files. The
+// targets are redirects and the operands of the programs that write.
+function writeProblem(cmds: Simple[]): string | undefined {
+  for (const cmd of cmds) {
+    const targets = [...cmd.out];
+    cmd.argv.forEach((word, at) => {
+      const how = Object.hasOwn(WRITER_OPERANDS, path.basename(word)) ? WRITER_OPERANDS[path.basename(word)] : undefined;
+      const args = cmd.argv.slice(at + 1);
+      const files = args.filter((a) => !a.startsWith("-"));
+      if (path.basename(word) === "sed" && !args.some((a) => /^(-[a-zA-Z]*i|--in-place)/.test(a))) return;
+      if (path.basename(word) === "dd") targets.push(...args.filter((a) => a.startsWith("of=")).map((a) => a.slice(3)));
+      else if (how) targets.push(...(how === "last" ? files.slice(-1) : files));
+    });
+    for (const target of targets) {
+      const parts = target.split("/");
+      if (parts.includes(".git")) return `writes ${target}: a path inside or named .git, where git finds hooks and config`;
+      if (parts.some((part) => OPENCODE_NAME.test(part) || HOOK_MANAGER_NAME.test(part))) return `writes ${target}, which opencode or a git hook loads and runs`;
     }
   }
   return undefined;
@@ -807,14 +1035,34 @@ export async function decideShell(guard: Guard, session: SessionState, cwd: stri
   const scope = scopeFor(guard, session, cwd, rulesFor(guard, watch.matcher, s, pushOk));
   const verdict = bashVerdict(command, scope);
   if (verdict.action === "deny") return fromRules(verdict);
-  const gitIssue = gitProblem(command) ?? redirectProblem(command);
+  const cmds = allCommands(command);
+  const gitIssue = gitProblem(command) ?? writeProblem(cmds);
   if (gitIssue) return askBy(gitIssue);
-  const written = () => new Map([...session.files.keys(), ...scope.pending.keys()].map((p) => [path.basename(p), p] as [string, string]));
-  const extra = textGuards(watch.pairs(), { cwd: scope.cwd ?? cwd, cwdKnown: !/(^|[\s;&|(])(cd|pushd|popd)(\s|$)/.test(command), scope, written });
+  const cwdKnown = !/(^|[\s;&|(])(cd|pushd|popd)(\s|$)/.test(command);
+  const here = scope.cwd ?? cwd;
+  const known = () => new Set([...session.files.keys(), ...scope.pending.keys(), ...session.touched]);
+  // The file a word names. After a `cd` a relative word cannot be placed: it then stands for any
+  // file of that name this session wrote.
+  const resolve = (word: string): string | undefined => {
+    if (/[$`]/.test(word)) return undefined;
+    const p = tilde(word);
+    if (path.isAbsolute(p) || cwdKnown) return realish(path.resolve(here, p));
+    return [...known()].find((f) => path.basename(f) === path.basename(p));
+  };
+  const writes = writtenBy(cmds, resolve);
+  const written = () => new Set([...known(), ...writes]);
+  const context = { cwd: here, cwdKnown, scope, written, resolve };
+  const fromText = textGuards(watch.pairs(), context);
+  const fromWords = argvGuards(cmds, context);
+  const extra = !fromText ? fromWords : !fromWords ? fromText : fromText.action === "ask" ? fromText : fromWords.action === "ask" ? fromWords : (fromWords.files ? fromWords : fromText);
+  const commit = () => {
+    commitWrites(scope);
+    for (const p of writes) session.touched.add(p);
+  };
   if (verdict.action === "ask") return fromRules(verdict);
   if (extra?.action === "ask") return askBy(extra.reason);
   if (verdict.action === "allow" && !extra) {
-    commitWrites(scope);
+    commit();
     return fromRules(verdict);
   }
   const why = extra?.reason ?? reword(verdict.reason);
@@ -826,7 +1074,7 @@ export async function decideShell(guard: Guard, session: SessionState, cwd: stri
   if (typeof guard.classifier.askAbove !== "number" || !(score < guard.classifier.askAbove)) {
     return { effect: "ask", by: "model", rule: "classify", reason: `model risk ${score.toFixed(2)} (asks at ${guard.classifier.askAbove} and above)`, score, ms };
   }
-  commitWrites(scope);
+  commit();
   return { effect: "allow", by: "model", rule: "classify", reason: `model risk ${score.toFixed(2)}`, score, ms };
 }
 
@@ -845,8 +1093,8 @@ function realish(p: string): string {
   }
 }
 
-const HOOK_MANAGER_NAME = /^(\.husky|\.lefthook|\.?lefthook(-local)?\.(ya?ml|toml|json)|\.pre-commit-config\.ya?ml|\.overcommit\.yml)$/;
-const OPENCODE_NAME = /^(\.opencode|\.claude|\.agents|opencode\.jsonc?)$/;
+const HOOK_MANAGER_NAME = new RegExp(`^(${literal(HOOK_MANAGER_FILES)})$`);
+const OPENCODE_NAME = new RegExp(`^(${literal(OPENCODE_PROJECT_FILES)})$`);
 
 // Files the sandbox keeps read-only for shell commands; the edit tool must not be a way around.
 function protectedFile(guard: Guard, session: SessionState, target: string): string | undefined {

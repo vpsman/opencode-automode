@@ -9,7 +9,7 @@ import path from "node:path";
 import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { DEFAULT_ASK, decideFile, decideShell, gitOnly, mirrorable, SessionState, usesSsh, type Decision, type Guard } from "../decide.ts";
+import { DEFAULT_ASK, decideFile, decideShell, expectedRepos, gitOnly, mirrorable, sandboxBreaks, SessionState, usesSsh, type Decision, type Guard } from "../decide.ts";
 import { compileRules } from "../rules.ts";
 import { DEFAULT_CLASSIFIER } from "../kev.ts";
 
@@ -49,7 +49,19 @@ before(() => {
   git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init");
   git("push", "-q", "origin", "main"); // so the remote reports a default branch
   git("checkout", "-q", "-b", "feature/x");
+  git("push", "-q", "-u", "origin", "feature/x"); // a plain `git push` needs an upstream to work at all
 });
+// Sets a config key for one test and puts back what was there.
+const setConfig = (key: string, value: string) => {
+  let old: string | undefined;
+  try {
+    old = git("config", "--get", key).trim();
+  } catch {
+    // unset
+  }
+  git("config", key, value);
+  return () => (old === undefined ? git("config", "--unset", key) : git("config", key, old));
+};
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
 describe("git push matcher", () => {
@@ -110,11 +122,22 @@ describe("git push matcher", () => {
   });
 
   test("ask: a plain push goes to the branch's own remote, and that remote is unknown", async () => {
-    git("config", "branch.feature/x.remote", "nowhere");
+    const restore = setConfig("branch.feature/x.remote", "nowhere");
     try {
       assert.equal(await effect("git push"), "ask");
     } finally {
-      git("config", "--unset", "branch.feature/x.remote");
+      restore();
+    }
+  });
+
+  test("ask: a plain push on a branch with no upstream would only fail", async () => {
+    git("checkout", "-q", "-b", "feature/no-upstream");
+    try {
+      assert.equal(await effect("git push"), "ask");
+      assert.equal(await effect("git push origin feature/no-upstream"), "allow");
+    } finally {
+      git("checkout", "-q", "feature/x");
+      git("branch", "-q", "-D", "feature/no-upstream");
     }
   });
 
@@ -142,11 +165,11 @@ describe("git push matcher", () => {
 
   const withConfig = (key: string, value: string) => {
     test(`ask: git push with ${key}=${value} in config`, async () => {
-      git("config", key, value);
+      const restore = setConfig(key, value);
       try {
         assert.equal(await effect("git push"), "ask");
       } finally {
-        git("config", "--unset", key);
+        restore();
       }
     });
   };
@@ -297,7 +320,7 @@ describe("git layout tampering pauses auto-allow", () => {
     const plain = fs.mkdtempSync(path.join(tmp, "plain-"));
     const s = new SessionState(plain);
     assert.equal((await decideShell(guard, s, plain, "ls")).effect, "allow");
-    s.expectNewRepo = true; // what the plugin records when it asks about `git init`
+    s.expecting.push({ dirs: [fs.realpathSync(plain)], at: Date.now() }); // what the plugin records when a `git init` it asked about is approved
     execFileSync("git", ["init", "-q", plain]);
     assert.equal((await decideShell(guard, s, plain, "ls")).effect, "allow");
   });
@@ -676,4 +699,520 @@ describe("J: opencode's project config and the edit tool", () => {
     }
   });
   test("editing an ordinary project file is left to opencode", () => assert.equal(edit("src/main.ts"), undefined));
+});
+
+// ---- round 2 review findings ----
+
+describe("r2 A: the guard runs on what bash will run", () => {
+  // 1: a # or << the parser reads as a comment or a heredoc, inside ${...} or arithmetic.
+  expectEffect("ask", [
+    "echo \\ # $'\\'' ; id #'",
+    "echo a\\ #b; git fetch $'\\'' ; id #'",
+    "echo a\\\n# $'\\'' ; id #'",
+    "echo ${x:- #}; id",
+    "echo ${x:-a # $(id)}",
+    "(( true # $(id) ))",
+    "echo $[ 1 # $(id) ]",
+    "echo ${x:- <<EOF }\nid\nEOF",
+    // 2: the same inside a nested shell, and a nested command that is not literal.
+    "bash -c 'ls >&2#; id'",
+    "bash -c 'cat <<E\"OF\"\nhello\nEOF\nid\n'",
+    "eval 'ls >&2#; id'",
+    "x='; id'; bash -c \"ls $x\"",
+    "sudo bash -c 'echo ${x:- #}; id'",
+    // 3: text that bash evaluates as code.
+    "CI='$(id)'; printf '%s\\n' \"${CI@P}\"",
+    "for x in '$(id)'; do echo \"${x@P}\"; done",
+    "declare -i x='a[$(id)]'",
+    "test -v 'a[$(id)]'",
+    "declare x='b[$(id)]'; test -v \"$x\"",
+    "declare x='b[$(id)]'; echo ${!x}",
+    "for x in 'b[$(id)]'; do echo ${a[x]}; done",
+    "for PS4 in '$(id)'; do set -x; true; done",
+    // The sinks themselves, wherever the value comes from.
+    "declare -i n=x",
+    "typeset -i n",
+    "local -ri n=x",
+    "let n=x+1",
+    "test -v \"$name\"",
+    "[ -v a[x] ]",
+    "echo ${!name}",
+    "echo ${arr[i]}",
+    "echo \"${v@Q}\"",
+    "set -x",
+    "set -euxo pipefail",
+    "set -o xtrace",
+    "unset 'a[i]'",
+    "read -r 'a[i]' < f",
+    "printf -v 'a[i]' x",
+    "timeout 5 bash -c 'set -x; ls'",
+  ]);
+  // 4: options that make a program run another.
+  expectEffect("ask", [
+    "git grep -O'id' x",
+    "git grep --open-files-in-pager=id x",
+    "git grep --open-files-in-p=id x",
+    "git submodule foreach 'id'",
+    "git --no-pager submodule --quiet foreach id",
+    "git rebase -x 'id' main",
+    "git bisect run ./t.sh",
+    "tar -cf t.tar --checkpoint=1 --checkpoint-action=exec='id' f",
+    "tar -cf t.tar --checkpoint-ac=exec=id f",
+    "tar -cf t.tar -I 'id' f",
+    "tar cIf id t.tar f",
+    "tar -cf t.tar --use-compress-program=id f",
+    "tar -xf t.tar --to-command=id",
+    "tar -cf host:t.tar f",
+    "sort --compress-program=id f",
+    "sort --compress-prog id f",
+    "make --eval='$(shell id)'",
+    "make SHELL=/tmp/x all",
+    "fd -x id",
+    "fd . --exec-batch id",
+    "rg --pre id x .",
+    "man -P id ls",
+    "timeout 60 tar -xf t.tar --to-command=id",
+    "sudo tar -cf t.tar -I id f",
+    "tar -cf t.tar {--checkpoint=1,--checkpoint-action=exec=id} f",
+  ]);
+  expectEffect("classify", [
+    "sed -n '1e id' f",
+    "sed 's/.*/id/e' f",
+    "sed 's/a/b/w out' f",
+    "sed -n -e '1e id' f",
+    "sed --expression='1e id' f",
+    "sed -f script.sed f",
+    "awk 'BEGIN{\"id\" | getline}'",
+    "awk 'BEGIN{system(\"id\")}'",
+    "awk -f prog.awk f",
+    "awk -v c=id 'BEGIN{c | getline}'",
+    "gawk '@load \"x\"; BEGIN{}'",
+  ]);
+  expectEffect("allow", [
+    "sed -n '1,5p' README.md",
+    "sed 's/a/b/g' README.md",
+    "sed -i 's|a|b|' notes.txt",
+    "sed -e 's/a/b/' -e '/x/d' README.md",
+    "tar -czf out.tar.gz src",
+    "tar -xzf out.tar.gz -C build",
+    "sort -u README.md",
+    "git grep -n foo",
+    "git log --stat",
+    "git diff --stat",
+    "rg -n --hidden foo .",
+    "mkdir -p src/{a,b}",
+    "echo ${HOME:-x} \"${USER:-nobody}\"",
+    "bash -c 'ls -la'",
+  ]);
+  // 5: a shortened option is the option, for git.
+  expectEffect("ask", ["git reset --har HEAD", "git reset --hard HEAD", "git clean --forc", "git clean --force", "git checkout --forc x", "git branch --del --forc x", "git tag --del v1", "git restore --staged --work f", "git branch --set-up=origin/main", "git checkout --tr origin/x", "git gc --pru=now"]);
+  expectEffect("allow", ["git reset --soft HEAD~1", "git reset HEAD f", "git clean -n", "git branch --list", "git restore --staged f"]);
+  // 6: `>& file` writes the file; so does zsh's `>!`. One list of protected names.
+  expectEffect("ask", [
+    "printf 'x' >& CLAUDE.md",
+    "printf 'x' >&CLAUDE.md",
+    "printf 'x' >! CLAUDE.md",
+    "printf 'x' >>! notes.txt",
+    "echo x > CLAUDE.md",
+    "cp x .claude/skills/y/SKILL.md",
+    "mkdir -p .claude/commands",
+    "echo x > .agents/a.md",
+    "tee .claude/settings.json",
+    "mv x AGENTS.md",
+    "sed -i s/a/b/ .claude/settings.json",
+  ]);
+  expectEffect("allow", ["cat AGENTS.md", "cat CLAUDE.md", "ls .claude", "grep -r foo .claude .agents", "ls >&2", "ls 2>&1", "ls >/dev/null 2>&1"]);
+  test("6: the three lists of opencode's project files are one", async () => {
+    const { OPENCODE_PROJECT_FILES } = await import("../sandbox.ts");
+    for (const name of [".opencode", ".claude", ".agents", "opencode.json", "opencode.jsonc", "AGENTS.md", "CLAUDE.md"]) {
+      assert.ok(OPENCODE_PROJECT_FILES.includes(name), name);
+      assert.equal(kind(await decide(`echo x > ${name.startsWith(".") && !name.includes("json") ? `${name}/f` : name}`)), "ask", name);
+      assert.equal(decideFile(guard, new SessionState(repo), repo, path.join(repo, name.includes(".md") || name.includes("json") ? name : `${name}/f`))?.effect, "ask", name);
+    }
+  });
+});
+
+describe("r2 8: a write into a path named .git asks", () => {
+  expectEffect("ask", ["ln -s ../node_modules/.cache/r src/.git", "mkdir -p vendor/x/.git/hooks", "cp -r /tmp/r sub/.git", "echo x > sub/.git/config", "touch sub/.git/HEAD", "mv r sub/.git"]);
+  expectEffect("allow", ["mkdir -p node_modules/.cache/r/objects node_modules/.cache/r/refs", "touch .gitignore", "ls .git", "cat .git/HEAD"]);
+});
+
+describe("r2 21: code this session wrote goes to the model", () => {
+  before(() => {
+    fs.mkdirSync(path.join(repo, "scripts"), { recursive: true });
+    fs.writeFileSync(path.join(repo, "scripts", "build.sh"), "#!/bin/sh\necho build\n", { mode: 0o755 });
+    git("add", "scripts/build.sh");
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "build script");
+  });
+  expectEffect("classify", [
+    "printf 'id\\n' > 'my script.sh'; sh 'my script.sh'",
+    "echo 'id' >> scripts/build.sh; ./scripts/build.sh",
+    "sed -i 's/build/id/' scripts/build.sh && ./scripts/build.sh",
+    "sed -i '2i id' scripts/build.sh && ./scripts/build.sh",
+    "printf 'BEGIN{}' > x.awk; awk -f x.awk",
+    "printf 's/a/b/' > x.sed; sed -f x.sed README.md",
+    "printf 'all:\\n\\tid\\n' > x.mk; make -f x.mk",
+    "printf 'package main' > x.go; go run x.go",
+    "printf 'def test(): pass' > x_test.py; pytest x_test.py",
+    "printf 'id' > x.sh; cd scripts && sh ../x.sh",
+    "echo id | tee -a scripts/build.sh; bash scripts/build.sh",
+    "cp scripts/build.sh run.sh; ./run.sh",
+  ]);
+  // The boundary: a build or a test run that does not name the file is the project's own business.
+  expectEffect("allow", ["./scripts/build.sh", "printf 'all:\\n\\tid\\n' > Makefile; make", "echo x >> notes.txt; cat notes.txt", "printf 'x' > data.txt; sed 's/x/y/' data.txt"]);
+  test("across calls: an appended or edited script is the session's from then on", async () => {
+    const s = new SessionState(repo);
+    const run = async (c: string) => kind(await decideShell(guard, s, repo, c));
+    assert.equal(await run("./scripts/build.sh"), "allow");
+    assert.equal(await run("echo 'id' >> scripts/build.sh"), "allow");
+    assert.equal(await run("./scripts/build.sh"), "classify");
+    assert.equal(await run("bash scripts/build.sh"), "classify");
+    const t = new SessionState(repo);
+    assert.equal(kind(await decideShell(guard, t, repo, "sed -i 's/build/x/' scripts/build.sh")), "allow");
+    assert.equal(kind(await decideShell(guard, t, repo, "sh ./scripts/build.sh")), "classify");
+  });
+});
+
+describe("r2 22: variables set without NAME=", () => {
+  expectEffect("ask", [
+    "for PATH in /tmp/x; do ls; done",
+    "printf -v PATH /tmp/bin; ls",
+    "printf -v PATH '%s' /tmp/bin",
+    "read PATH <<< /tmp/x",
+    "read -r a PATH < f",
+    "read -a IFS < f",
+    "mapfile -t PATH < f",
+    "getopts ab PATH",
+    "declare PATH",
+    ": ${EDITOR:=/tmp/x}",
+    "while read -r HOME; do ls; done < f",
+  ]);
+  expectEffect("allow", ["for f in a b; do echo $f; done", "printf -v line '%s' x"]);
+});
+
+describe("r2 27: installs behind wrappers and under other names", () => {
+  expectEffect("ask", ["env -u X npm install", "timeout -s KILL 60 npm ci", "npm audit fix", "pnpm audit --fix fix", "cargo add serde", "uv run --with requests pytest", "nice -n 5 pip install x", "find . -name package.json -exec npm install \;"]);
+  expectEffect("allow", ["npm audit", "cargo build", "uv run pytest", "ls node_modules/yarn", "which npm"]);
+});
+
+describe("r2 29: the environment asks where it matters, and no further", () => {
+  expectEffect("ask", ["PYTHONPATH=src pytest", "NODE_OPTIONS=--max-old-space-size=8192 npm run build", "CC=clang make", "PAGER=cat git log"]);
+  expectEffect("allow", ["f=src/x; ls $f", "n=3; echo $n", "curl http://localhost:3000/#/x", "echo a#b"]);
+  expectEffect("classify", ["FOO=1 frobnicate", "FOO=bar npm test"]);
+});
+
+describe("r2 B: the layout check", () => {
+  const fresh = () => {
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(tmp, "proj-")));
+    execFileSync("git", ["init", "-q", dir]);
+    return dir;
+  };
+  test("8: a .git that is a symbolic link appearing pauses the session", async () => {
+    const dir = fresh();
+    const s = new SessionState(dir);
+    assert.equal((await decideShell(guard, s, dir, "ls")).effect, "allow");
+    fs.mkdirSync(path.join(dir, "node_modules", ".cache", "r"), { recursive: true });
+    fs.mkdirSync(path.join(dir, "src"));
+    fs.symlinkSync("../node_modules/.cache/r", path.join(dir, "src", ".git"));
+    const d = await decideShell(guard, s, dir, "ls");
+    assert.match(d.reason, /paused/);
+    assert.ok(d.reason.includes(path.join(dir, "src", ".git")), d.reason);
+  });
+  test("8: the makings of a repository under node_modules pause it before any link is made", async () => {
+    const dir = fresh();
+    const s = new SessionState(dir);
+    assert.equal((await decideShell(guard, s, dir, "ls")).effect, "allow");
+    for (const d of ["objects", "refs"]) fs.mkdirSync(path.join(dir, "node_modules", ".cache", "r", d), { recursive: true });
+    fs.writeFileSync(path.join(dir, "node_modules", ".cache", "r", "HEAD"), "ref: refs/heads/main\n");
+    assert.match((await decideShell(guard, s, dir, "ls")).reason, /paused.*node_modules\/\.cache\/r/);
+  });
+  test("9: a repository appearing under node_modules pauses the session", async () => {
+    const dir = fresh();
+    const s = new SessionState(dir);
+    assert.equal((await decideShell(guard, s, dir, "ls")).effect, "allow");
+    execFileSync("git", ["init", "-q", path.join(dir, "node_modules", "pkg")]);
+    assert.match((await decideShell(guard, s, dir, "ls")).reason, /paused.*node_modules\/pkg\/\.git/);
+  });
+  test("9: a repository six levels down pauses the session", async () => {
+    const dir = fresh();
+    const s = new SessionState(dir);
+    assert.equal((await decideShell(guard, s, dir, "ls")).effect, "allow");
+    execFileSync("git", ["init", "-q", path.join(dir, "a", "b", "c", "d", "e", "f")]);
+    assert.match((await decideShell(guard, s, dir, "ls")).reason, /paused/);
+  });
+  test("13: where an asked command would create a repository", () => {
+    const dir = fresh();
+    assert.deepEqual(expectedRepos("git init sub", dir), [path.join(dir, "sub")]);
+    assert.deepEqual(expectedRepos("git init", dir), [dir]);
+    assert.deepEqual(expectedRepos("mkdir x && cd x && git init -q", dir), [path.join(dir, "x")]);
+    assert.deepEqual(expectedRepos("git clone https://example.invalid/a/tool.git", dir), [path.join(dir, "tool")]);
+    assert.deepEqual(expectedRepos("git clone -q https://example.invalid/a/tool.git vendor/t", dir), [path.join(dir, "vendor", "t")]);
+    assert.deepEqual(expectedRepos("git worktree add ../wt feature", dir), [path.join(path.dirname(dir), "wt"), path.join(dir, ".git")]);
+    for (const c of ["git push origin init-x", "git status", "git commit -m 'init clone worktree submodule'", "git init $(pwd)/x", "sudo ls"]) assert.equal(expectedRepos(c, dir), undefined, c);
+  });
+  test("13: an approval covers the place the command named, and nothing else", async () => {
+    const dir = fresh();
+    const s = new SessionState(dir);
+    assert.equal((await decideShell(guard, s, dir, "ls")).effect, "allow");
+    s.expecting.push({ dirs: [path.join(dir, "named")], at: Date.now(), done: true });
+    execFileSync("git", ["init", "-q", path.join(dir, "named")]);
+    assert.equal((await decideShell(guard, s, dir, "ls")).effect, "allow");
+    assert.equal(s.expecting.length, 0, "a finished approval covers one check");
+    execFileSync("git", ["init", "-q", path.join(dir, "later")]);
+    assert.match((await decideShell(guard, s, dir, "ls")).reason, /paused/);
+    const dir2 = fresh();
+    const t = new SessionState(dir2);
+    assert.equal((await decideShell(guard, t, dir2, "ls")).effect, "allow");
+    t.expecting.push({ dirs: [path.join(dir2, "named")], at: Date.now() });
+    execFileSync("git", ["init", "-q", path.join(dir2, "elsewhere")]);
+    assert.match((await decideShell(guard, t, dir2, "ls")).reason, /paused.*elsewhere/);
+  });
+  test("13: an approved command does not explain a new opencode.json", async () => {
+    const dir = fresh();
+    const s = new SessionState(dir);
+    assert.equal((await decideShell(guard, s, dir, "ls")).effect, "allow");
+    s.expecting.push({ dirs: [dir], at: Date.now() });
+    fs.writeFileSync(path.join(dir, "opencode.json"), "{}\n");
+    assert.match((await decideShell(guard, s, dir, "ls")).reason, /paused.*opencode\.json/);
+  });
+  test("25: opencode's files appearing in a writable directory above the session directory pause it", async () => {
+    const dir = fresh();
+    const sub = path.join(dir, "packages", "app");
+    fs.mkdirSync(sub, { recursive: true });
+    const s = new SessionState(sub);
+    assert.equal((await decideShell(guard, s, sub, "ls")).effect, "allow");
+    fs.writeFileSync(path.join(dir, "opencode.json"), "{}\n");
+    const d = await decideShell(guard, s, sub, "ls");
+    assert.match(d.reason, /paused/);
+    assert.ok(d.reason.includes(path.join(dir, "opencode.json")), d.reason);
+  });
+});
+
+describe("r2 C: the check runs on what will run", () => {
+  const ssh = (c: string, cwd = repo, s = new SessionState(repo)) => usesSsh(c, cwd, s);
+  const global = process.env.GIT_CONFIG_GLOBAL!;
+  const withGlobal = async (text: string, fn: () => Promise<void> | void) => {
+    const before = fs.readFileSync(global, "utf8");
+    fs.writeFileSync(global, before + text);
+    try {
+      await fn();
+    } finally {
+      fs.writeFileSync(global, before);
+    }
+  };
+  const withHook = async (name: string, fn: () => Promise<void> | void) => {
+    const hook = path.join(repo, ".git", "hooks", name);
+    fs.mkdirSync(path.dirname(hook), { recursive: true });
+    fs.writeFileSync(hook, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    try {
+      await fn();
+    } finally {
+      fs.rmSync(hook);
+    }
+  };
+
+  test("14: a cd that fails does not move the check to another repository", () => {
+    const planted = path.join(tmp, "planted14");
+    execFileSync("git", ["init", "-q", planted]);
+    try {
+      // bash's cd fails here, and after `;` git still runs, in the tool call's own directory.
+      assert.ok(!ssh(`cd ${repo}/nope/..; git fetch origin`, planted));
+      assert.ok(!ssh(`cd ${repo}; git fetch origin`, planted));
+      assert.ok(!ssh(`cd ${repo}/nope/.. && git fetch origin`, planted));
+      assert.ok(ssh(`cd ${repo} && git fetch origin`, planted));
+    } finally {
+      fs.rmSync(planted, { recursive: true, force: true });
+    }
+  });
+  test("14: the same for a push", async () => {
+    const planted = path.join(tmp, "planted14p");
+    execFileSync("git", ["init", "-q", planted]);
+    try {
+      assert.equal(await effect(`cd ${repo}/nope/..; git push origin feature/x`, planted), "ask");
+      assert.equal(await effect(`cd ${repo}; git push origin feature/x`, planted), "ask");
+    } finally {
+      fs.rmSync(planted, { recursive: true, force: true });
+    }
+  });
+  test("15: a quoted ~ is not the home directory", () => {
+    assert.ok(!ssh("git -C '~/work' fetch origin"));
+    assert.ok(!ssh('cd "~" && git fetch origin'));
+  });
+
+  // 16: `printf -v` and `test -v` evaluate a subscript on the remote side.
+  expectEffect("ask", [
+    `ssh lab 'printf -v '"'"'a[$(id)]'"'"' x'`,
+    `ssh lab 'test -v '"'"'a[$(id)]'"'"`,
+    "ssh lab 'printf -v x y'",
+    "ssh lab 'test -v x'",
+    "ssh lab '[ -v x ]'",
+    `ssh lab 'echo '"'"'$(id)'"'"`,
+    "ssh lab 'test -N /etc/passwd'",
+    // 18: recursive reads print whatever lies below, credentials included.
+    "ssh lab 'grep -r \"\" /home/admin'",
+    "ssh lab 'sudo grep -R x /root'",
+    "ssh lab 'grep --include=id_rsa -e x /home'",
+    "ssh lab 'rg x /etc'",
+    "ssh lab 'rg --hidden --files /home/admin'",
+    "ssh lab 'sudo rg \"\" /root'",
+    "ssh lab 'ps auxe'",
+    "ssh lab 'ps e'",
+  ]);
+  expectEffect("allow", [
+    "ssh lab 'echo hello world'",
+    "ssh lab 'printf hello'",
+    "ssh lab 'test -f /etc/hostname && echo yes'",
+    "ssh lab 'grep -i error /var/log/syslog'",
+    "ssh lab 'rg --files /srv'",
+    "ssh lab 'ps aux'",
+    "ssh lab 'ps -ef'",
+  ]);
+
+  test("17: the push that would run is the push that is checked (remote.pushDefault)", async () => {
+    // A second remote whose default branch has the current branch's name.
+    const publish = path.join(tmp, "publish.git");
+    execFileSync("git", ["init", "-q", "--bare", "-b", "feature/x", publish]);
+    git("remote", "add", "publish", publish);
+    git("push", "-q", "publish", "feature/x");
+    try {
+      assert.equal(await effect("git push"), "allow");
+      await withGlobal("[remote]\n\tpushDefault = publish\n", async () => assert.equal(await effect("git push"), "ask"));
+    } finally {
+      git("remote", "remove", "publish");
+      fs.rmSync(publish, { recursive: true, force: true });
+    }
+  });
+  test("17: a push refspec in your own config decides where the branch goes", async () => {
+    await withGlobal("[remote \"origin\"]\n\tpush = HEAD:refs/heads/main\n[push]\n\tdefault = current\n", async () => assert.equal(await effect("git push"), "ask"));
+    assert.equal(await effect("git push"), "allow");
+  });
+  test("17: a key with no value is true for git (push.followTags)", async () => {
+    await withGlobal("[push]\n\tfollowTags\n", async () => assert.equal(await effect("git push"), "ask"));
+  });
+  test("17: a repository with no remotes gives nothing the agent", () => {
+    const bare = path.join(tmp, "noremotes");
+    execFileSync("git", ["init", "-q", "-b", "main", bare]);
+    execFileSync("git", ["-C", bare, "config", "branch.main.remote", "ssh://example.invalid/x.git"]);
+    try {
+      assert.ok(!usesSsh("git fetch", bare, new SessionState(bare)));
+      assert.ok(!usesSsh("git pull", bare, new SessionState(bare)));
+    } finally {
+      fs.rmSync(bare, { recursive: true, force: true });
+    }
+  });
+  test("17: with no remote named, the one git would pick must be known", () => {
+    const restore = setConfig("branch.feature/x.remote", "nowhere");
+    try {
+      assert.ok(!ssh("git fetch"));
+      assert.ok(ssh("git fetch origin"));
+    } finally {
+      restore();
+    }
+    assert.ok(ssh("git fetch"));
+    assert.ok(ssh("git fetch --all"));
+  });
+
+  test("24: the agent is only given at the top of a checkout", () => {
+    fs.mkdirSync(path.join(repo, "sub24"));
+    try {
+      assert.ok(!ssh("cd sub24 && git fetch"));
+      assert.ok(!ssh("git -C sub24 fetch origin"));
+      assert.ok(ssh("git -C . fetch origin"));
+    } finally {
+      fs.rmSync(path.join(repo, "sub24"), { recursive: true });
+    }
+  });
+  test("24: not when a hook would run with it", async () => {
+    await withHook("pre-push", async () => {
+      assert.ok(!ssh("git push origin feature/x"));
+      assert.equal(await effect("git push origin feature/x"), "ask");
+      assert.ok(ssh("git fetch origin"), "pre-push does not run on a fetch");
+    });
+    await withHook("post-merge", () => {
+      assert.ok(!ssh("git pull"));
+      assert.ok(ssh("git fetch"));
+    });
+    await withHook("reference-transaction", () => assert.ok(!ssh("git fetch")));
+    await withHook("pre-push.sample", () => assert.ok(ssh("git push origin feature/x")));
+  });
+});
+
+describe("r2 E: allowed means it can work", () => {
+  for (const c of [
+    "git commit -m \"$(cat <<'EOF'\nfix: a thing (#12)\n\nIt's done, with $vars and `ticks` left alone.\nEOF\n)\"",
+    "git commit -m x 2>&1",
+    "git add -A && git commit -m x 2>&1",
+    "git add -u",
+    "git stash -u",
+    "git commit -F msg",
+    "git rebase main",
+    "timeout 60 git fetch origin",
+    "git push origin feature/x",
+    "git commit -qm 'plain' >/dev/null 2>&1",
+  ]) test(`git-only: ${JSON.stringify(c)}`, () => assert.ok(gitOnly(c)));
+  for (const c of [
+    "git commit -m \"$(cat <<EOF\n$(id)\nEOF\n)\"",
+    "git commit -m \"$(date)\"",
+    "git commit -m \"a $x\"",
+    "git add src/*.ts",
+    "npm test && git commit -am x",
+    "git fetch -u x origin",
+    "git rebase -x id main",
+    "git rebase -i main",
+    "git add -p",
+    "git commit -m x > out.txt",
+    "timeout 60 npm test",
+  ]) test(`not git-only: ${JSON.stringify(c)}`, () => assert.ok(!gitOnly(c)));
+
+  const breaks = (c: string, s = new SessionState(repo)) => (s.roots ?? decideShell(guard, s, repo, "ls"), sandboxBreaks(c, repo, s));
+  test("23: a git command that writes .git from a call that is not git-only would fail, so it asks", async () => {
+    const s = new SessionState(repo);
+    await decideShell(guard, s, repo, "ls");
+    for (const c of ["npm test && git commit -am x", "git commit -m \"it's $x\"", "git add src/*.ts", "git commit -m x > out.txt", "git stash && npm test", "echo done; git tag v2"]) assert.match(sandboxBreaks(c, repo, s) ?? "", /read-only/, c);
+    for (const c of ["git status", "git log --oneline | head", "git diff > out.patch", "git add -A && git commit -m x", "git stash list | wc -l", "git branch --list", "git tag", "npm test"]) assert.equal(sandboxBreaks(c, repo, s), undefined, c);
+  });
+  test("30: signing needs keys the sandbox hides", async () => {
+    const s = new SessionState(repo);
+    await decideShell(guard, s, repo, "ls");
+    git("config", "commit.gpgsign", "true");
+    try {
+      assert.match(sandboxBreaks("git commit -m x", repo, s) ?? "", /sign/);
+      assert.equal(sandboxBreaks("git status", repo, s), undefined);
+    } finally {
+      git("config", "--unset", "commit.gpgsign");
+    }
+    assert.match(sandboxBreaks("git commit -S -m x", repo, s) ?? "", /sign/);
+    assert.equal(sandboxBreaks("git commit -m x", repo, s), undefined);
+  });
+  test("30: a fetch that needs the ssh agent and would not get it asks", async () => {
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(tmp, "sshproj-")));
+    execFileSync("git", ["init", "-q", "-b", "main", dir]);
+    execFileSync("git", ["-C", dir, "remote", "add", "origin", "git@example.invalid:team/x.git"]);
+    const s = new SessionState(dir);
+    await decideShell(guard, s, dir, "ls");
+    assert.equal(sandboxBreaks("git fetch origin", dir, s), undefined, "the single plain fetch gets the agent");
+    assert.match(sandboxBreaks("git fetch origin && git status", dir, s) ?? "", /ssh agent/);
+    fs.mkdirSync(path.join(dir, "sub"));
+    assert.match(sandboxBreaks("cd sub && git fetch origin", dir, s) ?? "", /ssh agent/);
+  });
+  test("30: a fetch over https with a credential helper asks", async () => {
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(tmp, "httpsproj-")));
+    execFileSync("git", ["init", "-q", "-b", "main", dir]);
+    execFileSync("git", ["-C", dir, "remote", "add", "origin", "https://example.invalid/team/x.git"]);
+    const s = new SessionState(dir);
+    await decideShell(guard, s, dir, "ls");
+    assert.equal(sandboxBreaks("git fetch origin", dir, s), undefined);
+    execFileSync("git", ["-C", dir, "config", "credential.helper", "store"]);
+    assert.match(sandboxBreaks("git fetch origin", dir, s) ?? "", /credential helper/);
+  });
+  test("30: a value that spans lines in your git config does not take the agent away", () => {
+    const global = process.env.GIT_CONFIG_GLOBAL!;
+    const before = fs.readFileSync(global, "utf8");
+    fs.writeFileSync(global, before + '[alias]\n\tboth = "!f() { \\\n\tgit status; \\\n\t}; f"\n\tnote = "line one\\nline two"\n');
+    try {
+      assert.ok(usesSsh("git fetch origin", repo, new SessionState(repo)));
+    } finally {
+      fs.writeFileSync(global, before);
+    }
+  });
 });

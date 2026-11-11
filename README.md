@@ -14,7 +14,8 @@ For each shell tool call:
    `bash -c`, wrappers like `sudo`/`timeout`, redirects and pipelines:
    - **deny**: wipes of `/`, `$HOME` or system dirs, `mkfs`, `dd` to disks, fork bombs
    - **ask**: `sudo`, pushes, `ssh`/`scp`, outbound data, `curl | sh`, credential reads, writes
-     outside the project, changes to opencode's config, `AGENTS.md`/`CLAUDE.md` or this plugin,
+     outside the project, changes to opencode's config, `AGENTS.md`/`CLAUDE.md`, `.claude/`,
+     `.agents/` or this plugin, a write to any path with a `.git` component,
      plus this plugin's additions (`DEFAULT_ASK` in `decide.ts`): tokens on a `curl` line,
      hunting for credential files, git `-c` overrides, `GIT_*`/`SSH_*`/`LD_*` environment,
      `declare`, `printf -v`, brace expansion, namerefs or computed names, git commands that
@@ -29,23 +30,53 @@ For each shell tool call:
    The rules allow by ruling out the spellings they know, and bash, git and the GNU tools accept
    more. `guard.ts` runs around them and works the other way round: it accepts the forms it
    understands and asks about the rest.
-   - **Syntax** the rules' parser reads differently from bash asks: `$'...'`, a `#` that is not
-     at the start of a word, heredoc delimiters that are not one plain or fully quoted word,
-     indented heredoc terminators, backslashes in backticks, `${x@P}`, unbalanced quotes.
+   - **Syntax** the rules' parser reads differently from bash asks. The parser has no
+     `${...}`, no arithmetic and no brace expansion, and reads their insides as command text,
+     so the guard follows both readings and accepts plain forms only: `$'...'` asks; inside
+     `${...}` and `$((...))` quotes, a `#` at the start of a word, `<<`, `${x@P}`, `${!x}` and
+     subscripts or offsets that are not numbers ask; so do `$[...]`, `>& file`, `>!`, a quoted
+     number before a redirect, heredoc delimiters that are not one plain or fully quoted word,
+     indented heredoc terminators, backslashes in backticks, unbalanced quotes, and a
+     substitution with a parenthesis inside quotes, a comment or a heredoc. A brace expansion
+     that makes an option, an absolute path or a remote asks (`curl {-d,@f}`); `src/{a,b}` and
+     `--exclude={a,b}` do not. Quoted text shaped like `a[$(...)]` asks, because bash runs it
+     wherever it reaches an arithmetic context. A `#` inside a word is text
+     (`http://host/#/x`). The same checks run on every string a nested shell is handed
+     (`sh -c '...'`, `eval ...`, also behind `sudo`, `timeout`, `xargs`, `find -exec`), and
+     such a string asks when it is built from a variable or a substitution.
+     `test/differential.test.mts` holds this as a class: it runs each input in real bash and
+     fails if a hidden command ran while the decision was an allow.
    - **git**: any global option outside a short list (`-C`, a few harmless `-c` keys,
      `--no-pager`, ...) asks, wherever the word `git` appears, as does any abbreviation of
-     `--upload-pack`, `--receive-pack` or `--exec`. A commit message that spells out a git
-     option asks too.
+     `--upload-pack`, `--receive-pack`, `--exec` or `--open-files-in-pager`, `git grep -O`,
+     `git submodule foreach`, `git bisect run`, `git rebase -x`/`-i`, and a shortened spelling
+     of an option the rules look for (`--har` for `--hard`, `--forc`, `--del`). A commit
+     message that spells out a git option asks too.
    - **Per command**, also inside `sh -c`, `sudo`, `xargs`, and with the program named by path
      (`/usr/bin/npm`): printing the environment (`env`, `printenv`, bare `export`/`set`);
      setting `PATH`, `HOME`, `XDG_*`, `GIT_*`, `LD_*` and other variables that change what
      runs; package installs (`npm install/i/ci/add`, bare `yarn`, `pip install`, `uv add`,
-     `cargo install`, `go install`, `go run pkg@version`, `npx`, options before the
-     subcommand); and a credential file named by a glob or braces (`cat .env*`). Your own
-     `ask`/`deny`/`classify` rules also match a program named by path.
-   - **To the model instead of an allow**: running a file this session wrote (`sh x.sh` after
-     `printf ... > x.sh`; the model is shown the start of the file), a file to read that is
-     named at run time (`cat "$f"`), and other variables set for a command.
+     `cargo install`/`add`, `go install`, `go run pkg@version`, `npx`, `npm audit fix`,
+     `uv run --with`, options before the subcommand, also behind `env -u X` or
+     `timeout -s KILL 60`); a variable from that list set without `NAME=` (`for PATH in`,
+     `read`, `printf -v`, `mapfile`, `getopts`, `${NAME:=x}`); options that make a program run
+     another (tar `--checkpoint-action`, `-I`, `--to-command`, `-F`; `sort
+     --compress-program`; `make --eval`, `SHELL=`; `fd -x`; `rg --pre`; `man -P`); builtins
+     that evaluate a value as arithmetic or print through `PS4` (`let`, `declare -i`,
+     `test -v` with a subscript or a variable, `set -x`); a glob that matches a file whose
+     name starts with `-`; and a credential file named by a glob or braces (`cat .env*`). Your
+     own `ask`/`deny`/`classify` rules also match a program named by path.
+   - **To the model instead of an allow**: running a file this session wrote, appended to or
+     edited in place (`sh x.sh` after `printf ... > x.sh`, `./build.sh` after `echo ... >>
+     build.sh` or `sed -i`; the model is shown the start of the file). That covers a shell or
+     an interpreter given the file, the file run by its path, `awk -f`, `sed -f`, `make -f`,
+     `go run` and `pytest` when they name it. It stops there: a bare `make`, `npm test` or a
+     program the session compiled runs the project's code by design, and the model does not
+     see it first. Also to the model: a `sed` script with more than substitutions, prints and
+     deletes (sed can run commands and write files), an `awk` program with `system`,
+     `getline` or a pipe, a file to read that is named at run time (`cat "$f"`), and other
+     variables set for a command (a variable set on a line of its own stays in the shell and
+     is not asked about).
 2. **Kev.** Kev-0.8B on llama.cpp's `llama-server` (`/v1/systemone`) scores "is this command
    risky?". Below `askAbove` (0.2) it runs; otherwise it asks. Down, slow (> `timeoutMs`),
    garbled or out-of-range (not between 0 and 1) answers ask. The plugin never turns an error
@@ -65,31 +96,39 @@ For each shell tool call:
      sandbox. A build that must write a shared cache fails with "Read-only file system"; list
      the directory in `sandboxWritable` if you accept that, or run the fetch step yourself.
    - **Git directories** found under the project, `allowedPaths` and temp dirs (main, linked
-     worktrees, submodules, bare repos; up to 4 levels deep) are read-only, as are `.git`
-     pointer files, every repository's `core.hooksPath` (a relative global one too), files that
-     `.git/config` includes, the known hook-manager files (`.husky/`, `lefthook.yml` and its
-     variants, `.pre-commit-config.yaml`, `.overcommit.yml`) and opencode's project config
-     (`opencode.json[c]`, `.opencode/`, `.claude/`, `.agents/`, `AGENTS.md`, in the session
-     directory and each writable parent). The plugin creates an empty `.opencode/` in the
+     worktrees, submodules, bare repos; at any depth, `node_modules` included) are read-only
+     all the way down, mounts beneath them included, as are `.git` pointer files, every
+     repository's `core.hooksPath` (a relative one, global or not, in every worktree that
+     leads to the repository), files that `.git/config` includes (as deep as git follows
+     them), the known hook-manager files (`.husky/`, `lefthook.yml` and its variants,
+     `.pre-commit-config.yaml`, `.overcommit.yml`) and opencode's project files
+     (`opencode.json[c]`, `.opencode/`, `.claude/`, `.agents/`, `AGENTS.md`, `CLAUDE.md`, in
+     the session directory and each writable parent). The plugin creates an empty `.opencode/` in the
      session directory (git does not show empty directories) so that it can be made read-only
      rather than appear later with a plugin in it. Every directory between a writable root and
-     a protected or hidden path is pinned, so no parent can be renamed and rebuilt. A tool call
-     made only of plain git commands in plain words (`add`, `commit`, `checkout`, `fetch`, ...,
-     no redirects, variables, `--output` or `--exec`) may write inside git directories, except
-     hooks, config and `commondir`, and cannot rename them.
+     a protected or hidden path is pinned, so no parent can be renamed and rebuilt. A mount
+     holds a directory in place, not a symbolic link: when a link lies on the way to a
+     protected path, or a `.git` is itself a link, the command asks. A tool call made only of
+     plain git commands in plain words (`add`, `commit`, `checkout`, `rebase`, `fetch`,
+     `push`, ..., no variables, `--output` or `--exec`; output may go to `/dev/null` or
+     `2>&1`, and a commit message may come from `"$(cat <<'EOF' ... EOF)"`) may write inside
+     git directories, except hooks, config and `commondir`, and cannot rename them.
    - **Hidden**: your whole runtime directory (systemd user manager, D-Bus session bus,
      gpg-agent, other tools' sockets), the system D-Bus, Docker, containerd, podman, libvirt,
      LXD and X11 socket directories, any other socket under `/run` or the temp dirs that you
-     can connect to, and credential locations: `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`,
+     can connect to (at any depth), and credential locations: `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`,
      `~/.netrc`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.npmrc`, `~/.config/gh`,
-     `~/.config/glab-cli`, `~/.config/op`, `~/.config/gcloud`, keyrings, shell histories,
-     `~/.m2/settings.xml`, opencode's config, data and state directories (the state holds the
+     `~/.config/glab-cli`, `~/.config/op`, `~/.config/gcloud`, keyrings, shell histories
+     (bash, zsh, fish, atuin), browser profiles, `~/.gem/credentials`, composer's and
+     containers' `auth.json`, Kerberos ticket caches, `~/.m2/settings.xml`, opencode's config, data and state directories (the state holds the
      local server's password), this plugin's state directory (the decision log), following
      `XDG_*_HOME`, plus `sandboxHidePaths`. On top of that list, every entry of `$HOME`, of its
      dot-directories and of `~/.config` and `~/.local/share` that the rules would ask about
-     reading is hidden, and so are such files up to 3 levels down in the project (`.env`,
-     `*.pem`, `id_rsa`, `credentials.json`, ...; `.env.example` stays). A hidden file reads as
-     empty and cannot be written; `sandboxShowPaths` brings one back. **Environment**: a
+     reading is hidden, and so are such files at any depth in the project and `allowedPaths`,
+     `node_modules` included (`.env`, `*.pem`, `id_rsa`, `credentials.json`, ...;
+     `.env.example` stays), together with what a symbolic link of such a name points to. A
+     hidden file reads as empty and cannot be written; `sandboxShowPaths` brings one back (a
+     test fixture called `server.key`, say). **Environment**: a
      variable passes only if its name is a well-known harmless one (`PATH`, `HOME`, `LANG`,
      toolchain directories, ...) or its value plainly is no secret (short, a number, a list of
      paths), and never if its name looks like a credential (`*KEY*`, `*TOKEN*`, `*SECRET*`,
@@ -97,10 +136,12 @@ For each shell tool call:
      `GITHUB_*`, `DISPLAY`, `XAUTHORITY`, ...). `lockwrite` drops everything not on that list
      itself, and the dropped names are logged. Private keys in `~/.ssh` are never visible. The
      ssh agent (wherever its socket lives), `known_hosts` and `config` are visible only to a
-     tool call that is a single plain `git fetch/pull/push/ls-remote` of the project's own
-     repository (same git directory as at session start, naming a remote it had then with
-     unchanged URLs, options from a short list, and only harmless keys in the repository's
-     config), or a single `ssh`/`scp` command.
+     tool call that is a single plain `git fetch/pull/push/ls-remote` at the top of one of the
+     project's own checkouts (same git directory as at session start, to a remote it had then
+     with unchanged URLs, the one git itself would pick when none is named, options from a
+     short list, only harmless keys in the repository's config, and no hook that the command
+     would run), or a single `ssh`/`scp` command. After `cd`, the command must be joined by
+     `&&` and the directory must exist; a quoted `~` is not your home directory.
    - **Nothing outlives the tool call.** The shell runs under the PID namespace's init, which
      exits with it; the kernel then kills whatever the command left in the background (a dev
      server started with `&` included). Processes outside the sandbox cannot be signalled, and
@@ -110,17 +151,28 @@ For each shell tool call:
 
    The command text is never changed, so opencode's own rules and prompts see the real
    command. Commands you approve in a prompt run unsandboxed, exactly as shown. If an allowed
-   command cannot be sandboxed (unsupported shell, the sandbox self-test failed at startup, or
-   a protection cannot be put in place, such as a `core.hooksPath` behind a symlink), it asks
-   instead.
+   command cannot be sandboxed (unsupported shell, the sandbox self-test failed at startup, a
+   protection cannot be put in place, such as a `core.hooksPath` behind a symlink or a `.git`
+   that is one, or the scan of the writable directories hit its limit), it asks instead. So
+   does an allowed command that could only fail in the sandbox: git writing `.git` from a
+   call that is not made only of plain git commands (`npm test && git commit`), git signing
+   commits, git needing the ssh agent without getting it, git logging in through a credential
+   helper. opencode runs the tool calls of one message at the same time and does not say
+   which shell belongs to which call, so a shell is sandboxed only when every identical
+   command waiting for one is an allow. If two identical commands issued together get
+   different verdicts, both ask, and the one that would have been allowed may still run
+   sandboxed when you approve it: the one case where an approved command is not run as is.
 
 The plugin records the project's git layout at session start, nested repositories and pointer
 files included, and checks it before every decision. If it changes in a way git never does
 itself (a `.git` replaced or moved, a pointer file rewritten, `commondir` or `config.worktree`
-planted, a repository, linked worktree or `opencode.json` appearing where there was none, up to
-4 levels deep), auto-allow pauses. The prompt and opencode's log say what was found and where.
-Deleting a nested repository does not pause. New repositories and worktrees are expected right
-after a `git init`, `clone`, `worktree` or `submodule` command the plugin asked you about. To
+planted, a repository, a `.git` symbolic link, a linked worktree or one of opencode's project
+files appearing where there was none, at any depth, `node_modules` included), auto-allow
+pauses. The prompt and opencode's log say what was found and where. Deleting a nested
+repository does not pause. New repositories and worktrees are expected only from a `git init`,
+`clone`, `worktree add` or `submodule` command that the plugin asked you about and you
+approved, in the place that command named, from your approval until the command has finished.
+A new worktree joins the project on the same terms. To
 resume after you have looked, run `touch ~/.local/state/opencode-automode/resume` in your own
 terminal; a sandboxed command cannot. `lockwrite` is written in Rust with one dependency, the `libc` crate, pinned by
 `Cargo.lock` and built with `--locked`. The plugin's own git calls run with fsmonitor, hooks,
@@ -138,9 +190,10 @@ asks once, when the schedule is created, and then runs the check without any san
 your whole environment. The plugin judges that approval like any command, whoever created the
 schedule, and at most lets it ask, never auto-allows.
 
-**Invalid settings.** If `automode.json` (or the plugin's options) cannot be parsed, has a value
-of the wrong type or a setting the plugin does not know, nothing is auto-allowed until you fix
-it: every command that would have run asks, and the prompt says what is wrong. Falling back to
+**Invalid settings.** If `automode.json` (or the plugin's options) cannot be parsed, holds
+`null`, has a value of the wrong type, a setting the plugin does not know, a relative path, or
+an `allowedPaths`/`sandboxWritable` entry that is `/`, a top-level directory or your home,
+nothing is auto-allowed until you fix it: every command that would have run asks, and the prompt says what is wrong. Falling back to
 defaults would silently drop `enabled: false` and your own ask and deny rules.
 
 ## Settings
@@ -152,11 +205,11 @@ defaults would silently drop `enabled: false` and your own ask and deny rules.
 | `enabled` | `true` | Off: the plugin changes nothing and opencode's own rules apply. |
 | `useClassifier` | `true` | Off: what the rules leave open asks instead of going to Kev. |
 | `classifier` | the unix socket above, `askAbove` 0.2, `timeoutMs` 5000 | Kev server (`endpoint`: `unix:/path` or an http URL), threshold (above 0, at most 1) and reply timeout. |
-| `rules` | empty | Your own `allow`/`ask`/`deny`/`classify` patterns: a glob over one simple command (`*` any text, trailing ` *` optional) or `re:` + regex. |
-| `allowedPaths` | none | Extra directories counted as the project (writable, writes there allowed). |
-| `sshHosts` | none | `ssh` to these targets runs when it is the whole tool call, in plain words, and the remote command only uses read-only programs with options from a per-program allowlist (`cat`, `df`, `journalctl`, `systemctl status`, `ip addr`, ...), with no variables, substitutions or redirects except to `/dev/null`, and ssh itself only uses harmless options (`-q`, `-T`, `-p`, `-l`, `-o BatchMode/ConnectTimeout/...`). A target matches as listed: `lab` covers `ssh lab ...` only; list `admin@lab` to allow that user. |
+| `rules` | empty | Your own `allow`/`ask`/`deny`/`classify` patterns: a glob over one simple command (`*` any text, trailing ` *` optional) or `re:` + regex. Rules in the plugin's options are added to the file's. |
+| `allowedPaths` | none | Extra directories counted as the project (writable, writes there allowed). Absolute or `~/...`. |
+| `sshHosts` | none | `ssh` to these targets runs when it is the whole tool call, in plain words, and the remote command only uses read-only programs with options from a per-program allowlist (`cat`, `df`, `journalctl`, `systemctl status`, `ip addr`, ...), with no variables, substitutions or redirects except to `/dev/null` (no recursive `grep`, `rg` only to list files, no `printf -v` or `test -v`: they print or run more than the words say), and ssh itself only uses harmless options (`-q`, `-T`, `-p`, `-l`, `-o BatchMode/ConnectTimeout/...`). A target matches as listed: `lab` covers `ssh lab ...` only; list `admin@lab` to allow that user. |
 | `sshReadOnlySudo` | `false` | On `sshHosts`: also allow `sudo [-n] <read-only command>`. |
-| `allowFeatureBranchPush` | `false` | `git push` runs when it is the whole tool call, in plain words, pushes the project's own repository to the remote it would actually use (the named one, else the branch's remote, else `origin`) whose URLs (all of them) are unchanged since the session started, targets a non-protected branch by its plain name (not `main`/`master`/`release*`/`develop`/... nor the default branch the remote reports; qualified forms like `heads/x` ask), and the repository's own config holds only keys from a list of harmless ones (no `pushurl`, `mirror`, `insteadOf`, `sshCommand`, `askPass`, hooks, helpers, ...; `push.followTags` and `remote.*.mirror` ask in any scope). Force, deletes, tags and `--no-verify` ask. |
+| `allowFeatureBranchPush` | `false` | `git push` runs when it is the whole tool call, in plain words, from the top of one of the project's checkouts. The plugin asks git itself what the push would do (`git push --dry-run --porcelain`, hooks off) and allows it when every URL git would connect to belongs to a remote the session started with, unchanged since (all of its URLs), and every ref goes from a branch to a non-protected branch (not `main`/`master`/`release*`/`develop`/... nor the default branch the remote reports) without force or delete. So git's own precedence decides (`branch.*.pushRemote`, `remote.pushDefault`, `remote.*.push`, `push.default`), in any config scope; a push that would only fail (no upstream) asks. The repository's own config must hold only keys from a list of harmless ones (no `pushurl`, `mirror`, `insteadOf`, `sshCommand`, `askPass`, hooks, helpers, ...; `push.followTags` and `remote.*.mirror` ask in any scope), and no `pre-push` hook may exist. Force, deletes, tags and `--no-verify` ask. The dry run costs one more round trip to the remote. |
 | `sandbox` | `true` | Off: auto-allowed commands run unsandboxed. Not recommended. |
 | `sandboxWritable` | none | More directories auto-allowed commands may write to, for example a build cache. What lands there may run outside the sandbox later. |
 | `sandboxKeepSockets` | none | Sockets to leave visible (e.g. your ssh agent for all commands). |
@@ -194,8 +247,9 @@ Then add the plugin folder's absolute path to `"plugins"` in `~/.config/opencode
 `index.ts` imports `Plugin.define` from `@opencode/plugin` as a value. Inside opencode (2.2.7)
 that import is served by the host's own bundled copy, and the copy in `node_modules` is not
 loaded; `npm ci` is what the type check and the tests use. The systemd unit runs `llama-server`
-with no network, a read-only view of your home and a system-call filter, since it parses text
-the agent chooses. `fetch.sh` re-checks the model file's SHA-256 on every run.
+with no network, no view of your home except its own directory, none of your runtime
+directory except its own socket directory (so no session bus), and a system-call filter, since
+it parses text the agent chooses. `fetch.sh` re-checks the model file's SHA-256 on every run.
 `fetch.sh` downloads llama.cpp (MIT) from its GitHub releases and the Kev model from Hugging Face
 (`ggml-org/Kev-0.8B-GGUF`); check the model card for the model's licence.
 Everything lives under `~/.local/share/opencode-automode` (override with `OPENCODE_AUTOMODE_HOME`
@@ -212,6 +266,11 @@ runtime directory and git config under `~/.cache/opencode-automode-test` (it can
 `/tmp`, which the rules treat as project space) and removes it afterwards. No model is needed:
 tests that involve one start a local stub server.
 
+- `test/differential.test.mts`: the desync class. Every input holds a marker command the rules
+  ask about; each runs in real bash inside the sandbox wrapper, and the test fails if the
+  marker ran while the decision was an allow. Inputs: `test/desync-inputs.txt` (both review
+  rounds and their variants) and 2,500 from a seeded generator (`DESYNC_FUZZ=100000` for more,
+  `DESYNC_SEED` for other ones). bash only: zsh is not run.
 - `test/guard.test.mts`: the syntax check, the strict tokenizer, git option parsing, globs.
 - `test/decide.test.mts`: the decision rules. Each assertion says whether the rules asked or
   merely left the command to the (absent) model.
@@ -258,11 +317,27 @@ message), which is why pushes and ssh use deterministic rules instead.
   known files are read-only (`.husky/`, lefthook, pre-commit, overcommit), but only where they
   already exist, and a hook that calls `npm run lint` or a script in the repository runs
   whatever that has become. Read the diff before you run or commit.
-- **Credentials are found by name.** A secret in a file the rules do not recognise, deeper than
-  3 levels in the project, or inside `node_modules`, `target` and similar skipped directories
-  is readable. `cat "$(printf .env)"` is not an ask by rule: it goes to the model, and the
-  sandbox hides the file. Sockets elsewhere under `$HOME`, or more than 3 levels below a temp
-  directory, are not searched for.
+- **Credentials are found by name.** A secret in a file the rules do not recognise is
+  readable, and so is `.git/config` with a token in a remote URL. `cat "$(printf .env)"` is
+  not an ask by rule: it goes to the model, and the sandbox hides the file. Credential files in
+  the temp directories are not searched for, nor are sockets elsewhere under `$HOME`.
+- **The scan has a budget.** Before every allowed command the writable directories are walked
+  in full: the project, `allowedPaths` and the temp directories (about 0.2 s for 176,000
+  entries in `/tmp` on the test machine). Past 400,000 entries or 1.5 s per directory, or with
+  more than 5,000 credential files, the command asks and the prompt says which limit was hit.
+  A directory of yours that cannot be listed asks too.
+- **Code bash evaluates from data.** bash evaluates a variable's value again in every
+  arithmetic context (`$((x))`, `[[ $x -eq 1 ]]`, subscripts, `${s:x}`), so a value like
+  `a[$(cmd)]` runs. The guard asks about the builtins and forms listed above and about such
+  text when it is written in the command; a value that comes from a file, the environment or
+  a program's output is not seen.
+- **Programs are judged by name.** Apart from the options listed above (git, tar, sort, make,
+  fd, rg, man, sed, awk), an allowed program is not checked for options that make it run
+  another program or read a script. Whatever it starts runs inside the sandbox.
+- **Builds and tests run the session's code.** `make`, `npm test`, `cargo build` and a program
+  the session compiled run what the session wrote, without the model seeing it first.
+- **zsh.** The parser checks are tested against bash. zsh's `>!` asks; its other extensions
+  (glob qualifiers, `=cmd`, `${(e)x}`) were only read, not run.
 - **opencode's project config.** `opencode.json[c]` in the session directory cannot be made
   read-only before it exists. A sandboxed command that creates one is detected at the next
   decision (auto-allow pauses and the prompt names the file), but opencode may have loaded it
@@ -276,10 +351,13 @@ message), which is why pushes and ssh use deterministic rules instead.
   it can authenticate wherever your keys open, including this machine if it runs sshd. The
   rules only auto-allow `ssh` to `sshHosts`; keep that list short.
 - **`/tmp` is shared.** It stays writable and shared with other processes, because agents and
-  opencode's own tools pass files through it.
+  opencode's own tools pass files through it. A repository there has its existing hooks and
+  config made read-only; what cannot be protected in it (a missing include, a link) is left,
+  where the same thing in the project would make the command ask.
+- **A `.git` that is a symbolic link** (Android `repo` checkouts) cannot be made read-only, so
+  in such a project every command that would be allowed asks.
 - **Late arrivals.** Sockets, credential files and git repositories created after a command
   starts are not covered for that command (hence `git clone` and `git init` ask).
-  Repositories more than 4 levels below a writable directory are not found.
 - **Schedules.** After approval, a schedule's checks run outside the sandbox with your whole
   environment (opencode starts them directly), so approve schedules with care.
 - **Background work and terminals.** Nothing a sandboxed command starts survives it, and

@@ -17,9 +17,12 @@ Anything that breaks a guarantee the README states, for example:
 - the plugin failing open: an error, timeout or unexpected input ending in "allow".
 
 The limits listed under "Known gaps" in the README (network access, reads of files that are not
-hidden, project files that run later, the ssh agent for ssh commands, shared `/tmp`, an
-`opencode.json` created mid-session, scheduled checks after approval) are known and not
-vulnerabilities in themselves, but ways to turn them into one of the above are.
+hidden, project files that run later, builds and tests running the session's code, values bash
+evaluates as arithmetic when they come from a file or the environment, allowed programs judged
+by name, the ssh agent for ssh commands, shared `/tmp`, an `opencode.json` created mid-session,
+scheduled checks after approval) are known and not vulnerabilities in themselves, but ways to
+turn them into one of the above are. A shell input that bash runs differently from how the
+rules read it is always one: `test/differential.test.mts` is the place to add it.
 
 ## Reporting
 

@@ -23,6 +23,7 @@ assert.ok(configFile.startsWith(home) && !home.startsWith("/tmp"), "run through 
 type Hook = (event: any) => unknown;
 interface Host {
   tool: Hook;
+  after: Hook;
   shell: Hook;
   permission: Hook;
   emit(event: unknown): Promise<void>;
@@ -36,7 +37,7 @@ async function start(config?: unknown, options?: unknown, raw?: string): Promise
   else if (config !== undefined) fs.writeFileSync(configFile, JSON.stringify(config));
   else fs.rmSync(configFile, { force: true });
   const hooks: Record<string, Hook> = {};
-  const hook = (kind: string) => ({ hook: async (_name: string, fn: Hook) => ((hooks[kind] = fn), { dispose: async () => {} }) });
+  const hook = (kind: string) => ({ hook: async (name: string, fn: Hook) => ((hooks[`${kind}.${name}`] = fn), { dispose: async () => {} }) });
   const queue: unknown[] = [];
   let wake: (() => void) | undefined;
   const ctx = {
@@ -58,9 +59,10 @@ async function start(config?: unknown, options?: unknown, raw?: string): Promise
   };
   const dispose = await (plugin as any).setup(ctx);
   const host: Host = {
-    tool: hooks.tool,
-    shell: hooks.shell,
-    permission: hooks.permission,
+    tool: hooks["tool.execute.before"],
+    after: hooks["tool.execute.after"],
+    shell: hooks["shell.create.before"],
+    permission: hooks["permission.evaluate"],
     async emit(event) {
       queue.push(event);
       wake?.();
@@ -338,10 +340,10 @@ describe("D2/H3: settings", () => {
     const code = `
       const plugin = (await import(${JSON.stringify(path.join(ROOT, "index.ts"))})).default;
       const hooks = {};
-      const hook = (k) => ({ hook: async (_n, fn) => ((hooks[k] = fn), { dispose: async () => {} }) });
+      const hook = () => ({ hook: async (n, fn) => ((hooks[n] = fn), { dispose: async () => {} }) });
       const dispose = await plugin.setup({ options: undefined, location: { directory: ${JSON.stringify(project)} }, tool: hook("tool"), shell: hook("shell"), permission: hook("permission"),
         event: { subscribe: () => (async function* () {})() } });
-      await hooks.tool({ tool: "shell", sessionID: "s", messageID: "m", id: "1", input: { command: "ls" } });
+      await hooks["execute.before"]({ tool: "shell", sessionID: "s", messageID: "m", id: "1", input: { command: "ls" } });
       await dispose();`;
     const r = spawnSync(process.execPath, ["--input-type=module", "-e", code], { cwd, env: { ...process.env, XDG_STATE_HOME: "", XDG_CONFIG_HOME: "" }, encoding: "utf8" });
     assert.equal(r.status, 0, r.stderr);
@@ -368,5 +370,210 @@ describe("C10: a pause is reported with what was found", () => {
     } finally {
       fs.rmSync(path.join(project, "third_party"), { recursive: true, force: true });
     }
+  });
+});
+
+// ---- round 2 review findings ----
+
+describe("r2 13: a new repository is expected only where an approved command put it", () => {
+  const asked = async (host: Host, command: string, sessionID: string) => {
+    const made = await call(host, command, { sessionID });
+    assert.equal(made.permission.effect, "ask", command);
+    return made;
+  };
+  const reply = async (host: Host, id: string, answer: string) => {
+    await host.emit({ type: "permission.asked", data: { id: `per_${id}`, sessionID: "x", action: "shell", resources: [], source: { type: "tool", messageID: "m1", id } } });
+    await host.emit({ type: "permission.replied", data: { requestID: `per_${id}`, reply: answer } });
+  };
+  const fresh = (name: string) => {
+    const dir = path.join(project, name);
+    fs.rmSync(dir, { recursive: true, force: true });
+    return dir;
+  };
+  test("approved: the repository it names may appear, and nothing is paused", async () => {
+    const host = await start();
+    assert.equal((await call(host, "ls", { sessionID: "e1" })).permission.effect, "allow");
+    const dir = fresh("approved-repo");
+    const { id } = await asked(host, "git init approved-repo", "e1");
+    await reply(host, id, "once");
+    execFileSync("git", ["init", "-q", dir]);
+    await host.after({ tool: "shell", sessionID: "e1", messageID: "m1", id, status: "completed" });
+    try {
+      assert.equal((await call(host, "ls", { sessionID: "e1" })).permission.effect, "allow");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("asked but not approved: what appears pauses the session", async () => {
+    const host = await start();
+    assert.equal((await call(host, "ls", { sessionID: "e2" })).permission.effect, "allow");
+    const dir = fresh("unapproved-repo");
+    const { id } = await asked(host, "git init unapproved-repo", "e2");
+    await reply(host, id, "reject");
+    execFileSync("git", ["init", "-q", dir]);
+    try {
+      const next = await call(host, "ls", { sessionID: "e2" });
+      assert.equal(next.permission.effect, "ask");
+      assert.match(next.permission.message, /paused.*unapproved-repo/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("asked and still unanswered: a second call in the same message cannot use it", async () => {
+    const host = await start();
+    assert.equal((await call(host, "ls", { sessionID: "e3" })).permission.effect, "allow");
+    const dir = fresh("planted-meanwhile");
+    await asked(host, "git init /tmp/automode-elsewhere", "e3");
+    execFileSync("git", ["init", "-q", dir]);
+    try {
+      assert.match((await call(host, "ls", { sessionID: "e3" })).permission.message, /paused/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("approved, but the repository appears somewhere else", async () => {
+    const host = await start();
+    assert.equal((await call(host, "ls", { sessionID: "e4" })).permission.effect, "allow");
+    const dir = fresh("not-the-named-one");
+    const { id } = await asked(host, "git init the-named-one", "e4");
+    await reply(host, id, "always");
+    execFileSync("git", ["init", "-q", dir]);
+    try {
+      assert.match((await call(host, "ls", { sessionID: "e4" })).permission.message, /paused.*not-the-named-one/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("a push to a branch called init-x explains nothing", async () => {
+    const host = await start();
+    assert.equal((await call(host, "ls", { sessionID: "e5" })).permission.effect, "allow");
+    const dir = fresh("after-push");
+    const { id } = await asked(host, "git push origin init-x", "e5");
+    await reply(host, id, "once");
+    execFileSync("git", ["init", "-q", dir]);
+    try {
+      assert.match((await call(host, "ls", { sessionID: "e5" })).permission.message, /paused/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("r2 26: a shell is sandboxed only when it cannot belong to a call that asks", () => {
+  test("after a call whose shell never came, the next identical one runs sandboxed with its own plan, and is not asked about", async () => {
+    const host = await start();
+    await call(host, "ls -1", { noShell: true }); // orphaned
+    const secret = path.join(project, ".env");
+    fs.writeFileSync(secret, "TOKEN=x\n");
+    try {
+      const { permission, shell } = await call(host, "ls -1");
+      assert.equal(permission.effect, "allow", permission.message);
+      assert.ok(wrapped(shell));
+      assert.ok(list(shell.env, "AUTOMODE_HIDE").includes(secret), "the plan is the one made for this call");
+    } finally {
+      fs.rmSync(secret);
+    }
+  });
+  test("a call that is over leaves the queue", async () => {
+    const host = await start();
+    const first = await call(host, "ls -2", { noShell: true });
+    await host.after({ tool: "shell", sessionID: "s1", messageID: "m1", id: first.id, status: "error" });
+    const { permission, shell } = await call(host, "ls -2");
+    assert.equal(permission.effect, "allow");
+    assert.ok(wrapped(shell));
+  });
+  test("identical commands with different verdicts: no shell is sandboxed, and the allowed one asks", async () => {
+    const host = await start();
+    const command = "ls -3";
+    assert.equal((await call(host, "ls", { sessionID: "mixed" })).permission.effect, "allow");
+    const event = (id: string) => ({ tool: "shell", sessionID: "mixed", messageID: "m1", id, input: { command } });
+    await host.tool(event("a")); // allowed
+    const planted = path.join(project, "mixed-repo");
+    execFileSync("git", ["init", "-q", planted]);
+    try {
+      await host.tool(event("b")); // asks: the session is paused now
+      const shells = [1, 2].map(() => ({ command, cwd: project, timeout: 1, shell: "/bin/bash", env: baseEnv() as Record<string, string | undefined> }));
+      for (const s of shells) await host.shell(s);
+      assert.ok(!shells.some(wrapped), "a shell that may belong to the asked call was sandboxed");
+      for (const id of ["a", "b"]) {
+        const permission: any = { sessionID: "mixed", action: "shell", resources: [command], source: { type: "tool", messageID: "m1", id }, effect: "allow" };
+        await host.permission(permission);
+        assert.equal(permission.effect, "ask", id);
+      }
+    } finally {
+      fs.rmSync(planted, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("r2 32: schedules are never auto-allowed", () => {
+  test("a later run of a check asks with the sandbox switched off too", async () => {
+    const host = await start({ sandbox: false });
+    const tick: any = { sessionID: "s1", action: "shell", resources: ["ls"], effect: "allow" };
+    await host.permission(tick);
+    assert.equal(tick.effect, "ask");
+  });
+});
+
+describe("r2 E: what the sandbox would only make fail asks", () => {
+  test("23: a commit after a test run in one call", async () => {
+    const { permission } = await call(await start(), "npm test && git commit -am x");
+    assert.equal(permission.effect, "ask");
+    assert.match(permission.message, /cannot work in the sandbox.*read-only/);
+  });
+  test("23: the commit agents write runs, with a writable .git", async () => {
+    const { permission, shell } = await call(await start(), "git commit --allow-empty -m \"$(cat <<'EOF'\nA message.\n\nIt's fine.\nEOF\n)\"");
+    assert.equal(permission.effect, "allow", permission.message);
+    assert.ok(!list(shell.env, "AUTOMODE_RO").includes(path.join(project, ".git")), "the git directory is not read-only as a whole");
+    assert.ok(list(shell.env, "AUTOMODE_RO").includes(path.join(project, ".git", "hooks")));
+  });
+  test("with the sandbox off nothing would fail, so nothing extra asks", async () => {
+    const { permission } = await call(await start({ sandbox: false }), "npm test && git commit -am x");
+    assert.equal(permission.effect, "allow");
+  });
+});
+
+describe("r2 20/28: settings", () => {
+  const settingsAsk = async (config: unknown, options?: unknown, raw?: string) => {
+    const { permission } = await call(await start(config, options, raw), "ls");
+    return permission;
+  };
+  test("20: a settings file that holds null is invalid", async () => {
+    const permission = await settingsAsk(undefined, undefined, "null");
+    assert.equal(permission.effect, "ask");
+    assert.match(permission.message, /settings are invalid/);
+  });
+  test("20: no plugin options at all is fine", async () => {
+    assert.equal((await settingsAsk(undefined, null)).effect, "allow");
+  });
+  test("28: rules in the plugin options add to the file's rules", async () => {
+    const host = await start({ rules: { ask: ["wc *"] } }, { rules: { ask: ["du *"] } });
+    assert.match((await call(host, "wc -l README")).permission.message, /your ask rule/);
+    assert.match((await call(host, "du -sh .")).permission.message, /your ask rule/);
+  });
+  for (const [name, config] of [
+    ["a relative allowedPaths entry", { allowedPaths: ["build"] }],
+    ["allowedPaths: ~", { allowedPaths: ["~"] }],
+    ["allowedPaths: /", { allowedPaths: ["/"] }],
+    ["sandboxWritable: /usr", { sandboxWritable: ["/usr"] }],
+    ["a relative sandboxWritable entry", { sandboxWritable: ["./cache"] }],
+    ["a relative sandboxHidePaths entry", { sandboxHidePaths: ["secrets"] }],
+  ] as [string, unknown][]) {
+    test(`28: ${name} is invalid`, async () => assert.match((await settingsAsk(config)).message ?? "", /settings are invalid/));
+  }
+  test("28: paths below the home directory are fine", async () => {
+    assert.equal((await settingsAsk({ allowedPaths: ["~/scratch"], sandboxWritable: ["~/.cargo/registry"], sandboxHidePaths: ["~/private"] })).effect, "allow");
+  });
+});
+
+describe("r2 33: the model server's unit", () => {
+  const unit = fs.readFileSync(path.join(ROOT, "systemd", "opencode-automode-kev.service"), "utf8");
+  const setting = (name: string) => unit.split("\n").filter((line) => line.startsWith(`${name}=`)).map((line) => line.slice(name.length + 1));
+  test("it sees none of the home directory but its own data, and none of the runtime directory but its own socket", () => {
+    assert.deepEqual(setting("ProtectHome"), ["tmpfs"]);
+    assert.deepEqual(setting("BindReadOnlyPaths"), ["%h/.local/share/opencode-automode"]);
+    assert.deepEqual(setting("TemporaryFileSystem"), ["%t:ro"]);
+    assert.deepEqual(setting("BindPaths"), ["%t/opencode-automode"]);
+    assert.deepEqual(setting("PrivateNetwork"), ["yes"]);
   });
 });

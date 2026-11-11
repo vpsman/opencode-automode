@@ -13,7 +13,15 @@
 //   permission.evaluate   apply the decision. An allow whose shell was not swapped asks instead,
 //                         so a missing or broken sandbox never widens what runs.
 // opencode 2.2.7 fires the three in that order for one call (core/src/tool.ts, shell.ts,
-// tool/plugin/shell.ts), and hands create.before the child's whole environment.
+// tool/plugin/shell.ts), and hands create.before the child's whole environment. It runs the
+// tool calls of one message at the same time, each in a fiber of its own (SessionStep.attempt),
+// so the hooks of two calls interleave; and create.before carries no call id, so a shell cannot
+// be told from the shell of an identical command. A shell is therefore sandboxed only when
+// every identical call in flight is an allow.
+//   tool.execute.after    the call is over: it leaves the queue, and what it was approved to
+//                         create is no longer expected.
+//   permission.asked / permission.replied (events)   which prompt belongs to which call, and
+//                         the user's answer: an approval is what makes a new repository expected.
 // edit and read only ever tighten (guard and opencode config files, credential files).
 // opencode `deny` rules never reach the hook, so they always win. Any error asks.
 //
@@ -27,7 +35,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Plugin } from "@opencode/plugin";
 import { compileRules, compilePattern } from "./rules.ts";
-import { decideFile, decideRead, decideShell, expectsNewRepo, gitOnly, mirrorable, projectRoots, SessionState, usesSsh, type Decision, type Guard } from "./decide.ts";
+import { decideFile, decideRead, decideShell, expectedRepos, gitOnly, mirrorable, projectRoots, sandboxBreaks, SessionState, usesSsh, type Decision, type Expected, type Guard } from "./decide.ts";
 import { envKept, plan, realpath, type Plan } from "./sandbox.ts";
 import { loadConfig, type Config } from "./config.ts";
 
@@ -130,10 +138,20 @@ const WRAP_WINDOW_MS = 15_000;
 interface Call {
   command: string;
   cwd: string;
+  sessionID: string;
   decision: Decision;
   sandbox?: Plan;
   exposeSsh?: boolean;
+  // A shell for this command and directory was sandboxed while the call was waiting for one.
   wrapped?: boolean;
+  // A shell for this command and directory was left as it is while the call was waiting for
+  // one, and it may have been this call's: an allow asks instead.
+  unsure?: boolean;
+  // permission.evaluate was applied, or the tool call is over: it waits for no shell.
+  settled?: boolean;
+  // Where the command would create repositories, when it asks; and the approval of that.
+  expects?: string[];
+  expecting?: Expected;
   at: number;
 }
 
@@ -205,6 +223,8 @@ export default Plugin.define({
     const unseen = new Map<string, { at: number; decision: Decision }>();
     const toWrap = new Map<string, Call[]>();
     const wrapKey = (command: string, cwd: string) => `${path.resolve(cwd)}\u0000${command}`;
+    // The calls for one command and directory that still wait for their shell.
+    const waiting = (key: string) => (toWrap.get(key) ?? []).filter((c) => !c.settled && Date.now() - c.at < WRAP_WINDOW_MS);
     const bound = <K, V>(map: Map<K, V>, max: number) => {
       while (map.size > max) map.delete(map.keys().next().value!);
     };
@@ -225,8 +245,11 @@ export default Plugin.define({
       } catch (e) {
         decision = { effect: "ask", by: "rules", rule: "ask", reason: `automode failed, asking instead: ${(e as Error).message}` };
       }
-      const call: Call = { command, cwd, decision, at: Date.now() };
-      if (decision.effect === "allow" && sandboxReady) {
+      const call: Call = { command, cwd, sessionID: event.sessionID, decision, at: Date.now() };
+      // Allowed must mean it can work: what the sandbox would only make fail asks instead.
+      const broken = decision.effect === "allow" && sandboxReady ? sandboxBreaks(command, cwd, s) : undefined;
+      if (broken) call.decision = { ...decision, effect: "ask", reason: `would be allowed, but it cannot work in the sandbox: ${broken}` };
+      else if (decision.effect === "allow" && sandboxReady) {
         try {
           const roots = projectRoots(s);
           call.exposeSsh = usesSsh(command, cwd, s);
@@ -247,34 +270,57 @@ export default Plugin.define({
           call.decision = { ...decision, effect: "ask", reason: `would be allowed, but the sandbox could not be prepared: ${(e as Error).message}` };
         }
       }
-      // Every call is queued, asks too: a shell is only sandboxed when every call still waiting
-      // for a shell with the same command and directory is an allow, so a sandbox can never end
-      // up on the wrong call.
+      // Every call is queued, asks too, until its permission is evaluated or it is over.
       const key = wrapKey(command, cwd);
       call.at = Date.now();
-      toWrap.set(key, [...(toWrap.get(key) ?? []).filter((c) => call.at - c.at < WRAP_WINDOW_MS), call]);
+      toWrap.set(key, [...waiting(key), call]);
       bound(toWrap, 200);
-      if (call.decision.effect === "ask" && !s.tampered && expectsNewRepo(command)) s.expectNewRepo = true;
+      // If the user approves it, what it creates is expected, where it said it would create it.
+      if (call.decision.effect === "ask" && !s.tampered) call.expects = expectedRepos(command, cwd);
       calls.set(callKey(event.messageID, event.id), call);
       bound(calls, 500);
       log(config, { sessionID: event.sessionID, tool: event.tool, command: clip(command), cwd, ...call.decision, totalMs: Date.now() - started });
     });
 
+    // The user approved the prompt for this call: from now until the call is over, a repository
+    // may appear where the command named one.
+    const approved = (call: Call | undefined) => {
+      if (!call?.expects || call.expecting) return;
+      call.expecting = { dirs: call.expects, at: Date.now() };
+      session(call.sessionID).expecting.push(call.expecting);
+    };
+
+    const afterHook = await ctx.tool.hook("execute.after", (event) => {
+      const call = calls.get(callKey(event.messageID, event.id));
+      if (!call) return;
+      call.settled = true;
+      // A command the plugin asked about only runs to the end when the user approved it. This
+      // also covers an approval whose event has not arrived yet.
+      if (event.status === "completed" && call.decision.effect === "ask") approved(call);
+      if (call.expecting) call.expecting.done = true;
+    });
+
     const shellHook = await ctx.shell.hook("create.before", (event) => {
       // create.before gets the raw workdir; opencode resolves it against the session directory.
       const key = wrapKey(event.command, resolveWorkdir(project, event.cwd));
-      // Calls whose shell never came (the tool failed first, or opencode denied it) are dropped,
+      // Calls whose shell never came (the tool failed first, or opencode denied it) drop out,
       // so they cannot take the place of a later identical command.
-      const queue = (toWrap.get(key) ?? []).filter((c) => Date.now() - c.at < WRAP_WINDOW_MS);
+      const queue = waiting(key);
       if (!queue.length) return void toWrap.delete(key);
-      const allAllowed = queue.every((c) => c.decision.effect === "allow" && c.sandbox);
-      const call = queue.shift()!;
-      if (queue.length) toWrap.set(key, queue);
-      else toWrap.delete(key);
-      if (!allAllowed || !call.sandbox) return; // left as is: an allow among them will ask
+      toWrap.set(key, queue);
       const shell = resolveShell(event.shell);
       const kind = shell ? path.basename(shell) : "";
-      if (!shell || !WRAPPABLE.has(kind)) return; // left as is: evaluate will ask
+      // Which of the waiting calls this shell belongs to cannot be known. It is sandboxed only
+      // when that makes no difference: every one of them is an allow of the same session.
+      const allAllowed = queue.every((c) => c.decision.effect === "allow" && c.sandbox && !c.unsure) && new Set(queue.map((c) => c.sessionID)).size === 1;
+      if (!allAllowed || !shell || !WRAPPABLE.has(kind)) {
+        // Left as it is. It may be the shell of any of them, so none may run on an allow.
+        for (const c of queue) c.unsure = true;
+        return;
+      }
+      // The plan made last is the freshest.
+      const call = queue.at(-1)!;
+      const sandbox = call.sandbox!;
       if (!call.exposeSsh && !config.sandboxKeepSockets.length) delete event.env.SSH_AUTH_SOCK;
       // Only variables that plainly hold no credential pass. They are removed here, and lockwrite
       // drops everything not on the list as well, whatever environment it was started with.
@@ -283,15 +329,15 @@ export default Plugin.define({
       if (dropped.length) log(config, { command: clip(call.command, 200), envDropped: dropped });
       event.env.AUTOMODE_ENV_KEEP = joined(keep);
       event.env.AUTOMODE_SHELL = shell;
-      event.env.AUTOMODE_RW = joined(call.sandbox.rw);
-      event.env.AUTOMODE_RO = joined(call.sandbox.ro);
-      event.env.AUTOMODE_HIDE = joined(call.sandbox.hide);
-      event.env.AUTOMODE_PIN = joined(call.sandbox.pin);
-      event.env.AUTOMODE_TMPFS = joined(call.sandbox.tmpfs);
+      event.env.AUTOMODE_RW = joined(sandbox.rw);
+      event.env.AUTOMODE_RO = joined(sandbox.ro);
+      event.env.AUTOMODE_HIDE = joined(sandbox.hide);
+      event.env.AUTOMODE_PIN = joined(sandbox.pin);
+      event.env.AUTOMODE_TMPFS = joined(sandbox.tmpfs);
       const coverFile = cover();
       if (coverFile) event.env.AUTOMODE_COVER = coverFile;
       event.shell = path.join(WRAPPER_DIR, kind);
-      call.wrapped = true;
+      for (const c of queue) c.wrapped = true;
     });
 
     const apply = (event: { effect: string; message?: string }, decision: Decision) => {
@@ -329,10 +375,12 @@ export default Plugin.define({
             }
             // Not a tool call this plugin saw start. Judge the statements
             // opencode split out; nothing here can be sandboxed, so an allow becomes an ask.
+            // (Whether or not the sandbox is on: a schedule's later checks come this way, and
+            // a schedule is never auto-allowed.)
             const decision = await decide(session(event.sessionID), project, event.resources.join("\n"));
-            if (decision.effect === "allow" && config.sandbox) {
+            if (decision.effect === "allow") {
               decision.effect = "ask";
-              decision.reason = `would be allowed (${decision.reason || "rules"}), but this call cannot be sandboxed`;
+              decision.reason = `would be allowed (${decision.reason || "rules"}), but this is not a tool call the plugin saw start, so it cannot be sandboxed`;
             }
             apply(event, decision);
             unseen.set(cacheKey, { at: Date.now(), decision });
@@ -341,11 +389,14 @@ export default Plugin.define({
             return;
           }
           const decision = { ...call.decision };
-          if (decision.effect === "allow" && config.sandbox && !call.wrapped) {
+          call.settled = true;
+          if (decision.effect === "allow" && config.sandbox && (!call.wrapped || call.unsure)) {
             decision.effect = "ask";
-            decision.reason = sandboxReady
-              ? `would be allowed (${decision.reason || "rules"}), but its shell could not be sandboxed`
-              : `would be allowed (${decision.reason || "rules"}), but the sandbox is unavailable: ${sandboxProblem}`;
+            decision.reason = !sandboxReady
+              ? `would be allowed (${decision.reason || "rules"}), but the sandbox is unavailable: ${sandboxProblem}`
+              : call.wrapped
+                ? `would be allowed (${decision.reason || "rules"}), but an identical command issued at the same time was not, and their shells cannot be told apart. If you approve this one it may still run sandboxed`
+                : `would be allowed (${decision.reason || "rules"}), but its shell could not be sandboxed`;
             log(config, { ...base, command: clip(call.command), sandboxMiss: true });
           }
           apply(event, decision);
@@ -377,6 +428,8 @@ export default Plugin.define({
     // Mirror "Always allow" replies for shell requests into the plugin's allow rules.
     const stop = new AbortController();
     const pending = new Map<string, string[]>();
+    // Prompts for shell tool calls: request id -> the call.
+    const prompts = new Map<string, string>();
     void (async () => {
       try {
         for await (const raw of ctx.event.subscribe({ types: ["permission.asked", "permission.replied"], signal: stop.signal })) {
@@ -386,7 +439,13 @@ export default Plugin.define({
             const save = Array.isArray(data.save) ? (data.save as unknown[]).filter((x): x is string => typeof x === "string") : [];
             if (save.length) pending.set(data.id, save);
             bound(pending, 200);
+            const source = data.source as { type?: unknown; messageID?: unknown; id?: unknown } | undefined;
+            if (source?.type === "tool" && typeof source.messageID === "string" && typeof source.id === "string") prompts.set(data.id, callKey(source.messageID, source.id));
+            bound(prompts, 200);
           } else if (event.type === "permission.replied" && typeof data.requestID === "string") {
+            const asked = prompts.get(data.requestID);
+            prompts.delete(data.requestID);
+            if (asked && (data.reply === "once" || data.reply === "always")) approved(calls.get(asked));
             const save = pending.get(data.requestID);
             pending.delete(data.requestID);
             if (data.reply === "always" && save) {
@@ -414,6 +473,7 @@ export default Plugin.define({
       toWrap.clear();
       await permissionHook.dispose();
       await shellHook.dispose();
+      await afterHook.dispose();
       await toolHook.dispose();
     };
   },
