@@ -1,0 +1,4 @@
+rules.ts is vendored from pi-automode-classifier
+(https://github.com/deepu105/pi-automode-classifier), MIT, copyright (c) 2026
+Deepu K Sasidharan; see LICENSE.pi-automode-classifier. checkouts() and
+inCheckout() in decide.ts are adapted from the same project.
