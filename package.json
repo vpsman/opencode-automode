@@ -1,0 +1,24 @@
+{
+  "name": "opencode-automode",
+  "version": "0.1.0",
+  "description": "Local auto mode for opencode 2.x permissions: Pi rules, Kev on llama.cpp, Landlock write sandbox.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.2.7"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "@types/node": "24.10.1"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "bench": "node bench/run.mjs",
+    "build:sandbox": "gcc -O2 -Wall -Wextra -o sandbox/lockwrite sandbox/lockwrite.c && mkdir -p sandbox/bin && for s in bash zsh sh; do ln -sf ../lockwrite sandbox/bin/$s; done && sandbox/lockwrite --selftest",
+    "test": "node --test \"test/*.test.mts\""
+  }
+}
