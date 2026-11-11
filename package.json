@@ -18,7 +18,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "bench": "node bench/run.mjs",
-    "build:sandbox": "gcc -O2 -Wall -Wextra -o sandbox/lockwrite sandbox/lockwrite.c && mkdir -p sandbox/bin && for s in bash zsh sh; do ln -sf ../lockwrite sandbox/bin/$s; done && sandbox/lockwrite --selftest",
-    "test": "node --test \"test/*.test.mts\""
+    "build:sandbox": "cargo build --release --locked --manifest-path sandbox/lockwrite-rs/Cargo.toml && cp sandbox/lockwrite-rs/target/release/lockwrite sandbox/lockwrite && mkdir -p sandbox/bin && for s in bash zsh sh; do ln -sf ../lockwrite sandbox/bin/$s; done && sandbox/lockwrite --selftest",
+    "test": "node test/run.mjs"
   }
 }

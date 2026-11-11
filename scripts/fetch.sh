@@ -1,7 +1,10 @@
 #!/bin/sh
 # Downloads llama.cpp's CPU build and the Kev decision model, checking each SHA-256.
 # Installs under $OPENCODE_AUTOMODE_HOME (default ~/.local/share/opencode-automode), which is
-# where systemd/opencode-automode-kev.service expects them. Re-running skips what is present.
+# where systemd/opencode-automode-kev.service expects them. Re-running skips what is present
+# and intact: a model file already there is checked against its SHA-256 again and replaced if
+# it does not match. (The unpacked llama.cpp tree cannot be re-checked: only the archive has a
+# published hash. Delete $OPENCODE_AUTOMODE_HOME/llama to fetch it again.)
 #   scripts/fetch.sh          Kev-0.8B (774 MB, the default model)
 #   scripts/fetch.sh --4b     also Kev-4B (4.5 GB, for benchmarking; slower, not more accurate)
 set -eu
@@ -23,7 +26,11 @@ if [ ! -x "$HOME_DIR/llama/$LLAMA_BUILD/llama-$LLAMA_BUILD/llama-server" ]; then
 fi
 
 get() { # repo file sha256
-  [ -f "$HOME_DIR/models/$2" ] && return 0
+  if [ -f "$HOME_DIR/models/$2" ]; then
+    if (cd "$HOME_DIR/models" && echo "$3  $2" | sha256sum -c - >/dev/null 2>&1); then return 0; fi
+    echo "fetch.sh: $2 does not match its SHA-256, downloading it again" >&2
+    rm -f "$HOME_DIR/models/$2"
+  fi
   curl -fsSL -o "$HOME_DIR/models/$2.part" "https://huggingface.co/$1/resolve/main/$2"
   (cd "$HOME_DIR/models" && echo "$3  $2.part" | sha256sum -c - && mv "$2.part" "$2")
 }

@@ -16,16 +16,17 @@ Anything that breaks a guarantee the README states, for example:
 - something planted by a sandboxed command that later runs outside the sandbox;
 - the plugin failing open: an error, timeout or unexpected input ending in "allow".
 
-The limits listed under "Known gaps" in the README (network access, non-secret reads, the ssh
-agent for ssh commands, shared `/tmp`, scheduled checks after approval) are known and not
+The limits listed under "Known gaps" in the README (network access, reads of files that are not
+hidden, project files that run later, the ssh agent for ssh commands, shared `/tmp`, an
+`opencode.json` created mid-session, scheduled checks after approval) are known and not
 vulnerabilities in themselves, but ways to turn them into one of the above are.
 
 ## Reporting
 
 Please report privately through GitHub: **Security → Report a vulnerability** on this
 repository. Include the command or setup that shows the problem, your Linux kernel version, and
-if you can the matching line from `~/.local/state/opencode-automode/decisions.jsonl` (check it
-for anything private first).
+if you can the matching line from `~/.local/state/opencode-automode/decisions.jsonl` (it holds
+the full text of every command, so check it for anything private first).
 
 Please don't open a public issue for a vulnerability until a fix is released. Reports are
 handled on a best-effort basis; there is no bounty.

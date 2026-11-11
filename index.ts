@@ -12,6 +12,8 @@
 //                         ask are not sandboxed: what you approve runs as you saw it.
 //   permission.evaluate   apply the decision. An allow whose shell was not swapped asks instead,
 //                         so a missing or broken sandbox never widens what runs.
+// opencode 2.2.7 fires the three in that order for one call (core/src/tool.ts, shell.ts,
+// tool/plugin/shell.ts), and hands create.before the child's whole environment.
 // edit and read only ever tighten (guard and opencode config files, credential files).
 // opencode `deny` rules never reach the hook, so they always win. Any error asks.
 //
@@ -24,70 +26,40 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Plugin } from "@opencode/plugin";
-import { compileRules, compilePattern, type Action } from "./rules.ts";
-import { DEFAULT_CLASSIFIER, type ClassifierConfig } from "./kev.ts";
-import { DEFAULT_ASK, decideFile, decideRead, decideShell, gitOnly, mirrorable, projectRoots, SessionState, usesSsh, type Decision, type Guard } from "./decide.ts";
-import { DEFAULT_CACHE_DIRS, plan, realpath, type Plan } from "./sandbox.ts";
+import { compileRules, compilePattern } from "./rules.ts";
+import { decideFile, decideRead, decideShell, expectsNewRepo, gitOnly, mirrorable, projectRoots, SessionState, usesSsh, type Decision, type Guard } from "./decide.ts";
+import { envKept, plan, realpath, type Plan } from "./sandbox.ts";
+import { loadConfig, type Config } from "./config.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOME = os.homedir();
-const CONFIG_DIR = path.join(process.env.XDG_CONFIG_HOME ?? path.join(HOME, ".config"), "opencode");
+// An empty XDG variable counts as unset, as in sandbox.ts and the XDG specification.
+const CONFIG_DIR = path.join(process.env.XDG_CONFIG_HOME || path.join(HOME, ".config"), "opencode");
 const CONFIG_FILE = path.join(CONFIG_DIR, "automode.json");
-const STATE_DIR = path.join(process.env.XDG_STATE_HOME ?? path.join(HOME, ".local", "state"), "opencode-automode");
+const STATE_DIR = path.join(process.env.XDG_STATE_HOME || path.join(HOME, ".local", "state"), "opencode-automode");
 const ALWAYS_FILE = path.join(STATE_DIR, "always.json");
 const LOG_FILE = path.join(STATE_DIR, "decisions.jsonl");
+// Touched by the user to resume auto-allow after a pause (see gitTampered).
+const RESUME_FILE = path.join(STATE_DIR, "resume");
+// An empty file bound over hidden files inside the sandbox.
+const COVER_FILE = path.join(STATE_DIR, "empty");
 const LOCKWRITE = path.join(HERE, "sandbox", "lockwrite");
 const WRAPPER_DIR = path.join(HERE, "sandbox", "bin");
 // Shells the wrapper stands in for. opencode passes `-c <command>` (zsh: `+o nomatch -c`).
 const WRAPPABLE = new Set(["bash", "zsh", "sh"]);
 
-interface Config {
-  enabled: boolean;
-  useClassifier: boolean;
-  classifier: ClassifierConfig;
-  rules: Partial<Record<Action, string[]>>;
-  allowedPaths: string[];
-  sshHosts: string[];
-  sshReadOnlySudo: boolean;
-  allowFeatureBranchPush: boolean;
-  sandbox: boolean;
-  sandboxWritable: string[];
-  sandboxKeepSockets: string[];
-  sandboxShowPaths: string[];
-  sandboxHidePaths: string[];
-  sandboxKeepEnv: string[];
-  log: boolean;
+// The state directory holds every command the agent ran: private to the user, and hidden from
+// sandboxed commands (see the plan's hidePaths).
+function stateDir() {
+  fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  fs.chmodSync(STATE_DIR, 0o700);
 }
 
-const expandHome = (p: string) => (p === "~" ? HOME : p.startsWith("~/") ? path.join(HOME, p.slice(2)) : p);
-
-function loadConfig(options: unknown): Config {
-  let file: Record<string, unknown> = {};
-  try {
-    if (fs.existsSync(CONFIG_FILE)) file = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
-  } catch (e) {
-    console.error(`[opencode-automode] ignoring unreadable ${CONFIG_FILE}: ${(e as Error).message}`);
-  }
-  const opts = typeof options === "object" && options !== null ? (options as Record<string, unknown>) : {};
-  const merged = { ...file, ...opts } as Partial<Config>;
-  const rules = merged.rules ?? {};
-  return {
-    enabled: merged.enabled ?? true,
-    useClassifier: merged.useClassifier ?? true,
-    classifier: { ...DEFAULT_CLASSIFIER, ...(merged.classifier ?? {}) },
-    rules: { ...rules, ask: [...DEFAULT_ASK, ...(rules.ask ?? [])] },
-    allowedPaths: (merged.allowedPaths ?? []).map(expandHome),
-    sshHosts: merged.sshHosts ?? [],
-    sshReadOnlySudo: merged.sshReadOnlySudo ?? false,
-    allowFeatureBranchPush: merged.allowFeatureBranchPush ?? false,
-    sandbox: merged.sandbox ?? true,
-    sandboxWritable: [...DEFAULT_CACHE_DIRS, ...(merged.sandboxWritable ?? []).map(expandHome)],
-    sandboxKeepSockets: (merged.sandboxKeepSockets ?? []).map(expandHome),
-    sandboxShowPaths: (merged.sandboxShowPaths ?? []).map(expandHome),
-    sandboxHidePaths: (merged.sandboxHidePaths ?? []).map(expandHome),
-    sandboxKeepEnv: merged.sandboxKeepEnv ?? [],
-    log: merged.log ?? true,
-  };
+function privateWrite(file: string, text: string, append = false) {
+  stateDir();
+  if (append) fs.appendFileSync(file, text, { mode: 0o600 });
+  else fs.writeFileSync(file, text, { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
 }
 
 // "Always allow" patterns, per project: { "<project realpath>": ["git status *", ...] }.
@@ -108,15 +80,13 @@ function loadAlways(project: string): string[] {
 function saveAlways(project: string, list: string[]) {
   const data = loadAlwaysFile();
   data[project] = list;
-  fs.mkdirSync(STATE_DIR, { recursive: true });
-  fs.writeFileSync(ALWAYS_FILE, JSON.stringify(data, null, 2) + "\n");
+  privateWrite(ALWAYS_FILE, JSON.stringify(data, null, 2) + "\n");
 }
 
 function log(config: Config, entry: Record<string, unknown>) {
   if (!config.log) return;
   try {
-    fs.mkdirSync(STATE_DIR, { recursive: true });
-    fs.appendFileSync(LOG_FILE, JSON.stringify({ time: new Date().toISOString(), ...entry }) + "\n");
+    privateWrite(LOG_FILE, JSON.stringify({ time: new Date().toISOString(), ...entry }) + "\n", true);
   } catch {
     // Logging must never change a decision.
   }
@@ -149,11 +119,13 @@ function selftest(): string | undefined {
 
 // opencode resolves a tool's workdir against the session directory, expanding a leading `~`.
 const resolveWorkdir = (base: string, dir: string) => path.resolve(base, dir === "~" ? HOME : dir.startsWith("~/") ? path.join(HOME, dir.slice(2)) : dir);
-// Environment variables that look like credentials are not passed to sandboxed commands.
-const SECRET_ENV = /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|CREDENTIALS?|AUTH|SESSION|COOKIE|PRIVATE)(_|$)|^(AWS|AZURE|GCP|GOOGLE|OPENAI|ANTHROPIC|GITHUB|GH|GITLAB|NPM|PYPI|CARGO_REGISTRY|DOCKER|HF|HUGGING_?FACE|OPENCODE_SERVER)_/i;
 const clip = (text: string, max = 4000) => (text.length > max ? `${text.slice(0, max)} ... (${text.length} chars)` : text);
 const callKey = (messageID: string, id: string) => `${messageID}\u0000${id}`;
-const joined = (paths: string[]) => paths.filter((p) => !p.includes(":")).join(":");
+// lockwrite takes its lists newline-separated; plan() reports a path with a newline as a problem.
+const joined = (paths: string[]) => paths.join("\n");
+// A call waits this long for its shell. opencode creates the shell right after the tool hook
+// returns, so anything older belongs to a call that never got one.
+const WRAP_WINDOW_MS = 15_000;
 
 interface Call {
   command: string;
@@ -162,12 +134,32 @@ interface Call {
   sandbox?: Plan;
   exposeSsh?: boolean;
   wrapped?: boolean;
+  at: number;
 }
 
 export default Plugin.define({
   id: "opencode-automode",
   async setup(ctx) {
-    const config = loadConfig(ctx.options);
+    const loaded = loadConfig(CONFIG_FILE, ctx.options);
+    const config: Config = loaded.config;
+    // With settings that cannot be used as written, nothing is auto-allowed.
+    const configProblem = loaded.problem ? `automode settings are invalid, so nothing is auto-allowed: ${loaded.problem}` : undefined;
+    if (configProblem) console.error(`[opencode-automode] ${configProblem}`);
+    try {
+      stateDir();
+      if (!fs.existsSync(COVER_FILE)) fs.writeFileSync(COVER_FILE, "", { mode: 0o400 });
+      for (const file of [LOG_FILE, ALWAYS_FILE]) if (fs.existsSync(file)) fs.chmodSync(file, 0o600);
+    } catch {
+      // Without the cover file hidden files read as /dev/null.
+    }
+    const cover = () => {
+      try {
+        const st = fs.statSync(COVER_FILE);
+        return st.isFile() && st.size === 0 ? COVER_FILE : undefined;
+      } catch {
+        return undefined;
+      }
+    };
     const project = ctx.location.directory;
     const projectKey = realpath(project);
     let always = loadAlways(projectKey);
@@ -186,7 +178,19 @@ export default Plugin.define({
       sshHosts: config.sshHosts,
       sshReadOnlySudo: config.sshReadOnlySudo,
       allowFeatureBranchPush: config.allowFeatureBranchPush,
+      resumeFile: RESUME_FILE,
     });
+    // A decision that would run without a prompt becomes a prompt while the settings are invalid.
+    const held = (decision: Decision): Decision => (configProblem && decision.effect === "allow" ? { ...decision, effect: "ask", reason: configProblem } : decision);
+    const paused = new Set<SessionState>();
+    const decide = async (s: SessionState, cwd: string, command: string): Promise<Decision> => {
+      const decision = held(await decideShell(guard, s, cwd, command));
+      if (s.tampered && !paused.has(s)) {
+        paused.add(s);
+        console.error(`[opencode-automode] auto-allow paused: ${s.tampered.reason}. To resume after checking: touch ${RESUME_FILE}`);
+      } else if (!s.tampered) paused.delete(s);
+      return decision;
+    };
     let guard = makeGuard();
 
     const sessions = new Map<string, SessionState>();
@@ -198,7 +202,6 @@ export default Plugin.define({
 
     // Decisions by tool call, and allowed calls waiting for their shell to be created.
     const calls = new Map<string, Call>();
-    const schedules = new Set<string>();
     const unseen = new Map<string, { at: number; decision: Decision }>();
     const toWrap = new Map<string, Call[]>();
     const wrapKey = (command: string, cwd: string) => `${path.resolve(cwd)}\u0000${command}`;
@@ -208,18 +211,6 @@ export default Plugin.define({
 
     const toolHook = await ctx.tool.hook("execute.before", async (event) => {
       if (!config.enabled) return;
-      // opencode registers it as `opencode_schedule_create` (namespace joined with `_`).
-      if (/(^|[._])schedule_create$/.test(event.tool)) {
-        // Remember the agent's own schedule checks: their permission request arrives later as
-        // `unattended`, and must be judged like any other command (see permission.evaluate).
-        const input = event.input as Record<string, unknown> | undefined;
-        for (const key of ["if", "until"]) {
-          const run = (input?.[key] as { run?: unknown } | undefined)?.run;
-          if (typeof run === "string") schedules.add(`${event.sessionID}\u0000${run}`);
-        }
-        while (schedules.size > 200) schedules.delete(schedules.values().next().value!);
-        return;
-      }
       if (event.tool !== "shell" && event.tool !== "bash") return;
       const input = event.input as { command?: unknown; workdir?: unknown } | undefined;
       if (typeof input?.command !== "string") return;
@@ -230,11 +221,11 @@ export default Plugin.define({
       const s = session(event.sessionID);
       let decision: Decision;
       try {
-        decision = await decideShell(guard, s, cwd, command);
+        decision = await decide(s, cwd, command);
       } catch (e) {
         decision = { effect: "ask", by: "rules", rule: "ask", reason: `automode failed, asking instead: ${(e as Error).message}` };
       }
-      const call: Call = { command, cwd, decision };
+      const call: Call = { command, cwd, decision, at: Date.now() };
       if (decision.effect === "allow" && sandboxReady) {
         try {
           const roots = projectRoots(s);
@@ -247,7 +238,8 @@ export default Plugin.define({
             exposeSsh: call.exposeSsh,
             keepSockets: config.sandboxKeepSockets,
             showPaths: config.sandboxShowPaths,
-            hidePaths: config.sandboxHidePaths,
+            hidePaths: [...config.sandboxHidePaths, STATE_DIR],
+            project,
           });
           if (p.problem) throw new Error(p.problem);
           call.sandbox = p;
@@ -259,9 +251,10 @@ export default Plugin.define({
       // for a shell with the same command and directory is an allow, so a sandbox can never end
       // up on the wrong call.
       const key = wrapKey(command, cwd);
-      toWrap.set(key, [...(toWrap.get(key) ?? []), call]);
+      call.at = Date.now();
+      toWrap.set(key, [...(toWrap.get(key) ?? []).filter((c) => call.at - c.at < WRAP_WINDOW_MS), call]);
       bound(toWrap, 200);
-      if (call.decision.effect === "ask" && /(^|[;&|]\s*)git( -C \S+)* (init|clone)\b/.test(command)) s.expectNewRepo = true;
+      if (call.decision.effect === "ask" && !s.tampered && expectsNewRepo(command)) s.expectNewRepo = true;
       calls.set(callKey(event.messageID, event.id), call);
       bound(calls, 500);
       log(config, { sessionID: event.sessionID, tool: event.tool, command: clip(command), cwd, ...call.decision, totalMs: Date.now() - started });
@@ -270,25 +263,33 @@ export default Plugin.define({
     const shellHook = await ctx.shell.hook("create.before", (event) => {
       // create.before gets the raw workdir; opencode resolves it against the session directory.
       const key = wrapKey(event.command, resolveWorkdir(project, event.cwd));
-      const queue = toWrap.get(key);
-      if (!queue?.length) return;
+      // Calls whose shell never came (the tool failed first, or opencode denied it) are dropped,
+      // so they cannot take the place of a later identical command.
+      const queue = (toWrap.get(key) ?? []).filter((c) => Date.now() - c.at < WRAP_WINDOW_MS);
+      if (!queue.length) return void toWrap.delete(key);
       const allAllowed = queue.every((c) => c.decision.effect === "allow" && c.sandbox);
       const call = queue.shift()!;
-      if (!queue.length) toWrap.delete(key);
+      if (queue.length) toWrap.set(key, queue);
+      else toWrap.delete(key);
       if (!allAllowed || !call.sandbox) return; // left as is: an allow among them will ask
       const shell = resolveShell(event.shell);
       const kind = shell ? path.basename(shell) : "";
       if (!shell || !WRAPPABLE.has(kind)) return; // left as is: evaluate will ask
+      if (!call.exposeSsh && !config.sandboxKeepSockets.length) delete event.env.SSH_AUTH_SOCK;
+      // Only variables that plainly hold no credential pass. They are removed here, and lockwrite
+      // drops everything not on the list as well, whatever environment it was started with.
+      const { keep, dropped } = envKept(event.env, config.sandboxKeepEnv);
+      for (const name of dropped) delete event.env[name];
+      if (dropped.length) log(config, { command: clip(call.command, 200), envDropped: dropped });
+      event.env.AUTOMODE_ENV_KEEP = joined(keep);
       event.env.AUTOMODE_SHELL = shell;
       event.env.AUTOMODE_RW = joined(call.sandbox.rw);
       event.env.AUTOMODE_RO = joined(call.sandbox.ro);
       event.env.AUTOMODE_HIDE = joined(call.sandbox.hide);
       event.env.AUTOMODE_PIN = joined(call.sandbox.pin);
       event.env.AUTOMODE_TMPFS = joined(call.sandbox.tmpfs);
-      for (const name of Object.keys(event.env)) {
-        if (SECRET_ENV.test(name) && !config.sandboxKeepEnv.includes(name) && name !== "SSH_AUTH_SOCK") delete event.env[name];
-      }
-      if (!call.exposeSsh && !config.sandboxKeepSockets.length) delete event.env.SSH_AUTH_SOCK;
+      const coverFile = cover();
+      if (coverFile) event.env.AUTOMODE_COVER = coverFile;
       event.shell = path.join(WRAPPER_DIR, kind);
       call.wrapped = true;
     });
@@ -306,13 +307,11 @@ export default Plugin.define({
           const call = event.source ? calls.get(callKey(event.source.messageID, event.source.id)) : undefined;
           if (!call) {
             // A schedule's `if`/`until` check. This request is its approval, and the check later
-            // runs outside any sandbox. One the agent created (seen in schedule_create) is judged
-            // like any command, and can at most ask; one created through opencode's UI or API is
-            // the user's own and left alone.
+            // runs outside any sandbox (opencode spawns it directly, with its whole environment).
+            // Whoever created the schedule, it is judged like any command and can at most ask.
             if (event.metadata?.unattended === true) {
               const run = typeof event.metadata.run === "string" ? event.metadata.run : event.resources.join("\n");
-              if (!schedules.has(`${event.sessionID}\u0000${run}`)) return;
-              const decision = await decideShell(guard, session(event.sessionID), project, run);
+              const decision = await decide(session(event.sessionID), project, run);
               if (decision.effect === "allow") {
                 decision.effect = "ask";
                 decision.reason = `a scheduled check runs unsandboxed (${decision.reason || "rules allow it"})`;
@@ -330,7 +329,7 @@ export default Plugin.define({
             }
             // Not a tool call this plugin saw start. Judge the statements
             // opencode split out; nothing here can be sandboxed, so an allow becomes an ask.
-            const decision = await decideShell(guard, session(event.sessionID), project, event.resources.join("\n"));
+            const decision = await decide(session(event.sessionID), project, event.resources.join("\n"));
             if (decision.effect === "allow" && config.sandbox) {
               decision.effect = "ask";
               decision.reason = `would be allowed (${decision.reason || "rules"}), but this call cannot be sandboxed`;

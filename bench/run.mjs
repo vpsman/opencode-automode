@@ -4,7 +4,9 @@
 //
 // Rows: {id, command, label: 1 risky | 0 safe | null unlabelled, cwd?}. In command and cwd,
 // {home} is $HOME and {project} a scratch git repository.
-// Usage: node bench/run.mjs --tag kev-0.8b --suites-dir <dir> [--suites a,b] [--endpoint url]
+// Each row is decided as the plugin would: one fixed session project (the scratch repository),
+// the row's directory as the command's working directory, and the production reply timeout.
+// Usage: node bench/run.mjs --tag kev-0.8b --suites-dir <dir> [--suites a,b] [--endpoint url] [--timeout ms]
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -18,7 +20,8 @@ const { values: args } = parseArgs({
     tag: { type: "string" },
     "suites-dir": { type: "string", multiple: true },
     suites: { type: "string" },
-    endpoint: { type: "string", default: "http://127.0.0.1:11438" },
+    endpoint: { type: "string" },
+    timeout: { type: "string" },
     limit: { type: "string" },
   },
 });
@@ -41,7 +44,8 @@ const guard = {
   guarded: [root],
   configDirs: [path.join(os.homedir(), ".config", "opencode")],
   allowedPaths: [],
-  classifier: { ...DEFAULT_CLASSIFIER, endpoint: args.endpoint, askAbove: 1.01, timeoutMs: 60_000 },
+  // A reply slower than production's timeout is an ask there, so it is one here (`by: "model-error"`).
+  classifier: { ...DEFAULT_CLASSIFIER, endpoint: args.endpoint ?? DEFAULT_CLASSIFIER.endpoint, askAbove: 1.01, timeoutMs: args.timeout ? Number(args.timeout) : DEFAULT_CLASSIFIER.timeoutMs },
   useClassifier: true,
 };
 
@@ -65,9 +69,10 @@ for (const file of files) {
     if (done.has(row.id)) continue;
     const cwd = row.cwd ? fill(row.cwd) : project;
     const command = fill(row.command);
-    // A fresh session per row: rows are independent.
+    // A fresh session per row (rows are independent), always of the same project: the plugin's
+    // project is the session's directory, never the directory a command runs in.
     const where = fs.existsSync(cwd) ? cwd : project;
-    const d = await decideShell(guard, new SessionState(where), where, command);
+    const d = await decideShell(guard, new SessionState(project), where, command);
     fs.appendFileSync(out, JSON.stringify({ id: row.id, label: row.label ?? null, rule: d.rule, by: d.by, effect: d.effect, score: d.score, ms: d.ms, reason: d.reason }) + "\n");
   }
   console.log(`${suite}: ${n} rows in ${((Date.now() - started) / 1000).toFixed(1)} s`);

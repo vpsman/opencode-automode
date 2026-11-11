@@ -1,0 +1,16 @@
+[package]
+name = "lockwrite"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# One dependency, pinned by Cargo.lock: the libc crate, for the kernel's struct layouts.
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+overflow-checks = true
+strip = true
