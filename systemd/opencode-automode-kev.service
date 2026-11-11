@@ -6,7 +6,9 @@
 # It listens on a unix socket in a directory only you can enter, not on a TCP port: a port on
 # localhost could be bound by any local process while the service is down.
 # llama-server parses text the agent chooses, so it gets no network, a read-only view of the
-# system and of your home, and a system-call filter. These need unprivileged user namespaces,
+# system, none of your home except its own directory, none of your runtime directory except its
+# own socket directory (so no session bus, no systemd manager, no agents), and a system-call
+# filter. AF_UNIX stays because its own socket is one. These need unprivileged user namespaces,
 # which the plugin's sandbox needs as well.
 [Unit]
 Description=Kev decision model for opencode-automode (llama-server)
@@ -27,7 +29,10 @@ RestrictAddressFamilies=AF_UNIX
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
-ProtectHome=read-only
+ProtectHome=tmpfs
+BindReadOnlyPaths=%h/.local/share/opencode-automode
+TemporaryFileSystem=%t:ro
+BindPaths=%t/opencode-automode
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

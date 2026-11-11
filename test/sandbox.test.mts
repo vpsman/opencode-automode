@@ -9,7 +9,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { after, before, describe, test } from "node:test";
+import { after, afterEach, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import * as sandbox from "../sandbox.ts";
 import { gitOnly, usesSsh, SessionState } from "../decide.ts";
@@ -286,7 +286,7 @@ describe("C: protections tied to a path", () => {
       assert.ok(!fs.existsSync(path.join(target, "hooks")), "the plugin created a directory outside the project");
       // The symlink itself sits in the project and could be swapped for a directory: nothing
       // can protect that, so the command asks.
-      assert.match(p.problem ?? "", /core\.hooksPath .* could not be created safely|symlink/);
+      assert.match(p.problem ?? "", /core\.hooksPath .* could not be created safely|symbolic link/);
     } finally {
       git("config", "--unset", "core.hooksPath");
       fs.rmSync(path.join(repo, "link"));
@@ -501,5 +501,218 @@ describe("H8/I: what is hidden", () => {
   });
   test("~/.ssh is hidden unless the command uses ssh", () => {
     assert.equal(attempt(`ls -A ${sshDir} | wc -l`).out.split("\n")[0].trim(), "0");
+  });
+});
+
+// ---- round 2 review findings ----
+
+describe("r2 B: what a sandboxed command could plant", () => {
+  const uid = process.getuid!();
+  const cleanup: (() => void)[] = [];
+  const made = (...paths: string[]) => cleanup.push(() => paths.forEach((p) => fs.rmSync(p, { recursive: true, force: true })));
+  afterEach(() => {
+    for (const undo of cleanup.splice(0).reverse()) undo();
+  });
+
+  test("7: a read-only git directory is read-only below its pinned children too", () => {
+    const source = path.join(tmp, "sub-src");
+    execFileSync("git", ["init", "-q", source]);
+    execFileSync("git", ["-C", source, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "s"]);
+    git("-c", "protocol.file.allow=always", "submodule", "add", "-q", source, "libsub");
+    made(source, path.join(repo, "libsub"), path.join(repo, ".gitmodules"), path.join(repo, ".git", "modules"));
+    cleanup.push(() => {
+      git("reset", "-q");
+      spawnSync("git", ["-C", repo, "config", "--remove-section", "submodule.libsub"]);
+    });
+    const r = attempt("mkdir -p .git/modules/other/hooks; echo x > .git/modules/planted; echo x > .git/modules/libsub/planted");
+    assert.ok(r.plan.pin.includes(path.join(repo, ".git", "modules")), "the test needs .git/modules to be pinned");
+    assert.match(r.out, /Read-only file system/);
+    for (const name of ["other", "planted", "libsub/planted"]) assert.ok(!fs.existsSync(path.join(repo, ".git", "modules", name)), name);
+  });
+
+  test("7: opencode's project directories are read-only below a pinned child", () => {
+    execFileSync("git", ["init", "-q", path.join(repo, ".claude", "skills", "x")]);
+    made(path.join(repo, ".claude"));
+    const r = attempt("echo x > .claude/skills/new.md; mkdir .claude/skills/y");
+    assert.ok(r.plan.pin.includes(path.join(repo, ".claude", "skills")), "the test needs .claude/skills to be pinned");
+    assert.ok(!fs.existsSync(path.join(repo, ".claude", "skills", "new.md")) && !fs.existsSync(path.join(repo, ".claude", "skills", "y")), r.out);
+  });
+
+  test("8: a .git that is a symbolic link cannot be protected: the plan says so, and its target is read-only", () => {
+    const target = path.join(repo, "node_modules", ".cache", "r");
+    for (const d of ["objects", "refs"]) fs.mkdirSync(path.join(target, d), { recursive: true });
+    fs.writeFileSync(path.join(target, "HEAD"), "ref: refs/heads/main\n");
+    fs.mkdirSync(path.join(repo, "src"), { recursive: true });
+    fs.symlinkSync("../node_modules/.cache/r", path.join(repo, "src", ".git"));
+    made(path.join(repo, "node_modules"), path.join(repo, "src"));
+    const p = planFor("ls");
+    assert.match(p.problem ?? "", /src\/\.git is a symbolic link/);
+    assert.ok(p.ro.includes(target), JSON.stringify(p.ro));
+  });
+
+  test("9: a repository under node_modules is protected like any other", () => {
+    const nested = path.join(repo, "node_modules", "pkg");
+    execFileSync("git", ["init", "-q", nested]);
+    made(path.join(repo, "node_modules"));
+    const r = attempt("printf '[core]\\n\\tfsmonitor = /tmp/x\\n' >> node_modules/pkg/.git/config");
+    assert.ok(r.plan.ro.includes(path.join(nested, ".git")), JSON.stringify(r.plan.ro));
+    assert.ok(!/fsmonitor/.test(fs.readFileSync(path.join(nested, ".git", "config"), "utf8")));
+  });
+
+  test("10: a pointer file in a temp directory does not move a relative core.hooksPath away from the project", () => {
+    // The project is outside the temp directories here, so they are walked after it.
+    const project = path.join(home, "proj10");
+    execFileSync("git", ["init", "-q", project]);
+    execFileSync("git", ["-C", project, "config", "core.hooksPath", ".githooks"]);
+    const decoy = path.join(tmp, "decoy");
+    fs.mkdirSync(decoy);
+    fs.writeFileSync(path.join(decoy, ".git"), `gitdir: ${path.join(project, ".git")}\n`);
+    made(decoy, project);
+    const p = plan({ projectRoots: [project], allowedPaths: [], cacheDirs: [], gitWritable: false, exposeSsh: false, keepSockets: [], showPaths: [], hidePaths: [], project });
+    assert.equal(p.problem, undefined);
+    assert.ok(p.ro.includes(path.join(project, ".githooks")), JSON.stringify(p.ro));
+  });
+
+  test("11: config includes are followed as deep as git follows them", () => {
+    const names = ["a.gitconfig", "b.gitconfig", "c.gitconfig", "d.gitconfig", "e.gitconfig"];
+    names.forEach((name, i) => fs.writeFileSync(path.join(repo, name), i + 1 < names.length ? `[include]\n\tpath = ${names[i + 1]}\n` : "[core]\n\tabbrev = 12\n"));
+    git("config", "include.path", "../a.gitconfig");
+    made(...names.map((n) => path.join(repo, n)));
+    cleanup.push(() => git("config", "--unset", "include.path"));
+    const r = attempt("printf '[core]\\n\\tfsmonitor = /tmp/x\\n' >> e.gitconfig; printf x >> d.gitconfig");
+    for (const name of names) assert.ok(r.plan.ro.includes(path.join(repo, name)), name);
+    assert.ok(!/fsmonitor/.test(fs.readFileSync(path.join(repo, "e.gitconfig"), "utf8")));
+  });
+
+  test("11: an include that cannot be listed is a problem, not an empty list", () => {
+    fs.writeFileSync(path.join(repo, "broken.gitconfig"), "[include\n\tpath = = =\n");
+    git("config", "include.path", "../broken.gitconfig");
+    // Undone in reverse: the file goes first, or git cannot read its own config to unset the key.
+    cleanup.push(() => git("config", "--unset", "include.path"));
+    made(path.join(repo, "broken.gitconfig"));
+    assert.match(planFor("ls").problem ?? "", /broken\.gitconfig/);
+  });
+
+  test("12: a core.hooksPath behind a symbolic link in any component is a problem", () => {
+    fs.mkdirSync(path.join(repo, "tools", "hooks"), { recursive: true });
+    fs.symlinkSync("tools", path.join(repo, "link"));
+    git("config", "core.hooksPath", "link/hooks");
+    made(path.join(repo, "tools"), path.join(repo, "link"));
+    cleanup.push(() => git("config", "--unset", "core.hooksPath"));
+    assert.match(planFor("ls").problem ?? "", /symbolic link/);
+  });
+
+  test("12: lockwrite refuses to pin something that is not a directory", () => {
+    fs.symlinkSync(tmp, path.join(repo, "not-a-dir"));
+    made(path.join(repo, "not-a-dir"));
+    const p = planFor("ls");
+    const env = { ...process.env, AUTOMODE_SHELL: "/bin/bash", AUTOMODE_RW: p.rw.join(SEP), AUTOMODE_RO: p.ro.join(SEP), AUTOMODE_HIDE: p.hide.join(SEP), AUTOMODE_PIN: [...p.pin, path.join(repo, "not-a-dir")].join(SEP), AUTOMODE_TMPFS: p.tmpfs.join(SEP), AUTOMODE_COVER: cover };
+    const r = spawnSync(WRAPPER, ["-c", "echo ran"], { cwd: repo, env, encoding: "utf8" });
+    assert.equal(r.status, 126, r.stderr);
+    assert.doesNotMatch(r.stdout, /ran/);
+  });
+
+  test("19: credential files are hidden at any depth, and a symbolic link's target with them", () => {
+    const deep = path.join(repo, "a", "b", "c", "d", "e");
+    fs.mkdirSync(deep, { recursive: true });
+    fs.writeFileSync(path.join(deep, ".env"), "TOKEN=deep\n");
+    fs.writeFileSync(path.join(repo, "real-settings.txt"), "TOKEN=linked\n");
+    fs.symlinkSync("real-settings.txt", path.join(repo, ".env.production"));
+    fs.mkdirSync(path.join(repo, "node_modules", "pkg"), { recursive: true });
+    fs.writeFileSync(path.join(repo, "node_modules", "pkg", "server.key"), "KEY\n");
+    made(path.join(repo, "a"), path.join(repo, "real-settings.txt"), path.join(repo, ".env.production"), path.join(repo, "node_modules"));
+    const r = attempt("cat a/b/c/d/e/.env real-settings.txt .env.production node_modules/pkg/server.key");
+    assert.doesNotMatch(r.out, /TOKEN|KEY/);
+    assert.ok(r.plan.hide.includes(path.join(repo, "real-settings.txt")));
+  });
+
+  test("19: more credential files than the cap is a problem, not a silent stop", () => {
+    for (let i = 0; i < 30; i++) fs.writeFileSync(path.join(repo, `.a${String(i).padStart(3, "0")}.key`), "k\n");
+    fs.writeFileSync(path.join(repo, ".env"), "TOKEN=x\n");
+    made(...Array.from({ length: 30 }, (_, i) => path.join(repo, `.a${String(i).padStart(3, "0")}.key`)), path.join(repo, ".env"));
+    const before = { ...sandbox.limits };
+    cleanup.push(() => Object.assign(sandbox.limits, before));
+    assert.ok(planFor("ls").hide.includes(path.join(repo, ".env")));
+    assert.equal(planFor("ls").problem, undefined);
+    sandbox.limits.secrets = 10;
+    assert.match(planFor("ls").problem ?? "", /credential/);
+    Object.assign(sandbox.limits, before);
+    sandbox.limits.entries = 5;
+    assert.match(planFor("ls").problem ?? "", /stopped/);
+  });
+
+  test("19: a directory of the project that cannot be listed is a problem", () => {
+    const dir = path.join(repo, "unlistable");
+    fs.mkdirSync(dir, { mode: 0o300 });
+    cleanup.push(() => {
+      fs.chmodSync(dir, 0o700);
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+    assert.match(planFor("ls").problem ?? "", /unlistable cannot be listed/);
+  });
+
+  test("31: histories, browser profiles and registry logins the old list missed are hidden", () => {
+    const files = [".local/share/fish/fish_history", ".local/share/atuin/history.db", ".gem/credentials", ".config/composer/auth.json", ".composer/auth.json", ".config/containers/auth.json", ".mozilla/firefox/profiles.ini", ".config/google-chrome/Default/Cookies"];
+    for (const f of files) {
+      fs.mkdirSync(path.dirname(path.join(home, f)), { recursive: true });
+      fs.writeFileSync(path.join(home, f), "private\n");
+    }
+    const ticket = `/tmp/krb5cc_${uid}_automodeTest`;
+    fs.writeFileSync(ticket, "ticket\n");
+    made(ticket);
+    const r = attempt(`cat ${files.map((f) => path.join(home, f)).join(" ")} ${ticket}`);
+    assert.doesNotMatch(r.out, /private|ticket/);
+  });
+
+  test("31: a socket deep below a temp directory is hidden", async () => {
+    const dir = path.join(tmp, "s1", "s2", "s3", "s4", "s5");
+    const server = await listen(path.join(dir, "deep.sock"));
+    made(path.join(tmp, "s1"));
+    try {
+      assert.ok(planFor("ls").hide.includes(path.join(dir, "deep.sock")));
+    } finally {
+      server.close();
+    }
+  });
+});
+
+describe("r2 19: the cheap credential test lets through everything the rules know", () => {
+  const names = [
+    "id_rsa", "id_ed25519", "id_ecdsa_work", "id_dsa", "server.pem", "server.key", "store.p12", "cert.pfx", "trust.jks", "app.keystore", "vault.kdbx", ".env", ".env.local", ".env.production",
+    "credentials.json", "credentials.yaml", "credentials.toml", "credentials.ini", "credentials.csv", "credentials.xml", "secrets.json", "secret.yml", "secrets.env", "secret.txt",
+    "my-service-account.json", "service_principal-prod.json", "gcp-serviceaccount.json", ".netrc", ".npmrc", ".pypirc", ".git-credentials", ".vault-token", ".pgpass", ".htpasswd", ".bash_history", ".zsh_history",
+    "login.keychain", "login.keychain-db", "SERVER.KEY", "Private.PEM",
+  ];
+  const places = [".ssh/anything", ".aws/credentials", ".gnupg/x", ".kube/config", ".azure/x", ".oci/x", ".password-store/x", ".config/gcloud/x", ".config/op/x", ".config/gh/hosts.yml", ".docker/config.json", ".cargo/credentials", ".cargo/credentials.toml", ".terraform.d/credentials.tfrc.json", ".local/share/keyrings/x"];
+  test("names and places", () => {
+    let secret = 0;
+    for (const rel of [...names.map((n) => `src/${n}`), ...places]) {
+      const parts = `/home/someone/project/${rel}`.split("/");
+      // The walk tests every component as it meets it: one of them must pass both tests.
+      const hit = parts.some((_, i) => i > 0 && sandbox.isSecretPath(parts.slice(0, i + 1).join("/")) && sandbox.maybeSecret(parts[i], parts[i - 1]));
+      const known = parts.some((_, i) => i > 0 && sandbox.isSecretPath(parts.slice(0, i + 1).join("/")));
+      if (known) secret++;
+      assert.equal(hit, known, rel);
+    }
+    assert.ok(secret > 45, `only ${secret} of the samples are credentials for the rules`);
+  });
+});
+
+describe("r2 30: an allowed push can do all of its work", () => {
+  test("the remote-tracking ref is updated, which needs a writable git directory", () => {
+    const remote = path.join(tmp, "push-remote.git");
+    execFileSync("git", ["init", "-q", "--bare", remote]);
+    git("remote", "add", "pushed", remote);
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "to push");
+    const branch = git("rev-parse", "--abbrev-ref", "HEAD").trim();
+    try {
+      const r = run(`git push pushed ${branch}`);
+      assert.equal(r.status, 0, r.out);
+      assert.doesNotMatch(r.out, /Read-only file system|cannot lock ref|unable to/);
+      assert.equal(git("rev-parse", `refs/remotes/pushed/${branch}`).trim(), git("rev-parse", "HEAD").trim());
+    } finally {
+      git("remote", "remove", "pushed");
+      fs.rmSync(remote, { recursive: true, force: true });
+    }
   });
 });

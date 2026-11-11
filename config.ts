@@ -5,7 +5,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { compilePattern, type Action } from "./rules.ts";
+import { compilePattern, isRootLike, type Action } from "./rules.ts";
 import { DEFAULT_CLASSIFIER, type ClassifierConfig } from "./kev.ts";
 import { DEFAULT_ASK } from "./decide.ts";
 import { DEFAULT_CACHE_DIRS } from "./sandbox.ts";
@@ -33,6 +33,8 @@ const expandHome = (p: string) => (p === "~" ? HOME : p.startsWith("~/") ? path.
 
 const BOOLEANS = ["enabled", "useClassifier", "sshReadOnlySudo", "allowFeatureBranchPush", "sandbox", "log"] as const;
 const LISTS = ["allowedPaths", "sshHosts", "sandboxWritable", "sandboxKeepSockets", "sandboxShowPaths", "sandboxHidePaths", "sandboxKeepEnv"] as const;
+// Directories these open for writing: never /, a top-level directory, $HOME or one above it.
+const WRITABLE_LISTS = ["allowedPaths", "sandboxWritable"];
 const ACTIONS: Action[] = ["allow", "ask", "deny", "classify"];
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const isStrings = (v: unknown): v is string[] => Array.isArray(v) && v.every((x) => typeof x === "string" && x.length > 0);
@@ -56,8 +58,10 @@ export const defaults = (): Config => ({
 });
 
 // The settings in `raw` applied over `config`; every problem found is added to `problems`.
-function apply(config: Config, raw: unknown, where: string, problems: string[]) {
-  if (raw === undefined || raw === null) return;
+// `optional`: no value at all is fine (opencode passes null when the plugin has no options). A
+// settings file that holds `null` is not a settings file.
+function apply(config: Config, raw: unknown, where: string, problems: string[], optional = false) {
+  if (optional && (raw === undefined || raw === null)) return;
   if (!isObject(raw)) return void problems.push(`${where} must be an object`);
   const bad = (key: string, want: string) => void problems.push(`${where}: "${key}" must be ${want}`);
   for (const [key, value] of Object.entries(raw)) {
@@ -68,7 +72,16 @@ function apply(config: Config, raw: unknown, where: string, problems: string[]) 
       if (!isStrings(value)) bad(key, "a list of strings");
       else if (key === "sshHosts" && !value.every((h) => /^[\w.-]+(@[\w.-]+)?$/.test(h))) bad(key, "a list of host names, each optionally with a user (user@host)");
       else if (key === "sandboxKeepEnv" && !value.every((n) => /^[A-Za-z_]\w*$/.test(n))) bad(key, "a list of variable names");
-      else config[key as (typeof LISTS)[number]] = key === "sshHosts" || key === "sandboxKeepEnv" ? value : value.map(expandHome);
+      else if (key === "sshHosts" || key === "sandboxKeepEnv") config[key] = value;
+      else {
+        // A relative path would mean something else in every project and every working directory.
+        const paths = value.map(expandHome);
+        const relative = paths.find((p) => !path.isAbsolute(p));
+        const wide = WRITABLE_LISTS.includes(key) ? paths.find((p) => isRootLike(path.resolve(p))) : undefined;
+        if (relative !== undefined) bad(key, `a list of absolute paths (or ~/...); ${JSON.stringify(relative)} is relative`);
+        else if (wide !== undefined) bad(key, `a list of directories below your home or elsewhere; ${JSON.stringify(wide)} is /, a top-level directory, or your home or above`);
+        else config[key as Exclude<(typeof LISTS)[number], "sshHosts" | "sandboxKeepEnv">] = paths;
+      }
     } else if (key === "rules") {
       if (!isObject(value) || !Object.entries(value).every(([action, list]) => ACTIONS.includes(action as Action) && isStrings(list))) {
         bad(key, "an object with allow, ask, deny and classify lists of patterns");
@@ -82,7 +95,8 @@ function apply(config: Config, raw: unknown, where: string, problems: string[]) 
             problems.push(`${where}: rules.${action} pattern ${JSON.stringify(pattern)} is not valid: ${(e as Error).message}`);
           }
         }
-        config.rules[action] = [...(action === "ask" ? DEFAULT_ASK : []), ...list];
+        // Added to what is there already: the plugin options do not replace the file's rules.
+        config.rules[action] = [...new Set([...(config.rules[action] ?? (action === "ask" ? DEFAULT_ASK : [])), ...list])];
       }
     } else if (key === "classifier") {
       if (!isObject(value)) {
@@ -130,6 +144,6 @@ export function loadConfig(configFile: string, options: unknown): Loaded {
       problems.push(`${configFile} is not valid JSON: ${(e as Error).message}`);
     }
   }
-  apply(config, options, "plugin options", problems);
+  apply(config, options, "plugin options", problems, true);
   return problems.length ? { config: defaults(), problem: problems.join("; ") } : { config };
 }
