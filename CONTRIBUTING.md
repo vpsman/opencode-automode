@@ -18,21 +18,25 @@ Anything else, including false prompts ("this harmless command keeps asking"), i
 Open an issue first only for large or design-level changes; otherwise just send the pull request.
 
 ```sh
-npm install --ignore-scripts
+npm ci --ignore-scripts
 npm run typecheck
 npm run build:sandbox
+npm test                 # uses a throwaway $HOME; needs no model
 ```
 
 A few things keep the plugin trustworthy, so please keep them true:
 
 - **Fail closed.** Errors, timeouts, missing files and anything unexpected must end in "ask",
-  never "allow".
+  never "allow". Where code grants trust (an allow, the ssh agent, a writable `.git`, a
+  read-only verdict for a remote command), it accepts the exact forms it understands and asks
+  about the rest; it does not list the spellings known to be dangerous.
 - **Only the plugin's own decisions are sandboxed and auto-allowed.** What a user approves in a
   prompt runs exactly as shown.
 - **`rules.ts` is vendored unchanged** from
   [pi-automode-classifier](https://github.com/deepu105/pi-automode-classifier). Fixes to the
-  shell rules belong upstream; once released, re-vendor the file. Rules specific to this
-  plugin go in `decide.ts` (`DEFAULT_ASK`, the ssh and push matchers).
+  shell rules belong upstream; once released, re-vendor the file. Until then a gap in the
+  rules is closed around them, in `guard.ts`. Rules specific to this plugin go in `decide.ts`
+  (`DEFAULT_ASK`, the ssh and push matchers).
 - **Changes to rules, thresholds or the model come with numbers.** Run the bench before and
   after and put both in the pull request:
 

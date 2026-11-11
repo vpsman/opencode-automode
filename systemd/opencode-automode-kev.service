@@ -1,16 +1,45 @@
-# Kev decision model for opencode-automode, on llama.cpp's llama-server (localhost only).
+# Kev decision model for opencode-automode, on llama.cpp's llama-server.
 # Install: run scripts/fetch.sh, cp this file to ~/.config/systemd/user/, then
 #   systemctl --user daemon-reload && systemctl --user enable --now opencode-automode-kev
 # The plugin asks (never allows) when this server is down, so a stopped service only costs prompts.
+#
+# It listens on a unix socket in a directory only you can enter, not on a TCP port: a port on
+# localhost could be bound by any local process while the service is down.
+# llama-server parses text the agent chooses, so it gets no network, a read-only view of the
+# system and of your home, and a system-call filter. These need unprivileged user namespaces,
+# which the plugin's sandbox needs as well.
 [Unit]
 Description=Kev decision model for opencode-automode (llama-server)
 
 [Service]
 Environment=OPENCODE_AUTOMODE_HOME=%h/.local/share/opencode-automode
-ExecStart=/bin/sh -c 'exec "$OPENCODE_AUTOMODE_HOME/llama/b12283/llama-b12283/llama-server" -m "$OPENCODE_AUTOMODE_HOME/models/Kev-0.8B-Q8_0.gguf" --host 127.0.0.1 --port 11438 --no-webui --parallel 1 --ctx-size 4096 --sleep-idle-seconds 300'
+RuntimeDirectory=opencode-automode
+RuntimeDirectoryMode=0700
+UMask=0077
+ExecStart=/bin/sh -c 'exec "$OPENCODE_AUTOMODE_HOME/llama/b12283/llama-b12283/llama-server" -m "$OPENCODE_AUTOMODE_HOME/models/Kev-0.8B-Q8_0.gguf" --host "$RUNTIME_DIRECTORY/kev.sock" --no-webui --parallel 1 --ctx-size 4096 --sleep-idle-seconds 300'
 Restart=on-failure
 RestartSec=5
 Nice=5
+
+NoNewPrivileges=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=default.target

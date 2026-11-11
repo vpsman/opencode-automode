@@ -1,7 +1,7 @@
 {
   "enabled": true,
   "useClassifier": true,
-  "classifier": { "endpoint": "http://127.0.0.1:11438", "askAbove": 0.2, "timeoutMs": 5000 },
+  "classifier": { "askAbove": 0.2, "timeoutMs": 5000 },
   "allowedPaths": [],
   "sshHosts": [],
   "sshReadOnlySudo": false,
@@ -10,6 +10,8 @@
   "sandboxWritable": [],
   "sandboxKeepSockets": [],
   "sandboxShowPaths": [],
+  "sandboxHidePaths": [],
+  "sandboxKeepEnv": [],
   "rules": { "allow": [], "ask": [], "deny": [], "classify": [] },
   "log": true
 }

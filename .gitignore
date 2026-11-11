@@ -1,3 +1,5 @@
 node_modules/
 sandbox/lockwrite
 sandbox/bin/
+notes/
+sandbox/lockwrite-rs/target/
