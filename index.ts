@@ -34,9 +34,9 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Plugin } from "@opencode/plugin";
-import { compileRules, compilePattern } from "./rules.ts";
-import { decideFile, decideRead, decideShell, expectedRepos, gitOnly, mirrorable, projectRoots, sandboxBreaks, SessionState, usesSsh, type Decision, type Expected, type Guard } from "./decide.ts";
-import { envKept, plan, realpath, type Plan } from "./sandbox.ts";
+import { compileRules, compilePattern, within } from "./rules.ts";
+import { decideFile, decideRead, decideShell, EXPECT_MS, expectedRepos, gitOnly, gitStateTampered, gitTampered, mirrorable, movesRefs, noteGitCall, projectRoots, pushCandidate, realish, sandboxBreaks, SessionState, usesSsh, type Decision, type Expected, type GitCall, type Guard } from "./decide.ts";
+import { envKept, plan, realpath, Scan, type Plan } from "./sandbox.ts";
 import { loadConfig, type Config } from "./config.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -53,8 +53,15 @@ const RESUME_FILE = path.join(STATE_DIR, "resume");
 const COVER_FILE = path.join(STATE_DIR, "empty");
 const LOCKWRITE = path.join(HERE, "sandbox", "lockwrite");
 const WRAPPER_DIR = path.join(HERE, "sandbox", "bin");
-// Shells the wrapper stands in for. opencode passes `-c <command>` (zsh: `+o nomatch -c`).
-const WRAPPABLE = new Set(["bash", "zsh", "sh"]);
+// Shells the wrapper stands in for (sandbox/bin/<name>). opencode passes `-c <command>`.
+const WRAPPABLE = new Set(["bash", "sh"]);
+// What a shell really is decides whether it is wrapped (round 3, finding 37): the checks model
+// bash's syntax, and dash's is a subset of it. `bash` is wrapped when it really is bash, and `sh`
+// when it really is bash or dash, after every symbolic link (/etc/alternatives included). zsh,
+// busybox, mksh, ksh, yash and anything else read syntax the checks never saw, so an allow under
+// them asks ("its shell could not be sandboxed").
+const REALLY: Record<string, string[]> = { bash: ["bash"], sh: ["bash", "dash"] };
+const wrappable = (shell: string) => (REALLY[path.basename(shell)] ?? []).includes(path.basename(realpath(shell)));
 
 // The state directory holds every command the agent ran: private to the user, and hidden from
 // sandboxed commands (see the plan's hidePaths).
@@ -134,6 +141,38 @@ const joined = (paths: string[]) => paths.join("\n");
 // A call waits this long for its shell. opencode creates the shell right after the tool hook
 // returns, so anything older belongs to a call that never got one.
 const WRAP_WINDOW_MS = 15_000;
+// Calls that run at the same time (round 3, findings 18 and 36). A call may still run from its
+// decision until its tool call is over and no process of it is left: a call run in the
+// background, or moved there, ends its tool call while its process runs. Every shell the plugin
+// sees gets `AUTOMODE_CALL=<token>` in its environment, and the processes that carry it show
+// whether the call still runs: lockwrite's outer process lives as long as the sandboxed command,
+// and an unsandboxed command's processes inherit it. A call that started and has no process left
+// a minute later is over even if its tool call never ended; one that never started, an hour
+// after its decision.
+const STARTED_GRACE_MS = 60_000;
+const NEVER_STARTED_MS = 3_600_000;
+
+// The AUTOMODE_CALL tokens of every process whose environment this user can read; undefined when
+// /proc cannot be listed (then every call counts as running).
+function runningTokens(): Set<string> | undefined {
+  let pids: string[];
+  try {
+    pids = fs.readdirSync("/proc").filter((name) => /^\d+$/.test(name));
+  } catch {
+    return undefined;
+  }
+  const tokens = new Set<string>();
+  for (const pid of pids) {
+    let environ: string;
+    try {
+      environ = fs.readFileSync(`/proc/${pid}/environ`, "latin1");
+    } catch {
+      continue; // gone, or another user's
+    }
+    for (const entry of environ.split("\0")) if (entry.startsWith("AUTOMODE_CALL=")) tokens.add(entry.slice("AUTOMODE_CALL=".length));
+  }
+  return tokens;
+}
 
 interface Call {
   command: string;
@@ -153,6 +192,24 @@ interface Call {
   expects?: string[];
   expecting?: Expected;
   at: number;
+  // The AUTOMODE_CALL tokens of the shells that may be this call's.
+  tokens: string[];
+  // A plain `git push` the feature-branch check looks at: from the start of its decision, other
+  // calls that could change what it sends ask.
+  push?: boolean;
+  // Allowed, and able to move HEAD or a branch (a git-only call that does more than read).
+  mover?: boolean;
+  // Allowed with a writable `.git` (a git-only call): when it is over, the operation state it
+  // left is checked against its subcommands (round 3, finding 33).
+  gitCall?: GitCall;
+  decided?: boolean;
+  // When its process could start: an allow when its permission was applied, an ask when the user
+  // approved it. An allow that asks after all (its shell was not sandboxed) counts as an ask.
+  started?: number;
+  downgraded?: boolean;
+  rejected?: boolean;
+  // tool.execute.after.
+  ended?: number;
 }
 
 export default Plugin.define({
@@ -201,8 +258,8 @@ export default Plugin.define({
     // A decision that would run without a prompt becomes a prompt while the settings are invalid.
     const held = (decision: Decision): Decision => (configProblem && decision.effect === "allow" ? { ...decision, effect: "ask", reason: configProblem } : decision);
     const paused = new Set<SessionState>();
-    const decide = async (s: SessionState, cwd: string, command: string): Promise<Decision> => {
-      const decision = held(await decideShell(guard, s, cwd, command));
+    const decide = async (s: SessionState, cwd: string, command: string, scan?: Scan): Promise<Decision> => {
+      const decision = held(await decideShell(guard, s, cwd, command, undefined, scan));
       if (s.tampered && !paused.has(s)) {
         paused.add(s);
         console.error(`[opencode-automode] auto-allow paused: ${s.tampered.reason}. To resume after checking: touch ${RESUME_FILE}`);
@@ -229,23 +286,105 @@ export default Plugin.define({
       while (map.size > max) map.delete(map.keys().next().value!);
     };
 
+    // Calls that may still run, in every session of this plugin (sessions in one directory share
+    // it, so this is per checkout). See STARTED_GRACE_MS.
+    const live = new Set<Call>();
+    const nonce = `${process.pid}.${Date.now().toString(36)}`;
+    let shells = 0;
+    // A call that is over: an approved command's window closes, and what it made joins the
+    // baseline now rather than at its session's next decision, so that no other session waits.
+    const finish = (c: Call) => {
+      live.delete(c);
+      if (c.gitCall) {
+        c.gitCall.done = true;
+        try {
+          gitStateTampered(session(c.sessionID));
+        } catch {
+          // the next decision checks again
+        }
+      }
+      if (!c.expecting) return;
+      c.expecting.done = true;
+      try {
+        gitTampered(session(c.sessionID), RESUME_FILE);
+      } catch {
+        // the next decision checks again
+      }
+    };
+    const sweep = () => {
+      let procs: Set<string> | undefined | null = null;
+      const running = (c: Call) => {
+        if (procs === null) procs = runningTokens();
+        return !procs || c.tokens.some((t) => procs!.has(t));
+      };
+      for (const c of [...live]) {
+        const alive = c.rejected
+          ? false
+          : c.ended !== undefined
+            ? running(c)
+            : c.started === undefined
+              ? Date.now() - c.at < NEVER_STARTED_MS || running(c)
+              : Date.now() - c.started < STARTED_GRACE_MS || running(c);
+        if (!alive) finish(c);
+      }
+    };
+    // New-repository windows that are open: an approved command may be creating one.
+    const windows = () => [...sessions.values()].flatMap((x) => x.expecting).filter((e) => Date.now() - e.at < EXPECT_MS);
+    // Whether a call could write in one of these directories: its sandbox's writable roots, or
+    // anywhere when it runs unsandboxed.
+    const reaches = (c: Call, dirs: string[]) => !c.sandbox || dirs.some((d) => c.sandbox!.rw.some((r) => within(d, r) || within(r, d)));
+    const asks = (c: Call) => c.decision.effect === "ask" || !!c.downgraded;
+    const pushNote = (call: Call) => {
+      const push = [...live].find((c) => c !== call && c.push && (!c.decided || (c.decision.effect === "allow" && !c.downgraded)));
+      return push ? ` (a checked push is still running: ${clip(push.command, 80)}; if this moves HEAD or a branch before it finishes, the push sends that instead)` : "";
+    };
+    // Why an allowed call must ask because of what may run beside it.
+    const besides = (call: Call, background: boolean): string | undefined => {
+      const others = [...live].filter((c) => c !== call);
+      if (call.push) {
+        if (background) return "a push run in the background could send another branch than the one checked, if HEAD moves before it runs";
+        const mover = others.find((c) => c.decided && (c.mover || asks(c)));
+        if (mover) return `another call that can move HEAD or a branch may still be running (${clip(mover.command, 80)}), so the push could send another branch than the one checked`;
+      }
+      if (call.mover) {
+        const push = others.find((c) => c.push && (!c.decided || c.decision.effect === "allow"));
+        if (push) return `a checked push may still be running (${clip(push.command, 80)}), and this call could move HEAD or a branch under it`;
+      }
+      const open = windows().find((e) => reaches(call, e.dirs));
+      if (open) return `an approved command may still be creating a repository in ${open.dirs[0]}, and this call could write there`;
+      return undefined;
+    };
+
     const toolHook = await ctx.tool.hook("execute.before", async (event) => {
       if (!config.enabled) return;
       if (event.tool !== "shell" && event.tool !== "bash") return;
-      const input = event.input as { command?: unknown; workdir?: unknown } | undefined;
+      const input = event.input as { command?: unknown; workdir?: unknown; background?: unknown } | undefined;
       if (typeof input?.command !== "string") return;
       const command = input.command;
       // opencode resolves workdir against the session directory without following symlinks.
       const cwd = typeof input.workdir === "string" && input.workdir ? resolveWorkdir(project, input.workdir) : project;
       const started = Date.now();
       const s = session(event.sessionID);
-      let decision: Decision;
+      const call: Call = { command, cwd, sessionID: event.sessionID, decision: { effect: "ask", by: "rules", rule: "ask", reason: "deciding" }, at: started, tokens: [] };
+      sweep();
+      // A push holds its mark from here, through the dry run, until it is over.
       try {
-        decision = await decide(s, cwd, command);
+        if (config.allowFeatureBranchPush && pushCandidate(command, cwd)) call.push = true;
+      } catch {
+        call.push = true;
+      }
+      live.add(call);
+      // The walks of this call: the decision and the plan share them (round 3, finding 40).
+      const scan = new Scan();
+      let decision: Decision;
+      let gitWrites = false;
+      try {
+        decision = await decide(s, cwd, command, scan);
       } catch (e) {
         decision = { effect: "ask", by: "rules", rule: "ask", reason: `automode failed, asking instead: ${(e as Error).message}` };
       }
-      const call: Call = { command, cwd, sessionID: event.sessionID, decision, at: Date.now() };
+      call.decision = decision;
+      call.at = Date.now();
       // Allowed must mean it can work: what the sandbox would only make fail asks instead.
       const broken = decision.effect === "allow" && sandboxReady ? sandboxBreaks(command, cwd, s) : undefined;
       if (broken) call.decision = { ...decision, effect: "ask", reason: `would be allowed, but it cannot work in the sandbox: ${broken}` };
@@ -253,23 +392,39 @@ export default Plugin.define({
         try {
           const roots = projectRoots(s);
           call.exposeSsh = usesSsh(command, cwd, s);
+          const gitWritable = gitOnly(command);
+          call.mover = gitWritable && movesRefs(command);
+          gitWrites = gitWritable;
           const p = plan({
             projectRoots: roots,
             allowedPaths: config.allowedPaths,
             cacheDirs: config.sandboxWritable,
-            gitWritable: gitOnly(command),
+            gitWritable,
             exposeSsh: call.exposeSsh,
             keepSockets: config.sandboxKeepSockets,
             showPaths: config.sandboxShowPaths,
             hidePaths: [...config.sandboxHidePaths, STATE_DIR],
             project,
-          });
+          }, scan);
           if (p.problem) throw new Error(p.problem);
           call.sandbox = p;
         } catch (e) {
           call.decision = { ...decision, effect: "ask", reason: `would be allowed, but the sandbox could not be prepared: ${(e as Error).message}` };
         }
       }
+      // Unsandboxed (the sandbox switched off), an allowed git call can move anything.
+      if (call.decision.effect === "allow" && !config.sandbox) call.mover = /(^|[^\w.-])git($|[^\w.-])/.test(command);
+      if (call.decision.effect === "allow") {
+        const reason = besides(call, input.background === true);
+        if (reason) call.decision = { ...call.decision, effect: "ask", reason: `would be allowed, but ${reason}` };
+      }
+      if (call.decision.effect !== "allow") call.mover = false;
+      // From here until it is over, operation state its subcommands leave is expected.
+      else if (gitWrites && call.sandbox) call.gitCall = noteGitCall(s, command);
+      // An approved prompt runs unsandboxed: it could move HEAD under a checked push. Say so.
+      if (call.decision.effect === "ask") call.decision = { ...call.decision, reason: call.decision.reason + pushNote(call) };
+      call.decided = true;
+      if (call.decision.effect === "deny") live.delete(call);
       // Every call is queued, asks too, until its permission is evaluated or it is over.
       const key = wrapKey(command, cwd);
       call.at = Date.now();
@@ -284,20 +439,29 @@ export default Plugin.define({
 
     // The user approved the prompt for this call: from now until the call is over, a repository
     // may appear where the command named one.
+    // An allowed call that may still run and could write there makes the window expect nothing:
+    // what appears may be that call's (finding 36). Calls decided later ask while it is open.
     const approved = (call: Call | undefined) => {
-      if (!call?.expects || call.expecting) return;
-      call.expecting = { dirs: call.expects, at: Date.now() };
-      session(call.sessionID).expecting.push(call.expecting);
+      if (!call) return;
+      call.started ??= Date.now();
+      if (!call.expects || call.expecting) return;
+      sweep();
+      const expecting: Expected = { dirs: call.expects, at: Date.now() };
+      if ([...live].some((c) => c !== call && c.decided && c.decision.effect === "allow" && !c.downgraded && reaches(c, expecting.dirs))) expecting.tainted = true;
+      call.expecting = expecting;
+      session(call.sessionID).expecting.push(expecting);
     };
 
     const afterHook = await ctx.tool.hook("execute.after", (event) => {
       const call = calls.get(callKey(event.messageID, event.id));
       if (!call) return;
       call.settled = true;
+      call.ended = Date.now();
       // A command the plugin asked about only runs to the end when the user approved it. This
       // also covers an approval whose event has not arrived yet.
       if (event.status === "completed" && call.decision.effect === "ask") approved(call);
-      if (call.expecting) call.expecting.done = true;
+      // Over once no process of it is left: the window of an approved command closes then.
+      sweep();
     });
 
     const shellHook = await ctx.shell.hook("create.before", (event) => {
@@ -308,14 +472,18 @@ export default Plugin.define({
       const queue = waiting(key);
       if (!queue.length) return void toWrap.delete(key);
       toWrap.set(key, queue);
+      // Marks the processes of this shell, whichever of the waiting calls it belongs to.
+      const token = `${nonce}.${++shells}`;
+      for (const c of queue) c.tokens.push(token);
       const shell = resolveShell(event.shell);
       const kind = shell ? path.basename(shell) : "";
       // Which of the waiting calls this shell belongs to cannot be known. It is sandboxed only
       // when that makes no difference: every one of them is an allow of the same session.
       const allAllowed = queue.every((c) => c.decision.effect === "allow" && c.sandbox && !c.unsure) && new Set(queue.map((c) => c.sessionID)).size === 1;
-      if (!allAllowed || !shell || !WRAPPABLE.has(kind)) {
+      if (!allAllowed || !shell || !WRAPPABLE.has(kind) || !wrappable(shell)) {
         // Left as it is. It may be the shell of any of them, so none may run on an allow.
         for (const c of queue) c.unsure = true;
+        event.env.AUTOMODE_CALL = token;
         return;
       }
       // The plan made last is the freshest.
@@ -328,6 +496,9 @@ export default Plugin.define({
       for (const name of dropped) delete event.env[name];
       if (dropped.length) log(config, { command: clip(call.command, 200), envDropped: dropped });
       event.env.AUTOMODE_ENV_KEEP = joined(keep);
+      // lockwrite drops every AUTOMODE_* variable from the command's environment; its own process
+      // keeps this one for as long as the command runs.
+      event.env.AUTOMODE_CALL = token;
       event.env.AUTOMODE_SHELL = shell;
       event.env.AUTOMODE_RW = joined(sandbox.rw);
       event.env.AUTOMODE_RO = joined(sandbox.ro);
@@ -399,8 +570,28 @@ export default Plugin.define({
                 : `would be allowed (${decision.reason || "rules"}), but its shell could not be sandboxed`;
             log(config, { ...base, command: clip(call.command), sandboxMiss: true });
           }
+          if (decision.effect === "allow") call.started ??= Date.now();
+          else if (call.decision.effect === "allow") {
+            call.downgraded = true;
+            decision.reason += pushNote(call);
+          }
           apply(event, decision);
           return;
+        }
+        if (event.action === "edit") {
+          // An edit could build a repository where an approved command may be creating one.
+          sweep();
+          const open = windows();
+          for (const resource of event.resources) {
+            const target = realish(path.isAbsolute(resource) ? resource : path.resolve(project, resource));
+            const dir = open.flatMap((e) => e.dirs).find((d) => within(target, d));
+            if (dir) {
+              const decision: Decision = { effect: "ask", by: "rules", rule: "ask", reason: `edit inside ${dir}, where an approved command may still be creating a repository` };
+              apply(event, decision);
+              log(config, { ...base, target, ...decision });
+              return;
+            }
+          }
         }
         if (event.action === "edit" || event.action === "read") {
           for (const resource of event.resources) {
@@ -446,6 +637,10 @@ export default Plugin.define({
             const asked = prompts.get(data.requestID);
             prompts.delete(data.requestID);
             if (asked && (data.reply === "once" || data.reply === "always")) approved(calls.get(asked));
+            else if (asked && data.reply === "reject") {
+              const rejected = calls.get(asked);
+              if (rejected) rejected.rejected = true;
+            }
             const save = pending.get(data.requestID);
             pending.delete(data.requestID);
             if (data.reply === "always" && save) {
@@ -470,6 +665,7 @@ export default Plugin.define({
       stop.abort();
       sessions.clear();
       calls.clear();
+      live.clear();
       toWrap.clear();
       await permissionHook.dispose();
       await shellHook.dispose();

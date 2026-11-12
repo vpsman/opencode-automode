@@ -224,8 +224,16 @@ export interface Found {
   tops: Map<string, Set<string>>; // git dir -> every worktree top level that leads to it
   secrets: Set<string>; // what the rules call a credential file or directory
   sockets: Set<string>; // sockets this user can connect to
+  // Directories this process could reach into but cannot list, below a root that is not the
+  // caller's own (in its own roots each is a problem instead): the plan covers them up.
+  unlistable: Set<string>;
+  // Credential directories the walk went on into: what lies there is hidden whole by the plan,
+  // and is still seen by the layout check.
+  veiled: Set<string>;
   problems: string[];
 }
+
+const emptyFound = (): Found => ({ gitDirs: new Set(), pointers: new Set(), links: new Set(), tops: new Map(), secrets: new Set(), sockets: new Set(), unlistable: new Set(), veiled: new Set(), problems: [] });
 
 const isDir = (p: string) => {
   try {
@@ -242,6 +250,24 @@ const reachable = (p: string) => {
     return false;
   }
 };
+// Whether this process could put something in a directory or reach what is in it, judged by
+// access(2) for this process and not by who owns it: it can enter it (X) or write it (W), or it
+// owns it and so can change its mode. Round 3, finding 26.
+const enterable = (dir: string) => {
+  for (const mode of [fs.constants.X_OK, fs.constants.W_OK]) {
+    try {
+      fs.accessSync(dir, mode);
+      return true;
+    } catch {
+      // not this way
+    }
+  }
+  try {
+    return fs.lstatSync(dir).uid === process.getuid?.();
+  } catch {
+    return false;
+  }
+};
 
 // The rules' credential test resolves the path on disk, which is too slow to run on every entry
 // of a large tree. This cheap test picks the entries worth asking it about. It is broader than
@@ -252,8 +278,13 @@ const MAYBE_SECRET = /^(\.|id_)|key|secret|credential|service|\.(pem|p12|pfx|jks
 const SECRET_PARENT = /^(\..*|gh|gcloud|op|keyrings|Keychains)$/;
 export const maybeSecret = (name: string, parent: string) => MAYBE_SECRET.test(name) || SECRET_PARENT.test(parent);
 
-function scanRoot(root: string, skip: Set<string>, found: Found, secrets: boolean, writable: boolean) {
-  const uid = process.getuid?.() ?? -1;
+// Walks per root, for tests (round 3, finding 40).
+export const walkCount = new Map<string, number>();
+
+// The walk of one root. `secrets`: credential files are looked for too.
+function scanRoot(root: string, skip: Set<string>, secrets: boolean): Found {
+  walkCount.set(root, (walkCount.get(root) ?? 0) + 1);
+  const found = emptyFound();
   const started = Date.now();
   let entries = 0;
   let stopped = false;
@@ -263,7 +294,8 @@ function scanRoot(root: string, skip: Set<string>, found: Found, secrets: boolea
     found.tops.get(gitDir)!.add(top);
   };
   // `inGit`: below a `.git/modules`, where only the git directories of submodules matter.
-  const visit = (dir: string, inGit: boolean) => {
+  // `veiled`: below a credential directory, where no further credential is recorded.
+  const visit = (dir: string, inGit: boolean, veiled: boolean) => {
     if (stopped) return;
     let list: fs.Dirent[];
     try {
@@ -271,18 +303,11 @@ function scanRoot(root: string, skip: Set<string>, found: Found, secrets: boolea
     } catch (e) {
       const code = (e as NodeJS.ErrnoException).code;
       if (code === "ENOENT" || code === "ENOTDIR") return; // gone since it was listed
-      // A directory this user owns and cannot list can still be written into: whatever is
-      // planted there stays out of sight. Someone else's is closed to this user both ways.
-      // Where nothing can be written (/run), only a directory that can be entered matters: a
-      // socket in it could be reached without being seen.
-      let own = true;
-      try {
-        own = fs.lstatSync(dir).uid === uid;
-        if (!writable) fs.accessSync(dir, fs.constants.X_OK);
-      } catch {
-        own &&= writable;
-      }
-      if (own || code !== "EACCES") found.problems.push(`${dir} cannot be listed (${code}), so what is in it cannot be protected`);
+      // A directory that cannot be listed but can be entered or written (or whose mode this user
+      // could change) can hold what stays out of sight: a planted repository, a socket. One that
+      // is closed to this process both ways holds nothing it can reach.
+      if (code !== "EACCES") found.problems.push(`${dir} cannot be listed (${code}), so what is in it cannot be protected`);
+      else if (enterable(dir)) found.unlistable.add(dir);
       return;
     }
     entries += list.length;
@@ -297,7 +322,7 @@ function scanRoot(root: string, skip: Set<string>, found: Found, secrets: boolea
     for (const e of list) {
       const p = path.join(dir, e.name);
       if (inGit) {
-        if (e.isDirectory() && (!gitDirHere || e.name === "modules")) visit(p, true);
+        if (e.isDirectory() && (!gitDirHere || e.name === "modules")) visit(p, true, veiled);
         continue;
       }
       if (e.name === ".git") {
@@ -307,7 +332,7 @@ function scanRoot(root: string, skip: Set<string>, found: Found, secrets: boolea
           if (target !== p && isDir(target)) addGitDir(target, realpath(dir));
         } else if (e.isDirectory()) {
           addGitDir(realpath(p), realpath(dir));
-          visit(path.join(p, "modules"), true);
+          visit(path.join(p, "modules"), true, veiled);
         } else if (e.isFile()) {
           found.pointers.add(p);
           let text = "";
@@ -329,32 +354,101 @@ function scanRoot(root: string, skip: Set<string>, found: Found, secrets: boolea
         }
         continue;
       }
-      if (secrets && maybeSecret(e.name, path.basename(dir)) && isSecretPath(p)) {
+      if (secrets && !veiled && maybeSecret(e.name, path.basename(dir)) && isSecretPath(p)) {
         found.secrets.add(p);
         // A link named like a credential file: what it points to holds the secret.
         if (e.isSymbolicLink()) found.secrets.add(realpath(p));
+        // A credential directory is hidden whole; the walk goes on so that the layout check,
+        // which shares it, still sees a repository planted there.
+        else if (e.isDirectory() && !skip.has(p)) {
+          found.veiled.add(p);
+          visit(p, false, true);
+        }
         continue;
       }
       if (e.isSocket()) {
         if (reachable(p)) found.sockets.add(p);
-      } else if (e.isDirectory() && !skip.has(p)) visit(p, false);
+      } else if (e.isDirectory() && !skip.has(p)) visit(p, false, veiled);
     }
   };
-  visit(root, false);
-}
-
-// Everything below the given directories. `skip` holds directories that are not entered (the
-// runtime directory under /run, which is covered whole).
-export function discover(dirs: string[], skip: string[] = [], secretsIn: string[] = [], writable = true): Found {
-  const found: Found = { gitDirs: new Set(), pointers: new Set(), links: new Set(), tops: new Map(), secrets: new Set(), sockets: new Set(), problems: [] };
-  const roots = [...new Set(dirs.map(realpath))];
-  // A root inside another one is walked once, as itself.
-  for (const root of roots) scanRoot(root, new Set([...roots.filter((r) => r !== root), ...skip]), found, secretsIn.includes(root), writable);
+  visit(root, false, false);
   return found;
 }
 
-// Git directories and pointer files below the given directories.
-export const findGitEntries = (dirs: string[]): Found => discover(dirs);
+// The walks of one decision (round 3, finding 40). A shell call's git snapshot, layout check,
+// decision and sandbox plan, or an edit's check, each need the same roots walked; one Scan made
+// for that call walks each root once and hands every caller the same result. It is never kept
+// for another call: a stale walk would miss a repository the previous command made.
+export class Scan {
+  private walks = new Map<string, { found: Found; secrets: boolean }>();
+  walk(root: string, skip: Set<string>, secrets: boolean): Found {
+    // Only the skipped directories inside the root change what its walk sees.
+    const key = [root, ...[...skip].filter((d) => d !== root && d.startsWith(root.endsWith("/") ? root : root + "/")).sort()].join("\u0000");
+    const done = this.walks.get(key);
+    // A walk that looked for credential files answers one that did not.
+    if (done && (done.secrets || !secrets)) return done.found;
+    const found = scanRoot(root, skip, secrets);
+    this.walks.set(key, { found, secrets });
+    return found;
+  }
+}
+
+export interface DiscoverOptions {
+  // Directories that are not entered (the runtime directory under /run, which is covered whole).
+  skip?: string[];
+  // Roots in which credential files are looked for.
+  secretsIn?: string[];
+  // The caller's own roots (the project and the allowed paths; all of them unless given): there,
+  // a directory that cannot be listed is a problem. Elsewhere it is listed in `unlistable`.
+  own?: string[];
+  scan?: Scan;
+}
+
+// Everything below the given directories. A root inside another one is walked once, as itself.
+export function discover(dirs: string[], o: DiscoverOptions = {}): Found {
+  const found = emptyFound();
+  const roots = [...new Set(dirs.map(realpath))];
+  const secretsIn = new Set((o.secretsIn ?? []).map(realpath));
+  const own = new Set((o.own ?? dirs).map(realpath));
+  const scan = o.scan ?? new Scan();
+  for (const root of roots) {
+    const part = scan.walk(root, new Set([...roots.filter((r) => r !== root), ...(o.skip ?? [])]), secretsIn.has(root));
+    for (const key of ["gitDirs", "pointers", "links", "secrets", "sockets", "veiled"] as const) for (const p of part[key]) found[key].add(p);
+    for (const [gitDir, tops] of part.tops) found.tops.set(gitDir, new Set([...(found.tops.get(gitDir) ?? []), ...tops]));
+    found.problems.push(...part.problems);
+    for (const dir of part.unlistable) {
+      if (own.has(root)) found.problems.push(`${dir} cannot be listed (EACCES) but can be entered or written, so what is in it cannot be protected`);
+      else found.unlistable.add(dir);
+    }
+  }
+  return found;
+}
+
+// Git directories and pointer files below the project's checkouts. Within one decision (a
+// `scan`), the walk also looks for credential files, so that the plan can use the same walk.
+export const findGitEntries = (dirs: string[], scan?: Scan): Found => discover(dirs, { secretsIn: scan ? dirs : [], scan });
+
+// What a credential directory hides whole is left out of the plan: nothing below it can be
+// reached from the sandbox.
+const veiledPath = (found: Found, p: string) => {
+  if (!found.veiled.size) return false;
+  for (let dir = path.dirname(p); dir !== path.dirname(dir); dir = path.dirname(dir)) if (found.veiled.has(dir)) return true;
+  return found.veiled.has(p);
+};
+function unveiled(found: Found): Found {
+  if (!found.veiled.size) return found;
+  const keep = (p: string) => !veiledPath(found, p);
+  const tops = new Map<string, Set<string>>();
+  for (const [gitDir, set] of found.tops) if (keep(gitDir)) tops.set(gitDir, new Set([...set].filter(keep)));
+  return {
+    ...found,
+    gitDirs: new Set([...found.gitDirs].filter(keep)),
+    pointers: new Set([...found.pointers].filter(keep)),
+    links: new Set([...found.links].filter(keep)),
+    tops,
+    sockets: new Set([...found.sockets].filter(keep)),
+  };
+}
 
 const expandGitPath = (value: string, base: string) => path.resolve(base, value.replace(/^~(?=\/|$)/, HOME));
 
@@ -584,7 +678,7 @@ function homeSecrets(): string[] {
 // Sockets of other services. The runtime directory is covered whole (or entry by entry around a
 // socket that must stay); the usual system socket directories are covered where they exist; and
 // every socket under /run and the temp directories that this user can connect to is covered.
-function sockets(keep: Set<string>, found: Found, problems: string[]): string[] {
+function sockets(keep: Set<string>, found: Found, problems: string[], scan?: Scan): string[] {
   const uid = process.getuid?.() ?? 0;
   const runtime = realpath(process.env.XDG_RUNTIME_DIR || `/run/user/${uid}`);
   const out = new Set<string>();
@@ -606,25 +700,33 @@ function sockets(keep: Set<string>, found: Found, problems: string[]): string[] 
   ]) {
     if (fs.existsSync(p)) out.add(realpath(p));
   }
-  const underRun = discover(["/run"], [runtime, ...out], [], false);
+  // Nothing under /run is the caller's own: a directory there that can be entered and not listed
+  // is covered whole, as is one in a temp directory (round 3, finding 26).
+  const underRun = discover(["/run"], { skip: [runtime, ...out], own: [], scan });
   problems.push(...underRun.problems);
+  for (const p of [...found.unlistable, ...underRun.unlistable]) if (!kept(p)) out.add(p);
   for (const p of [...found.sockets, ...underRun.sockets]) if (![...out].some((covered) => within(p, covered))) out.add(p);
   return [...out].filter((p) => !keep.has(p) && !keep.has(realpath(p)));
 }
 
-// What stays read-only for every command: used for the plan, and to make the edit tool ask.
-export function protectedPaths(o: Pick<PlanOptions, "projectRoots" | "allowedPaths" | "project">): string[] {
+// What stays read-only for every command, to make the edit tool ask; and what could not be
+// protected, which makes every edit ask as it makes a shell command ask (round 3, finding 11).
+export function protectedPaths(o: Pick<PlanOptions, "projectRoots" | "allowedPaths" | "project">, scan?: Scan): { paths: string[]; problems: string[] } {
   const searchDirs = [...new Set([...o.projectRoots, ...o.allowedPaths].map(realpath))];
-  return [...gitPaths(discover(searchDirs), searchDirs, searchDirs, false, searchDirs).ro, ...opencodePaths(o.project, searchDirs).ro];
+  const found = discover(searchDirs, { scan });
+  const git = gitPaths(unveiled(found), searchDirs, searchDirs, false, searchDirs);
+  const opencode = opencodePaths(o.project, searchDirs);
+  return { paths: [...git.ro, ...opencode.ro], problems: [...found.problems, ...git.problems, ...opencode.problems] };
 }
 
-export function plan(o: PlanOptions): Plan {
+// `scan`: the walks of this call's decision, used again here (round 3, finding 40).
+export function plan(o: PlanOptions, scan?: Scan): Plan {
   const own = [...new Set([...o.projectRoots, ...o.allowedPaths].map(realpath))];
   const searchDirs = [...new Set([...own, ...["/tmp", "/var/tmp", os.tmpdir()].map(realpath)])];
   const rwDirs = [...new Set([...searchDirs, ...o.cacheDirs.map(realpath)])];
   // Credential files are looked for in the project and the allowed paths; the temp directories
   // are shared with everything else on the machine.
-  const found = discover(searchDirs, [], own);
+  const found = unveiled(discover(searchDirs, { secretsIn: own, own, scan }));
   const git = gitPaths(found, searchDirs, rwDirs, o.gitWritable, own);
   const opencode = opencodePaths(o.project, rwDirs);
   const ro = [...new Set([...git.ro, ...opencode.ro])];
@@ -642,7 +744,7 @@ export function plan(o: PlanOptions): Plan {
   const secrets = secretList.flatMap((p) => [p, realpath(p)]).filter((p) => !show.has(realpath(p)));
   // The ssh agent, wherever it lives (outside the scanned directories too), unless this call may use it.
   const agentPaths = agent && !o.exposeSsh ? [agent, realpath(agent)] : [];
-  const hide = [...new Set([...sockets(keep, found, problems), ...secrets, ...agentPaths])].filter((p) => lexists(p) && !keep.has(p) && !keep.has(realpath(p)));
+  const hide = [...new Set([...sockets(keep, found, problems, scan), ...secrets, ...agentPaths])].filter((p) => lexists(p) && !keep.has(p) && !keep.has(realpath(p)));
   // A directory that holds a protected path could be renamed and rebuilt without it: every
   // directory between a writable root and such a path is pinned.
   const pin = new Set<string>();

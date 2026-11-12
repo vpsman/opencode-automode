@@ -1,0 +1,329 @@
+## everyday
+git status
+====
+## everyday
+git diff
+====
+## everyday
+git add -A
+====
+## everyday
+git commit -m x
+====
+## everyday: a heredoc commit message
+git commit -m "$(cat <<'EOF'
+fix: a heredoc message
+
+With a body.
+EOF
+)"
+====
+## everyday
+npm test
+====
+## everyday
+cargo build
+====
+## everyday
+make
+====
+## everyday (pytest is a stand-in)
+pytest
+====
+## everyday
+ls
+====
+## everyday
+rg foo src
+====
+## everyday
+sed -n '1,5p' f
+====
+## everyday
+awk '{print $1}' f
+====
+## everyday, 14
+for f in *.ts; do head -3 "$f"; done
+====
+## everyday
+cd dir && ls
+====
+## everyday
+npm test 2>&1 | tail -20
+====
+## everyday
+npm run build && \
+npm test
+====
+## everyday: a backslash-newline straight after &&
+npm run build &&\
+npm test
+====
+## everyday: a backslash-newline straight after |
+git log --oneline |\
+  head -5
+====
+## everyday: a backslash-newline straight after ||
+npm test ||\
+  echo failed
+====
+## everyday: a backslash-newline straight after &&
+cd web &&\
+  npm test
+====
+## everyday
+mkdir -p src/{a,b}
+====
+## 13: two git commands on two lines
+git add -A
+git commit -m x
+====
+## 13: a glob in git add
+git add src/*.ts
+====
+## 13: a ! in a double-quoted message
+git commit -m "feat!: x"
+====
+## 13: a trailing newline
+git commit -m x<NL>
+====
+## 13: GIT_EDITOR for a rebase in progress
+GIT_EDITOR=true git rebase --continue
+====
+## 13: a heredoc message with an unmatched )
+git commit -m "$(cat <<'EOF'
+fix: two steps
+
+1) first
+2) second
+EOF
+)"
+====
+## 13: a heredoc message with an unmatched (
+git commit -m "$(cat <<'EOF'
+fix: an unmatched ( here
+EOF
+)"
+====
+## 13: a heredoc delimiter written <<EOF
+git commit -m "$(cat <<EOF
+fix: unquoted delimiter
+EOF
+)"
+====
+## 13: a heredoc delimiter written <<"EOF"
+git commit -m "$(cat <<"EOF"
+fix: double-quoted delimiter
+EOF
+)"
+====
+## 14
+sed -n '5,$p' f
+====
+## 14
+grep 'foo$' f
+====
+## 14
+rg 'TODO$'
+====
+## 14 (the brief's `jq 'select(.a == $v)'` needs $v defined to work)
+jq --arg v x 'select(.a == $v)' data.json
+====
+## 14
+cd dir && cat *.md
+====
+## 27
+git remote update
+====
+## 27
+git bisect start
+====
+## 27
+git apply --index p.diff
+====
+## 27
+git symbolic-ref HEAD refs/heads/main
+====
+## 27 (without tag.gpgSign; the signing case is a scenario in decide.test.mts)
+git tag -a v1 -m x
+====
+## 28 (pytest is a stand-in)
+PYTHONPATH=src pytest
+====
+## 28
+NODE_OPTIONS=--max-old-space-size=8192 npm run build
+====
+## 28 (clang is not installed here; the Makefile does not use $(CC))
+CC=clang make
+====
+## 28
+PAGER=cat git log
+====
+## 29 (pnpm is a stand-in)
+pnpm --filter web test
+====
+## 29
+npm --prefix web run build
+====
+## 29 (yarn is a stand-in)
+yarn --cwd x test
+====
+## 29
+cargo -q build
+====
+## 29 (go is a stand-in)
+go -C dir test
+====
+## group E additions: git
+git status --short
+====
+## group E additions: git
+git diff --stat
+====
+## group E additions: git
+git diff --cached --name-only
+====
+## group E additions: git
+git log --oneline -10
+====
+## group E additions: git
+git show --stat HEAD
+====
+## group E additions: git
+git rev-parse --abbrev-ref HEAD
+====
+## group E additions: git
+git symbolic-ref --short HEAD
+====
+## group E additions: git
+git add src/a.ts src/b.ts && git commit -m "feat: x"
+====
+## group E additions: git, 13 (a ! in double quotes)
+git add -A && git commit -m "fix(scope)!: breaking"
+====
+## group E additions: git, 13 (a glob and two lines)
+git add src/*.ts
+git commit -m "chore: globs"
+====
+## group E additions: git
+git commit -am "wip"
+====
+## group E additions: git
+git restore --staged CHANGELOG.md
+====
+## group E additions: git
+git mv dir/notes.md dir/notes2.md
+====
+## group E additions: git
+git stash && git stash pop
+====
+## group E additions: git (also: `switch -c` is not git's -c)
+git switch -c fix/x
+====
+## group E additions: git
+git checkout -b feature/y
+====
+## group E additions: git
+git branch feature/z
+====
+## group E additions: git
+git tag v0.1.0
+====
+## group E additions: git (a remote that is a local path)
+git fetch origin
+====
+## group E additions: git
+git pull --ff-only
+====
+## group E additions: git, 27
+git bisect start && git bisect reset
+====
+## group E additions: git, 13 (a heredoc message with parentheses on several lines)
+git add -A && git commit -m "$(cat <<'EOF'
+feat: add x
+
+- one (first)
+- two)
+EOF
+)"
+====
+## group E additions: git, 13
+GIT_EDITOR=true git commit --amend --no-edit
+====
+## group E additions: package managers, 29
+npm --silent test
+====
+## group E additions: package managers, 29
+npm --prefix x test
+====
+## group E additions: package managers, 29 (pnpm is a stand-in)
+pnpm -C web test
+====
+## group E additions: package managers, 29 (pnpm is a stand-in)
+pnpm -r test
+====
+## group E additions: package managers, 29 (yarn is a stand-in)
+yarn --silent test
+====
+## group E additions: package managers, 29
+cargo -q check
+====
+## group E additions: package managers, 29
+cargo --offline build
+====
+## group E additions: package managers, 29 (go is a stand-in)
+go -C dir vet
+====
+## group E additions: loops, 14
+for f in src/*.ts; do echo "== $f"; head -5 "$f"; done
+====
+## group E additions: loops, 14
+for f in dir/*.md; do wc -l "$f"; done
+====
+## group E additions: loops, 14
+for f in *.json; do jq . "$f"; done
+====
+## group E additions: loops, 14
+for f in src/*.ts
+do
+  grep -n 'export' "$f"
+done
+====
+## group E additions: quoted scripts, 14
+awk -F' ' '{print $1}' f
+====
+## group E additions: quoted scripts, 14
+awk 'NR==2 {print $2}' f
+====
+## group E additions: quoted scripts, 14
+sed -n '/beta/,$p' f
+====
+## group E additions: quoted scripts, 14
+grep -n 'export const' src/*.ts
+====
+## group E additions: quoted scripts, 14
+grep -cE 'one$|foo$' f
+====
+## group E additions: quoted scripts, 14
+rg -n '1;$' src
+====
+## group E additions: quoted scripts, 14
+jq -r '.a' data.json
+====
+## group E additions: quoted scripts, 14
+jq '.a | length' data.json
+====
+## group E additions: quoted scripts, 14
+cat src/a.ts | awk '{print $NF}'
+====
+## group E additions: a known directory, 14
+cd dir && head -1 *.md
+====
+## group E additions: a known directory, 14
+cd src && grep -l 'export' *.ts
+====
+## group E additions: globs
+ls src/*.ts | wc -l
+====
+## group E additions: a command that expands $HOME (also: the test home's name)
+ls "$HOME" > /dev/null

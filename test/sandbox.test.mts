@@ -19,6 +19,7 @@ const ROOT = path.resolve(import.meta.dirname, "..");
 const WRAPPER = path.join(ROOT, "sandbox", "bin", "bash");
 // Lists reach lockwrite newline-separated.
 const SEP = "\n";
+const within = (p: string, dir: string) => p === dir || p.startsWith(dir + "/");
 const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "automode-sbx-")));
 const repo = path.join(tmp, "repo");
 const home = os.homedir();
@@ -714,5 +715,137 @@ describe("r2 30: an allowed push can do all of its work", () => {
       git("remote", "remove", "pushed");
       fs.rmSync(remote, { recursive: true, force: true });
     }
+  });
+});
+
+// ---- round 3, group D ----
+
+// Round 3, finding 26: a directory that cannot be listed is judged by what this process can do
+// with it (access(2)), not by who owns it. No second user is available to an unprivileged test:
+// process.getuid answers another uid while the plan is made, so this user's own directories
+// stand in for someone else's (the kernel still answers access(2) for the real user).
+describe("r3 26: a directory that can be entered or written but not listed", () => {
+  const cleanup: (() => void)[] = [];
+  afterEach(() => {
+    for (const undo of cleanup.splice(0).reverse()) undo();
+  });
+  const unlistable = (dir: string, mode: number, inside?: () => void) => {
+    fs.mkdirSync(dir, { recursive: true });
+    inside?.();
+    fs.chmodSync(dir, mode);
+    cleanup.push(() => {
+      fs.chmodSync(dir, 0o700);
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+  };
+  const asOther = <T>(fn: () => T): T => {
+    const real = process.getuid;
+    const other = process.getuid!() + 4242;
+    process.getuid = () => other;
+    try {
+      return fn();
+    } finally {
+      process.getuid = real;
+    }
+  };
+  for (const mode of [0o300, 0o100, 0o200]) {
+    test(`r3 26: someone else's directory in the project, mode ${mode.toString(8)}, holding a bare repository, is a problem`, () => {
+      const dir = path.join(repo, "shared");
+      unlistable(dir, mode, () => execFileSync("git", ["init", "-q", "--bare", path.join(dir, "r.git")]));
+      assert.match(asOther(() => planFor("ls")).problem ?? "", /shared cannot be listed/);
+    });
+  }
+  test("r3 26: someone else's directory in a temp directory that can be entered is covered, and commands still run", () => {
+    const dir = path.join(tmp, "r3-26-other");
+    unlistable(dir, 0o100);
+    const p = asOther(() => planFor("ls"));
+    assert.equal(p.problem, undefined);
+    assert.ok(p.hide.includes(dir), p.hide.join(" "));
+    const env = { ...process.env, AUTOMODE_SHELL: "/bin/bash", AUTOMODE_RW: p.rw.join(SEP), AUTOMODE_RO: p.ro.join(SEP), AUTOMODE_HIDE: p.hide.join(SEP), AUTOMODE_PIN: p.pin.join(SEP), AUTOMODE_TMPFS: p.tmpfs.join(SEP), AUTOMODE_COVER: cover };
+    const r = spawnSync(WRAPPER, ["-c", `touch ${dir}/planted 2>/dev/null; echo ran`], { cwd: repo, env, encoding: "utf8" });
+    assert.match(r.stdout, /ran/, r.stderr);
+    fs.chmodSync(dir, 0o700);
+    assert.ok(!fs.existsSync(path.join(dir, "planted")));
+  });
+  test("r3 26: an unlistable directory under /run that can be entered is covered", (t) => {
+    const found = ["/run/sudo", "/run/containerd", "/run/systemd/inaccessible"].find((d) => {
+      try {
+        fs.readdirSync(d);
+        return false;
+      } catch {
+        try {
+          fs.accessSync(d, fs.constants.X_OK);
+          return fs.statSync(d).isDirectory();
+        } catch {
+          return false;
+        }
+      }
+    });
+    if (!found) return t.skip("no directory under /run here that can be entered and not listed");
+    const p = planFor("ls");
+    assert.equal(p.problem, undefined);
+    assert.ok(p.hide.some((h) => within(found, h)), `${found} not covered: ${p.hide.filter((h) => h.startsWith("/run")).join(" ")}`);
+  });
+  test("r3 26: unchanged: someone else's directory closed both ways is no problem, this user's own is", () => {
+    const dir = path.join(repo, "closed");
+    unlistable(dir, 0o000);
+    assert.equal(asOther(() => planFor("ls")).problem, undefined);
+    // The owner can change the mode back.
+    assert.match(planFor("ls").problem ?? "", /closed cannot be listed/);
+  });
+});
+
+// Round 3, finding 34, and lockwrite started as root. opencode gives the shell /dev/null and
+// sockets, never a terminal; a terminal on stdin, stdout or stderr would stay reachable from the
+// sandbox (TIOCSTI where the kernel allows it, TIOCSWINSZ and tcsetattr everywhere), so lockwrite
+// refuses to run anything. Started as uid 0 the command would keep its capabilities in the
+// sandbox's user namespace and could make a read-only mount writable again: refused too.
+describe("r3 34: lockwrite refuses a terminal and root", () => {
+  const PTY = path.join(ROOT, "test", "pty-run.py");
+  const marker = path.join(repo, "r3-34-ran");
+  afterEach(() => fs.rmSync(marker, { force: true }));
+  const envFor = () => {
+    const p = planFor("ls");
+    return { ...process.env, AUTOMODE_SHELL: "/bin/bash", AUTOMODE_RW: p.rw.join(SEP), AUTOMODE_RO: p.ro.join(SEP), AUTOMODE_HIDE: p.hide.join(SEP), AUTOMODE_PIN: p.pin.join(SEP), AUTOMODE_TMPFS: p.tmpfs.join(SEP), AUTOMODE_COVER: cover };
+  };
+  const onTerminal = (fds: string, args: string[], env: NodeJS.ProcessEnv = envFor()) => {
+    const r = spawnSync("python3", ["-I", PTY, fds, ...args], { cwd: repo, env, encoding: "utf8", timeout: 30_000 });
+    assert.equal(r.status, 0, r.stderr);
+    return JSON.parse(r.stdout) as { status: number; tty: string; stdout: string; stderr: string };
+  };
+  for (const fds of ["0,1,2", "0", "1", "2"]) {
+    test(`r3 34: with descriptor(s) ${fds} on a terminal, the command does not run and lockwrite exits 126`, () => {
+      const r = onTerminal(fds, [WRAPPER, "-c", `touch ${marker}; echo ran`]);
+      assert.equal(r.status, 126, JSON.stringify(r));
+      assert.match(r.tty + r.stderr, /terminal/);
+      assert.ok(!fs.existsSync(marker), "the command ran");
+    });
+  }
+  test("r3 34: --selftest still works from a terminal", () => {
+    const r = onTerminal("0,1,2", [path.join(ROOT, "sandbox", "lockwrite"), "--selftest"], { PATH: process.env.PATH });
+    assert.equal(r.status, 0, JSON.stringify(r));
+    assert.match(r.tty, /lockwrite: ok/);
+  });
+  test("r3 34: with pipes and /dev/null, as opencode starts it, the command runs", () => {
+    const r = spawnSync(WRAPPER, ["-c", `touch ${marker}; echo ran`], { cwd: repo, env: envFor(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /ran/);
+    assert.ok(fs.existsSync(marker));
+  });
+  const userns = spawnSync("unshare", ["-Ur", "true"]).status === 0;
+  test("r3 34: started as uid 0 (unshare -Ur), lockwrite refuses, the selftest too", (t) => {
+    if (!userns) return t.skip("unprivileged user namespaces (unshare -Ur) are not available here");
+    const r = spawnSync("unshare", ["-Ur", WRAPPER, "-c", `touch ${marker}; echo ran`], { cwd: repo, env: envFor(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    assert.equal(r.status, 126, r.stdout + r.stderr);
+    assert.match(r.stderr, /root|uid 0/);
+    assert.ok(!fs.existsSync(marker), "the command ran");
+    const self = spawnSync("unshare", ["-Ur", path.join(ROOT, "sandbox", "lockwrite"), "--selftest"], { encoding: "utf8" });
+    assert.equal(self.status, 126, self.stdout + self.stderr);
+  });
+  test("r3 34: started with capabilities kept in a user namespace (not root), the command has none", (t) => {
+    if (spawnSync("unshare", ["-U", "--map-current-user", "--keep-caps", "true"]).status !== 0) return t.skip("unshare --keep-caps is not available here");
+    const r = spawnSync("unshare", ["-U", "--map-current-user", "--keep-caps", WRAPPER, "-c", "grep -E '^Cap(Eff|Prm|Amb)' /proc/self/status"], { cwd: repo, env: envFor(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(r.stdout.trim().split("\n").map((l) => l.split(/\s+/)[1]), ["0000000000000000", "0000000000000000", "0000000000000000"], r.stdout);
   });
 });

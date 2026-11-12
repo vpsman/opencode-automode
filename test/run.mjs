@@ -2,7 +2,9 @@
 // $HOME, the global git config, the user's runtime directory or their ssh agent.
 //
 // The home cannot live in /tmp (the rules treat temp directories as writable project space), so
-// it is made under ~/.cache/opencode-automode-test (or $AUTOMODE_TEST_BASE) and removed after.
+// it is made under ~/.cache/automode-tests (or $AUTOMODE_TEST_BASE) and removed after. The name
+// must not hold "opencode-automode": a default ask rule matches that, so every tested command that
+// expands $HOME would ask for that reason alone.
 // Usage: node test/run.mjs [test files...]
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -10,7 +12,7 @@ import os from "node:os";
 import path from "node:path";
 
 const root = path.dirname(import.meta.dirname);
-const base = process.env.AUTOMODE_TEST_BASE || path.join(os.homedir(), ".cache", "opencode-automode-test");
+const base = process.env.AUTOMODE_TEST_BASE || path.join(os.homedir(), ".cache", "automode-tests");
 fs.mkdirSync(base, { recursive: true });
 const home = fs.mkdtempSync(path.join(base, "h-"));
 const dirs = { config: path.join(home, ".config"), state: path.join(home, ".local", "state"), data: path.join(home, ".local", "share"), cache: path.join(home, ".cache"), run: path.join(home, "run") };

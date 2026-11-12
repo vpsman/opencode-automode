@@ -17,8 +17,8 @@
 // Reads of files that are not hidden, execution and the network are not restricted.
 //
 // It stands in for the shell: opencode runs it through a link named like the real shell
-// (sandbox/bin/bash, .../zsh, .../sh) with the arguments it would give that shell, so the
-// command itself is never rewritten. lockwrite sets up the sandbox, then runs
+// (sandbox/bin/bash or .../sh) with the arguments it would give that shell, so the command
+// itself is never rewritten. lockwrite sets up the sandbox, then runs
 //   $AUTOMODE_SHELL <its own arguments>
 // Environment (lists are newline-separated, so a ':' in a path is fine):
 //   AUTOMODE_SHELL     the real shell, e.g. /bin/bash
@@ -37,6 +37,14 @@
 //
 // `lockwrite --selftest` sets everything up around /tmp and exits 0, or fails like a run would.
 // Fails closed: if any step fails, the command does not run (exit 126).
+//
+// Before any of that it refuses (exit 126):
+//   - to start as root (real, effective or saved uid 0): the command would keep every capability
+//     in the new user namespace and could make the read-only mounts writable again;
+//   - to run a command while stdin, stdout or stderr is a terminal: an inherited terminal stays
+//     reachable from inside (TIOCSTI where the kernel still allows it, TIOCSWINSZ, tcsetattr).
+//     opencode gives the shell /dev/null and sockets. --selftest runs no command and may be
+//     started from a terminal.
 //
 // Written in Rust for the string handling: the path lists, the environment filter and the
 // mountinfo parser see names an earlier command could have chosen, before the sandbox is up.
@@ -360,6 +368,22 @@ fn write_file(target: &str, text: &str) {
 fn main() {
     let args: Vec<OsString> = env::args_os().collect();
     let selftest = env::var_os("AUTOMODE_SHELL").is_none() && args.len() == 2 && args[1] == "--selftest";
+    let (mut ruid, mut euid, mut suid) = (0, 0, 0);
+    // SAFETY: getresuid writes the three ids into the places it is given.
+    if unsafe { libc::getresuid(&mut ruid, &mut euid, &mut suid) } != 0 {
+        die(b"getresuid");
+    }
+    if ruid == 0 || euid == 0 || suid == 0 {
+        fail("started as root (uid 0): the command would keep its capabilities inside the sandbox and could undo its read-only mounts");
+    }
+    if !selftest {
+        for (fd, name) in [(0, "stdin"), (1, "stdout"), (2, "stderr")] {
+            // SAFETY: isatty takes an integer.
+            if unsafe { libc::isatty(fd) } == 1 {
+                fail(&format!("{name} is a terminal, which a sandboxed command could still control; run it with stdin, stdout and stderr redirected"));
+            }
+        }
+    }
     let shell = if selftest { Some(OsString::from("/bin/sh")) } else { env::var_os("AUTOMODE_SHELL") };
     let writable = if selftest { vec![b"/tmp".to_vec()] } else { list(env::var_os("AUTOMODE_RW")) };
     let optional = |name: &str| if selftest { Vec::new() } else { list(env::var_os(name)) };
@@ -521,6 +545,12 @@ fn main() {
         // SAFETY: integer arguments only.
         if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) } != 0 {
             die(b"close_range");
+        }
+        // Capabilities handed down in the ambient set would survive the exec below, and inside
+        // this user namespace they would let the command undo the mounts.
+        // SAFETY: prctl with integer arguments.
+        if unsafe { libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong, 0, 0, 0) } != 0 {
+            die(b"prctl(PR_CAP_AMBIENT_CLEAR_ALL)");
         }
         // The real shell, with exactly the arguments opencode passed.
         let error = process::Command::new(&shell).arg0(&shell).args(&args[1..]).exec();
