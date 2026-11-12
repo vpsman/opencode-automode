@@ -18,8 +18,9 @@ Anything that breaks a guarantee the README states, for example:
 
 The limits listed under "Known gaps" in the README (network access, reads of files that are not
 hidden, project files that run later, builds and tests running the session's code, values bash
-evaluates as arithmetic when they come from a file or the environment, allowed programs judged
-by name, the ssh agent for ssh commands, shared `/tmp`, an `opencode.json` created mid-session,
+evaluates as arithmetic in a script or program the command runs, allowed programs judged by
+name, the ssh agent for ssh commands, remote read-only checks that read only the words, shared
+`/tmp`, two opencode processes on one checkout, an `opencode.json` created mid-session,
 scheduled checks after approval) are known and not vulnerabilities in themselves, but ways to
 turn them into one of the above are. A shell input that bash runs differently from how the
 rules read it is always one: `test/differential.test.mts` is the place to add it.
