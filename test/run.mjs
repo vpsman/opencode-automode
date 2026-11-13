@@ -27,6 +27,9 @@ fs.writeFileSync(path.join(home, ".gitconfig"), "[user]\n\tname = test\n\temail 
 
 const env = { ...process.env, HOME: home, XDG_CONFIG_HOME: dirs.config, XDG_STATE_HOME: dirs.state, XDG_DATA_HOME: dirs.data, XDG_CACHE_HOME: dirs.cache, XDG_RUNTIME_DIR: dirs.run, GIT_CONFIG_GLOBAL: path.join(home, ".gitconfig"), GIT_CONFIG_NOSYSTEM: "1" };
 for (const name of Object.keys(env)) if (/^(SSH_|GIT_(DIR|WORK_TREE|SSH)|OPENCODE|AUTOMODE_(?!TEST_))/.test(name)) delete env[name];
+// Under `npm test` npm hands down where the real user's and the machine's npmrc files are; the
+// decision for an `npx` reads the user's one (decide.ts, npxReading), so they go as well.
+for (const name of Object.keys(env)) if (/^npm_config_(userconfig|globalconfig)$/i.test(name)) delete env[name];
 
 const files = process.argv.slice(2);
 let status = 1;
