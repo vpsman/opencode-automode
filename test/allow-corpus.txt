@@ -1,6 +1,18 @@
 ## everyday
 git status
 ====
+## r4 B4: branch without implicit tracking
+git branch --no-track b4-local main
+====
+## r4 B4: curl headers
+curl -I file:///etc/hostname
+====
+## r4 B4: explicit GET
+curl -s -X GET --max-time 5 file:///etc/hostname
+====
+## r4 B4: file list input
+printf 'f\n' > names.txt && file -f names.txt
+====
 ## everyday
 git diff
 ====
@@ -327,3 +339,624 @@ ls src/*.ts | wc -l
 ====
 ## group E additions: a command that expands $HOME (also: the test home's name)
 ls "$HOME" > /dev/null
+====
+## r4 9: a newline after a null redirect
+git add -A 2>&1<NL>
+====
+## r4 9: a null redirect, then a second line
+git add -A >/dev/null
+git commit -m x
+====
+## r4 9: a glob at the top level after --
+git add -- *.ts
+====
+## r4 9: a comment that runs to the end of its line
+git add -A # stage changes
+git commit -m x
+====
+## r4 9: a comment on a line of its own
+# stage and commit
+git add -A
+git commit -m x
+====
+## r4 9: a backslashed backtick in double quotes
+git commit -m "use \`foo\`"
+====
+## r4 9: a backslashed double quote in double quotes
+git commit -m "say \"hi\""
+====
+## r4 9: a backslashed dollar and backslash in double quotes
+git commit -m "cost \$5, path C:\\tmp"
+====
+## r4 9: a last pipe into tail with a count
+git commit -m x 2>&1 | tail -5
+====
+## r4 9: a last pipe into head
+git add -A && git status | head
+====
+## r4 9: a last pipe into head with a count
+git log --oneline | head -n 3
+====
+## r4 9: a trailing || true
+git commit -m x || true
+====
+## r4 9: letters outside ASCII in a path
+git add café.txt
+====
+## r4 9: letters outside ASCII in a message
+git commit -m "fix: naïve café handling"
+====
+## r4 11: a shell's name as an argument of rg
+rg fish -c src
+====
+## r4 11: a shell's name as an argument of echo
+echo zsh -c ls
+====
+## r4 27: [[ ]] before a command
+[[ -f f ]] && echo yes
+====
+## r4 27: [[ ]] in an if
+if [[ -d src && ! -e nope ]]; then ls src; fi
+====
+## r4 27: a counter
+i=0
+i=$((i+1))
+echo "$i"
+====
+## r4 27: a while read loop over a file
+while read -r l; do echo "$l"; done < f
+====
+## r4 27: a version check
+node -v
+====
+## r4 27: a variable in grep's pattern
+name=foo; grep -rn "$name" src
+====
+## r4 27: variables in a sed script
+a=one; b=uno; sed -i "s/$a/$b/" g
+====
+## r4 27: a variable in rg's pattern
+name=foo; rg -n "$name" src
+====
+## r4 27: awk comparing a field
+awk '$3 > max' f
+====
+## r4 27: awk with || in a pattern
+awk 'NR==1 || /foo/' f
+====
+## r4 27: awk with > inside an if
+awk '{ if ($1 > max) max = $1 } END { print max }' f
+====
+## r4 27: a $ that expands nothing, in a nested shell's code
+bash -c 'grep "foo$" f'
+====
+## r4 29: the usual first line of a script
+set -euxo pipefail
+ls
+====
+## r4 29: the usual first line of a script, before a test run
+set -euo pipefail; npm test
+====
+## r4 5: a makefile named by its path
+make -f Makefile all
+====
+## r4 5: a makefile named by its path
+make -f ./Makefile
+====
+## r4 5: a makefile in another directory
+make -C dir -f ../Makefile
+====
+## r4 5: a makefile of a directory make changes into
+cd dir && make -f ../Makefile
+====
+## r4 6: a bracket in a glob
+ls *.[jt]s
+====
+## r4 6: a POSIX class in a glob
+ls [[:upper:]]*
+====
+## r4 6: a POSIX class in a glob read by a reader
+head -1 src/[[:lower:]].ts
+====
+## r4 6: a bracket in a glob read by a reader
+wc -l src/[ab].ts
+====
+## r4 18: a fetch that prunes the remote-tracking refs
+git fetch --prune
+====
+## r4 18: a fetch of one branch
+git fetch origin main
+====
+## r4 18: a fetch of every remote, pruned
+git fetch --all --prune
+====
+## r4 18: a fetch with tags
+git fetch --tags origin
+====
+## r4 18b: a quiet pruning fetch, short options in a cluster
+git fetch -qp origin
+====
+## r4 18b: a quiet pull of one branch that merges
+git pull -q --no-rebase origin main
+====
+## r4 18b: a fetch with a job count and a depth
+git fetch -j 2 --depth=1 origin main
+====
+## r4 7b: text that names a git command is printed, not run
+echo "set it with: git config user.name 'Your Name'"
+====
+## r4 7b: a history search for text that names a git command
+git log --oneline -S 'git config user.name'
+====
+## r4 7b: branches listed by two patterns with a slash
+git branch --list 'feat/*' 'fix/*'
+====
+## r4 19: a branch checked out from a subdirectory
+git -C dir checkout main
+====
+## r4 19: a branch checked out
+git checkout main
+====
+## r4 19: git run in a subdirectory
+git -C dir diff --stat
+====
+## r4 20: a patch checked before it is applied
+git apply --check p.diff
+====
+## r4 20: what a patch changes
+git apply --stat p.diff
+====
+## r4 7: a config read by name
+git config user.name
+====
+## r4 7: a config read with --get
+git config --get remote.origin.url
+====
+## r4 7: git 2.46's config get
+git config get user.email
+====
+## r4 7: the config listed
+git config --list --show-origin
+====
+## r4 17: a download saved to a file
+curl -fsSL file:///etc/hostname -o host.txt
+====
+## r4 17: a request with a plain header
+curl -s -H 'Accept: application/json' file:///etc/hostname
+====
+## r4 17: the status code alone
+curl -sS -o /dev/null -w '%{http_code}' file:///etc/hostname
+====
+## r4 17: a download with retries and a time limit
+curl -L --retry 3 --max-time 10 -o out.txt file:///etc/hostname
+====
+## r4 17: a name looked up
+getent hosts localhost
+====
+## r4 4: a project script the session has not written
+./scripts/build.sh
+====
+## r4 4: a project script run by a shell
+bash scripts/build.sh
+====
+## r4 B7 2: a named write in one directory, then a project script that lives and runs in another
+sed -i 's/readme/README/' dir/readme.md && cd scripts && ./build.sh
+====
+## r4 4: a glob as a write target
+sed -i 's/export/export/' src/*.ts
+====
+## r4 4: an archive made and listed
+tar -cf out.tar src && tar -tf out.tar
+====
+## r4 16: the last background job
+sleep 0 & wait $!
+====
+## r4 16: special parameters as written
+echo "$?" $# "$@"
+====
+## r4 16: a tag with a message that holds parentheses
+git tag -a v0.0.1 -m 'first (test) release'
+====
+## r4 16: a stash with a message
+git stash push -m 'before refactor'
+====
+## r4 25: ordinary fetch still works
+git fetch origin
+====
+## r4 24: absent hooksPath is an ordinary lookup
+git worktree list
+====
+## r4 N1: ordinary git writes retain directory identity
+git add -A && git commit -m x
+====
+## r4 22: git maintenance still works
+git gc
+====
+## r4 8: ordinary build still works
+npm run build
+====
+## r4 26: a build may use private shared memory
+npm --prefix ipc run build
+====
+## r4 26: a test runner may fork workers
+npm test
+====
+## r4 23: a reader runs when no checked push is pending
+git diff --ext-diff
+====
+## r4 21: a plain status does not need absent control files
+git status
+====
+## r4 21: a stale pointer file and an empty directory named .git do not stop work
+git status --porcelain=v1
+====
+## r4 22: a branch named like a credential file is a branch (its ref is not hidden)
+git branch --list | grep -c secrets
+====
+## r4 16: braces that make words bash has keywords for
+mkdir -p {in,out} && ls -d in out
+====
+## r4 16: the word function as an argument
+grep -rn function src; git status --short
+====
+## r4 16: a copy beside the file
+cp src/a.ts{,.bak} && ls src
+====
+## r4 21: a status from a subdirectory
+cd src && git status --short
+====
+## r4 21: a commit in a nested repository named with -C
+git -C nested commit -m nested
+====
+## r4 21: a file staged in a linked worktree
+git -C linked add new
+====
+## r4 21: a commit in a submodule kept under modules/
+git -C sub commit -m submodule
+====
+## r4 21: a status in a husky project with a linked worktree, twice in one session
+git status --branch --short
+====
+## r4 21: a fetch that goes into a submodule kept in its own work tree
+git fetch --recurse-submodules origin
+====
+## r4 21: a status from inside a submodule kept in its own work tree
+git -C lib status --short
+====
+## r4 B3 1 (E1): a pattern that names a git command, piped
+grep -rn "git clone" . | head -5
+====
+## r4 B3 1 (E1): a pattern that names a git command, counted
+rg -n 'git init' . | wc -l
+====
+## r4 B3 1 (E1): a note that names a git command, appended
+echo "run git clone URL first" >> notes.txt
+====
+## r4 B3 1 (E1): git's own output searched for a git command
+git log --oneline | grep 'git init' | head
+====
+## r4 B3 1 (E1): a pattern that names a git worktree action
+grep -rn 'git worktree add' . | head
+====
+## r4 B3 1 (E1): a note that names a push, through tee
+echo "git push -u origin main" | tee -a notes.txt
+====
+## r4 B3 1 (E1): a pattern that names a branch from a remote
+grep -rn 'git checkout -b x origin/main' . | head
+====
+## r4 B3 3: a loop that reads a file of the project line by line
+while read -r l; do echo "$l"; done < f
+====
+## r4 B3 3: a group that reads a file of the project
+{ wc -l; } < f
+====
+## r4 B3b 1: a loop that reads a notes file line by line
+while read -r l; do echo "$l"; done < notes.txt
+====
+## r4 B3b 1: a group fed a file after a cd
+cd src && { cat; } < a.ts
+====
+## r4 B3b 1: a group fed a file after a cd on a line of its own
+cd dir; { wc -l; } < notes.md
+====
+## r4 B3b 1: a group whose words look like keywords
+{ echo then if; cat; } < f
+====
+## r4 B3b 1: sort reads its input
+sort < f
+====
+## r4 B3b 1: count the lines of a file
+wc -l < CHANGELOG.md
+====
+## r4 B3b 1: a patch checked from standard input
+git apply --check < p.diff
+====
+## r4 B3b 1: tr on a file
+tr a b < f
+====
+## r4 B3b 1: an empty input
+cat < /dev/null
+====
+## r4 B3b 1: the first line into a variable
+read -r x < f
+====
+## r4 B3b 1: a file read into a variable
+x=$(< f); echo "$x"
+====
+## r4 B3b 1: a loop over files the call names
+for n in f g; do wc -l < "$n"; done
+====
+## r4 B3c 1: a subshell that changes directory, fed a file there
+(cd src; wc -l < a.ts)
+====
+## r4 B3c 1: a subshell that changes directory and reads a file there
+(cd src && cat a.ts) | wc -l
+====
+## r4 B3c 1: there and back
+cd src && ls && cd .. && ls
+====
+## r4 B3c 1: into a directory the call makes
+mkdir -p out && cd out && ls
+====
+## r4 B3d 1: a cd certain to succeed, then a read after `;`
+cd src; cat a.ts
+====
+## r4 B3d 1: a cd after a command that changes nothing
+echo start; cd src; wc -l a.ts
+====
+## r4 B3d 1: there and back, with `;`
+cd src && ls; cd ..; ls
+====
+## r4 B3d 1: a cd after a command that may change the tree, in a chain
+git status --short && cd src && cat a.ts
+====
+## r4 B3d 2: into a directory the call makes, after a command that changes nothing
+echo go; mkdir -p out && cd out && ls
+====
+## r4 B3d 3: no operand, at the top of the work tree (B5: the plugin resolves it)
+cd "$(git rev-parse --show-toplevel)" && git status
+====
+## r4 B3d 3: a subcommand and options, at the top of the work tree (B5)
+cd "$(git rev-parse --show-toplevel)" && git log -1 | head -n 5
+====
+## r4 B3d 3: a make target, at the top of the work tree (B5)
+cd "$(git rev-parse --show-toplevel)" && make all
+====
+## r4 B3d 6: a function's body, run where its one call stands
+cd src; ls() { cat a.ts; }; ls
+====
+## r4 B5 4: tests at the top of the work tree (go is a stand-in)
+cd "$(git rev-parse --show-toplevel)" && go test ./...
+====
+## r4 B5 4: a build at the top of the work tree
+cd "$(git rev-parse --show-toplevel)" && cargo build --release
+====
+## r4 B5 4: a directory under the top of the work tree
+cd "$(git rev-parse --show-toplevel)/src" && wc -l a.ts
+====
+## r4 B5 4: a directory under $PWD
+cd "$PWD/src" && wc -l a.ts
+====
+## r4 B5 4: a directory under $(pwd)
+cd "$(pwd)/src" && cat a.ts
+====
+## r4 B5 4: the same, unquoted
+cd $(pwd)/src && ls
+====
+## r4 B5 4: a clean build directory, made after an rm of that name
+cd src && rm -rf build && mkdir build && cd build && ls
+====
+## r4 B5 4: the same with mkdir -p, then make from the directory above
+cd dir && rm -rf build && mkdir -p build && cd build && make -C ../..
+====
+## r4 B5 4: a cd with -P, and one with --
+cd -P src && ls; cd -- .. && ls
+====
+## r4 B3c 4: a variable that plainly holds a file's name, as the input
+n=CHANGELOG.md; wc -l < "$n"
+====
+## r4 B3c 4: the same, unquoted
+file=f; wc -l < $file
+====
+## r4 B3c 4: a file under $PWD
+wc -l < "$PWD/f"
+====
+## r4 B3c 4: a loop over directories, a file in each
+for d in src; do wc -l < "$d/a.ts"; done
+====
+## r4 21: in a submodule's work tree: a commit of what changed
+git commit -am x
+====
+## r4 21: in a submodule's work tree: everything staged
+git add -A
+====
+## r4 21: in a submodule's work tree: a gc
+git gc
+====
+## r4 21: in a submodule's work tree: a stash
+git stash
+====
+## r4 21: in a submodule's work tree: a status
+git status
+====
+## r4 21: a pull that updates a submodule kept in its own work tree
+git pull --recurse-submodules origin moved-lib
+====
+## r4 21: a new branch where submodule.recurse is set
+git switch -c feature
+====
+## r4 21: a pull where only the fetch goes into submodules
+git pull
+====
+## r4 12: the refs of the project's remote
+git ls-remote origin
+====
+## r4 12: the refs of a repository named by its path
+git ls-remote --heads ../../remote.git | head -3
+====
+## r4 21: after git rm of a submodule: a status
+git status
+====
+## r4 21: after git rm of a submodule: a fetch
+git fetch origin
+====
+## r4 21: after git rm of a submodule: an edit in place
+sed -i 's/alpha/ALPHA/' f
+====
+## r4 21: a reset that keeps local changes where submodule.recurse is set
+git reset --keep HEAD
+====
+## r4 21: a reset of the index where submodule.recurse is set
+git reset -q
+====
+## r4 21: into a linked directory and back: everything staged
+cd link && cd .. && git add -A
+====
+## r4 21: into a linked directory and back: a status
+cd link && cd .. && git status
+====
+## r4 21: a status in a directory the kernel reaches through a link
+git -C link/.. status --short
+====
+## r4 21: in a linked worktree: a status
+git status
+====
+## r4 21: in a linked worktree: a commit of what changed
+git commit -am work
+====
+## r4 21: in a linked worktree: a stash
+git stash
+====
+## r4 21: in a linked worktree: a gc
+git gc
+====
+## r4 21: in a linked worktree: the worktrees
+git worktree list
+====
+## r4 21: in a linked worktree: a fetch
+git fetch origin
+====
+## r4 21: in a submodule's work tree: a fetch
+git fetch origin
+====
+## r4 21: in a submodule's work tree: a new branch
+git switch -c topic
+====
+## r4 25: a fetch where the repository sets push.default and submodule.recurse
+git fetch origin
+====
+## r4 21: a status in a husky project whose hooks path is not there yet
+git status --branch --short
+====
+## r4 B7 2: a runner whose output a tee keeps
+npm test 2>&1 | tee test.log
+====
+## r4 B7 3: after a write in the same call, a diff
+echo more >> notes.txt && git diff --stat
+====
+## r4 B7 3: after a write, a log and a show
+echo more >> notes.txt && git log --oneline -1 && git show --stat HEAD
+====
+## r4 B7 3: after a write, a loop
+echo more >> notes.txt; for f in dir/*.md; do wc -l "$f"; done
+====
+## r4 B7 3: after a write, an if and a case
+echo more >> notes.txt; if [ -f notes.txt ]; then echo there; fi
+====
+## r4 B7 3: after a write, sed, awk and jq
+echo '{"a": 1}' > t.json && jq .a t.json && sed -n 1p t.json && awk '{print $1}' f
+====
+## r4 B7 3: after a write, an edit in place and a status
+echo more >> notes.txt && sed -i 's/more/less/' notes.txt && git status --short
+====
+## r4 B7 3: after a write, an archive made and unpacked into a directory of its own
+echo more >> notes.txt && tar -cf out.tar src && mkdir -p out && tar -xf out.tar -C out
+====
+## r4 B7 3: after a write, small tools
+echo more >> notes.txt; date +%Y; basename src/a.ts; sleep 0; du -sh src; md5sum f
+====
+## r4 B7 8: a branch from a commit that is no ref
+git checkout -b from-commit HEAD~0
+====
+## r4 B7 8: a branch made and deleted
+git branch gone-soon && git branch -d gone-soon
+====
+## r4 B7 8: a fetch into a remote-tracking branch, named without refs/
+git fetch origin main:remotes/origin/main
+====
+## r4 B7 11: bun's subcommands (bun is a stand-in)
+bun test && bun run build
+====
+## r4 B7 11: a file moved, then a list
+mv g g2 && ls
+====
+## r4 21: to the top of the repository from a directory below it, then a commit
+cd "$(git rev-parse --show-toplevel)" && git commit -m x
+====
+## r4 21: to the top of the repository from a directory below it, then everything staged
+cd "$(git rev-parse --show-toplevel)" && git add .
+====
+## r4 21: a status here and in a submodule, on one line
+git status; cd subm; git status
+====
+## r4 21: a status here and the log of a submodule, on lines
+git status --short
+cd subm
+git log --oneline -3
+====
+## r4 21: in a linked worktree: a status, and its submodule's changes staged
+git status --short && git -C subm add -A
+====
+## r4 21: a merge that stopped on a conflict, given up
+git merge --abort
+====
+## real cargo: a build with one dependency from the read-only registry cache
+cargo build
+====
+## real cargo: the tests, with the dependency
+cargo test
+====
+## real cargo: a check
+cargo check
+====
+## real cargo: a release build
+cargo build --release
+====
+## real cargo: a build, then the tests
+cargo build && cargo test
+====
+## real cargo: the dependency tree
+cargo tree
+====
+## real cargo: the program itself
+cargo run
+====
+## real npm: the test script is node's runner on a test that requires the dependency
+npm test
+====
+## real npm: the build script requires the dependency
+npm run build
+====
+## real npm: the installed tree
+npm ls
+====
+## real npm: the installed tree, every level
+npm ls --all
+====
+## real npm: the build program by its name
+node build.cjs
+====
+## real python3: the unit tests, found from the top
+python3 -m unittest
+====
+## real python3: the unit tests of one directory
+python3 -m unittest discover -s tests -t .
+====
+## real python3: one test module, verbosely
+python3 -m unittest -v tests.test_greet
+====
+## real cc: a recipe that compiles a C file and its header
+make hello
+====
+## real cc: the same, then the tests
+make hello && npm test

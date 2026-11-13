@@ -1,11 +1,13 @@
 // lockwrite: run a shell command so that it, and everything it starts, can only write to a set
 // of directories, cannot change chosen files inside them, cannot reach chosen local sockets,
 // and does not outlive the tool call. No root needed:
-//   1. a private user + mount + PID namespace, in which
+//   1. a private user + mount + PID + IPC namespace (SysV IPC is the call's own), in which
 //        every mount outside the writable directories is remounted read-only (so chmod, utime
 //        and setxattr fail there too, which Landlock does not mediate),
 //        AUTOMODE_RO paths (e.g. .git/hooks, .git/config) are bind-mounted read-only, with
-//        every mount beneath them, and
+//        every mount beneath them,
+//        AUTOMODE_REOPEN directories inside them are made writable again (a submodule's git
+//        directory inside a superproject's `.git` that is read-only whole), and
 //        AUTOMODE_HIDE paths (local sockets, credential files) are covered up;
 //   2. Landlock ABI >= 5 (Linux >= 6.10) confining every filesystem write, truncate and rename
 //      to AUTOMODE_RW and denying ioctl on device files (no TIOCSTI), and on ABI >= 6
@@ -17,13 +19,21 @@
 // Reads of files that are not hidden, execution and the network are not restricted.
 //
 // It stands in for the shell: opencode runs it through a link named like the real shell
-// (sandbox/bin/bash or .../sh) with the arguments it would give that shell, so the command
-// itself is never rewritten. lockwrite sets up the sandbox, then runs
+// (sandbox/bin/bash or .../sh) with the arguments it would give that shell. lockwrite sets up
+// the sandbox, then runs
 //   $AUTOMODE_SHELL <its own arguments>
+// or, when the plugin hands over the text it judged (AUTOMODE_COMMAND),
+//   $AUTOMODE_SHELL -c "$AUTOMODE_COMMAND"
 // Environment (lists are newline-separated, so a ':' in a path is fine):
 //   AUTOMODE_SHELL     the real shell, e.g. /bin/bash
+//   AUTOMODE_COMMAND   the command to run in place of the one in the arguments, which must be
+//                      `-c <command>` (optional)
 //   AUTOMODE_RW        directories where writes are allowed
 //   AUTOMODE_RO        paths made read-only (optional)
+//   AUTOMODE_REOPEN    directories inside an AUTOMODE_RO path that stay writable: each is bound
+//                      onto itself once the read-only binds are made, and that one mount is
+//                      made writable; the read-only mounts beneath it stay as they are
+//                      (optional). Each must lie inside AUTOMODE_RW, as Landlock requires anyway.
 //   AUTOMODE_HIDE      sockets, files or directories to cover (optional)
 //   AUTOMODE_PIN       directories bound onto themselves, so that they cannot be renamed or
 //                      replaced (optional)
@@ -214,6 +224,31 @@ fn make_readonly(target: &[u8]) {
     remount_readonly_tree(target);
 }
 
+// A directory inside a read-only bind that the command may write after all. It is bound onto
+// itself again, with every mount beneath it (the read-only binds of its own hooks and config,
+// which keep their flag: only the new mount at `target` itself is changed), and that mount is
+// made writable. The directory around it stays a read-only mount: nothing can be made, renamed
+// or removed there, the way to `target` included, and `target` is a mount point, which cannot be
+// renamed either. Clearing the flag is allowed because this process set it itself (the kernel
+// locks read-only only on mounts that were read-only when the namespace was made; such a one
+// fails here, and the command does not run).
+// One that is not there, or is not a directory, cannot be reopened: no run.
+fn reopen(target: &[u8]) {
+    match kind(target) {
+        Some(kind) if kind.is_dir() => {}
+        _ => fail(&format!("{}: must be a directory to be made writable inside a read-only one", String::from_utf8_lossy(target))),
+    }
+    if !sys_mount(Some(target), target, None, libc::MS_BIND | libc::MS_REC, None) {
+        die(target);
+    }
+    let c = cstr(target);
+    let attr = MountAttr { attr_set: 0, attr_clr: MOUNT_ATTR_RDONLY, propagation: 0, userns_fd: 0 };
+    // SAFETY: `c` is NUL-terminated; `attr` has the kernel's mount_attr layout and outlives the call.
+    if unsafe { libc::syscall(libc::SYS_mount_setattr, libc::AT_FDCWD, c.as_ptr(), 0 as libc::c_uint, &attr as *const MountAttr, mem::size_of::<MountAttr>()) } != 0 {
+        die(target);
+    }
+}
+
 fn hide(target: &[u8], cover: &[u8]) {
     let Some(kind) = kind(target) else { return };
     if kind.is_symlink() {
@@ -388,6 +423,11 @@ fn main() {
     let writable = if selftest { vec![b"/tmp".to_vec()] } else { list(env::var_os("AUTOMODE_RW")) };
     let optional = |name: &str| if selftest { Vec::new() } else { list(env::var_os(name)) };
     let (readonly, hidden, pinned, tmpfs) = (optional("AUTOMODE_RO"), optional("AUTOMODE_HIDE"), optional("AUTOMODE_PIN"), optional("AUTOMODE_TMPFS"));
+    let reopened = optional("AUTOMODE_REOPEN");
+    // Only what Landlock lets the command write anyway may be made writable again.
+    if let Some(outside) = reopened.iter().find(|target| !under(target, &writable)) {
+        fail(&format!("{}: AUTOMODE_REOPEN names a path outside AUTOMODE_RW", String::from_utf8_lossy(outside)));
+    }
     let keep = if selftest { None } else { env::var_os("AUTOMODE_ENV_KEEP").map(|v| list(Some(v))) };
     let cover_file = if selftest { None } else { env::var_os("AUTOMODE_COVER") };
     let abi_cap = env::var("AUTOMODE_FAKE_ABI").ok().map(|v| v.trim().parse::<i64>().unwrap_or(0));
@@ -401,6 +441,23 @@ fn main() {
             fail("AUTOMODE_COVER must be an empty regular file");
         }
     }
+    // AUTOMODE_COMMAND: the text the plugin judged. It runs in place of the command opencode
+    // handed over, so that what was judged is what runs. Only for the one argument form opencode
+    // uses for the shells that are wrapped, `-c <command>`; anything else does not run.
+    let shell_args: Vec<OsString> = match if selftest { None } else { env::var_os("AUTOMODE_COMMAND") } {
+        Some(text) => {
+            if args.len() != 3 || args[1] != "-c" {
+                fail("AUTOMODE_COMMAND is set, but the arguments are not `-c <command>`");
+            }
+            // bash and dash go on reading options after `-c`: such a text would be taken for
+            // options, not for the command that was judged.
+            if matches!(text.as_bytes().first(), Some(b'-') | Some(b'+')) {
+                fail("AUTOMODE_COMMAND starts with - or +, which the shell would read as options");
+            }
+            vec![OsString::from("-c"), text]
+        }
+        None => args[1..].to_vec(),
+    };
 
     // The environment: every AUTOMODE_* variable goes, and with a keep list everything not on it.
     let names: Vec<OsString> = env::vars_os().map(|(name, _)| name).collect();
@@ -411,12 +468,12 @@ fn main() {
         }
     }
 
-    // 1. Private user + mount + PID namespace. The uid stays the same, so files keep their owner
+    // 1. Private user + mount + PID + IPC namespace. The uid stays the same, so files keep their owner
     //    and a non-root exec drops every capability the namespace granted.
     // SAFETY: getuid and getgid cannot fail; unshare takes flags only.
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-    if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID) } != 0 {
-        die(b"unshare(user, mount, pid namespace)");
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWIPC) } != 0 {
+        die(b"unshare(user, mount, pid, ipc namespace)");
     }
     write_file("/proc/self/setgroups", "deny");
     write_file("/proc/self/uid_map", &format!("{uid} {uid} 1"));
@@ -481,6 +538,9 @@ fn main() {
     }
     for target in &readonly {
         make_readonly(target);
+    }
+    for target in &reopened {
+        reopen(target); // after every read-only bind, so none of them covers it again
     }
     for target in &hidden {
         hide(target, &cover);
@@ -552,8 +612,9 @@ fn main() {
         if unsafe { libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong, 0, 0, 0) } != 0 {
             die(b"prctl(PR_CAP_AMBIENT_CLEAR_ALL)");
         }
-        // The real shell, with exactly the arguments opencode passed.
-        let error = process::Command::new(&shell).arg0(&shell).args(&args[1..]).exec();
+        // The real shell, with the arguments opencode passed, or with the judged text as its
+        // `-c` command (AUTOMODE_COMMAND).
+        let error = process::Command::new(&shell).arg0(&shell).args(&shell_args).exec();
         die_with(shell.as_bytes(), error);
     }
     loop {
