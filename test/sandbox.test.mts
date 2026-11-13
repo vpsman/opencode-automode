@@ -12,7 +12,7 @@ import path from "node:path";
 import { after, afterEach, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import * as sandbox from "../sandbox.ts";
-import { gitOnly, usesSsh, SessionState } from "../decide.ts";
+import { gitDirectories, gitOnly, pushDestinations, usesSsh, SessionState } from "../decide.ts";
 
 const { plan } = sandbox;
 const ROOT = path.resolve(import.meta.dirname, "..");
@@ -36,9 +36,23 @@ interface RunOptions {
   gitWritable?: boolean;
   env?: Record<string, string>;
   cacheDirs?: string[];
+  allowedPaths?: string[];
 }
+// As index.ts makes it: a git-only call is granted the repositories its git commands end in, and
+// the one a push goes to.
 const planFor = (command: string, o: RunOptions = {}) =>
-  plan({ projectRoots: [repo], allowedPaths: [], cacheDirs: o.cacheDirs ?? [], gitWritable: o.gitWritable ?? gitOnly(command), exposeSsh: usesSsh(command, repo, new SessionState(repo)), keepSockets: [], showPaths: [], hidePaths: [], project: repo });
+  plan({
+    projectRoots: [repo],
+    allowedPaths: o.allowedPaths ?? [],
+    cacheDirs: o.cacheDirs ?? [],
+    gitWritable: o.gitWritable ?? gitOnly(command),
+    ...(gitOnly(command) ? { gitCwds: gitDirectories(command, repo), gitPushTo: pushDestinations(command, repo) } : {}),
+    exposeSsh: usesSsh(command, repo, new SessionState(repo)),
+    keepSockets: [],
+    showPaths: [],
+    hidePaths: [],
+    project: repo,
+  });
 
 function run(command: string, o: RunOptions = {}) {
   const p = planFor(command, o);
@@ -47,7 +61,7 @@ function run(command: string, o: RunOptions = {}) {
     ...process.env,
     AUTOMODE_SHELL: "/bin/bash",
     AUTOMODE_RW: p.rw.join(SEP),
-    AUTOMODE_RO: p.ro.join(SEP),
+    AUTOMODE_RO: p.ro.join(SEP), AUTOMODE_REOPEN: p.reopen.join(SEP),
     AUTOMODE_HIDE: p.hide.join(SEP),
     AUTOMODE_PIN: p.pin.join(SEP),
     AUTOMODE_TMPFS: p.tmpfs.join(SEP),
@@ -79,6 +93,107 @@ before(() => {
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
 describe("normal work inside the project", () => {
+  test("r4 24: a timed-out global hooks lookup is a problem", () => {
+    const bin = fs.mkdtempSync(path.join(tmp, "timeout-bin-"));
+    const gitExe = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+    fs.writeFileSync(path.join(bin, "git"), `#!/bin/sh\ncase " $* " in *" --git-dir "*) ;; *" core.hooksPath "*) exec sleep 5;; esac\nexec '${gitExe}' "$@"\n`, { mode: 0o755 });
+    const before = process.env.PATH;
+    process.env.PATH = `${bin}:${before}`;
+    try { assert.match(planFor("git status").problem ?? "", /hooksPath/); }
+    finally { process.env.PATH = before; }
+  });
+  test("r4 26: outside SysV shared memory, queues and semaphores are unreachable", () => {
+    const helper = path.join(tmp, "ipc-probe.py");
+    fs.writeFileSync(helper, [
+      "import ctypes, sys, json",
+      "c = ctypes.CDLL(None, use_errno=True)",
+      "mode = sys.argv[1]",
+      "if mode == 'create':",
+      "    ids = [c.shmget(0, 4096, 0o1600), c.msgget(0, 0o1600), c.semget(0, 1, 0o1600)]",
+      "    assert min(ids) >= 0, (ids, ctypes.get_errno())",
+      "    print(json.dumps(ids))",
+      "else:",
+      "    a,b,d = map(int, sys.argv[2:])",
+      "    buf = ctypes.create_string_buffer(512)",
+      "    if mode == 'remove':",
+      "        c.shmctl(a, 0, None); c.msgctl(b, 0, None); c.semctl(d, 0, 0)",
+      "    else:",
+      "        print(' '.join('hidden' if r < 0 else 'reachable' for r in [c.shmctl(a, 2, buf), c.msgctl(b, 2, buf), c.semctl(d, 0, 12)]))",
+    ].join("\n"));
+    const ids: number[] = JSON.parse(execFileSync("python3", [helper, "create"], { encoding: "utf8" }));
+    try {
+      const r = run(`python3 '${helper}' check ${ids.join(" ")}`);
+      assert.equal(r.status, 0, r.out);
+      assert.equal(r.stdout.trim(), "hidden hidden hidden");
+    } finally { execFileSync("python3", [helper, "remove", ...ids.map(String)]); }
+  });
+  test("r4 26: a worker pool and POSIX shared memory still work", () => {
+    const r = run("python3 -c 'import multiprocessing as m; from multiprocessing import shared_memory; p=m.Pool(2); assert p.map(abs, [-1,-2]) == [1,2]; p.close(); p.join(); s=shared_memory.SharedMemory(create=True,size=16); s.buf[0]=42; s.close(); s.unlink(); print(\"ok\")'");
+    assert.equal(r.status, 0, r.out);
+    assert.equal(r.stdout.trim(), "ok");
+  });
+  test("r4 8: showing a credential directory keeps its repositories protected", () => {
+    const base = path.join(repo, ".aws");
+    const bare = path.join(base, "fixtures", "fixture.git");
+    execFileSync("git", ["init", "-q", "--bare", bare]);
+    try {
+      const p = plan({ projectRoots: [repo], allowedPaths: [], cacheDirs: [], gitWritable: false, exposeSsh: false, keepSockets: [], showPaths: [base], hidePaths: [], project: repo });
+      assert.ok(p.ro.includes(bare), "visible bare repository is read-only");
+      assert.ok(!p.hide.includes(base));
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
+  });
+  test("r4 22: credentials and sockets inside .git are hidden at every depth", async () => {
+    const base = path.join(repo, ".git", "private-fixture");
+    fs.mkdirSync(base);
+    const samples = [
+      "private.pem", "private.key", ".env", "credentials.json", "id_ed25519",
+      "id_rsa", "id_ecdsa_work", "id_dsa", "store.p12", "cert.pfx", "trust.jks", "app.keystore", "vault.kdbx", ".env.local", ".env.production",
+      "credentials.yaml", "credentials.toml", "credentials.ini", "credentials.csv", "credentials.xml", "secrets.json", "secret.yml", "secrets.env", "secret.txt",
+      "my-service-account.json", "service_principal-prod.json", "gcp-serviceaccount.json", ".netrc", ".npmrc", ".pypirc", ".git-credentials", ".vault-token", ".pgpass", ".htpasswd", ".bash_history", ".zsh_history",
+      "login.keychain", "login.keychain-db", "SERVER.KEY", "Private.PEM",
+      ".ssh/anything", ".aws/credentials", ".gnupg/x", ".kube/config", ".azure/x", ".oci/x", ".password-store/x", ".config/gcloud/x", ".config/op/x", ".config/gh/hosts.yml", ".docker/config.json", ".cargo/credentials", ".cargo/credentials.toml", ".terraform.d/credentials.tfrc.json", ".local/share/keyrings/x",
+    ];
+    for (const f of samples) {
+      fs.mkdirSync(path.dirname(path.join(base, f)), { recursive: true });
+      fs.writeFileSync(path.join(base, f), "secret\n");
+    }
+    const socket = path.join(base, "agent.sock");
+    const server = await listen(socket);
+    try {
+      const p = planFor("git status");
+      let checked = 0;
+      for (const f of samples) {
+        const file = path.join(base, f);
+        if (!sandbox.isSecretPath(file)) continue;
+        checked++;
+        assert.ok(p.hide.some((hidden) => within(file, hidden)), f);
+      }
+      assert.ok(checked > 45, `${checked} credential patterns exercised`);
+      assert.ok(p.hide.includes(socket), "socket");
+      const r = run("cat .git/private-fixture/private.pem");
+      assert.equal(r.stdout, "");
+      assert.equal(r.status, 0, r.out);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+  // Since the seventh pass the value is the one git itself uses: read once in your own config
+  // (outside any repository), and in each repository as git reads it there and as the git that
+  // receives a push reads it (`-C <dir> --git-dir .`).
+  const lookups = { "your own": '*" --git-dir "*) ;; *" core.hooksPath "*) exit 128;;', "the repository's": '*" --git-dir . "*) ;; *" --git-dir "*" core.hooksPath "*) exit 128;;', "the receiving": '*" --git-dir . "*" core.hooksPath "*) exit 128;;' };
+  for (const [scope, pattern] of Object.entries(lookups)) test(`r4 24: failed ${scope} hooks lookup is a problem`, () => {
+    const bin = fs.mkdtempSync(path.join(tmp, "lookup-bin-"));
+    const gitExe = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+    fs.writeFileSync(path.join(bin, "git"), `#!/bin/sh\ncase " $* " in ${pattern} esac\nexec '${gitExe}' "$@"\n`, { mode: 0o755 });
+    const before = process.env.PATH;
+    process.env.PATH = `${bin}:${before}`;
+    try {
+      assert.match(planFor("git status").problem ?? "", /hooksPath|hooks path/);
+    } finally {
+      process.env.PATH = before;
+    }
+  });
   test("writes work for ordinary commands", () => {
     const r = run("echo x > f && cat f");
     assert.equal(r.status, 0, r.out);
@@ -607,7 +722,7 @@ describe("r2 B: what a sandboxed command could plant", () => {
     fs.symlinkSync(tmp, path.join(repo, "not-a-dir"));
     made(path.join(repo, "not-a-dir"));
     const p = planFor("ls");
-    const env = { ...process.env, AUTOMODE_SHELL: "/bin/bash", AUTOMODE_RW: p.rw.join(SEP), AUTOMODE_RO: p.ro.join(SEP), AUTOMODE_HIDE: p.hide.join(SEP), AUTOMODE_PIN: [...p.pin, path.join(repo, "not-a-dir")].join(SEP), AUTOMODE_TMPFS: p.tmpfs.join(SEP), AUTOMODE_COVER: cover };
+    const env = { ...process.env, AUTOMODE_SHELL: "/bin/bash", AUTOMODE_RW: p.rw.join(SEP), AUTOMODE_RO: p.ro.join(SEP), AUTOMODE_REOPEN: p.reopen.join(SEP), AUTOMODE_HIDE: p.hide.join(SEP), AUTOMODE_PIN: [...p.pin, path.join(repo, "not-a-dir")].join(SEP), AUTOMODE_TMPFS: p.tmpfs.join(SEP), AUTOMODE_COVER: cover };
     const r = spawnSync(WRAPPER, ["-c", "echo ran"], { cwd: repo, env, encoding: "utf8" });
     assert.equal(r.status, 126, r.stderr);
     assert.doesNotMatch(r.stdout, /ran/);
@@ -716,6 +831,94 @@ describe("r2 30: an allowed push can do all of its work", () => {
       fs.rmSync(remote, { recursive: true, force: true });
     }
   });
+
+  // Round 4, finding 21 (decision 1): a push also works in the repository it pushes to.
+  test("r4 21: a push to a bare repository in an allowed path works, and another call cannot write there", () => {
+    const allowed = fs.mkdtempSync(path.join(home, "push-allowed-"));
+    const remote = path.join(allowed, "store.git");
+    execFileSync("git", ["init", "-q", "--bare", remote]);
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "to an allowed path");
+    try {
+      const r = run(`git push ${remote} HEAD:refs/heads/pushed`, { allowedPaths: [allowed] });
+      assert.equal(r.status, 0, r.out);
+      assert.equal(execFileSync("git", ["--git-dir", remote, "rev-parse", "refs/heads/pushed"], { encoding: "utf8" }).trim(), git("rev-parse", "HEAD").trim());
+      // Its hooks and config are read-only for the push as well.
+      const planted = attempt(`echo x >> ${remote}/config; echo x > ${remote}/hooks/pre-receive`, { allowedPaths: [allowed], gitWritable: true });
+      assert.match(planted.out, /Read-only file system/);
+      assert.ok(!fs.existsSync(path.join(remote, "hooks", "pre-receive")));
+      // A git-only call that does not push there has it read-only whole.
+      attempt(`echo x > ${remote}/planted`, { allowedPaths: [allowed], gitWritable: true });
+      assert.ok(!fs.existsSync(path.join(remote, "planted")));
+    } finally {
+      fs.rmSync(allowed, { recursive: true, force: true });
+    }
+  });
+
+  test("r4 21: a fetch and a pull from a repository on this machine only read it: they work with it read-only", () => {
+    const remote = path.join(tmp, "fetch-remote.git");
+    execFileSync("git", ["init", "-q", "--bare", remote]);
+    git("remote", "add", "fetched", remote);
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "to fetch back");
+    const branch = git("rev-parse", "--abbrev-ref", "HEAD").trim();
+    execFileSync("git", ["-C", repo, "push", "-q", "fetched", `HEAD:refs/heads/${branch}`]);
+    try {
+      for (const command of ["git fetch fetched", `git pull --ff-only fetched ${branch}`]) {
+        const r = run(command);
+        assert.equal(r.status, 0, `${command}: ${r.out}`);
+        assert.ok(r.plan.ro.includes(remote), `${command}: the source is read-only`);
+        assert.ok(!r.plan.gitDirs.includes(remote), command);
+      }
+      assert.equal(git("rev-parse", `refs/remotes/fetched/${branch}`).trim(), git("rev-parse", "HEAD").trim());
+    } finally {
+      git("remote", "remove", "fetched");
+      fs.rmSync(remote, { recursive: true, force: true });
+    }
+  });
+});
+
+// Round 4, finding 21 (decision 1): a populated submodule is part of the repository a command
+// works in, whether git keeps it under `modules/` or in the submodule's own work tree.
+describe("r4 21: a call that goes into a submodule kept in its own work tree", () => {
+  const upstream = path.join(tmp, "lib-upstream");
+  const superUpstream = path.join(tmp, "super-upstream.git");
+  const lib = path.join(repo, "lib");
+  const identity = ["-c", "user.name=t", "-c", "user.email=t@t"];
+  const inLib = (...args: string[]) => execFileSync("git", ["-C", lib, ...args], { encoding: "utf8" });
+  let second = "";
+  before(() => {
+    // `lib/.git` is a directory (what `git submodule add` leaves for a clone that was there).
+    execFileSync("git", ["init", "-q", upstream]);
+    execFileSync("git", ["-C", upstream, ...identity, "commit", "-q", "--allow-empty", "-m", "one"]);
+    execFileSync("git", ["clone", "-q", upstream, lib]);
+    git("-c", "protocol.file.allow=always", "submodule", "add", "-q", upstream, "lib");
+    assert.ok(fs.statSync(path.join(lib, ".git")).isDirectory(), "the submodule keeps its git directory in its work tree");
+    git(...identity, "commit", "-q", "-m", "a submodule");
+    execFileSync("git", ["init", "-q", "--bare", superUpstream]);
+    git("remote", "add", "super", superUpstream);
+    git("push", "-q", "super", "HEAD:refs/heads/main");
+    execFileSync("git", ["-C", upstream, ...identity, "commit", "-q", "--allow-empty", "-m", "two"]);
+    second = execFileSync("git", ["-C", upstream, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  });
+  after(() => {
+    git("remote", "remove", "super");
+    git("rm", "-q", "-f", "--cached", "lib", ".gitmodules");
+    git(...identity, "commit", "-q", "-m", "no submodule");
+    git("config", "--remove-section", "submodule.lib");
+    for (const dir of [lib, upstream, superUpstream, path.join(repo, ".gitmodules")]) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("r4 21: a fetch that recurses fetches in the submodule", () => {
+    const r = run("git fetch --recurse-submodules=yes super");
+    assert.equal(r.status, 0, r.out);
+    assert.doesNotMatch(r.out, /Errors during submodule fetch|Read-only file system/);
+    assert.equal(inLib("rev-parse", "refs/remotes/origin/HEAD").trim(), second);
+    assert.ok(r.plan.gitDirs.includes(path.join(lib, ".git")), "the submodule is in the call's before-and-after check");
+  });
+
+  test("r4 21: a call that is not git-only still has the submodule's git directory read-only", () => {
+    attempt("echo x > lib/.git/planted");
+    assert.ok(!fs.existsSync(path.join(lib, ".git", "planted")));
+  });
 });
 
 // ---- round 3, group D ----
@@ -761,7 +964,7 @@ describe("r3 26: a directory that can be entered or written but not listed", () 
     const p = asOther(() => planFor("ls"));
     assert.equal(p.problem, undefined);
     assert.ok(p.hide.includes(dir), p.hide.join(" "));
-    const env = { ...process.env, AUTOMODE_SHELL: "/bin/bash", AUTOMODE_RW: p.rw.join(SEP), AUTOMODE_RO: p.ro.join(SEP), AUTOMODE_HIDE: p.hide.join(SEP), AUTOMODE_PIN: p.pin.join(SEP), AUTOMODE_TMPFS: p.tmpfs.join(SEP), AUTOMODE_COVER: cover };
+    const env = { ...process.env, AUTOMODE_SHELL: "/bin/bash", AUTOMODE_RW: p.rw.join(SEP), AUTOMODE_RO: p.ro.join(SEP), AUTOMODE_REOPEN: p.reopen.join(SEP), AUTOMODE_HIDE: p.hide.join(SEP), AUTOMODE_PIN: p.pin.join(SEP), AUTOMODE_TMPFS: p.tmpfs.join(SEP), AUTOMODE_COVER: cover };
     const r = spawnSync(WRAPPER, ["-c", `touch ${dir}/planted 2>/dev/null; echo ran`], { cwd: repo, env, encoding: "utf8" });
     assert.match(r.stdout, /ran/, r.stderr);
     fs.chmodSync(dir, 0o700);
@@ -806,7 +1009,7 @@ describe("r3 34: lockwrite refuses a terminal and root", () => {
   afterEach(() => fs.rmSync(marker, { force: true }));
   const envFor = () => {
     const p = planFor("ls");
-    return { ...process.env, AUTOMODE_SHELL: "/bin/bash", AUTOMODE_RW: p.rw.join(SEP), AUTOMODE_RO: p.ro.join(SEP), AUTOMODE_HIDE: p.hide.join(SEP), AUTOMODE_PIN: p.pin.join(SEP), AUTOMODE_TMPFS: p.tmpfs.join(SEP), AUTOMODE_COVER: cover };
+    return { ...process.env, AUTOMODE_SHELL: "/bin/bash", AUTOMODE_RW: p.rw.join(SEP), AUTOMODE_RO: p.ro.join(SEP), AUTOMODE_REOPEN: p.reopen.join(SEP), AUTOMODE_HIDE: p.hide.join(SEP), AUTOMODE_PIN: p.pin.join(SEP), AUTOMODE_TMPFS: p.tmpfs.join(SEP), AUTOMODE_COVER: cover };
   };
   const onTerminal = (fds: string, args: string[], env: NodeJS.ProcessEnv = envFor()) => {
     const r = spawnSync("python3", ["-I", PTY, fds, ...args], { cwd: repo, env, encoding: "utf8", timeout: 30_000 });
