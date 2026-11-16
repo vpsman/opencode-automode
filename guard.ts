@@ -4790,7 +4790,9 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
     if (longOption(args, ["--extract", "--get"]) || args.some((a) => /^-[a-zA-Z]*x/.test(a) && !a.startsWith("--")) || /^[a-zA-Z]*x/.test(first)) return `${name} -x writes the files the archive names`;
   }
   if ((name === "unzip" && unzipWords(args).writes) || name === "7z" || name === "cpio" || name === "rar" || name === "unrar") return `${name} writes the files the archive names`;
-  if (/^(gunzip|unxz|unzstd|bunzip2|uncompress)$/.test(name) || (/^(gzip|xz|zstd|bzip2)$/.test(name) && args.some((a) => /^(-[a-zA-Z]*d|--decompress|--uncompress)$/.test(a)))) return `${name} -d writes files next to its input`;
+  // (Council project review 1, round 4: `-d` anywhere in a cluster, `gzip -dk`; and the other
+  // compressors the write checks know.)
+  if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|unlz4)$/.test(name) || (/^(gzip|xz|zstd|bzip2|lzop|lz4|lzip|brotli)$/.test(name) && args.some((a) => /^(-[a-zA-Z]*d[a-zA-Z]*|--decompress|--uncompress)$/.test(a)))) return `${name} -d writes files next to its input`;
   if (name === "patch") {
     const got = getopt(args, PATCH_OPTIONS);
     if (got.unknown || !got.opts.some((o) => ["--dry-run", "-o", "--output"].includes(o.name))) return "patch writes the files the diff names";
@@ -4867,7 +4869,12 @@ function unnamedWriteDirs(name: string, args: string[]): (string | undefined)[] 
   if (name === "7z") return args.some((a) => /^-o/.test(a)) ? place(args.filter((a) => /^-o/.test(a)).map((a) => a.slice(2))) : [];
   if (name === "git") return [undefined];
   if (name === "curl" || name === "wget") return place(fetcherWrites(name, args).chosen.map((c) => c.dir || "."));
-  if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|gzip|xz|zstd|bzip2)$/.test(name)) return place(args.filter((a) => !a.startsWith("-")).map((f) => path.dirname(f)));
+  // (Round 4: an option that puts the output elsewhere, zstd's `--output-dir-flat=.`, lzop's
+  // `-p`, a `-o`: the place is not read, and the project is marked.)
+  if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|unlz4|gzip|xz|zstd|bzip2|lzop|lz4|lzip|brotli)$/.test(name)) {
+    if (args.some((a) => /^--(output|path)|^-[a-zA-Z]*[op]/.test(a))) return [undefined];
+    return place(args.filter((a) => !a.startsWith("-")).map((f) => path.dirname(f)));
+  }
   if (["cp", "mv", "install", "rsync"].includes(name)) {
     const words = copyWords(name, args);
     if (words.unknown) return [undefined];
@@ -7067,6 +7074,27 @@ const SAFE_AFTER_WRITE = new Set([
   // their only allowed options are the ones on fetcherWords' lists.
   ...listed("curl wget"),
 ]);
+// Council project review 1, round 4: whether a command runs a program that may run code the
+// session can write (index.ts holds a write back while one may still be running): a file by its
+// path, a shell given a script, or a name off the safe list. git and the readers whose program-
+// running options are judged on their own (their programs are program positions of their own,
+// or ask) are not.
+const RUN_READERS = new Set(["git", "sed", "jq", "find", "zip", ...AWKS]);
+export function runsProjectCode(cmds: Simple[]): boolean {
+  return cmds.some((cmd) =>
+    programs(cmd.argv).some((at) => {
+      const word = cmd.argv[at];
+      const name = path.basename(word);
+      const args = cmd.argv.slice(at + 1);
+      if (word.includes("/")) return true;
+      if (SHELLS.has(name)) return name === "source" || name === "." || shellScript(name, args) !== undefined;
+      if (name === "rg") return args.some((w) => w === "--pre" || w.startsWith("--pre="));
+      if (name === "less" || name === "more" || name === "tar") return pagerRuns(name, args);
+      return !SAFE_AFTER_WRITE.has(name) && !RUN_READERS.has(name);
+    }),
+  );
+}
+const pagerRuns = (name: string, args: string[]) => (name === "tar" ? !!process.env.TAR_OPTIONS : args.some((a) => /^-[a-zA-Z]*k|^--l/.test(a)) || !!process.env.LESSOPEN || !!process.env.LESSCLOSE);
 // git's subcommands that read objects, refs or the index, or write refs: no filter, driver or
 // alias runs for them, and their hooks and config are read-only in the sandbox. (`push` among
 // them, as `fetch` is: it sends objects, and whether it may run at all is the push check's.)

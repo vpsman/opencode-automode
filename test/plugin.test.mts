@@ -2497,6 +2497,8 @@ describe("council project review 1: one record of what was written for every ses
     try {
       const before = await call(host, "npm test", { sessionID: "cp1-before" });
       assert.equal(before.permission.effect, "allow", before.permission.message);
+      // (Over before the write: a write waits for no call that runs code of the project, round 4.)
+      await host.after({ tool: "shell", sessionID: "cp1-before", messageID: "m1", id: before.id, status: "completed" });
       const wrote = await call(host, "sed -i 's/echo ok/echo changed/' package.json", { sessionID: "cp1-parent" });
       assert.equal(wrote.permission.effect, "allow", wrote.permission.message);
       for (const id of ["cp1-child", "cp1-before"]) {
@@ -2525,7 +2527,9 @@ describe("council project review 1, round 2: what the record and the shell's env
     g("checkout", "-q", here);
     try {
       const host = await start({ useClassifier: false });
-      assert.equal((await call(host, "npm test", { sessionID: "cp1r2-b" })).permission.effect, "allow");
+      const first = await call(host, "npm test", { sessionID: "cp1r2-b" });
+      assert.equal(first.permission.effect, "allow");
+      await host.after({ tool: "shell", sessionID: "cp1r2-b", messageID: "m1", id: first.id, status: "completed" });
       const sw = await call(host, "git switch cp1-r2-other", { sessionID: "cp1r2-a" });
       assert.equal(sw.permission.effect, "allow", sw.permission.message);
       assert.equal(runShell(sw.shell).status, 0);
@@ -2597,3 +2601,26 @@ describe("council project review 1, round 3: a plant one session made pauses the
     }
   });
 });
+
+describe("council project review 1, round 4: a write waits for no call that runs code of the project", () => {
+  test("a write asks while an allowed call that runs programs of the project may still be running", async () => {
+    const host = await start({ useClassifier: false });
+    const runner = decidedCall(host, "sleep 1; make", "cp1r4");
+    await runner.decision;
+    const w = await call(host, "printf 'all:\\n' > cp1r4.mk", { sessionID: "cp1r4" });
+    assert.equal(w.permission.effect, "ask");
+    assert.match(w.permission.message, /may still be running/);
+  });
+  test("a call that only reads holds no write back", async () => {
+    const host = await start({ useClassifier: false });
+    const reader = decidedCall(host, "sleep 1; ls", "cp1r4-ls");
+    await reader.decision;
+    const ok = await call(host, "printf x > cp1r4.txt", { sessionID: "cp1r4-ls" });
+    assert.equal(ok.permission.effect, "allow", ok.permission.message);
+  });
+});
+function decidedCall(host: Host, command: string, sessionID: string) {
+  const id = `dc-${++ids}`;
+  const decision = host.tool({ tool: "shell", sessionID, messageID: "m1", id, input: { command } });
+  return { id, decision };
+}

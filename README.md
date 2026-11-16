@@ -225,7 +225,10 @@ For each shell tool call:
      As a second line the plugin keeps what the session wrote, for the whole session,
      approved commands and approved edits included, in one record for every session of the
      project (a subagent works in a session of its own); a session an earlier opencode process
-     saw counts as having written anywhere in the project: once the session has written a file
+     saw, or a call the model allowed, counts as having written anywhere in the project. A call
+     that writes asks while another allowed call that runs programs of the project (anything
+     off the safe list below) may still be running, in the same message, in the background or
+     in another session: that call was judged before the write: once the session has written a file
      anywhere in the project, every program goes to the model unless it is on a short safe
      list (shell syntax and builtins, text, file and archive tools, `curl` and `wget`, and
      git's commands that read, add, commit, switch or fetch, but not `pull`, `merge`
@@ -889,6 +892,10 @@ message), which is why pushes and ssh use deterministic rules instead.
   include, a symbolic or hard link) is left, where the same thing in the project or an
   `allowedPaths` directory would make the command ask. Your global hooks directory is
   checked wherever it lies.
+- **The plugin's own git** (its lookups, and the dry-run push with its ssh) runs with a `PATH`
+  without the entries a call can write (the project, `allowedPaths`, `sandboxWritable`, the
+  temp directories, relative ones): where the only `git` on `PATH` is in one of those (a
+  project-local toolchain), its lookups fail and the calls that need them ask.
 - **Calls running at the same time** are tracked within one opencode process. Two opencode
   processes on one checkout do not see each other's calls: a push one of them checked and a
   git-only call of the other do not hold each other back, and an approval in one opens no

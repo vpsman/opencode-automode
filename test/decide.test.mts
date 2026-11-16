@@ -704,7 +704,8 @@ describe("G: feature-branch push", () => {
   withKey("some.unknownKey", "x");
 
   test("G1: a config that cannot be read asks", async () => {
-    const bin = fs.mkdtempSync(path.join(tmp, "bin-"));
+    // (In the home: the plugin's own git leaves temp directories out of its PATH.)
+    const bin = fs.mkdtempSync(path.join(os.homedir(), "bin-"));
     const real = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
     fs.writeFileSync(path.join(bin, "git"), `#!/bin/sh\ncase " $* " in *" config "*"--show-scope"*) exit 3;; esac\nexec ${real} "$@"\n`, { mode: 0o755 });
     const before = process.env.PATH;

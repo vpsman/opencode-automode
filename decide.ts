@@ -38,6 +38,7 @@ import { scoreCommand, type ClassifierConfig } from "./kev.ts";
 import { findGitEntries, gitArgs, Scan, gitEnv, gitReadsElsewhere, gitRun, inGitDir, located as followed, madeByPlan, pushHooksMissing, HOOK_MANAGER_FILES, OPENCODE_CONFIG_NAMES, OPENCODE_PROJECT_FILES, opencodeDirs, protectedPaths, realpath, safeGit, workTreeSubmodules } from "./sandbox.ts";
 import { canonical, type Printed } from "./canon.ts";
 import { PathWalkError, PWD_LEAD, fetchDestination, functionNames, pathFinds, pathHas, procRelative, runsItsWords, tempDirs, unseenWriter } from "./guard.ts";
+import { runsProjectCode } from "./guard.ts";
 import { abbreviates, allCommands, arithmeticAssignments, braceWords, expandNames, expandWord, gitMessageWords, EDITOR_ASSIGNMENT, editorCommand, programs, withoutGlobals, alsoByName, argvGuards, dangerousName, envAssignmentsOk, expansionProblem, gitCall, gitProblem, inputReads, landing, linkedReads, literalTargets, located, physical, placedReads, present, cdTo, type Place, type Places, observer, protectedNameIn, runtimeReads, single, stricter, strict, strictCommands, textGuards, tilde, tildeMismatch, unmodelled, writesOf, writtenBy, type Single, type StrictCommand, getopt, GIT_OPTIONS, lastOf, type Getopt, unreadableGlob, withoutExpansions } from "./guard.ts";
 
 export type Effect = "allow" | "ask" | "deny";
@@ -140,6 +141,10 @@ export interface Decision {
   bashOnly?: boolean;
   // A `"$(cat <<EOF ...)"` was printed as the text it stands for, judged by opencode's own PATH.
   folded?: boolean;
+  // Council project review 1, round 4: an allow that records writes, and one that runs programs
+  // of the project (index.ts: a write waits for no such call that may still be running).
+  writes?: boolean;
+  runsCode?: boolean;
   // On an ask: records what the call writes, as an allow does (its named writes, the marks of the
   // writes the checks cannot list, and the git work-tree changes it will make), for when the user
   // approves it (round 4, finding 4, second pass). The plugin calls it from its approval hook.
@@ -5409,7 +5414,13 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
     for (const r of roots.map(realish)) if (!session.unlisted.includes(r)) session.unlisted.push(r);
   };
   const asked = (d: Decision): Decision => (d.effect === "ask" ? { ...d, approve: d.rule === "classify" ? () => (commit(), unread()) : commit, ...(worktree.length ? { worktree } : {}) } : d);
-  const allowed = (d: Decision): Decision => (commit(), worktree.length ? { ...d, worktree } : d);
+  const d0 = { unread: false };
+  const flags = () => ({ ...(writes.length || marks.length || worktree.length || scope.pending.size || d0.unread ? { writes: true } : {}), ...(runsProjectCode(cmds) ? { runsCode: true } : {}) });
+  const allowed = (d: Decision): Decision => {
+    const f = flags();
+    commit();
+    return { ...d, ...f, ...(worktree.length ? { worktree } : {}) };
+  };
   if (gitIssue) return asked(askBy(gitIssue));
   if (writeIssue) return asked(askBy(writeIssue));
   if (verdict.action === "ask") return asked(fromRules(verdict));
@@ -5426,6 +5437,10 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   if (typeof guard.classifier.askAbove !== "number" || !(score < guard.classifier.askAbove)) {
     return asked({ effect: "ask", by: "model", rule: "classify", reason: `model risk ${score.toFixed(2)} (asks at ${guard.classifier.askAbove} and above)`, score, ms });
   }
+  // Council project review 1, round 4: what a call the model allows writes is code the checks do
+  // not read, as for one the user approves: the project is marked whole.
+  unread();
+  d0.unread = true;
   return allowed({ effect: "allow", by: "model", rule: "classify", reason: `model risk ${score.toFixed(2)}`, score, ms });
 }
 

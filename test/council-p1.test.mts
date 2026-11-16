@@ -10,10 +10,12 @@ import path from "node:path";
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_ASK, decideShell, SessionState, takeMoment, type Guard } from "../decide.ts";
-import { gitRun, plan } from "../sandbox.ts";
+import { gitRun, plan, pluginPath, setPluginWritable } from "../sandbox.ts";
+import http from "node:http";
 SessionState.moment = takeMoment;
 import { compileRules } from "../rules.ts";
 import { DEFAULT_CLASSIFIER } from "../kev.ts";
+import { runsProjectCode, allCommands } from "../guard.ts";
 
 assert.ok(process.env.GIT_CONFIG_GLOBAL?.startsWith(os.homedir()), "run through test/run.mjs, which supplies a throwaway $HOME");
 const base = fs.realpathSync(fs.mkdtempSync(path.join(os.homedir(), "council-p1-")));
@@ -224,4 +226,49 @@ test("git writes of the work tree the record missed, and uniq's stdin operand", 
 test("NODE_COMPILE_CACHE that is a writable root itself is a problem", async () => {
   const p = await withEnv({ NODE_COMPILE_CACHE: "/tmp" }, async () => plan({ projectRoots: [repo], allowedPaths: [], cacheDirs: [], gitWritable: false, exposeSsh: false, keepSockets: [], showPaths: [], hidePaths: [], project: repo }));
   assert.match(p.problem ?? "", /NODE_COMPILE_CACHE/);
+});
+
+// Round 4.
+test("decompressors that write the project: -d inside a cluster, and an output directory", async () => {
+  for (const writer of ["gzip -dk test.js.gz", "xz -dk f.xz", "zstd -dqf --output-dir-flat=. /tmp/x/test.js.zst", "zstd -d -f --output-dir-flat=. /tmp/x/test.js.zst"]) {
+    const s = new SessionState(repo);
+    await effect(writer, s);
+    assert.notEqual(await effect("npm test", s), "allow", writer);
+  }
+});
+
+test("a call the model allows marks the project as written", async () => {
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => res.end(JSON.stringify({ answers: { risky: { noul: 0.01 } } })));
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as { port: number }).port;
+  try {
+    const g = { ...guard, useClassifier: true, classifier: { ...DEFAULT_CLASSIFIER, endpoint: `http://127.0.0.1:${port}` } };
+    const s = new SessionState(repo);
+    const d = await decideShell(g, s, repo, `python3 -c "open('test.js','w').write('x')"`);
+    assert.equal(d.by, "model");
+    assert.equal(d.effect, "allow");
+    assert.ok(d.writes, "the decision says it writes");
+    const after = await decideShell(guard, s, repo, "npm test");
+    assert.notEqual(after.effect, "allow", after.reason);
+  } finally {
+    server.close();
+  }
+});
+
+test("what runs code of the project, for holding a write back", () => {
+  for (const c of ["make", "npm test", "./x.sh", "bash x.sh", "sleep 1; make", "rg --pre ./p x"]) assert.ok(runsProjectCode(allCommands(c)), c);
+  for (const c of ["ls", "git status", "cat f", "grep x f", "sed -n 1p f", "rg x"]) assert.ok(!runsProjectCode(allCommands(c)), c);
+});
+
+test("the plugin's own git has no PATH entry a call can write", () => {
+  const entries = [path.join(repo, "bin"), os.tmpdir(), "relative", "", "/usr/bin", "/bin"];
+  setPluginWritable((p) => p === repo || p.startsWith(repo + "/"));
+  try {
+    assert.deepEqual(pluginPath(entries.join(":")).split(":"), ["/usr/bin", "/bin"]);
+  } finally {
+    setPluginWritable(() => false);
+  }
 });

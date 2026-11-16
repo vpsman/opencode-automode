@@ -210,11 +210,29 @@ export interface GitResult {
   out: string;
 }
 
+// Council project review 1, round 4: the plugin's own git (its lookups, and the dry-run push
+// and ls-remote with their ssh) finds git and what git runs by PATH: an entry a call can write (in
+// the project or a writable path, a temp directory, a relative one) could hold a planted `git` or
+// `ssh` that would run in this process, outside the sandbox. Those entries are left out of its
+// PATH. `setPluginWritable` tells the places (index.ts); the working directory counts until then.
+let pluginWritable: ((p: string) => boolean) | undefined;
+export function setPluginWritable(writable: (p: string) => boolean): void {
+  pluginWritable = writable;
+}
+export function pluginPath(list = process.env.PATH ?? ""): string {
+  const temps = [...new Set(["/tmp", "/var/tmp", "/dev/shm", os.tmpdir()].flatMap((d) => [d, realpath(d)]))];
+  const cwd = process.cwd();
+  const writable = pluginWritable ?? ((p: string) => cwd !== "/" && !within(HOME, cwd) && within(p, cwd));
+  return list
+    .split(":")
+    .filter((e) => path.isAbsolute(e) && ![e, realpath(e)].some((p) => writable(p) || temps.some((t) => within(p, t))))
+    .join(":");
+}
 const GIT_SAFE = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.untrackedCache=false", "-c", "core.askPass=", "-c", "core.pager=cat"];
 export const gitEnv = (): NodeJS.ProcessEnv => {
   // GIT_NO_LAZY_FETCH: a partial clone's missing object is not fetched from its promisor remote,
   // whose `uploadpack` a repository's config names (council project review 1).
-  const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0", GIT_ASKPASS: "", SSH_ASKPASS: "", SSH_ASKPASS_REQUIRE: "never", GIT_PAGER: "cat", GIT_NO_LAZY_FETCH: "1" };
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0", GIT_ASKPASS: "", SSH_ASKPASS: "", SSH_ASKPASS_REQUIRE: "never", GIT_PAGER: "cat", GIT_NO_LAZY_FETCH: "1", PATH: pluginPath() };
   for (const name of ["GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_EXTERNAL_DIFF", "GIT_EDITOR"]) delete env[name];
   return env;
 };

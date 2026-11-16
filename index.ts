@@ -42,7 +42,7 @@ import { fileURLToPath } from "node:url";
 import { Plugin } from "@opencode/plugin";
 import { compileRules, compilePattern, within } from "./rules.ts";
 import { closeGitSnapshot, decideFile, decideRead, decideShell, EXPECT_MS, expectedRepos, gitDirectories, gitOnly, gitWriteDirectories, gitMaintainDirectories, gitStateTampered, gitTampered, mirrorable, noteGitCall, projectRoots, pushCandidate, pushDestinations, quarantineGitFiles, realish, sandboxBreaks, SessionState, unseenWrites, usesSsh, type Decision, type Expected, type GitCall, type Guard } from "./decide.ts";
-import { envKept, envStringProblem, gitElsewhere, plan, realpath, Scan, shellOwn, type Plan } from "./sandbox.ts";
+import { envKept, envStringProblem, gitElsewhere, plan, realpath, Scan, setPluginWritable, shellOwn, type Plan } from "./sandbox.ts";
 import { loadConfig, type Config } from "./config.ts";
 import { bentEnv, bentPath, pathFinds, pathHas, shellAlsoKeeps, shellCdpath } from "./guard.ts";
 import { canonical } from "./canon.ts";
@@ -313,6 +313,12 @@ export default Plugin.define({
       return decision;
     };
     let guard = makeGuard();
+    // Council project review 1, round 4: the places a call can write, which the plugin's own git
+    // leaves out of its PATH (sandbox.ts, pluginPath).
+    setPluginWritable((p) => {
+      const top = realpath(project);
+      return within(p, top) || within(p, project) || [...config.allowedPaths, ...config.sandboxWritable].some((d) => within(p, d));
+    });
 
     const sessions = new Map<string, SessionState>();
     const session = (id: string) => {
@@ -445,6 +451,13 @@ export default Plugin.define({
       if (call.mover) {
         const push = others.find((c) => c.push && (!c.decided || c.decision.effect === "allow"));
         if (push) return `a checked push may still be running (${clip(push.command, 80)}), and this call gets a writable .git, with which it could move HEAD or a branch under it`;
+      }
+      // Council project review 1, round 4: a call allowed earlier (in the same message, in the
+      // background, in another session) is judged by the record as it was then. A write now could
+      // change what it runs once it gets there: the write asks while one may still be running.
+      if (call.decision.writes) {
+        const runner = others.find((c) => c.decided && c.decision.effect === "allow" && c.decision.runsCode);
+        if (runner) return `another allowed call that runs programs of the project may still be running (${clip(runner.command, 80)}), and what this call writes could change what that runs after it was judged`;
       }
       const open = windows().find((e) => reaches(call, e.dirs));
       if (open) return `an approved command may still be creating a repository in ${open.dirs[0]}, and this call could write there`;

@@ -94,7 +94,8 @@ after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
 describe("normal work inside the project", () => {
   test("r4 24: a timed-out global hooks lookup is a problem", () => {
-    const bin = fs.mkdtempSync(path.join(tmp, "timeout-bin-"));
+    // (In the home: the plugin's own git leaves temp directories out of its PATH.)
+    const bin = fs.mkdtempSync(path.join(home, "timeout-bin-"));
     const gitExe = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
     fs.writeFileSync(path.join(bin, "git"), `#!/bin/sh\ncase " $* " in *" --git-dir "*) ;; *" core.hooksPath "*) exec sleep 5;; esac\nexec '${gitExe}' "$@"\n`, { mode: 0o755 });
     const before = process.env.PATH;
@@ -183,7 +184,7 @@ describe("normal work inside the project", () => {
   // receives a push reads it (`-C <dir> --git-dir .`).
   const lookups = { "your own": '*" --git-dir "*) ;; *" core.hooksPath "*) exit 128;;', "the repository's": '*" --git-dir . "*) ;; *" --git-dir "*" core.hooksPath "*) exit 128;;', "the receiving": '*" --git-dir . "*" core.hooksPath "*) exit 128;;' };
   for (const [scope, pattern] of Object.entries(lookups)) test(`r4 24: failed ${scope} hooks lookup is a problem`, () => {
-    const bin = fs.mkdtempSync(path.join(tmp, "lookup-bin-"));
+    const bin = fs.mkdtempSync(path.join(home, "lookup-bin-"));
     const gitExe = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
     fs.writeFileSync(path.join(bin, "git"), `#!/bin/sh\ncase " $* " in ${pattern} esac\nexec '${gitExe}' "$@"\n`, { mode: 0o755 });
     const before = process.env.PATH;
