@@ -2624,3 +2624,23 @@ function decidedCall(host: Host, command: string, sessionID: string) {
   const decision = host.tool({ tool: "shell", sessionID, messageID: "m1", id, input: { command } });
   return { id, decision };
 }
+
+describe("council project review 1, round 5: edits and hooked git calls", () => {
+  test("an edit asks while an allowed call that runs programs of the project may still be running", async () => {
+    const host = await start({ useClassifier: false });
+    const runner = decidedCall(host, "sleep 1; make", "cp1r5");
+    await runner.decision;
+    const permission: any = { sessionID: "cp1r5", action: "edit", resources: [path.join(project, "Makefile")], effect: "allow" };
+    await host.permission(permission);
+    assert.equal(permission.effect, "ask");
+    assert.match(permission.message, /may still be running/);
+  });
+  test("a write asks while an allowed git call that runs hooks may still be running", async () => {
+    const host = await start({ useClassifier: false });
+    const commit = decidedCall(host, "git commit --allow-empty -m cp1r5", "cp1r5-git");
+    await commit.decision;
+    const w = await call(host, "printf x > cp1r5.txt", { sessionID: "cp1r5-git" });
+    assert.equal(w.permission.effect, "ask");
+    assert.match(w.permission.message, /may still be running/);
+  });
+});

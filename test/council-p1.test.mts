@@ -272,3 +272,26 @@ test("the plugin's own git has no PATH entry a call can write", () => {
     setPluginWritable(() => false);
   }
 });
+
+// Round 5.
+test("what runs code of the project: git that runs hooks, and readers given a program file", () => {
+  for (const c of ["git commit -m x", "git checkout main", "git push", "sed -f s.sed f", "awk -f p.awk f", "jq -f q.jq f", "zip -T a.zip f"]) assert.ok(runsProjectCode(allCommands(c)), c);
+  for (const c of ["git status", "git diff", "git log -p", "sed -n 1p f", "awk '{print $1}' f", "jq . f"]) assert.ok(!runsProjectCode(allCommands(c)), c);
+});
+
+test("the plugin reads the work tree of no repository outside the project: it marks it whole", async () => {
+  const r = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp1-outside-")));
+  try {
+    execFileSync("git", ["init", "-q", "-b", "main", r]);
+    fs.writeFileSync(path.join(r, "f"), "x\n");
+    execFileSync("git", ["-C", r, "add", "f"]);
+    execFileSync("git", ["-C", r, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"]);
+    execFileSync("git", ["-C", r, "branch", "other"]);
+    const s = new SessionState(repo);
+    await effect(`git -C ${r} checkout other`, s);
+    assert.equal(s.worktree.length, 0, "no status taken");
+    assert.ok(s.unlisted.includes(r), JSON.stringify(s.unlisted));
+  } finally {
+    fs.rmSync(r, { recursive: true, force: true });
+  }
+});

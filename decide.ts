@@ -38,7 +38,7 @@ import { scoreCommand, type ClassifierConfig } from "./kev.ts";
 import { findGitEntries, gitArgs, Scan, gitEnv, gitReadsElsewhere, gitRun, inGitDir, located as followed, madeByPlan, pushHooksMissing, HOOK_MANAGER_FILES, OPENCODE_CONFIG_NAMES, OPENCODE_PROJECT_FILES, opencodeDirs, protectedPaths, realpath, safeGit, workTreeSubmodules } from "./sandbox.ts";
 import { canonical, type Printed } from "./canon.ts";
 import { PathWalkError, PWD_LEAD, fetchDestination, functionNames, pathFinds, pathHas, procRelative, runsItsWords, tempDirs, unseenWriter } from "./guard.ts";
-import { runsProjectCode } from "./guard.ts";
+import { gitOnlyReads, runsProjectCode } from "./guard.ts";
 import { abbreviates, allCommands, arithmeticAssignments, braceWords, expandNames, expandWord, gitMessageWords, EDITOR_ASSIGNMENT, editorCommand, programs, withoutGlobals, alsoByName, argvGuards, dangerousName, envAssignmentsOk, expansionProblem, gitCall, gitProblem, inputReads, landing, linkedReads, literalTargets, located, physical, placedReads, present, cdTo, type Place, type Places, observer, protectedNameIn, runtimeReads, single, stricter, strict, strictCommands, textGuards, tilde, tildeMismatch, unmodelled, writesOf, writtenBy, type Single, type StrictCommand, getopt, GIT_OPTIONS, lastOf, type Getopt, unreadableGlob, withoutExpansions } from "./guard.ts";
 
 export type Effect = "allow" | "ask" | "deny";
@@ -4998,10 +4998,16 @@ function worktreeStatus(top: string): Map<string, string> | undefined {
 }
 // The work-tree change a git call will make where it runs, or undefined where the check cannot
 // tell (the directory unknown, not a repository, HEAD unborn, git failing).
-function worktreeBefore(dir: string | undefined): WorkTreeChange | undefined {
+// Council project review 1, round 5: only in a repository of the project, whose configuration
+// every sandboxed call has read-only. One elsewhere (a temp directory) may be one a call still
+// running made after its plan, whose configuration it can rewrite between the filter check and
+// the status, and the status would run what it names here: its work tree is marked whole
+// (`outside`) and not read.
+function worktreeBefore(dir: string | undefined, roots: string[]): WorkTreeChange | { outside: string } | undefined {
   if (dir === undefined) return undefined;
   const top = safeGit(["-C", dir, "rev-parse", "--show-toplevel"])?.trim();
   if (!top) return undefined;
+  if (!roots.some((r) => within(realish(top), r))) return { outside: realish(top) };
   const head = safeGit(["-C", top, "rev-parse", "--verify", "-q", "HEAD"])?.trim();
   if (!head) return undefined;
   const status = worktreeStatus(top);
@@ -5288,7 +5294,11 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
       const at = cwdOf(u.cmd);
       let dir: string | undefined = at;
       for (const d of u.git) dir = /[$`*?[\]]/.test(d) || /^~[^/]/.test(d) ? undefined : path.isAbsolute(tilde(d)) ? tilde(d) : dir === undefined ? undefined : `${dir}/${d}`;
-      const before = worktreeBefore(dir);
+      const before = worktreeBefore(dir, projectRoots(session).map(realish));
+      if (before && "outside" in before) {
+        mark(before.outside, u.cmd);
+        continue;
+      }
       if (before) {
         if (!worktree.some((w) => w.top === before.top)) worktree.push(before);
         marksBy.set(u.cmd, [...(marksBy.get(u.cmd) ?? []), before.top]);
@@ -5415,7 +5425,10 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   };
   const asked = (d: Decision): Decision => (d.effect === "ask" ? { ...d, approve: d.rule === "classify" ? () => (commit(), unread()) : commit, ...(worktree.length ? { worktree } : {}) } : d);
   const d0 = { unread: false };
-  const flags = () => ({ ...(writes.length || marks.length || worktree.length || scope.pending.size || d0.unread ? { writes: true } : {}), ...(runsProjectCode(cmds) ? { runsCode: true } : {}) });
+  // (Round 5: a git that only reads runs what the repository's configuration names, as the
+  // safe list reads it: a filter, a textconv, fsmonitor.)
+  const gitReadRuns = () => cmds.some((cmd) => programs(cmd.argv).some((at) => path.basename(cmd.argv[at]) === "git" && gitOnlyReads(cmd.argv.slice(at + 1)) && gitConfigProblem(cmd, cmd.argv.slice(at + 1), true) !== undefined));
+  const flags = () => ({ ...(writes.length || marks.length || worktree.length || scope.pending.size || d0.unread ? { writes: true } : {}), ...(runsProjectCode(cmds) || gitReadRuns() ? { runsCode: true } : {}) });
   const allowed = (d: Decision): Decision => {
     const f = flags();
     commit();

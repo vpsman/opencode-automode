@@ -902,6 +902,15 @@ export default Plugin.define({
               return;
             }
           }
+          // Council project review 1, round 5: as for a shell call that writes (besides).
+          const runner = [...live].find((c) => c.decided && c.decision.effect === "allow" && c.decision.runsCode);
+          if (runner) {
+            const decision: Decision = { effect: "ask", by: "rules", rule: "ask", reason: `another allowed call that runs programs of the project may still be running (${clip(runner.command, 80)}), and this edit could change what that runs after it was judged` };
+            apply(event, decision);
+            log(config, { ...base, ...decision });
+            editAsked(0);
+            return;
+          }
         }
         if (event.action === "edit" || event.action === "read") {
           for (const [at, resource] of event.resources.entries()) {

@@ -7079,7 +7079,16 @@ const SAFE_AFTER_WRITE = new Set([
 // path, a shell given a script, or a name off the safe list. git and the readers whose program-
 // running options are judged on their own (their programs are program positions of their own,
 // or ask) are not.
-const RUN_READERS = new Set(["git", "sed", "jq", "find", "zip", ...AWKS]);
+// (Round 5: sed, awk, jq and zip with a program read from a file, or an option that runs one, by
+// the safe list's own tests.)
+const RUN_READERS = new Set(["find"]);
+// (Round 5: git runs the repository's hooks, and every ref it updates runs reference-transaction:
+// a runner, but for the subcommands that only read and run no hook.)
+const GIT_ONLY_READS = new Set(listed("status diff log show blame ls-files ls-tree rev-parse rev-list cat-file show-ref for-each-ref merge-base count-objects describe shortlog whatchanged grep"));
+export const gitOnlyReads = (args: string[]): boolean => {
+  const call = gitCall(args);
+  return typeof call !== "string" && GIT_ONLY_READS.has(call.sub ?? "");
+};
 export function runsProjectCode(cmds: Simple[]): boolean {
   return cmds.some((cmd) =>
     programs(cmd.argv).some((at) => {
@@ -7090,6 +7099,14 @@ export function runsProjectCode(cmds: Simple[]): boolean {
       if (SHELLS.has(name)) return name === "source" || name === "." || shellScript(name, args) !== undefined;
       if (name === "rg") return args.some((w) => w === "--pre" || w.startsWith("--pre="));
       if (name === "less" || name === "more" || name === "tar") return pagerRuns(name, args);
+      if (name === "sed") return sedProblem(args) !== undefined;
+      if (AWKS.has(name)) return awkProblem(args) !== undefined;
+      if (name === "jq") return args.some((w) => /^(-[a-zA-Z]*[fL]|--from-file|--library-path)/.test(w) || /\b(import|include)\b/.test(w));
+      if (name === "zip") return args.some((w) => /^-[a-zA-Z0-9]*T/.test(w) || /^--(test|unzip-command)/.test(w));
+      if (name === "git") {
+        const call = gitCall(args);
+        return typeof call === "string" || !GIT_ONLY_READS.has(call.sub ?? "");
+      }
       return !SAFE_AFTER_WRITE.has(name) && !RUN_READERS.has(name);
     }),
   );
