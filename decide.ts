@@ -24,6 +24,7 @@ import {
   isRootLike,
   makeScope,
   readVerdict,
+  realish,
   within,
   type Action,
   type Matcher,
@@ -117,8 +118,10 @@ export const PLAIN_PATTERN = /^(\.{1,2}\/|\/)?[A-Za-z0-9_][\w.+\/-]*( [\w.+\/:=@
 // "Always allow" is only mirrored for programs that do not run arbitrary other programs or send
 // data out: an allowlist, because the list of programs that can is open-ended (awk, sed, make,
 // docker, tar, strace, ...). Project scripts (`./x *`) are mirrored: they run sandboxed.
+// (Council round 1: not `git stash` or `git restore`, whose only asks are the rules' asks for what
+// they discard; a saved `git stash *` made `git stash clear` an allow.)
 const MIRROR_OK =
-  /^(\.\/\S+|git (status|diff|log|show|add|commit|checkout|switch|restore|stash|branch|tag|fetch|pull|merge|cherry-pick|revert|rm|mv|blame)|cargo (build|check|test|clippy|fmt|doc|tree|metadata|bench|nextest)|go (build|test|vet|fmt)|(npm|pnpm|yarn|bun) (run|test)|pytest|tsc|eslint|prettier|ruff|mypy|black|isort|jest|vitest|ls|cat|head|tail|grep|wc|diff|stat|file|tree|du|df|ps|jq|yq|uniq|cut)( |$)/;
+  /^(\.\/\S+|git (status|diff|log|show|add|commit|checkout|switch|branch|tag|fetch|pull|merge|cherry-pick|revert|rm|mv|blame)|cargo (build|check|test|clippy|fmt|doc|tree|metadata|bench|nextest)|go (build|test|vet|fmt)|(npm|pnpm|yarn|bun) (run|test)|pytest|tsc|eslint|prettier|ruff|mypy|black|isort|jest|vitest|ls|cat|head|tail|grep|wc|diff|stat|file|tree|du|df|ps|jq|yq|uniq|cut)( |$)/;
 export const mirrorable = (pattern: string) => PLAIN_PATTERN.test(pattern) && MIRROR_OK.test(pattern);
 
 export interface Decision {
@@ -5054,6 +5057,17 @@ export async function decideShell(guard: Guard, session: SessionState, cwd: stri
   if (issued) return withApproval(session, issued);
   const printed = canonical(command);
   if ("ask" in printed) return withApproval(session, askBy(`the command cannot be printed back in the plain spelling the rules and the shell read alike (${printed.ask})`));
+  // Council round 3: a folded `"$(cat <<'X' ...)"` runs no `cat`. That is the command as written
+  // only when the `cat` PATH finds is the real one: one in a directory a call can write (the
+  // project, an allowed path, a temp directory) may be another program, and the call asks, as a
+  // command that cannot be printed does (what you approve runs as issued).
+  if (printed.folded) {
+    const roots = projectRoots(session).map(realish);
+    const writable = (p: string) => [...roots, ...guard.allowedPaths, ...(guard.writable ?? [])].some((d) => within(realish(p), realish(d)));
+    // (A relative PATH entry is not placed: a `cd` in the call may come before the substitution.)
+    const odd = pathFinds("cat", undefined, writable, () => false);
+    if (odd) return withApproval(session, askBy(`the command's "$(cat <<EOF ...)" is printed as the text it stands for, and the cat it would run is not plainly the real one (${odd.why})`));
+  }
   const decision = await decidePrinted(guard, session, cwd, printed, signal, scan);
   return { ...withApproval(session, decision), printed: printed.text, ...(printed.bashOnly ? { bashOnly: true } : {}) };
   } catch (e) {
@@ -5341,7 +5355,7 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
     return at === ".git" ? "a path inside or named .git, where git finds hooks and config, which the command may write" : at ? "a file opencode or a git hook loads and runs, which the command may write" : undefined;
   };
   // B11: what a word reads, judged where it leads, and a link made to a credential location.
-  const fromPlaces = stricter(stricter(placedReads(where, scope, judgeAt, landedProtected), inputReads(printed.inputs, text, where, here, scope, printed.judgedInputs)), linkedReads(where, scope, judgeAt));
+  const fromPlaces = stricter(stricter(placedReads(where, scope, judgeAt, landedProtected), inputReads(printed.inputs, text, where, here, scope, printed.judgedInputs)), linkedReads(where, scope, judgeAt, landedProtected));
   const fromWords = stricter(stricter(stricter(argvGuards(cmds, context), expansionProblem(text)), stricter(runtimeReads(text, where, scope, (c, args, diff) => gitConfigProblem(c, args, diff) === undefined, printed), fromPlaces)), stricter(arithmeticAssignments(arithmeticSets), optionNamedPath(cmds, (c) => where.places.get(c)?.map((p) => p.real))));
   const combined = !fromText ? fromWords : !fromWords ? fromText : fromText.action === "ask" ? fromText : fromWords.action === "ask" ? fromWords : (fromWords.files ? fromWords : fromText);
   // The rules read a quoted `~` as the home directory, bash does not: their verdict is about other
@@ -5388,19 +5402,8 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
 }
 
 // The path with the symlinks of its deepest existing ancestor resolved.
-export function realish(p: string): string {
-  const tail: string[] = [];
-  for (let cur = p; ; ) {
-    try {
-      return path.join(fs.realpathSync(cur), ...tail);
-    } catch {
-      const parent = path.dirname(cur);
-      if (parent === cur) return p;
-      tail.unshift(path.basename(cur));
-      cur = parent;
-    }
-  }
-}
+// (One resolver for the rules and the checks here: rules.ts, realish.)
+export { realish };
 
 // Where `rel` leads from the directory `top` as the kernel walks it (a symbolic link is followed
 // before the `..` after it applies), when that is strictly inside `top`; undefined otherwise: an
@@ -5441,7 +5444,9 @@ const PROTECTED_NAMES = [".git", ...OPENCODE_PROJECT_FILES, ...HOOK_MANAGER_FILE
 // Files the sandbox keeps read-only for shell commands; the edit tool must not be a way around.
 function protectedFile(guard: Guard, session: SessionState, target: string, scan: Scan): string | undefined {
   const p = realish(target);
-  const parts = p.split("/");
+  // The names on the path as written and where it leads (council round 2: a link's own name in
+  // `.opencode/` asks, wherever it leads).
+  const parts = [...path.resolve(target).split("/"), ...p.split("/")];
   if (parts.includes(".git")) return "changes a file inside a git directory (hooks and config run code)";
   if (parts.some((part) => OPENCODE_NAME.test(part))) return "changes opencode's project-level config, which opencode loads without asking";
   if (parts.some((part) => HOOK_MANAGER_NAME.test(part))) return "changes a hook manager's files, which git hooks run";

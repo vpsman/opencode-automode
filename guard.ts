@@ -1736,7 +1736,9 @@ function gitDestroys(sub: string, rest: string[], exists?: (word: string) => boo
     const force = has(["--force"], "f");
     if (has([], "DMC") || (del && force) || (force && operands.length > 0) || (force && has(["--move", "--copy"], "mc"))) return discards;
   }
-  if (sub === "tag" && has(["--delete"], "d")) return discards;
+  // (Council round 3, reversing round 3's allow at the user's request: `tag -f` with a name
+  // replaces a tag that may be there, and tags keep no reflog to get the old one back.)
+  if (sub === "tag" && (has(["--delete"], "d") || (has(["--force"], "f") && operands.length > 0))) return discards;
   if (sub === "gc" && own.some((w) => /^--prune=/.test(w))) return "git gc --prune=<date> deletes objects nothing refers to, which git otherwise keeps for a while";
   if (sub === "fetch" || sub === "pull") return fetchMoves(sub, rest);
   return undefined;
@@ -6097,20 +6099,26 @@ export function placedReads(where: Located, scope: Scope, judgeAt: (dir: string,
 // kernel walks it), what a program reads that its words do not name (`grep -r`, `tar -C`), a link
 // a program other than ln, cp or mv makes (`tar x`, `git checkout`), and a link inside a
 // directory that cp or mv copies or moves whole.
-export function linkedReads(where: Located, scope: Scope, judgeAt: (dir: string, words: string[]) => { action: string; reason: string }): GuardVerdict | undefined {
+// `protectedAt` (council round 1): where a written word or a redirect leads through a link the
+// call makes, a protected place there (`ln -s .git/hooks/post-checkout h && echo x > h`) asks,
+// as writeProblem asks for one the tree holds now.
+export function linkedReads(where: Located, scope: Scope, judgeAt: (dir: string, words: string[]) => { action: string; reason: string }, protectedAt?: (file: string) => string | undefined): GuardVerdict | undefined {
   let verdict: GuardVerdict | undefined;
   const add = (reason: string) => void (verdict = stricter(verdict, { action: "ask", reason }));
   const classify = (reason: string) => void (verdict = stricter(verdict, { action: "classify", reason }));
   // The commands as they are read here: their words after bash's own (`if`, `!`) and the
   // directories they may run in.
-  const read: { own: string[]; dirs: string[]; argv: string[]; out: string[]; inputs: string[] }[] = [];
+  const read: { own: string[]; dirs: string[]; argv: string[]; out: string[]; inputs: string[]; cmd: Simple }[] = [];
+  // The words each command writes, as the guard lists them (for protectedAt).
+  const writeWords = new Map<Simple, Set<string>>();
+  if (protectedAt) for (const w of writesOf(where.cmds).writes) writeWords.set(w.cmd, new Set([...(writeWords.get(w.cmd) ?? []), w.word]));
   for (const cmd of where.cmds) {
     const places = where.places.get(cmd);
     if (!places || where.patterns.has(cmd)) continue;
     let k = 0;
     while (k < cmd.argv.length && RULES_KEYWORDS.has(cmd.argv[k])) k++;
     const own = cmd.argv.slice(k);
-    if (own.length >= 2 || cmd.out.length || cmd.in?.length) read.push({ own, dirs: [...new Set(places.map((p) => p.real))], argv: cmd.argv, out: cmd.out, inputs: cmd.in ?? [] });
+    if (own.length >= 2 || cmd.out.length || cmd.in?.length) read.push({ own, dirs: [...new Set(places.map((p) => p.real))], argv: cmd.argv, out: cmd.out, inputs: cmd.in ?? [], cmd });
   }
   // The links the call makes: where each lands (its name, with the directory it is in walked) and
   // what it may lead to.
@@ -6179,7 +6187,7 @@ export function linkedReads(where: Located, scope: Scope, judgeAt: (dir: string,
     }
   }
   // Each word as the rules read a path in it: after a `name=` and curl's `@`.
-  for (const { own, dirs, argv, inputs } of read) {
+  for (const { own, dirs, argv, inputs, cmd } of read) {
     const mine = ownLinks.get(argv);
     const madeHere = mine ? new Map([...made].filter(([at]) => !mine.has(at))) : made;
     // (mv, rm and unlink act on a link itself, not where it leads: a link the call made, named as
@@ -6216,6 +6224,8 @@ export function linkedReads(where: Located, scope: Scope, judgeAt: (dir: string,
         const self = onLink ? landed(homeOrHere(value, dir)) : undefined;
         const madeFor = self !== undefined && madeHere.has(self) ? new Map([...madeHere].filter(([at]) => at !== self)) : madeHere;
         for (const led of writesTo(value, dir, madeFor)) {
+          const held = writeWords.get(cmd)?.has(w) ? protectedAt?.(led) : undefined;
+          if (held) add(`${path.basename(own[0])} writes ${w}, which leads to ${led}: ${held}`);
           const v = again(led);
           if ((v.action === "ask" || v.action === "deny") && !CREDENTIAL_READ.test(v.reason) && !writtenAsks()) add(`${path.basename(own[0])} names ${w}, which leads to ${led}: ${v.reason}`);
           // S6: an answer of the model's for the walked path, where the written one is an allow.
@@ -6231,6 +6241,8 @@ export function linkedReads(where: Located, scope: Scope, judgeAt: (dir: string,
         if (t.length > ATTACHED_MAX) continue;
         if (expandedBeforeUp(t)) classify(`a redirect to ${t}, which holds an expansion before a \`..\`: where it leads cannot be walked`);
         for (const led of writesTo(t, dir, made)) {
+          const held = protectedAt?.(led);
+          if (held) add(`a redirect to ${t}, which leads to ${led}: ${held}`);
           const v = fileVerdict("edit", led, scope);
           if (v.action === "ask" || v.action === "deny") add(`a redirect to ${t}, which leads to ${led}: ${v.reason}`);
           else if (v.action === "classify") classify(`a redirect to ${t}, which leads to ${led}: ${v.reason}`);

@@ -76,6 +76,10 @@ export interface Printed {
   // (constantsOf): set once at the call's start, to plain text, and named nowhere else but as
   // `$name` or `${name}`. Only for the call itself, not the code of a nested shell.
   literals: string[];
+  // Council round 3: a `"$(cat <<'X' ...)"` was written as the text it stands for, so no `cat`
+  // runs for it. The caller checks that the `cat` PATH finds is one no call can have planted:
+  // where it is another program, the printed text would do something else than the command.
+  folded?: boolean;
 }
 export type Canonical = Printed | { ask: string };
 
@@ -667,6 +671,7 @@ class Lexer {
       // and not the other (found by the round 4 cross-check: a folded body was printed raw).
       if (this.operand && this.src.shared.docs !== docs) ask("a heredoc inside ${...}");
       const folded = quoted && this.src.shared.fold ? fold(tokens) : undefined;
+      if (folded !== undefined) folds++;
       if (folded !== undefined) this.lit(folded, true);
       else (this.parts ??= []).push({ kind: "sub", tokens, quoted });
     } else if (next === "{") this.param(quoted);
@@ -982,6 +987,8 @@ const PRIVATE = 0xe000;
 // How much text the braces of the command being printed have made so far (see `braces`).
 // `canonical` is not re-entered, so one counter serves it and the nested commands it prints.
 let braceText = 0;
+// How many `"$(cat <<'X' ...)"` were folded (Printed.folded), counted the same way.
+let folds = 0;
 
 // ---- variables that plainly hold a literal (round 4, finding 27, signed off) ----
 //
@@ -1346,7 +1353,9 @@ class Printer {
         // The cap is held before the texts are built: a long word times thousands of readings
         // took minutes to put in a set.
         if (out.length * texts.length > READINGS) return undefined;
-        out = [...new Set(out.flatMap((head) => texts.map((t) => head + t)))];
+        // (One text after distinct heads keeps them distinct: no set, which would hash each long
+        // head again at every part, quadratic in a word of thousands of parts.)
+        out = texts.length === 1 ? out.map((head) => head + texts[0]) : [...new Set(out.flatMap((head) => texts.map((t) => head + t)))];
       }
       return out;
     };
@@ -1883,12 +1892,16 @@ class Printer {
 function print(command: string, depth: number, where?: string): Printed & { defines: boolean; moves: boolean; dupOnCompound: boolean } {
   if (depth > MAX_DEPTH) ask("deeply nested shells");
   try {
+    const folded = folds;
     let tokens = new Lexer(command, depth, false).list(false);
     const names = new Set<string>();
     defined(tokens, names);
     const defines = names.size > 0;
-    // Read again without folding.
-    if (defines) tokens = new Lexer(command, depth, false, 0, { docs: 0, fold: false }).list(false);
+    // Read again without folding (and what the first reading folded is not counted).
+    if (defines) {
+      folds = folded;
+      tokens = new Lexer(command, depth, false, 0, { docs: 0, fold: false }).list(false);
+    }
     const braces = braceText;
     const printer = new Printer(command, depth, defines);
     const out = printer.list(tokens);
@@ -1919,6 +1932,7 @@ export function canonical(command: string): Canonical {
     // The shell is started as `<shell> -c <text>`, and bash and dash go on reading options
     // after `-c`: a text that starts with `-` or `+` is taken for options, not for a command.
     braceText = 0;
+    folds = 0;
     if (/^[-+]/.test(command)) return { ask: "a command line that starts with - or +, which the shell reads as its own options" };
     // The text is handed to the shell as one argument or one variable, and the kernel takes no
     // single string above 128 KiB: a command near that size could not run as printed.
@@ -1926,7 +1940,7 @@ export function canonical(command: string): Canonical {
     const { text, judged, bashOnly, inputs, judgedInputs, arithLed, literals } = print(command, 0);
     if (/^[-+]/.test(text)) return { ask: "a command line that starts with - or + once blanks, comments and line continuations are gone, which the shell would read as its own options" };
     if (Buffer.byteLength(text) > MAX_TEXT) return { ask: "a command too long to hand to the shell in one piece once printed" };
-    return { text, judged, bashOnly, inputs, judgedInputs, arithLed, literals };
+    return { text, judged, bashOnly, inputs, judgedInputs, arithLed, literals, ...(folds ? { folded: true } : {}) };
   } catch (e) {
     if (e instanceof Ask) return { ask: e.message };
     // A mistake in this reader must not become an error the caller has to think of: whatever

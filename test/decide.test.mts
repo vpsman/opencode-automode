@@ -2541,7 +2541,9 @@ describe("r3 C: the argv guards walk every program the rules unwrap", () => {
   expectR3("10", "ask", ["unset -v -- PATH; ls", "builtin unset PATH; ls", "eval unset PATH; ls", "select PATH; do ls; done", "read TAR_OPTIONS < f; export TAR_OPTIONS; tar -xf t.tar"]);
   expectR3("10", "allow", ["unset -f PATH; ls", "set -- -a; ls"]);
   expectR3("22", "ask", ["git checkout ./scripts", "git checkout HEAD@{1} r3c.txt", "git checkout -p", "git switch -fc x", "git branch -dD x", "git branch --force x", "git gc --prune=0"]);
-  expectR3("22", "allow", ["git checkout --orphan r3-orphan", "git tag -f v1"]);
+  expectR3("22", "allow", ["git checkout --orphan r3-orphan"]);
+  // (Council round 3: `git tag -f` replaces a tag, which keeps no reflog.)
+  expectR3("22", "ask", ["git tag -f v1"]);
   expectR3("23", "classify", ["mv -t scripts /tmp/build.sh; ./scripts/build.sh", "uniq /tmp/x scripts/build.sh; ./scripts/build.sh", "git mv a.sh scripts/build.sh; ./scripts/build.sh", "for i in 1 2; do ./scripts/build.sh; tar -xf t.tar; done", "mkdir r3x && cd r3x && echo id > b.sh && ./b.sh"]);
   expectR3("24", "ask", ["mkdir -p sub/.gi{t,x}/hooks", "cp x sub/.[g]it/config", "echo x > .gi{s..u}/config", "sort -o .git/hooks/pre-commit f", "cp -t .git/hooks x"]);
   expectR3("24", "allow", ["cp x sub/[.]git/config", "rm -rf build/*", "rm -f *.md", "mv *.json out/", "cp docs/*.md out/"]);

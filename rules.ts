@@ -78,14 +78,32 @@ const forDecider = (v: Verdict, scope: Scope): Verdict => (scope.chatDecider && 
 // ---- paths ----
 
 // realpath that also works for a path that does not exist: resolves the deepest existing
-// ancestor and keeps the rest.
-function realish(p: string): string {
+// ancestor and keeps the rest. A link whose target is not there (yet) is followed, as the kernel
+// follows it when a write creates the file: `notes.md -> ~/.bash_profile` is judged as
+// ~/.bash_profile, not as a new file in the project (council round 1). Past 40 links the kernel
+// refuses the write, and the path is kept as it was.
+export function realish(p: string): string {
   const tail: string[] = [];
   let cur = p;
-  for (;;) {
+  for (let hops = 0; ; ) {
     try {
       return path.join(fs.realpathSync.native(cur), ...tail);
     } catch {
+      // (The link's own directory exists, and is resolved first. The target is joined on as
+      // text, not normalised: realpath then takes each `..` after the link before it, as the
+      // kernel does (`pivot/../x` with `pivot -> ../deep`: council round 2).)
+      // (Not in /dev or /proc: `/dev/stdout` leads to a descriptor, which is no path.)
+      let target: string | undefined;
+      try {
+        if (!/^\/(dev|proc)(\/|$)/.test(cur) && fs.lstatSync(cur).isSymbolicLink()) {
+          const text = fs.readlinkSync(cur);
+          target = path.isAbsolute(text) ? text : `${fs.realpathSync.native(path.dirname(cur))}/${text}`;
+        }
+      } catch {}
+      if (target !== undefined && ++hops <= 40) {
+        cur = target;
+        continue;
+      }
       const parent = path.dirname(cur);
       if (parent === cur) return p;
       tail.unshift(path.basename(cur));
@@ -777,7 +795,7 @@ function git(args: string[], scope: Scope): Verdict {
   if (sub === "submodule" && operands(rest)[0] === "deinit" && flag("--force", "f")) return ask("git submodule deinit --force deletes submodule working trees with their local changes");
   if (sub === "branch") return has("-D") || (has("-d", "--delete") && has("-f", "--force")) ? ask("git branch -D deletes a branch") : ALLOW;
   if (sub === "stash") return has("drop", "clear") ? ask("git stash drop deletes stashed changes") : ALLOW;
-  if (sub === "tag") return has("-d", "--delete") ? ask("git tag -d deletes a tag") : ALLOW;
+  if (sub === "tag") return has("-d", "--delete") ? ask("git tag -d deletes a tag") : has("-f", "--force") ? ask("git tag -f replaces a tag, which keeps no reflog") : ALLOW;
   if (sub === "reset" || sub === "clean" || sub === "checkout" || sub === "restore") return ALLOW;
   if (sub === "config") {
     if (has("--global", "--system")) return has("--get", "--get-all", "--list", "-l") ? ALLOW : ask("changes git config outside the repository");

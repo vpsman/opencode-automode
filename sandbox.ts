@@ -866,6 +866,9 @@ export function located(p: string): string {
 
 interface Protected {
   ro: string[];
+  // The directories whose links linkedInto follows (council round 3), walked together by the
+  // caller: a chain from one protected directory through another is held there.
+  linkTops?: string[];
   pin: string[];
   problems: string[];
   // Git directories the call may write that lie inside one that is read-only whole (gitPaths).
@@ -887,15 +890,21 @@ interface Protected {
 // answer (realpath(3) of the link) must then be the path its text names. That file is made
 // read-only like the hook (gitPaths); a call could otherwise rewrite what the hook runs, at the
 // next commit of whoever commits, outside the sandbox. Undefined for any other shape: the link then asks.
+// (Council: a `..` may step out of a directory a call could replace with a link, which then
+// decides where the rest of the path goes: `../../tools/sub/../pc`. Only one that stays where it
+// is passes: the hooks directory or a directory above it, which the plan pins as the way to a
+// protected path, or a directory above the script, pinned once the script is made read-only.)
 function hookScript(link: string, own: string[]): string | undefined {
   try {
     // (`link` lies in a hooks directory protect gave: where it lies, with no link on the way.)
     const dir = path.dirname(link);
     const text = fs.readlinkSync(link);
     let at = text.startsWith("/") ? "/" : dir;
+    const left: string[] = [];
     for (const part of text.split("/").filter(Boolean)) {
       if (part === ".") continue;
       if (part === "..") {
+        left.push(at);
         at = path.dirname(at);
         continue;
       }
@@ -904,10 +913,224 @@ function hookScript(link: string, own: string[]): string | undefined {
     }
     const st = fs.lstatSync(at);
     if (!st.isFile() || st.nlink > 1 || fs.realpathSync.native(link) !== at) return undefined;
+    if (left.some((d) => !within(dir, d) && !within(at, d))) return undefined;
     return own.some((d) => within(at, d)) ? at : undefined;
   } catch {
     return undefined;
   }
+}
+
+// Where a path leads as the kernel walks it (each link followed before a `..` after it), with
+// every symbolic link met on the way; `missing` when a step does not exist (the rest joined on),
+// with `gap` the first step that does not: a `..` after it is taken by text here, where the kernel
+// would follow whatever a command puts there first (council round 6).
+// Undefined for a walk that cannot be done (a link that cannot be read, more than 40 links, a
+// file with more of the path after it).
+function walkLinks(abs: string): { at: string; links: string[]; missing: boolean; gap?: string; left: string[] } | undefined {
+  const links: string[] = [];
+  // (The directories a `..` steps out of: one a command can replace with a link decides where the
+  // `..` goes. Council round 8.)
+  const left: string[] = [];
+  const rest = abs.split("/").filter((s) => s !== "" && s !== ".");
+  let cur = "/";
+  for (let hops = 0; rest.length; ) {
+    const part = rest.shift()!;
+    if (part === "..") {
+      left.push(cur);
+      cur = path.dirname(cur);
+      continue;
+    }
+    const next = path.join(cur, part);
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(next);
+    } catch {
+      return { at: path.join(next, ...rest), links, missing: true, gap: next, left };
+    }
+    if (!st.isSymbolicLink()) {
+      // (A file with more of the path after it: the kernel refuses the path, and a command that
+      // replaces the file decides where it goes. Council round 7.)
+      if (rest.length && !st.isDirectory()) return undefined;
+      cur = next;
+      continue;
+    }
+    if (++hops > 40) return undefined;
+    links.push(next);
+    let text: string;
+    try {
+      text = fs.readlinkSync(next);
+    } catch {
+      return undefined;
+    }
+    rest.unshift(...text.split("/").filter((s) => s !== "" && s !== "."));
+    if (text.startsWith("/")) cur = "/";
+  }
+  return { at: cur, links, missing: false, left };
+}
+
+// The symbolic links below `dir` at any depth (links are not followed), and with `hardLinks` the
+// regular files there that have another name; undefined past `limit` directories. Only links and
+// directories are looked at closer (and files, for `hardLinks`): a large `node_modules` is cheap.
+// `unlisted`: directories that could not be listed (council round 6: what they hold is unseen).
+function linksBelow(dir: string, hardLinks: boolean, limit = 100_000): { links: string[]; hard: string[]; unlisted: string[] } | undefined {
+  const links: string[] = [];
+  const hard: string[] = [];
+  const unlisted: string[] = [];
+  const queue = [dir];
+  for (let seen = 0; queue.length; ) {
+    if (++seen > limit) return undefined;
+    const at = queue.pop()!;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(at, { withFileTypes: true });
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") unlisted.push(at);
+      continue;
+    }
+    for (const e of entries) {
+      const p = path.join(at, e.name);
+      if (e.isSymbolicLink()) links.push(p);
+      else if (e.isDirectory()) queue.push(p);
+      else if (hardLinks && e.isFile()) {
+        try {
+          if (fs.lstatSync(p).nlink > 1) hard.push(p);
+        } catch {
+          // gone
+        }
+      }
+    }
+  }
+  return { links, hard, unlisted };
+}
+
+// Council round 3: the links inside a directory that is read-only because opencode or a git hook
+// runs what it holds (`.opencode/`, `.claude/`, `.agents/`, `.husky/`, `.lefthook/`: `tops`, the
+// project's own). A link there cannot be changed, but where it leads can:
+// `.opencode/plugin/x.ts -> ../../tools/x.ts` left `tools/x.ts` writable to every call, and
+// opencode loaded it at its next start. Round 7, after four rounds of holes in a walk that
+// followed links from directory to directory: one level, and what cannot be vouched for asks.
+// - A file inside one of `tops` with another name (a hard link) asks, whether a link leads to it
+//   or not (round 8), under `node_modules` too (round 10): bun and pnpm install from their
+//   stores by hard links, and the project's own `node_modules` usually shares them. The message
+//   says how to reinstall them as copies.
+// - A link to a place inside one of `tops` is held there already.
+// - A link to a file: one with another name (a hard link) asks, wherever it lies; one inside a
+//   writable directory (the temp directories always count: the rules let the edit tool write
+//   there) is made read-only.
+// - A link to a directory: one that is or holds a directory a command can write (`../..`, the
+//   project's top, /var) asks. Any other is listed once, not followed further: a symbolic link
+//   in it, a file with another name, a directory that cannot be listed or too many asks. One
+//   inside a writable directory is then made read-only.
+// - A link whose walk leads through another link a command could replace, through a file with
+//   more of the path after it, out of a directory with a `..` that a command could replace with
+//   a link (round 8), or to a place not there yet whose first missing step a command could make,
+//   asks; so does a link the check cannot follow.
+// Every call asks while one of these stands, naming it. More asks in setups that link shared
+// folders with links of their own, for a rule small enough to check by reading it.
+const LINKED_DIRS = 64;
+function linkedInto(tops: string[], rwDirs: string[]): { ro: string[]; problems: string[] } {
+  const ro: string[] = [];
+  const problems: string[] = [];
+  if (!tops.length) return { ro, problems };
+  const writable = [...rwDirs, ...["/tmp", "/var/tmp", os.tmpdir()].map(realpath)];
+  const insideRw = (p: string) => writable.some((d) => within(p, d));
+  const held = tops.map(realpath);
+  const isHeld = (p: string) => held.some((h) => within(p, h));
+  const listed = new Set<string>();
+  // Why a hard-linked file asks. (Council round 10, the user's decision: no exception for
+  // `node_modules`. bun and pnpm install a package by hard links from their stores, and the
+  // project's own `node_modules` usually holds the same files, so a call could rewrite what
+  // opencode loads through them. Reinstalled as copies, the files have one name each.)
+  // (Where to install again: the directory that holds the outermost `node_modules` below the
+  // protected directory, for pnpm's `.pnpm/<pkg>/node_modules/<pkg>` and nested installs alike.)
+  const installDir = (f: string): string | undefined => {
+    const h = held.find((d) => within(f, d));
+    if (h === undefined) return undefined;
+    const rel = path.relative(h, f).split("/");
+    const at = rel.indexOf("node_modules");
+    return at < 0 ? undefined : path.join(h, ...rel.slice(0, at));
+  };
+  // (`where`: what to say of the file's place, right after its name.)
+  const hardWhy = (f: string, where = ""): string => {
+    const dir = installDir(f);
+    return dir !== undefined
+      ? `${f}${where} has more than one name (hard links), as bun and pnpm install a package from their store, which the project's own node_modules usually shares: a call can rewrite it through another name. In ${dir}, remove node_modules and install again as copies (\`bun install --backend=copyfile\`, or pnpm with \`--package-import-method=copy\`)`
+      : `${f}${where} has more than one name (hard links): it can be rewritten through another one`;
+  };
+  for (const top of held) {
+    const below = linksBelow(top, true);
+    if (!below) {
+      problems.push(`${top} holds too many directories to look for symbolic links among them`);
+      continue;
+    }
+    for (const d of below.unlisted) problems.push(`${d} cannot be listed, in ${top}, which opencode or a git hook runs from: a link in it could lead anywhere`);
+    // (Round 8: a file there with another name can be rewritten through that name.)
+    for (const f of below.hard) problems.push(hardWhy(f, `, in ${top}, which opencode or a git hook runs from,`));
+    for (const link of below.links) {
+      const w = walkLinks(link);
+      if (!w) {
+        problems.push(`${link} is a symbolic link the check cannot follow, in a directory opencode or a git hook runs from`);
+        continue;
+      }
+      const swappable = w.links.find((l) => insideRw(l) && !isHeld(l));
+      if (swappable) {
+        problems.push(`${link} leads through the symbolic link ${swappable}, which a command could replace: what opencode or a git hook runs through it cannot be protected`);
+        continue;
+      }
+      // (Round 8: a directory a `..` steps out of that a command could replace with a link, so
+      // that the `..` goes elsewhere. Not one that is read-only, a writable root itself, or a
+      // parent of a protected directory: those are pinned. A parent of the target is pinned too
+      // when the target is made read-only, below.)
+      const loose = w.left.filter((d) => insideRw(d) && !isHeld(d) && !writable.includes(d) && !held.some((h) => within(h, d)));
+      const swapped = `${link} steps out of ${loose[0]} with a \`..\`, a directory a command could replace with a link to send the rest of the path elsewhere`;
+      if (w.missing) {
+        if (loose.length) problems.push(swapped);
+        else if (insideRw(w.gap!) && !isHeld(w.gap!)) problems.push(`${link} leads to ${w.at}, which is not there, and ${w.gap} lies in a directory a command can write: a command could put what opencode or a git hook runs there`);
+        continue;
+      }
+      const st = fs.lstatSync(w.at);
+      if (isHeld(w.at)) {
+        if (loose.length) problems.push(swapped);
+        else if (st.isFile() && st.nlink > 1) problems.push(`${link} leads to a file opencode or a git hook runs: ${hardWhy(w.at)}`);
+        continue;
+      }
+      if (st.isDirectory()) {
+        if (writable.some((d) => within(d, w.at))) {
+          problems.push(`${link} leads to ${w.at}, which is or holds a directory a command can write: what opencode or a git hook loads through it cannot be held read-only`);
+          continue;
+        }
+        if (!listed.has(w.at)) {
+          listed.add(w.at);
+          if (listed.size > LINKED_DIRS) {
+            problems.push(`the directories opencode or a git hook runs from link to more than ${LINKED_DIRS} directories, too many to look at`);
+            continue;
+          }
+          const inner = linksBelow(w.at, true);
+          const why = !inner
+            ? "holds too many directories to look at"
+            : inner.unlisted.length
+              ? `holds ${inner.unlisted[0]}, which cannot be listed`
+              : inner.links.length
+                ? `holds the symbolic link ${inner.links[0]}, which is not followed this far`
+                : inner.hard.length
+                  ? `holds ${inner.hard[0]}, which has another name (a hard link)`
+                  : undefined;
+          if (why) {
+            problems.push(`${link} leads to the directory ${w.at}, which ${why}: what opencode or a git hook loads through it cannot be protected`);
+            continue;
+          }
+        }
+      } else if (st.nlink > 1) {
+        // (A file with another name asks wherever it lies: the other name may be in the project.)
+        problems.push(`${link} leads to ${w.at}, which has ${st.nlink} hard links: it can be rewritten through another name`);
+        continue;
+      }
+      const kept = insideRw(w.at);
+      if (loose.some((d) => !(kept && within(w.at, d)))) problems.push(swapped);
+      else if (kept) ro.push(w.at);
+    }
+  }
+  return { ro, problems };
 }
 
 // The regular files below `dir` (or `dir` itself, a file), at any depth, to `limit` entries:
@@ -1202,13 +1425,17 @@ function gitPaths(found: Found, searchDirs: string[], rwDirs: string[], gitWrita
   conditionalHooks([...globalIncludes, ...systemIncludes], sayGlobal);
   // Hook managers, at the top of every checkout.
   const tops = [...found.tops.values()].flatMap((set) => [...set]);
+  // (Council round 3: where the links in the hook managers' directories lead, below.)
+  const managerDirs: string[] = [];
   for (const top of new Set([...tops, ...searchDirs.filter((d) => !["/tmp", "/var/tmp", realpath(os.tmpdir())].includes(d))])) {
     for (const name of HOOK_MANAGER_FILES) {
       const p = path.join(top, name);
-      if (lexists(p)) protect(p, "the hook manager file");
+      if (!lexists(p)) continue;
+      const real = protect(p, "the hook manager file");
+      if (real !== undefined && isDir(real)) managerDirs.push(real);
     }
   }
-  return { ro: [...new Set(ro)].filter(lexists), pin: [...new Set(pin)], problems: [...all, ...globalProblems], reopen: [...new Set(reopen)], watch: [...new Set(watch)], whole: [...new Set(whole)], judged: [...judged] };
+  return { linkTops: managerDirs, ro: [...new Set(ro)].filter(lexists), pin: [...new Set(pin)], problems: [...all, ...globalProblems], reopen: [...new Set(reopen)], watch: [...new Set(watch)], whole: [...new Set(whole)], judged: [...judged] };
 }
 
 // The symbolic links inside a git directory, at any depth (ninth pass: the eighth looked at the
@@ -1384,15 +1611,20 @@ function opencodePaths(project: string | undefined, rwDirs: string[]): Protected
   const ro: string[] = [];
   const problems: string[] = [];
   const dirs = opencodeDirs(project, rwDirs);
+  const held: string[] = [];
   for (const dir of dirs) {
     for (const name of OPENCODE_PROJECT_FILES) {
       const p = path.join(dir, name);
       if (isSymlink(p)) problems.push(`${p} is a symbolic link and cannot be protected`);
       else if (lexists(p)) ro.push(p);
       else if (name === ".opencode" && dir === dirs[0] && ensureDir(p, rwDirs)) ro.push(p);
+      else continue;
+      if (!isSymlink(p) && isDir(p)) held.push(p);
     }
   }
-  return { ro, pin: [], problems };
+  // (Council round 3: where the links in `.opencode/`, `.claude/` and `.agents/` lead: the
+  // caller walks them with the hook managers' directories, linkedInto.)
+  return { ro, pin: [], problems, linkTops: held };
 }
 
 const secretScope = makeScope("/", []);
@@ -1468,10 +1700,13 @@ export function protectedPaths(o: Pick<PlanOptions, "projectRoots" | "allowedPat
   const searchDirs = [...new Set([...o.projectRoots, ...o.allowedPaths].map(realpath))];
   const found = discover(searchDirs, { scan });
   const git = gitPaths(found, searchDirs, searchDirs, false, searchDirs);
-  const opencode = opencodePaths(o.project, searchDirs);
+  // (Round 8: opencode's directories in the writable parents a call has, temp ones included, as
+  // the plan has them.)
+  const opencode = opencodePaths(o.project, [...new Set([...searchDirs, ...["/tmp", "/var/tmp", os.tmpdir()].map(realpath)])]);
   // An edit asks where a call would (ninth pass).
   const links = linksOut((git.whole ?? []).map((dir) => ({ dir })), found.gitDirs, searchDirs, ["/tmp", "/var/tmp", os.tmpdir()].map(realpath), new Set(git.judged));
-  return { paths: [...git.ro, ...opencode.ro], problems: [...found.problems, ...git.problems, ...links, ...opencode.problems] };
+  const linked = linkedInto([...(git.linkTops ?? []), ...(opencode.linkTops ?? [])], searchDirs);
+  return { paths: [...git.ro, ...opencode.ro, ...linked.ro], problems: [...found.problems, ...git.problems, ...links, ...opencode.problems, ...linked.problems] };
 }
 
 // `scan`: the walks of this call's decision, used again here (round 3, finding 40).
@@ -1600,8 +1835,12 @@ export function plan(o: PlanOptions, scan?: Scan): Plan {
     }
   }
   const opencode = opencodePaths(o.project, rwDirs);
-  const ro = [...new Set([...git.ro, ...opencode.ro, ...closed])];
-  const problems = [...found.problems, ...lookupProblems, ...git.problems, ...opencode.problems];
+  // (Of the hook managers' directories, only the project's own: a checkout in a temp directory is
+  // not this project's matter, and its links could otherwise make every call here ask. opencode's
+  // directories are the session's and its writable parents', temp ones included: round 8.)
+  const followed = linkedInto([...(git.linkTops ?? []).filter((t) => own.some((o) => within(t, o))), ...(opencode.linkTops ?? [])], rwDirs);
+  const ro = [...new Set([...git.ro, ...opencode.ro, ...followed.ro, ...closed])];
+  const problems = [...found.problems, ...lookupProblems, ...git.problems, ...opencode.problems, ...followed.problems];
   // ssh-using commands see known_hosts, config and public keys; private keys stay hidden.
   // Credential files in the project and the allowed paths, at any depth.
   const inProject = [...found.secrets];
@@ -1688,13 +1927,19 @@ export const shellOwn = (name: string) => SHELL_OWN.test(name);
 // something else, and so does one this process has and the shell does not (eighth pass:
 // opencode hands a shell the environment of its session, which need not be this process's; with
 // `GIT_CONFIG_GLOBAL` set here alone the checks judged one file and the shell's git read your
-// default one). `GIT_NO_REPLACE_OBJECTS` changes which commit a ref names.
+// default one). `GIT_NO_REPLACE_OBJECTS` changes which commit a ref names. `HOME` and
+// `XDG_CONFIG_HOME` are where git finds its global configuration when `GIT_CONFIG_GLOBAL` is not
+// set (council round 1: a session `HOME` in the project, with a `.gitconfig` the session wrote
+// there, ran its `core.fsmonitor` from an allowed `git status`).
 const GIT_ELSEWHERE = /^GIT_(DIR|WORK_TREE|INDEX_FILE|COMMON_DIR|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|NAMESPACE|CONFIG|CONFIG_COUNT|CONFIG_KEY_\d+|CONFIG_VALUE_\d+|CONFIG_PARAMETERS|EXEC_PATH|SHALLOW_FILE|GRAFT_FILE|REPLACE_REF_BASE|ATTR_SOURCE|IMPLICIT_WORK_TREE)$/;
-const GIT_ELSEWHERE_IF_OTHER = /^GIT_(CONFIG_GLOBAL|CONFIG_SYSTEM|CONFIG_NOSYSTEM|CEILING_DIRECTORIES|DISCOVERY_ACROSS_FILESYSTEM|NO_REPLACE_OBJECTS)$/;
+const GIT_ELSEWHERE_IF_OTHER = /^(GIT_(CONFIG_GLOBAL|CONFIG_SYSTEM|CONFIG_NOSYSTEM|CEILING_DIRECTORIES|DISCOVERY_ACROSS_FILESYSTEM|NO_REPLACE_OBJECTS)|HOME)$/;
+// (`XDG_CONFIG_HOME` unset is `$HOME/.config`: the directory each git would use is compared.)
+const xdgConfig = (env: Record<string, string | undefined>) => env.XDG_CONFIG_HOME || (env.HOME === undefined ? undefined : path.join(env.HOME, ".config"));
 // The first such variable in the environment a shell is about to be given (`own`: this
 // process's), or undefined. One of the second group may be the shell's or this process's alone.
 export function gitElsewhere(env: Record<string, string | undefined>, own: Record<string, string | undefined> = process.env): string | undefined {
-  return [...new Set([...Object.keys(env), ...Object.keys(own)])].sort().find((name) => (GIT_ELSEWHERE.test(name) ? env[name] !== undefined : GIT_ELSEWHERE_IF_OTHER.test(name) && env[name] !== own[name]));
+  const name = [...new Set([...Object.keys(env), ...Object.keys(own)])].sort().find((name) => (GIT_ELSEWHERE.test(name) ? env[name] !== undefined : GIT_ELSEWHERE_IF_OTHER.test(name) && env[name] !== own[name]));
+  return name ?? (xdgConfig(env) !== xdgConfig(own) ? "XDG_CONFIG_HOME" : undefined);
 }
 const plainValue = (v: string) => v.length <= 12 || /^[\d.]+$/.test(v) || (!v.includes("@") && v.split(":").every((part) => /^(\/|~\/|\.\.?\/)[^\s]*$/.test(part) || part === ""));
 
