@@ -223,10 +223,13 @@ export function pluginPath(list = process.env.PATH ?? ""): string {
   const temps = [...new Set(["/tmp", "/var/tmp", "/dev/shm", os.tmpdir()].flatMap((d) => [d, realpath(d)]))];
   const cwd = process.cwd();
   const writable = pluginWritable ?? ((p: string) => cwd !== "/" && !within(HOME, cwd) && within(p, cwd));
-  return list
+  const kept = list
     .split(":")
     .filter((e) => path.isAbsolute(e) && ![e, realpath(e)].some((p) => writable(p) || temps.some((t) => within(p, t))))
     .join(":");
+  // (Round 6: an empty PATH is searched as the working directory: with no entry left, git is not
+  // found at all, and the lookups that need it ask.)
+  return kept || "/nonexistent/automode-no-path";
 }
 const GIT_SAFE = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.untrackedCache=false", "-c", "core.askPass=", "-c", "core.pager=cat"];
 export const gitEnv = (): NodeJS.ProcessEnv => {

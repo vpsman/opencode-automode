@@ -224,12 +224,19 @@ For each shell tool call:
      session in the state directory's `moments/`, removed thirty days after its last use.
      As a second line the plugin keeps what the session wrote, for the whole session,
      approved commands and approved edits included, in one record for every session of the
-     project (a subagent works in a session of its own); a session an earlier opencode process
+     project (a subagent works in a session of its own). A write here is one of content: `touch`,
+     `mkdir` and a compressor's copy of a file already in the project (`gzip -k f`) are not
+     counted, since what they make is empty or comes from a file the record already judges.
+     A session an earlier opencode process
      saw, or a call the model allowed, counts as having written anywhere in the project. A call
      that writes, or an edit, asks while another allowed call that runs programs of the project
      (anything off the safe list below, a git command that runs hooks, a `sed`, `awk` or `jq`
      given a program file) may still be running, in the same message, in the background or in
-     another session: that call was judged before the write: once the session has written a file
+     another session: that call was judged before the write. The other way round too: a call
+     that runs programs of the project asks while an allowed write decided before it may not
+     have run yet, and one whose decision took time (the model, a push's dry run) asks if a
+     write was recorded meanwhile. Approved commands run outside the sandbox and hold no
+     write back: once the session has written a file
      anywhere in the project, every program goes to the model unless it is on a short safe
      list (shell syntax and builtins, text, file and archive tools, `curl` and `wget`, and
      git's commands that read, add, commit, switch or fetch, but not `pull`, `merge`

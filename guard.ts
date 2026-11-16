@@ -4946,6 +4946,12 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       else if (name === "less") [...valued(args, "o", "--log-file"), ...valued(args, "O", "--LOG-FILE")].forEach((f) => add(f, false));
       // (Round 3: `-` is the input operand, `uniq - out`; the last of two or more operands is the
       // output, an option's value counted among them, which can only record more.)
+      // (Council project review 1, round 6: `python3 -m json.tool IN OUT` writes OUT.)
+      else if (/^python[0-9.]*$/.test(name) && args.some((a, k) => (a === "-m" && args[k + 1] === "json.tool") || a === "-mjson.tool")) {
+        const at = args.findIndex((a, k) => (a === "-m" && args[k + 1] === "json.tool") || a === "-mjson.tool");
+        const operands = args.slice(at + (args[at] === "-m" ? 2 : 1)).filter((a) => a === "-" || !a.startsWith("-"));
+        if (operands.length > 1) add(operands[1], true);
+      }
       else if (name === "uniq" || name === "xxd") {
         const operands = args.filter((a) => a === "-" || !a.startsWith("-"));
         add(operands.length > 1 ? operands.at(-1) : undefined, false);
@@ -6755,7 +6761,8 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
     if (word.includes("/")) runs(word);
     // (B7-2: a test runner's or a builder's file operand is code it runs, `pytest x_test.py`,
     // `go run x.go`: judged by its change time too, where it names a file.)
-    if (SHELLS.has(name) || INTERPRETERS.has(name) || FILE_RUNNERS.has(name) || /^python3?(\.\d+)?$/.test(name)) for (const f of files) runs(f, FILE_RUNNERS.has(name) ? "file" : false);
+    // (Round 6: `pytest tests/test_a.py::test_one` names the file before the `::`.)
+    if (SHELLS.has(name) || INTERPRETERS.has(name) || FILE_RUNNERS.has(name) || /^python3?(\.\d+)?$/.test(name)) for (const f of files) runs(f.includes("::") ? f.replace(/::.*$/, "") : f, FILE_RUNNERS.has(name) || f.includes("::") ? "file" : false);
     if (INTERPRETERS.has(name) || /^python3?(\.\d+)?$/.test(name)) {
       // -m/-c/-e execute a module or inline code, not their next operand as a script path.
       if (!args.some((a) => /^(-m|-c|-e|--eval|--print)$/.test(a))) {
@@ -7396,8 +7403,30 @@ const RUNNER_PLACE_OPTIONS = /^(-C|-d|-f|-S|-B|-P|-c|--directory|--dir|--cwd|--p
 // package directory, a build directory).
 // A spelling the reading cannot place counts as a runner when any of its words could be the
 // runner subcommand, with a place the check cannot tell (fail closed).
+// Council project review 1, round 6: every path a runner's word may hold, whatever the option
+// (`--start-directory=/tmp/d`, `-s/tmp/d`, `-include/tmp/x`, `-C linker=/tmp/x`, `-wrapper
+// /bin/sh,/tmp/x.sh`, `t.py::test_a`, `/tmp/d/...`, a path in quoted JSON): each part after a
+// `=`, `,` or `:`, each tail from a `/`, a short option's attached value, cut at a quote or a
+// brace. Those that exist count as places, read fail-closed.
+function pathPieces(w: string): string[] {
+  const pieces = new Set<string>(w.startsWith("-") ? [] : [w]);
+  for (let k = 0; k < w.length; k++) if ("=,:".includes(w[k])) pieces.add(w.slice(k + 1));
+  for (let k = w.indexOf("/"); k > 0; k = w.indexOf("/", k + 1)) if (w[k - 1] !== "/" && w[k - 1] !== ".") pieces.add(w.slice(k));
+  if (/^-[A-Za-z]./.test(w) && !w.startsWith("--")) pieces.add(w.slice(2));
+  return [...pieces]
+    .flatMap((v) => v.split(/[,="'{}\s]/))
+    .map((v) => v.replace(/::.*$/, "").replace(/\/\.\.\.$/, ""))
+    .filter((v) => v !== "" && !v.startsWith(":") && !/[$`]/.test(v));
+}
 export function runnerPlaces(name: string, args: string[], cwd: string | undefined, resolve: (word: string) => string | undefined): (string | undefined)[] | undefined {
   const words = args.filter((a) => a !== "--");
+  const existing = (word: string): string[] => {
+    if (word.startsWith("@")) return [];
+    return pathPieces(word).flatMap((piece) => {
+      const p = resolve(piece);
+      return p !== undefined && fs.existsSync(p) ? [isFile(p) ? path.dirname(p) : p] : [];
+    });
+  };
   const read = RUNNER_SUBS.has(name) ? runnerSub(name, args) : undefined;
   // Trust is granted by safeAfterWrite, never by completing a list of dev tools.
   // make reads its words as codeFiles does: the `-C` chain, in every spelling.
@@ -7410,6 +7439,8 @@ export function runnerPlaces(name: string, args: string[], cwd: string | undefin
       const target = tilde(word);
       places.push(expands(word) || (!path.isAbsolute(target) && base === undefined) ? undefined : physical(path.isAbsolute(target) ? target : `${base}/${target}`));
     }
+    // (Round 6: make's other words too, read as every runner's are.)
+    for (const w of words) places.push(...(w.startsWith("@") ? [undefined] : existing(w)));
     return [...new Set(places)];
   }
   const places: (string | undefined)[] = [cwd];
@@ -7436,12 +7467,17 @@ export function runnerPlaces(name: string, args: string[], cwd: string | undefin
       if (value === undefined) continue;
       const p = resolve(value);
       place(value, !!p && isFile(p));
+      places.push(...existing(value));
       continue;
     }
-    if (w.startsWith("-")) continue;
-    // An operand that names something on disk is part of what runs (`pytest tests/test_x.py`).
-    const p = /[$`]/.test(w) ? undefined : resolve(w);
-    if (p !== undefined && fs.existsSync(p)) places.push(isFile(p) ? path.dirname(p) : p);
+    // Council project review 1, round 6: every path a word may hold counts, whatever the option
+    // (`--start-directory=/tmp/d`, `-s/tmp/d`, `-wrapper /bin/sh,/tmp/x.sh`, `t.py::test_a`,
+    // `/tmp/d/...`); a file of more words (`@args`) is not read, and leaves the place unknown.
+    if (w.startsWith("@")) {
+      places.push(undefined);
+      continue;
+    }
+    places.push(...existing(w));
   }
   return places;
 }

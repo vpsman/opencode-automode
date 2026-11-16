@@ -295,3 +295,62 @@ test("the plugin reads the work tree of no repository outside the project: it ma
     fs.rmSync(r, { recursive: true, force: true });
   }
 });
+
+// Round 6.
+test("the plugin's own git gets no empty PATH", () => {
+  setPluginWritable((p) => p === repo || p.startsWith(repo + "/"));
+  try {
+    assert.equal(pluginPath(repo), "/nonexistent/automode-no-path");
+  } finally {
+    setPluginWritable(() => false);
+  }
+});
+
+test("json.tool's output operand is a write", async () => {
+  // (Either the write goes to the model, or it is recorded and npm goes there after it.)
+  const s = new SessionState(repo);
+  const wrote = await effect("printf '{}' | python3 -m json.tool - package.json", s);
+  assert.ok(wrote !== "allow" || (await effect("npm test", s)) !== "allow");
+  assert.notEqual(await effect("python3 -m json.tool f ../out.json"), "allow", "held to the write test");
+});
+
+test("a runner's words name a written place in any spelling", async () => {
+  const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp1-r6-")));
+  try {
+    for (const c of [`python3 -m unittest discover --start-directory=${d}`, `python3 -m unittest discover -s${d}`, `rustc -C linker=${d}/test_a.py x.rs`, `gcc -include${d}/test_a.py -c t.c`, `make all ${d}/test_a.py`, `pytest -o pythonpath=${d} -p test_a`, `gcc @${d}/args -c t.c`]) {
+      const s = new SessionState(repo);
+      assert.equal(await effect(`printf x > ${d}/test_a.py`, s), "allow");
+      fs.writeFileSync(path.join(d, "test_a.py"), "x");
+      assert.notEqual(await effect(c, s), "allow", c);
+    }
+    const s = new SessionState(repo);
+    fs.mkdirSync(path.join(repo, "tests"), { recursive: true });
+    await effect("printf x > tests/test_a.py", s);
+    fs.writeFileSync(path.join(repo, "tests", "test_a.py"), "x");
+    for (const c of ["pytest tests/test_a.py::test_one", "python3 -m pytest tests/test_a.py::test_one"]) assert.notEqual(await effect(c, s), "allow", c);
+  } finally {
+    fs.rmSync(d, { recursive: true, force: true });
+    fs.rmSync(path.join(repo, "tests"), { recursive: true, force: true });
+  }
+});
+
+test("a runner whose decision was with the model while a write was recorded asks", async () => {
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => setTimeout(() => res.end(JSON.stringify({ answers: { risky: { noul: 0.01 } } })), 400));
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as { port: number }).port;
+  try {
+    const g = { ...guard, useClassifier: true, classifier: { ...DEFAULT_CLASSIFIER, endpoint: `http://127.0.0.1:${port}` } };
+    const s = new SessionState(repo);
+    const runner = decideShell(g, s, repo, "FOO=1 make");
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal((await decideShell(guard, s, repo, "printf x > notes.txt")).effect, "allow");
+    const d = await runner;
+    assert.equal(d.effect, "ask");
+    assert.match(d.reason, /recorded while this call was being decided/);
+  } finally {
+    server.close();
+  }
+});

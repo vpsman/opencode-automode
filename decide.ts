@@ -459,6 +459,9 @@ export class SessionState {
   // it: once the call is over, the files git changed are marked (added to `touched`); until then,
   // its repository counts as marked.
   worktree: WorkTreeChange[] = [];
+  // Council project review 1, round 6: how many times the record grew, shared like it: a call
+  // that runs programs of the project and was being decided while it grew asks.
+  record = { writes: 0 };
   constructor(project: string, id?: string) {
     this.project = realpath(project);
     const own = SessionState.moment();
@@ -5063,6 +5066,7 @@ function settleWorktree(session: SessionState): void {
     for (const d of changed.dirs) if (!session.unlisted.includes(realish(d))) session.unlisted.push(realish(d));
     return false;
   });
+  if (kept.length !== session.worktree.length) session.record.writes++;
   session.worktree.splice(0, session.worktree.length, ...kept);
 }
 
@@ -5123,6 +5127,7 @@ function withApproval(session: SessionState, d: Decision): Decision {
     ...d,
     approve: () => {
       for (const r of projectRoots(session).map(realish)) if (!session.unlisted.includes(r)) session.unlisted.push(r);
+      session.record.writes++;
     },
   };
 }
@@ -5130,6 +5135,8 @@ function withApproval(session: SessionState, d: Decision): Decision {
 // `printed.text` is what runs: the scanner and the checks that grant trust read it. The rules
 // and the guards read `printed.judged` (see canon.ts for the few places where the two differ).
 async function decidePrinted(guard: Guard, session: SessionState, cwd: string, printed: Printed, signal: AbortSignal | undefined, scan: Scan): Promise<Decision> {
+  // (Round 6: the record as it is when the decision begins; see `allowed`.)
+  const recordAt = session.record.writes;
   const run = printed.text;
   const text = printed.judged;
   // What the layout check could not see (a walk that stopped, a directory that cannot be listed)
@@ -5410,6 +5417,7 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
     if (committed) return;
     committed = true;
     commitWrites(scope);
+    session.record.writes++;
     for (const p of writes) session.touched.add(p);
     for (const d of marks) if (!session.unlisted.includes(d)) session.unlisted.push(d);
     session.worktree.push(...worktree);
@@ -5427,10 +5435,13 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   const d0 = { unread: false };
   // (Round 5: a git that only reads runs what the repository's configuration names, as the
   // safe list reads it: a filter, a textconv, fsmonitor.)
-  const gitReadRuns = () => cmds.some((cmd) => programs(cmd.argv).some((at) => path.basename(cmd.argv[at]) === "git" && gitOnlyReads(cmd.argv.slice(at + 1)) && gitConfigProblem(cmd, cmd.argv.slice(at + 1), true) !== undefined));
+  // (Round 6: and the hooks it runs, `post-index-change` for a status: gitAfterWrite.)
+  const gitReadRuns = () => cmds.some((cmd) => programs(cmd.argv).some((at) => path.basename(cmd.argv[at]) === "git" && gitOnlyReads(cmd.argv.slice(at + 1)) && gitAfterWrite(cmd, cmd.argv.slice(at + 1), true) !== undefined));
   const flags = () => ({ ...(writes.length || marks.length || worktree.length || scope.pending.size || d0.unread ? { writes: true } : {}), ...(runsProjectCode(cmds) || gitReadRuns() ? { runsCode: true } : {}) });
   const allowed = (d: Decision): Decision => {
     const f = flags();
+    // (Round 6: judged on the record as it was when this decision began.)
+    if (f.runsCode && session.record.writes !== recordAt) return asked(askBy("a write was recorded while this call was being decided, and it runs programs of the project, which may now be other than the ones judged"));
     commit();
     return { ...d, ...f, ...(worktree.length ? { worktree } : {}) };
   };
@@ -5534,11 +5545,13 @@ export function decideFile(guard: Guard, session: SessionState, cwd: string, tar
   const approve = () => {
     commitWrites(scope);
     if (![file, realish(file)].some((p) => scope.files.has(p))) scope.files.set(file, "other");
+    session.record.writes++;
   };
   if (verdict.action === "allow") {
     const reason = protectedFile(guard, session, path.resolve(cwd, target), scan);
     if (reason) return { effect: "ask", by: "rules", rule: "ask", reason: `edit ${reason}`, approve };
     commitWrites(scope);
+    session.record.writes++;
     return undefined;
   }
   const decision = fromRules(verdict);

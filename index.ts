@@ -334,6 +334,7 @@ export default Plugin.define({
           s.touched = first.touched;
           s.unlisted = first.unlisted;
           s.worktree = first.worktree;
+          s.record = first.record;
         }
         // Round 2: a session an earlier process saw (opencode restarted) may have written
         // anywhere in the project then: the project is marked whole, as for an approved call
@@ -458,6 +459,12 @@ export default Plugin.define({
       if (call.decision.writes) {
         const runner = others.find((c) => c.decided && c.decision.effect === "allow" && c.decision.runsCode);
         if (runner) return `another allowed call that runs programs of the project may still be running (${clip(runner.command, 80)}), and what this call writes could change what that runs after it was judged`;
+      }
+      // (Round 6, the other way round: an allowed write decided before this call may not have run
+      // yet, and this call was judged on the files as they are now.)
+      if (call.decision.runsCode) {
+        const writer = others.find((c) => c.decided && c.decision.effect === "allow" && c.decision.writes);
+        if (writer) return `another allowed call that writes may still be running (${clip(writer.command, 80)}), and this call, which runs programs of the project, was judged on the files as they were before that write`;
       }
       const open = windows().find((e) => reaches(call, e.dirs));
       if (open) return `an approved command may still be creating a repository in ${open.dirs[0]}, and this call could write there`;

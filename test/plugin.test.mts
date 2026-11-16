@@ -2644,3 +2644,16 @@ describe("council project review 1, round 5: edits and hooked git calls", () => 
     assert.match(w.permission.message, /may still be running/);
   });
 });
+
+describe("council project review 1, round 6: a runner waits for no write that may not have run yet", () => {
+  test("a runner asks while an allowed write decided before it may still be running", async () => {
+    const host = await start({ useClassifier: false });
+    // (A write into a temp directory: it does not reach make's places, so the record alone does
+    // not send make to the model.)
+    const writer = decidedCall(host, `printf x > ${path.join(tmp, "cp1r6.txt")}`, "cp1r6");
+    await writer.decision;
+    const r = await call(host, "make", { sessionID: "cp1r6" });
+    assert.equal(r.permission.effect, "ask");
+    assert.match(r.permission.message, /writes may still be running/);
+  });
+});
