@@ -1029,3 +1029,59 @@ describe("r4: a descriptor copy on a compound command, in a call that moves the 
     }
   });
 });
+
+// The closing fuzz seeds (seed 404): the printer passed bash's syntax errors through, and inside a
+// process substitution bash reads `<((` (as written) and `<( (` (printed) apart: what ran was not
+// the same. A pipe or `&&`/`||` with no command after it, and a word straight after a subshell's
+// `)`, are syntax errors bash refuses everywhere: the printer asks for them.
+describe("r4: syntax errors the printer does not pass through", () => {
+  test("an operator after a pipe, && or || with no command between asks", () => {
+    for (const c of ["ls | ; echo x", "ls |\n; echo x", "ls && ; echo x", "ls || & echo x", "ls | | cat", "(ls | )", "echo a | cat <(ls | ; echo y)", "echo $(ls |\n\t; ls)"]) assert.ok("ask" in canonical(c), JSON.stringify(c));
+  });
+  test("a word straight after a subshell's ) asks", () => {
+    for (const c of ["(echo a)ls", "(echo a) ls", "echo a | cat <( (echo b)ls )", "echo $( (echo b) ls)", "echo a|\\\nEOF<((\n\"|\\\n|'\"a b)ls |\\\n\t; ls -d hidden-by-the-generator\nEOF\n)"]) assert.ok("ask" in canonical(c), JSON.stringify(c));
+  });
+  test("what is no syntax error prints as before", () => {
+    for (const c of ["ls |\ncat", "ls &&\necho x", "(echo a) > f", "(echo a) | cat", "(echo a); ls", "(echo a) && ls", "case x in a) ls;; esac", "case x in (a) ls;; esac", "echo $( (echo b) )", "f() (echo a)", "(cd src && ls) 2>/dev/null"]) assert.ok(!("ask" in canonical(c)), JSON.stringify(c));
+  });
+});
+describe("r4: syntax errors the printer does not pass through: what stays", () => {
+  test("a function's () and the operators inside [[ ]] after a pipe print as before", () => {
+    for (const c of ["f() { ls; }", "f() { ls; }; f", "a=1 ls | [[ -n x || ls ]]", "ls | [[ -n x && -n y ]]", "f () { ls; }"]) assert.ok(!("ask" in canonical(c)), JSON.stringify(c));
+  });
+});
+
+// The closing reading (step 7, F2): the rules read `0` in place of arithmetic anywhere in a word, so
+// `cat id_ed$((25519))` was judged as `cat id_ed0` and `h$((1))/pre-commit` as `h0/pre-commit`. A
+// word that holds arithmetic and any other non-empty part asks; arithmetic standing alone as a word
+// is as before (its value is digits and a sign).
+describe("r4: arithmetic in a word with anything else asks", () => {
+  test("wherever it stands in the word", () => {
+    for (const c of ["cat id_ed$((25519))", "cp id_ed$((25519)) /tmp/x", "bash -c 'cat id_ed$((25519))'", "i=25519; cat id_ed$((i))", "cat id_ed$((0x637f))", "printf x > h$((1))/pre-commit", "cd sub$((1)) && cat f", "echo f$((1+2)).txt", "echo \"a$((1))\""]) assert.ok("ask" in canonical(c), JSON.stringify(c));
+  });
+  test("arithmetic alone is as before", () => {
+    for (const c of ["echo $((1+2))", "sleep $((2*3))", "seq 1 $((3-1))", "head -n $((2+3)) f", "echo \"$((1+2))\"", "((n++))", "for ((i=0;i<3;i++)); do echo $i; done"]) assert.ok(!("ask" in canonical(c)), JSON.stringify(c));
+  });
+});
+
+// The closing fuzz (seed 333 at 93c5c08): the printer rewrote the code of `eval` and `bash -c`
+// wherever a program could stand, and a word of digits can stand for a wrapper's value
+// (`timeout 5`), so in `1 eval 'a;b'` it printed the argument bash hands to the program `1` as
+// code: `'a ; b'`. (`1 eval '\ #x'ls` became `\'' '\'\''#'\'xls`.) The code is printed only where
+// bash runs the program: the words bash walks to, wrapper by wrapper.
+describe("r4: code is printed only where bash runs it", () => {
+  test("a word handed to another program keeps its text", () => {
+    for (const [c, want] of [["1 eval 'a;b'", "1 eval 'a;b'"], ["12 eval 'a;b'", "12 eval 'a;b'"], ["1 eval '\\ #x'ls", "1 eval '\\ #x'ls"], ["1 bash -c 'a;b'", "1 bash -c 'a;b'"], ["0 time eval 'a;b'", "0 time eval 'a;b'"]]) {
+      const r = canonical(c);
+      assert.ok(!("ask" in r), `${c}: ${JSON.stringify(r)}`);
+      assert.equal((r as { text: string }).text, want, c);
+    }
+  });
+  test("where bash runs it, as before", () => {
+    for (const [c, want] of [["eval 'a;b'", "a ; b"], ["timeout 5 eval 'a;b'", "a ; b"], ["nice -n 5 bash -c 'a;b'", "a ; b"], ["env X=1 bash -c 'a;b'", "a ; b"], ["command eval 'a;b'", "a ; b"], ["! eval 'a;b'", "a ; b"], ["X=1 eval 'a;b'", "a ; b"], ["time eval 'a;b'", "a ; b"], ["find . -exec bash -c 'a;b' \;", "a ; b"]]) {
+      const r = canonical(c);
+      assert.ok(!("ask" in r), `${c}: ${JSON.stringify(r)}`);
+      assert.ok((r as { text: string }).text.includes(want), `${c} -> ${JSON.stringify(r)}`);
+    }
+  });
+});

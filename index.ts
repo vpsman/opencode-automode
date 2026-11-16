@@ -41,15 +41,18 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Plugin } from "@opencode/plugin";
 import { compileRules, compilePattern, within } from "./rules.ts";
-import { closeGitSnapshot, decideFile, decideRead, decideShell, EXPECT_MS, expectedRepos, gitDirectories, gitOnly, gitWriteDirectories, gitMaintainDirectories, gitStateTampered, gitTampered, mirrorable, noteGitCall, projectRoots, pushCandidate, pushDestinations, quarantineGitFiles, realish, sandboxBreaks, SessionState, usesSsh, type Decision, type Expected, type GitCall, type Guard } from "./decide.ts";
+import { closeGitSnapshot, decideFile, decideRead, decideShell, EXPECT_MS, expectedRepos, gitDirectories, gitOnly, gitWriteDirectories, gitMaintainDirectories, gitStateTampered, gitTampered, mirrorable, noteGitCall, projectRoots, pushCandidate, pushDestinations, quarantineGitFiles, realish, sandboxBreaks, SessionState, unseenWrites, usesSsh, type Decision, type Expected, type GitCall, type Guard } from "./decide.ts";
 import { envKept, envStringProblem, gitElsewhere, plan, realpath, Scan, shellOwn, type Plan } from "./sandbox.ts";
 import { loadConfig, type Config } from "./config.ts";
-import { shellAlsoKeeps } from "./guard.ts";
+import { bentPath, shellAlsoKeeps, shellCdpath } from "./guard.ts";
 import { canonical } from "./canon.ts";
 
 // A command that holds the word `git` as a program's name (broad on purpose: `.git` and
 // `git.txt` are not it).
 const HOLDS_GIT = /(^|[^\w.-])git($|[^\w.-])/;
+// A command that holds `cd` or `pushd` as a word (as broad): the builtins that look a directory
+// up in CDPATH.
+const HOLDS_CD = /(^|[^\w.-])(cd|pushd)($|[^\w.-])/;
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOME = os.homedir();
@@ -217,6 +220,11 @@ interface Call {
   // That variable is this process's own and the shell does not have it (or has another value
   // of it): the checks' git reads configuration the shell's git does not.
   gitEnvLacks?: boolean;
+  // Its shell's CDPATH is not the one the checks followed its `cd` by ("": the shell has none).
+  cdpath?: string;
+  // Its shell's PATH holds an entry the session can write (in the project, a temp directory, empty
+  // or relative) that opencode's own does not: the safe list was judged by opencode's.
+  bentPath?: string;
   // permission.evaluate was applied, or the tool call is over: it waits for no shell.
   settled?: boolean;
   // Where the command would create repositories, when it asks; and the approval of that.
@@ -282,6 +290,7 @@ export default Plugin.define({
       guarded: [HERE, CONFIG_FILE, STATE_DIR],
       configDirs: [CONFIG_DIR],
       allowedPaths: config.allowedPaths,
+      writable: config.sandboxWritable,
       classifier: config.classifier,
       useClassifier: config.useClassifier,
       sshHosts: config.sshHosts,
@@ -305,12 +314,22 @@ export default Plugin.define({
     const sessions = new Map<string, SessionState>();
     const session = (id: string) => {
       let s = sessions.get(id);
-      if (!s) sessions.set(id, (s = new SessionState(project)));
+      // (B8-5: with its id, so that the moment it is measured from outlives a restart.)
+      if (!s) sessions.set(id, (s = new SessionState(project, id)));
       return s;
     };
 
     // Decisions by tool call, and allowed calls waiting for their shell to be created.
     const calls = new Map<string, Call>();
+    // B10-9: an edit the plugin asked about, by its tool call: what records its writes as the
+    // session's once the user approves it (opencode's reply, or the edit completing), as an
+    // approved shell call's are. Rejected or failed: dropped.
+    const editAsks = new Map<string, () => void>();
+    const editSettled = (key: string, approved: boolean) => {
+      const record = editAsks.get(key);
+      editAsks.delete(key);
+      if (approved) record?.();
+    };
     const unseen = new Map<string, { at: number; decision: Decision }>();
     const toWrap = new Map<string, Call[]>();
     const wrapKey = (command: string, cwd: string) => `${path.resolve(cwd)}\u0000${command}`;
@@ -441,8 +460,12 @@ export default Plugin.define({
       // Allowed must mean it can work: what the sandbox would only make fail asks instead.
       // (A command too long for the one environment string the wrapper is handed it in is
       // caught where the shell is made, with the names of the variables it keeps.)
-      const broken = decision.effect === "allow" && sandboxReady ? sandboxBreaks(run, cwd, s, [...config.allowedPaths, ...config.sandboxWritable]) : undefined;
+      const broken = decision.effect === "allow" && sandboxReady ? sandboxBreaks(run, cwd, s, [...config.allowedPaths, ...config.sandboxWritable], config.allowedPaths, scan) : undefined;
+      // B8-9, the opposite case: with the sandbox off, an archive or a patch asks (the names it
+      // writes are inside the file; decide.ts, unseenWrites).
+      const blind = decision.effect === "allow" && !config.sandbox ? unseenWrites(run) : undefined;
       if (broken) call.decision = { ...decision, effect: "ask", reason: `would be allowed, but it cannot work in the sandbox: ${broken}` };
+      else if (blind) call.decision = { ...decision, effect: "ask", reason: `would be allowed, but ${blind}` };
       else if (decision.effect === "allow" && sandboxReady) {
         try {
           const roots = projectRoots(s);
@@ -533,7 +556,7 @@ export default Plugin.define({
 
     const afterHook = await ctx.tool.hook("execute.after", (event) => {
       const call = calls.get(callKey(event.messageID, event.id));
-      if (!call) return;
+      if (!call) return editSettled(callKey(event.messageID, event.id), event.status === "completed");
       call.settled = true;
       call.ended = Date.now();
       // A command the plugin asked about only runs to the end when the user approved it. This
@@ -598,6 +621,39 @@ export default Plugin.define({
         }
         event.env.AUTOMODE_CALL = token;
         return;
+      }
+      // CDPATH as the shell has it (ninth pass). Where `sandboxKeepEnv` names it the shell keeps
+      // its own, which is its session's and need not be this process's: the checks followed a
+      // `cd src` to `./src` by this process's CDPATH (guard.ts, shellCdpath), and the shell
+      // would look `src` up somewhere else, or the other way round. A call that holds a `cd`
+      // is then not run as decided: the shell is left as it is and the call asks, saying why,
+      // as for a variable of git's that differs. (Not named there, the variable was taken out
+      // above, and the two agree.)
+      const cdpath = event.env.CDPATH || undefined;
+      if (config.enabled && config.sandboxKeepEnv.includes("CDPATH") && cdpath !== shellCdpath() && queue.some((c) => HOLDS_CD.test(c.decision.printed ?? c.command))) {
+        for (const c of queue) {
+          c.unsure = true;
+          c.cdpath = cdpath ?? "";
+        }
+        event.env.AUTOMODE_CALL = token;
+        return;
+      }
+      // PATH as the shell has it (B10's reading): the checks judge a program's name by opencode's
+      // own PATH (guard.ts, bentPath); a shell whose PATH holds an entry the session can write
+      // that opencode's does not may find another program under an allowed name.
+      const shellPath = event.env.PATH;
+      if (config.enabled && shellPath !== process.env.PATH && queue.some((c) => c.decision.effect === "allow")) {
+        const top = realpath(project);
+        const inProject = (p: string) => within(p, top) || within(p, project) || [...config.allowedPaths, ...config.sandboxWritable].some((d) => within(p, d));
+        const bent = bentPath(inProject, shellPath ?? "");
+        if (bent !== undefined && bentPath(inProject) === undefined) {
+          for (const c of queue) {
+            c.unsure = true;
+            c.bentPath = bent;
+          }
+          event.env.AUTOMODE_CALL = token;
+          return;
+        }
       }
       if (!config.sandbox && allAllowed && modelled) {
         // No wrapper to hand the text to: the shell is given the printed text as its command.
@@ -720,6 +776,10 @@ export default Plugin.define({
                 ? `${would}, but its shell does not inherit ${call.gitEnv}, which opencode's own environment sets: the checks read git's configuration as that variable says, and git in this shell would read another. Start opencode and its sessions with the same value (or with none), or approve this to run it as it is`
               : call.gitEnv
                 ? `${would}, but its shell inherits ${call.gitEnv}, which makes git work in another repository or with another configuration than the one that was judged (the checks read the repository in the command's directory). Unset it where opencode is started, or approve this to run it as it is; naming it in sandboxKeepEnv keeps it for sandboxed shells and does not change this`
+              : call.bentPath !== undefined
+                ? `${would}, but its shell's PATH holds ${clip(call.bentPath, 200)}, a directory the session can write, which opencode's own PATH does not: the checks judged the programs it names by opencode's PATH, and this shell may find others under the same names. Start opencode and its sessions with the same PATH, or approve this to run it as it is`
+              : call.cdpath !== undefined
+                ? `${would}, but its shell ${call.cdpath ? `has CDPATH=${clip(call.cdpath, 200)}` : "has no CDPATH"} and opencode's own environment ${shellCdpath() ? `has ${clip(shellCdpath()!, 200)}` : "has none"} (sandboxKeepEnv keeps the shell's): bash looks the directory of a cd up in CDPATH, and the checks followed this command's cd as opencode's own environment says, so it may lead somewhere else in this shell. Start opencode and its sessions with the same CDPATH (or with none), or approve this to run it as it is`
               : call.tooLong
                 ? `${would}, but the sandbox cannot be handed it: ${call.tooLong} (128 KiB for the command as it runs, and for the names of the environment variables it keeps)`
               : !config.sandbox
@@ -750,30 +810,43 @@ export default Plugin.define({
           apply(event, decision);
           return;
         }
+        // B10-9: an edit that asks records, when approved, what it writes from the resource that
+        // asked on (that one by its own decision's record, the rest as decided then).
+        const fileOf = (resource: string) => (path.isAbsolute(resource) ? resource : path.resolve(project, resource));
+        const editAsked = (from: number, first?: Decision) => {
+          if (event.action !== "edit" || !event.source) return;
+          editAsks.set(callKey(event.source.messageID, event.source.id), () => {
+            first?.approve?.();
+            for (const resource of event.resources.slice(first ? from + 1 : from)) decideFile(guard, session(event.sessionID), project, fileOf(resource))?.approve?.();
+          });
+          bound(editAsks, 200);
+        };
         if (event.action === "edit") {
           // An edit could build a repository where an approved command may be creating one.
           sweep();
           const open = windows();
           for (const resource of event.resources) {
-            const target = realish(path.isAbsolute(resource) ? resource : path.resolve(project, resource));
+            const target = realish(fileOf(resource));
             const dir = open.flatMap((e) => e.dirs).find((d) => within(target, d));
             if (dir) {
               const decision: Decision = { effect: "ask", by: "rules", rule: "ask", reason: `edit inside ${dir}, where an approved command may still be creating a repository` };
               apply(event, decision);
               log(config, { ...base, target, ...decision });
+              editAsked(0);
               return;
             }
           }
         }
         if (event.action === "edit" || event.action === "read") {
-          for (const resource of event.resources) {
-            const target = path.isAbsolute(resource) ? resource : path.resolve(project, resource);
+          for (const [at, resource] of event.resources.entries()) {
+            const target = fileOf(resource);
             const decision =
               event.action === "edit" ? decideFile(guard, session(event.sessionID), project, target) : decideRead(guard, session(event.sessionID), project, target);
             // Tighten only: a file verdict never turns opencode's ask into an allow.
             if (decision && decision.effect !== "allow") {
               apply(event, decision);
               log(config, { ...base, target, ...decision });
+              if (decision.effect === "ask") editAsked(at, decision);
               return;
             }
           }
@@ -805,9 +878,15 @@ export default Plugin.define({
             const source = data.source as { type?: unknown; messageID?: unknown; id?: unknown } | undefined;
             if (source?.type === "tool" && typeof source.messageID === "string" && typeof source.id === "string") prompts.set(data.id, callKey(source.messageID, source.id));
             bound(prompts, 200);
+          } else if (event.type === "permission.asked" && data.action === "edit" && typeof data.id === "string") {
+            // B10-9: an edit's prompt, by its tool call.
+            const source = data.source as { type?: unknown; messageID?: unknown; id?: unknown } | undefined;
+            if (source?.type === "tool" && typeof source.messageID === "string" && typeof source.id === "string") prompts.set(data.id, callKey(source.messageID, source.id));
+            bound(prompts, 200);
           } else if (event.type === "permission.replied" && typeof data.requestID === "string") {
             const asked = prompts.get(data.requestID);
             prompts.delete(data.requestID);
+            if (asked && editAsks.has(asked)) editSettled(asked, data.reply === "once" || data.reply === "always");
             if (asked && (data.reply === "once" || data.reply === "always")) approved(calls.get(asked));
             else if (asked && data.reply === "reject") {
               const rejected = calls.get(asked);

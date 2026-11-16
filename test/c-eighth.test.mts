@@ -179,39 +179,35 @@ test("r4 21: a link at the top of the git directory around a module that leads i
     assert.equal(planFor(r, "git status", lib).problem, undefined, "the fixture: put back, the call is planned again");
   }));
 
-test("r4 21: a link there whose target lies outside the writable directories changes nothing: the call is planned, runs, and cannot write through it", () =>
-  withLib(false, (r, session, g) => {
+// Tenth pass, the maintainer's decision "any link asks": a link there asks wherever it leads,
+// outside the writable directories too (judged by where it led, `<outside>/lnk/../d` was taken
+// for a place outside: xcheck/reviewers/c9-opus/p1-dotdot.test.mts).
+test("r4 21: a link there asks wherever it leads: outside the writable directories, into a temp directory, into the same git directory, into the module the call may write", () =>
+  withLib(false, (r, session) => {
     const dotGit = path.join(r, ".git");
     const lib = path.join(r, "lib");
-    const main = g("rev-parse", "main").trim();
-    const first = g("rev-list", "--max-parents=0", "HEAD").trim();
     d.projectRoots(session);
+    const asks = (at: string) => {
+      const problem = planFor(r, "git status", lib).problem ?? "";
+      assert.match(problem, /symbolic link/);
+      assert.ok(problem.includes(at), problem);
+    };
     // Beside the project, in the home directory: read-only in every sandbox.
-    linkedOut(dotGit, "refs", `${r}-refs`, () => {
-      const p = planFor(r, "git status", lib);
-      assert.equal(p.problem, undefined);
-      assert.notEqual(sandboxed(p, `printf '%s\\n' ${first} > ${dotGit}/refs/heads/main`, lib).status, 0);
-      assert.equal(g("rev-parse", "main").trim(), main);
-      // The link itself cannot be replaced: its directory is read-only.
-      assert.notEqual(sandboxed(p, `rm ${dotGit}/refs && ln -s /tmp ${dotGit}/refs`, lib).status, 0);
-      assert.equal(fs.readlinkSync(path.join(dotGit, "refs")), `${r}-refs`);
-      assert.equal(sandboxed(p, "git status --short", lib).status, 0);
-    });
-    // A temp directory is writable in every sandbox: a link there is the first case again.
+    linkedOut(dotGit, "refs", `${r}-refs`, () => asks(path.join(dotGit, "refs")));
     const inTmp = fs.mkdtempSync(path.join(os.tmpdir(), "c-eighth-refs-"));
     try {
       fs.rmSync(inTmp, { recursive: true });
-      linkedOut(dotGit, "refs", inTmp, () => assert.match(planFor(r, "git status", lib).problem ?? "", /symbolic link/));
+      linkedOut(dotGit, "refs", inTmp, () => asks(path.join(dotGit, "refs")));
     } finally {
       fs.rmSync(inTmp, { recursive: true, force: true });
     }
-    // And one that leads to another place inside the same read-only git directory.
     fs.symlinkSync(path.join(dotGit, "info"), path.join(dotGit, "lfs"));
-    assert.equal(planFor(r, "git status", lib).problem, undefined);
+    asks(path.join(dotGit, "lfs"));
     fs.rmSync(path.join(dotGit, "lfs"));
-    // One that leads into the module the call may write is the first case again.
     fs.symlinkSync(path.join(dotGit, "modules", "lib", "refs"), path.join(dotGit, "lfs"));
-    assert.match(planFor(r, "git status", lib).problem ?? "", /symbolic link/);
+    asks(path.join(dotGit, "lfs"));
+    fs.rmSync(path.join(dotGit, "lfs"));
+    assert.equal(planFor(r, "git status", lib).problem, undefined, "the fixture: put back, the call is planned again");
   }));
 
 test("r4 21: the same for every call that has the git directory read-only whole, and not for the one that may write it anyway", () =>

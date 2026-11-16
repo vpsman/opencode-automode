@@ -1,0 +1,147 @@
+# The sandbox wrapper and its tests, as run on 2026-11-16 (finding 34 of the round 4 review)
+#
+# kernel:  Linux 6.12.117+deb13-cloud-amd64
+# node:    v24.22.3
+# cargo:   cargo 1.99.1 (5f94df478 2026-08-27)
+# bash:    GNU bash, version 5.2.37(1)-release (x86_64-pc-linux-gnu)
+# git:     git version 2.47.3
+# tree:    the round 4 tree this file is committed with
+#
+# $ npm run build:sandbox
+> opencode-automode@0.1.0 build:sandbox
+> cargo build --release --locked --manifest-path sandbox/lockwrite-rs/Cargo.toml && cp sandbox/lockwrite-rs/target/release/lockwrite sandbox/lockwrite && mkdir -p sandbox/bin && rm -f sandbox/bin/zsh && for s in bash sh; do ln -sf ../lockwrite sandbox/bin/$s; done && sandbox/lockwrite --selftest
+   Compiling libc v0.2.191
+   Compiling lockwrite v0.1.0 (/srv/work/r4/final-34/sandbox/lockwrite-rs)
+    Finished `release` profile [optimized] target(s) in 1.21s
+lockwrite: ok (Landlock ABI 6, sockets and signals scoped)
+
+# $ node test/run.mjs test/sandbox.test.mts
+▶ normal work inside the project
+  ✔ r4 24: a timed-out global hooks lookup is a problem
+  ✔ r4 26: outside SysV shared memory, queues and semaphores are unreachable
+  ✔ r4 26: a worker pool and POSIX shared memory still work
+  ✔ r4 8: showing a credential directory keeps its repositories protected
+  ✔ r4 22: credentials and sockets inside .git are hidden at every depth
+  ✔ r4 24: failed your own hooks lookup is a problem
+  ✔ r4 24: failed the repository's hooks lookup is a problem
+  ✔ r4 24: failed the receiving hooks lookup is a problem
+  ✔ writes work for ordinary commands
+  ✔ a git-only call can add and commit
+  ✔ stdin, stdout and the exit code pass through
+  ✔ a command killed by a signal reports it
+  ✔ the shell starts with default signal handling (SIGPIPE ends a writer whose reader left)
+  ✔ AUTOMODE_* variables do not reach the command
+  ✔ /dev/shm is private and writable; /dev/null works
+  ✔ temp directories stay writable
+✔ normal work inside the project
+▶ containment
+  ✔ cannot write outside the writable directories, from the shell or a child
+  ✔ cannot create files in /dev (K4)
+  ✔ cannot plant a git hook
+  ✔ cannot change .git/config
+  ✔ cannot rename or replace .git
+  ✔ cannot rename a parent of a nested repository
+  ✔ cannot plant .git/commondir
+  ✔ cannot undo the read-only mounts
+  ✔ cannot signal processes outside the sandbox
+  ✔ cannot reach another process's filesystem view through /proc
+  ✔ inherited file descriptors are closed before the command runs
+✔ containment
+▶ K2: a git-only call may write in .git, but not its hooks or config
+  ✔ the mode is in force: ordinary files in .git can be written
+  ✔ cannot plant a hook
+  ✔ cannot change config
+  ✔ cannot rename .git or its hooks
+  ✔ cannot plant hooks in a core.hooksPath directory
+✔ K2: a git-only call may write in .git, but not its hooks or config
+▶ C: protections tied to a path
+  ✔ C1: a parent of core.hooksPath cannot be renamed and rebuilt
+  ✔ C2: the directory of a hidden socket cannot be moved out of sight
+  ✔ C3: a relative global core.hooksPath is protected in the worktree
+  ✔ C4: a file .git/config includes cannot be changed
+  ✔ C4: an include that does not exist yet inside the project cannot be protected, so the command asks
+  ✔ C6: a repository four levels below a temp directory is found
+  ✔ C8: a core.hooksPath that leads through a symlink is not created outside the project, and asks
+  ✔ C9: hook-manager files are read-only
+  ✔ J1: opencode's project config is read-only, and .opencode cannot be created later
+✔ C: protections tied to a path
+▶ D: build caches are read-only unless listed
+  ✔ D1: no cache directory is writable by default
+  ✔ sandboxWritable opts a directory in
+✔ D: build caches are read-only unless listed
+▶ F: lockwrite
+  ✔ F1: a kernel without Landlock ABI 5 runs nothing
+  ✔ F1: truncate outside the writable directories fails
+  ✔ F2: chmod, utime and setxattr outside the writable directories fail
+  ✔ F3: terminals are not writable and device ioctls are denied
+  ✔ F5: a background process does not outlive the tool call
+  ✔ I3: with a keep list, no other variable reaches the command
+✔ F: lockwrite
+▶ H8/I: what is hidden
+  ✔ H8: a socket with ':' in its name is hidden like any other
+  ✔ I1: every socket in the runtime directory is hidden, D-Bus and the systemd manager included
+  ✔ I1: the system D-Bus socket is hidden
+  ✔ I1: git's credential-cache socket is hidden, and display variables are dropped
+  ✔ I2: credential files the old list missed are hidden
+  ✔ I2: whatever the rules call a credential under $HOME or in the project is hidden
+  ✔ I3: only variables that plainly hold no credential are kept
+  ✔ an ssh agent socket outside the scanned directories is still hidden
+  ✔ a command that uses ssh sees known_hosts and config, never private keys
+  ✔ a command that uses ssh keeps the agent while the rest of the runtime directory is hidden
+  ✔ ~/.ssh is hidden unless the command uses ssh
+✔ H8/I: what is hidden
+▶ r2 B: what a sandboxed command could plant
+  ✔ 7: a read-only git directory is read-only below its pinned children too
+  ✔ 7: opencode's project directories are read-only below a pinned child
+  ✔ 8: a .git that is a symbolic link cannot be protected: the plan says so, and its target is read-only
+  ✔ 9: a repository under node_modules is protected like any other
+  ✔ 10: a pointer file in a temp directory does not move a relative core.hooksPath away from the project
+  ✔ 11: config includes are followed as deep as git follows them
+  ✔ 11: an include that cannot be listed is a problem, not an empty list
+  ✔ 12: a core.hooksPath behind a symbolic link in any component is a problem
+  ✔ 12: lockwrite refuses to pin something that is not a directory
+  ✔ 19: credential files are hidden at any depth, and a symbolic link's target with them
+  ✔ 19: more credential files than the cap is a problem, not a silent stop
+  ✔ 19: a directory of the project that cannot be listed is a problem
+  ✔ 31: histories, browser profiles and registry logins the old list missed are hidden
+  ✔ 31: a socket deep below a temp directory is hidden
+✔ r2 B: what a sandboxed command could plant
+▶ r2 19: the cheap credential test lets through everything the rules know
+  ✔ names and places
+✔ r2 19: the cheap credential test lets through everything the rules know
+▶ r2 30: an allowed push can do all of its work
+  ✔ the remote-tracking ref is updated, which needs a writable git directory
+  ✔ r4 21: a push to a bare repository in an allowed path works, and another call cannot write there
+  ✔ r4 21: a fetch and a pull from a repository on this machine only read it: they work with it read-only
+✔ r2 30: an allowed push can do all of its work
+▶ r4 21: a call that goes into a submodule kept in its own work tree
+  ✔ r4 21: a fetch that recurses fetches in the submodule
+  ✔ r4 21: a call that is not git-only still has the submodule's git directory read-only
+✔ r4 21: a call that goes into a submodule kept in its own work tree
+▶ r3 26: a directory that can be entered or written but not listed
+  ✔ r3 26: someone else's directory in the project, mode 300, holding a bare repository, is a problem
+  ✔ r3 26: someone else's directory in the project, mode 100, holding a bare repository, is a problem
+  ✔ r3 26: someone else's directory in the project, mode 200, holding a bare repository, is a problem
+  ✔ r3 26: someone else's directory in a temp directory that can be entered is covered, and commands still run
+  ✔ r3 26: an unlistable directory under /run that can be entered is covered
+  ✔ r3 26: unchanged: someone else's directory closed both ways is no problem, this user's own is
+✔ r3 26: a directory that can be entered or written but not listed
+▶ r3 34: lockwrite refuses a terminal and root
+  ✔ r3 34: with descriptor(s) 0,1,2 on a terminal, the command does not run and lockwrite exits 126
+  ✔ r3 34: with descriptor(s) 0 on a terminal, the command does not run and lockwrite exits 126
+  ✔ r3 34: with descriptor(s) 1 on a terminal, the command does not run and lockwrite exits 126
+  ✔ r3 34: with descriptor(s) 2 on a terminal, the command does not run and lockwrite exits 126
+  ✔ r3 34: --selftest still works from a terminal
+  ✔ r3 34: with pipes and /dev/null, as opencode starts it, the command runs
+  ✔ r3 34: started as uid 0 (unshare -Ur), lockwrite refuses, the selftest too
+  ✔ r3 34: started with capabilities kept in a user namespace (not root), the command has none
+✔ r3 34: lockwrite refuses a terminal and root
+ℹ tests 94
+ℹ suites 13
+ℹ pass 94
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 9681.886881
+# exit status: 0

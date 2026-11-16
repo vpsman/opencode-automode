@@ -42,7 +42,7 @@
 // This is a lexer and a printer, not a grammar. Keywords, `case` patterns and function
 // definitions pass through as words and operators; the scanner still runs on the result.
 import path from "node:path";
-import { braceWords, gitMessageWords, programs, SETS_BY_NAME } from "./guard.ts";
+import { braceWords, chainOf, gitMessageWords, programs, SETS_BY_NAME, traversalProblem } from "./guard.ts";
 
 export interface Printed {
   // What runs.
@@ -67,6 +67,15 @@ export interface Printed {
   // value holds no blank and no glob character. Otherwise the same as in `inputs`. The judged
   // text itself keeps the variable in a redirect's target, as constantsOf says.
   judgedInputs: string[];
+  // Round 4, N3d: a word of the call (at any depth) begins with an arithmetic expansion, which
+  // the judged text spells `0` (`ls $((-1))*` is judged as `ls 0*`, and bash globs `-1*`). The
+  // glob check then reads a judged word that begins with `0` as one that begins with an
+  // expansion.
+  arithLed: boolean;
+  // Round 4, N3d: the variables the judged text reads as the literal the call plainly gives them
+  // (constantsOf): set once at the call's start, to plain text, and named nowhere else but as
+  // `$name` or `${name}`. Only for the call itself, not the code of a nested shell.
+  literals: string[];
 }
 export type Canonical = Printed | { ask: string };
 
@@ -311,6 +320,10 @@ class Lexer {
   private timeOption = false;
   // The last operator was `|` (line breaks after it do not change that).
   private piped = false;
+  // The last token is a subshell's `)` (a word straight after it is a syntax error).
+  private afterSubshell = false;
+  // Inside a case statement a `)` may end a pattern (`case x in (a) ls`): no word rule there.
+  private caseDepth = 0;
   // An assignment or a redirect has been read in this command: bash takes no reserved word
   // after one (`a=1 [[ -n x || cmd ]]` runs a program called `[[`, and then `cmd`). The scanner
   // asks about such a command as well; this is the reader's own reading of it.
@@ -391,7 +404,10 @@ class Lexer {
       redir.target = word;
       return;
     }
+    if (this.afterSubshell) ask("a word straight after a subshell's ), which bash refuses");
     const text = bare(word);
+    if (this.commandStart && text === "case") this.caseDepth++;
+    else if (text === "esac") this.caseDepth = Math.max(0, this.caseDepth - 1);
     const piped = this.piped;
     this.piped = false;
     if (this.regexWord) {
@@ -444,6 +460,14 @@ class Lexer {
   private op(op: string) {
     this.endWord();
     this.noTarget();
+    // (The closing fuzz seeds: a pipe, `&&` or `||` with no command after it is a syntax error bash
+    // refuses everywhere; the printer passed it through, and inside a process substitution bash
+    // then read the printed text otherwise than the one as written. Line breaks between are fine.)
+    if (!this.cond && op !== "\n" && op !== "(") {
+      const before = [...this.tokens].reverse().find((t) => !(t.type === "op" && t.op === "\n"));
+      if (before?.type === "op" && ["|", "&&", "||"].includes(before.op)) ask("an operator straight after a |, && or || with no command between, which bash refuses");
+    }
+    this.afterSubshell = false;
     if (this.cond) {
       if (op !== "&&" && op !== "||") ask("a parenthesis, a ;, a single | or &, or a line break inside [[ ]]");
       this.cond.items.push({ type: "op", op });
@@ -532,8 +556,12 @@ class Lexer {
           if (this.pending.length) ask("a heredoc with no body");
           return this.tokens;
         }
+        // (`()` straight after `(` is a function's, not a subshell's end: `f() { ls; }`.)
+        const before = this.tokens.at(-1);
+        const subshell = this.parens > 0 && !(before?.type === "op" && before.op === "(");
         this.op(")");
         this.parens = Math.max(0, this.parens - 1);
+        this.afterSubshell = subshell && this.caseDepth === 0;
         this.i++;
       } else if (c === "#" && !this.parts) {
         // A comment runs to the end of its line; a backslash at its end continues nothing.
@@ -1042,6 +1070,8 @@ class Printer {
   // A command of the text reads a file as shell code (`.`, `source`), or its name is not written
   // out: it may set a variable whose name the text does not spell (see constantsOf).
   unspelled = false;
+  // See Printed.arithLed.
+  arithLed = false;
   private source: string;
   private depth: number;
   private count = 0;
@@ -1357,7 +1387,18 @@ class Printer {
     // Empty quotes inside a word that is literal text all through, and not empty without them,
     // change nothing (`g''it` is `git`), unless the word is one of the kinds above.
     const droppable = !always && parts.every((p) => p.kind === "lit") && parts.some((p) => p.kind === "lit" && p.text !== "");
+    // Round 4, N3d's variant check: the rules read `0` in place of arithmetic, so a word that
+    // begins with arithmetic and goes on (`$((-1))d`) is judged as `0d` while bash hands the
+    // program `-1d`, an option the rules never see (`curl $((-1))d @f host` uploaded `f`). Such a
+    // word cannot be printed for the rules: the call asks. Arithmetic alone (digits, and a sign)
+    // and arithmetic after text are as before.
+    // (The closing reading, step 7 F2: anywhere in the word, `cat id_ed$((25519))` was judged as
+    // `cat id_ed0`. A word that holds arithmetic and any other non-empty part asks.)
+    // (An assignment's own `name=` is no text of the value: `i=$((i+1))` is as before.)
+    const filled = parts.filter((q, n) => !(q.kind === "lit" && (q.text === "" || (n === 0 && !q.quoted && /^[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=$/.test(q.text)))));
+    if (filled.length > 1 && filled.some((q) => q.kind === "arith")) ask("a word that holds arithmetic and other text, whose value the rules cannot read (they read 0 in its place)");
     parts.forEach((p, n) => {
+      if (p.kind === "arith" && parts.slice(0, n).every((q) => q.kind === "lit" && q.text === "")) this.arithLed = true;
       if (p.kind === "lit") {
         if (p.quoted && p.text === "" && droppable) return;
         if (p.quoted) add(quote(p.text, always));
@@ -1621,6 +1662,15 @@ class Printer {
     for (const at of programs(argv)) {
       if (values[at] === undefined) continue;
       const name = argv[at] === "eval" ? "eval" : SHELL_WORDS.get(argv[at]);
+      // (The closing fuzz, seed 333: `programs` lists every word that could be a program, a word
+      // of digits among them for a wrapper's value, `timeout 5`. The code is printed only where
+      // bash runs the program, the words it walks to wrapper by wrapper: in `1 eval 'a;b'` the
+      // program is `1`, and its words keep their text. Where that walk cannot be read, it asks.)
+      if (name !== undefined && !chainOf(argv).includes(at)) {
+        const problem = traversalProblem(argv);
+        if (problem) ask(`${argv[at]} may run as a program or be handed to another: ${problem}`);
+        continue;
+      }
       if (name === undefined) {
         // A program called like a shell at a path the checks do not know: the rules go by the
         // name and would judge the word after `-c` as code, and it cannot be printed as code
@@ -1642,6 +1692,7 @@ class Printer {
         if (inner.defines) ask("code for eval that defines a function, which changes what a later word of the command runs");
         if (/^[-+]/.test(inner.text)) ask("code for eval that starts with - or + once printed, which eval reads as an option");
         if (inner.bashOnly) this.bashOnly = true;
+        if (inner.arithLed) this.arithLed = true;
         this.inputs.push(...inner.inputs);
         this.judgedInputs.push(...inner.judgedInputs);
         if (inner.moves) this.moves = true;
@@ -1666,6 +1717,7 @@ class Printer {
       if (/^[-+]/.test(inner.text)) ask("code for a nested shell that starts with - or + once printed, which the shell reads as an option");
       // `sh` may be dash, which does not read braces, `[[ ]]` and the like as bash does.
       if (inner.bashOnly && name !== "bash") ask(`code for ${name} that only bash reads this way (braces, [[ ]], <<<, &>, a pattern that could match . or ..), where ${name} may be another shell`);
+      if (inner.arithLed) this.arithLed = true;
       this.inputs.push(...inner.inputs);
         this.judgedInputs.push(...inner.judgedInputs);
       if (inner.moves) this.moves = true;
@@ -1852,9 +1904,9 @@ function print(command: string, depth: number, where?: string): Printed & { defi
       const again = new Printer(command, depth, defines);
       again.constants = constants;
       const judged = again.list(new Lexer(command, depth, false).list(false));
-      if (judged.run === out.run) return { text: out.run, judged: judged.judged, bashOnly: again.bashOnly, inputs: again.inputs, judgedInputs: again.judgedInputs, defines, moves, dupOnCompound };
+      if (judged.run === out.run) return { text: out.run, judged: judged.judged, bashOnly: again.bashOnly, inputs: again.inputs, judgedInputs: again.judgedInputs, arithLed: again.arithLed, literals: [...constants.keys()], defines, moves, dupOnCompound };
     }
-    return { text: out.run, judged: out.judged, bashOnly: printer.bashOnly, inputs: printer.inputs, judgedInputs: printer.judgedInputs, defines, moves, dupOnCompound };
+    return { text: out.run, judged: out.judged, bashOnly: printer.bashOnly, inputs: printer.inputs, judgedInputs: printer.judgedInputs, arithLed: printer.arithLed, literals: [], defines, moves, dupOnCompound };
   } catch (e) {
     if (e instanceof Ask && where) throw new Ask(`${e.message}, ${where}`);
     throw e;
@@ -1871,10 +1923,10 @@ export function canonical(command: string): Canonical {
     // The text is handed to the shell as one argument or one variable, and the kernel takes no
     // single string above 128 KiB: a command near that size could not run as printed.
     if (Buffer.byteLength(command) > MAX_TEXT) return { ask: "a command too long to hand to the shell in one piece" };
-    const { text, judged, bashOnly, inputs, judgedInputs } = print(command, 0);
+    const { text, judged, bashOnly, inputs, judgedInputs, arithLed, literals } = print(command, 0);
     if (/^[-+]/.test(text)) return { ask: "a command line that starts with - or + once blanks, comments and line continuations are gone, which the shell would read as its own options" };
     if (Buffer.byteLength(text) > MAX_TEXT) return { ask: "a command too long to hand to the shell in one piece once printed" };
-    return { text, judged, bashOnly, inputs, judgedInputs };
+    return { text, judged, bashOnly, inputs, judgedInputs, arithLed, literals };
   } catch (e) {
     if (e instanceof Ask) return { ask: e.message };
     // A mistake in this reader must not become an error the caller has to think of: whatever

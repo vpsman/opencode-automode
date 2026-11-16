@@ -913,9 +913,10 @@ describe("r4 B7 (guard level)", () => {
     assert.deepEqual(named("tar -xf a.tar -C .git/hooks"), [".git/hooks/"]);
     assert.deepEqual(named("tar xfC a.tar .git/hooks"), [".git/hooks/"]);
     assert.deepEqual(named("tar -xf a.tar --directory=out"), ["out/"]);
-    // Listing or making an archive writes nothing there.
+    // Listing or making an archive writes nothing there. (B9-6: making one writes the archive,
+    // in the directory tar starts in.)
     assert.deepEqual(named("tar -tf a.tar -C .git/hooks"), []);
-    assert.deepEqual(named("tar -cf a.tar -C src ."), []);
+    assert.deepEqual(named("tar -cf a.tar -C src ."), ["a.tar"]);
     assert.deepEqual(named("unzip a.zip -d .git/hooks"), [".git/hooks/"]);
     assert.deepEqual(named("unzip -l a.zip -d out"), []);
     assert.deepEqual(named("find . -maxdepth 0 -fprint0 .git/hooks/x"), [".git/hooks/x"]);
@@ -944,7 +945,7 @@ describe("r4 B7 (guard level)", () => {
   // The post-write check, with a context of its own.
   const verdictOf = (command: string, ctx: Record<string, unknown> = {}) => {
     const cmds = parse(command).cmds;
-    return g.argvGuards(cmds, { cwd: dir, cwdKnown: true, scope: makeScope(dir, []), written: () => new Set([`${dir}/note.txt`]), resolve: (word: string) => path.resolve(dir, word), cwdOf: () => dir, inProject: (p: string) => p.startsWith(dir), ...ctx });
+    return g.argvGuards(cmds, { cwd: dir, cwdKnown: true, scope: makeScope(dir, []), written: () => new Set([`${dir}/note.txt`]), resolve: (word: string) => path.resolve(dir, word), cwdOf: () => dir, inProject: (p: string) => p.startsWith(dir), gitConfigProblem: () => undefined, ...ctx });
   };
   test("r4 B7-3: after a write, a program on the safe list is not judged, and any other is", () => {
     for (const c of ["ls", "for f in a b", "done", "fi", "sleep 1", "sed -i s/a/b/ f", "awk '{print $1}' f", "jq . f", "curl -s https://h.invalid/x", "tar -tf a.tar", "wait", "bash -c true", "env ls", "git rev-parse HEAD", "git branch", "git cat-file -p HEAD:f", "git ls-files -s", "git push", "git clean -n", "git clean -ndx", "git clean --dry-run", "ping -c1 localhost", "dig example.com", "ss -ltn"])
@@ -954,28 +955,26 @@ describe("r4 B7 (guard level)", () => {
     // (sed and awk with a script from a file are the model's by their own check, written or not.)
     for (const c of ["sed -f s.sed f", "awk -f p.awk f", "sed 1e f", "awk 'BEGIN { system(\"id\") }'"]) assert.equal(verdictOf(c)?.action, "classify", c);
   });
-  test("r4 B7-3: git's readers are safe only where the configuration check says so", () => {
+  // (B8-2: the check is now of the repository's whole configuration, asked for every git command
+  // of the list; `diff` says the user's own diff programs are read too.)
+  test("r4 B7-3: git's commands are safe only where the configuration check says so", () => {
     const asked: [string, boolean][] = [];
-    const ctx = (answer: boolean) => ({ gitFiltersAbsent: (_: unknown, args: string[], diff = false) => (asked.push([args.join(" "), diff]), answer) });
-    for (const c of ["git status", "git add f", "git commit -m x", "git checkout main", "git stash", "git stash pop", "git stash push -m x"]) {
-      assert.equal(verdictOf(c, ctx(true)), undefined, c);
+    const ctx = (answer: string | undefined) => ({ gitConfigProblem: (_: unknown, args: string[], diff = false) => (asked.push([args.join(" "), diff]), answer) });
+    const bad = "with core.fsmonitor in the repository's configuration";
+    for (const c of ["git status", "git add f", "git commit -m x", "git checkout main", "git stash", "git stash pop", "git stash push -m x", "git branch", "git rev-parse HEAD", "git fetch", "git tag v2", "git ls-files", "git ls-files -m", "git ls-files --eol", "git cat-file -p HEAD:f", "git cat-file -t HEAD", "git clean -n", "git config --get user.name", "git worktree list", "git bisect log"]) {
+      assert.equal(verdictOf(c, ctx(undefined)), undefined, c);
       assert.equal(asked.pop()?.[1], false, c);
-      assert.match(verdictOf(c, ctx(false))?.reason ?? "", /after this session wrote/, c);
-      assert.match(verdictOf(c)?.reason ?? "", /after this session wrote/, `${c}, with no check to ask`);
+      assert.match(verdictOf(c, ctx(bad))?.reason ?? "", /runs git, with core\.fsmonitor in the repository's configuration, after this session wrote/, c);
+      assert.match(verdictOf(c, { gitConfigProblem: undefined })?.reason ?? "", /a configuration the check was not given, after this session wrote/, `${c}, with no check to ask`);
     }
     for (const c of ["git diff", "git log -3", "git show HEAD", "git blame f", "git stash list", "git stash show", "git describe", "git shortlog -s", "git cat-file --textconv HEAD:f", "git cat-file --filters HEAD:f"]) {
-      assert.equal(verdictOf(c, ctx(true)), undefined, c);
+      assert.equal(verdictOf(c, ctx(undefined)), undefined, c);
       assert.equal(asked.pop()?.[1], true, c);
-      assert.match(verdictOf(c, ctx(false))?.reason ?? "", /after this session wrote/, c);
+      assert.match(verdictOf(c, ctx(bad))?.reason ?? "", /after this session wrote/, c);
     }
-    // `ls-files -m` compares the work tree through the clean filter.
-    for (const c of ["git ls-files -m", "git ls-files --modified", "git ls-files -dm", "git ls-files --eol"]) {
-      assert.equal(verdictOf(c, ctx(true)), undefined, c);
-      assert.equal(asked.pop()?.[1], false, c);
-      assert.match(verdictOf(c, ctx(false))?.reason ?? "", /after this session wrote/, c);
-    }
-    // What is not on the list stays off it whatever the configuration says.
-    for (const c of ["git pull", "git merge x", "git rebase x", "git cherry-pick x", "git submodule status", "git grep x", "git clean -fd"]) assert.match(verdictOf(c, ctx(true))?.reason ?? "", /after this session wrote/, c);
+    // What is not on the list stays off it whatever the configuration says, and the check is
+    // not asked about a form that writes.
+    for (const c of ["git pull", "git merge x", "git rebase x", "git cherry-pick x", "git submodule status", "git grep x", "git clean -fd", "git config user.name x", "git worktree add ../w"]) assert.match(verdictOf(c, ctx(undefined))?.reason ?? "", /after this session wrote/, c);
   });
   test("r4 B7-2: the writes of the call's other commands count, the command's own do not", () => {
     const mine = new Set([`${dir}/own.txt`]);
@@ -989,9 +988,13 @@ describe("r4 B7 (guard level)", () => {
   });
   test("r4 B7-2: a program run by a path counts where it lives; a pattern of a case is no program", () => {
     const at = (cwd: string, written: string) => ({ cwdOf: () => cwd, resolve: (word: string) => path.resolve(cwd, word), written: () => new Set([written]) });
-    // It runs in src and lives in tools: a write in tools reaches it, one in docs does not.
+    // It runs in src and lives in tools: a write in tools reaches it. (B8-3: so does one anywhere
+    // else in the project; one outside the project reaches only where it lives or runs.)
     assert.match(verdictOf("../tools/check.sh", at(`${dir}/src`, `${dir}/tools/lib.sh`))?.reason ?? "", /after this session wrote/);
-    assert.equal(verdictOf("../tools/check.sh", at(`${dir}/src`, `${dir}/docs/x.md`)), undefined);
+    assert.match(verdictOf("../tools/check.sh", at(`${dir}/src`, `${dir}/docs/x.md`))?.reason ?? "", /runs check\.sh after this session wrote \.\.\/docs\/x\.md|after this session wrote docs\/x\.md/);
+    assert.equal(verdictOf("../tools/check.sh", at(`${dir}/src`, `${path.dirname(dir)}/elsewhere-b8/docs/x.md`)), undefined);
+    assert.match(verdictOf(`${path.dirname(dir)}/elsewhere-b8/tools/check.sh`, at(`${dir}/src`, `${path.dirname(dir)}/elsewhere-b8/tools/lib.sh`))?.reason ?? "", /after this session wrote/);
+    assert.match(verdictOf("../tools/check.sh", { ...at(`${dir}/src`, `${path.dirname(dir)}/elsewhere-b8/docs/x.md`), inProject: undefined })?.reason ?? "", /after this session wrote/, "with no project to ask about, every write counts");
     const star = parse("*").cmds[0];
     const ctx = { cwd: dir, cwdKnown: true, scope: makeScope(dir, []), written: () => new Set([`${dir}/note.txt`]), resolve: (word: string) => path.resolve(dir, word), cwdOf: () => dir };
     assert.match(g.argvGuard(star, ctx)?.reason ?? "", /after this session wrote/);

@@ -660,7 +660,9 @@ test("r4 21: a relative core.hooksPath your config sets for the project's reposi
       assert.equal(gitIn(r, "config", "--get", "core.hooksPath").trim(), ".myhooks", "the fixture: git reads the included value in the project");
       d.projectRoots(session);
       const p = planFor(r, "git status");
-      assert.equal(p.problem, undefined);
+      // (Twelfth pass, the maintainer's decision: a core.hooksPath that a conditional include
+      // sets asks, whatever its condition; what git reads here is protected all the same.)
+      assert.match(p.problem ?? "", /sets core\.hooksPath and git reads it only under a condition/);
       assert.ok(p.ro.includes(path.join(r, ".myhooks")), "the hooks directory git uses here stayed writable");
       const ran = sandboxed(p, `echo planted >> ${r}/.myhooks/pre-commit`, r);
       assert.notEqual(ran.status, 0);
@@ -982,20 +984,16 @@ test("r4 21: a call in a submodule under .git/modules can make no new name in th
     assert.equal(g("rev-parse", "--is-shallow-repository").trim(), "false");
   }));
 
-// Eighth pass: only a link that leads outside the writable directories. One that leads into the
-// project asks again (what git reads through it could be written there: test/c-eighth.test.mts).
-test("r4 21: a symbolic link at the top of the superproject's git directory that leads outside the writable directories does not make a call in a submodule ask", () =>
+// Eighth pass: only a link that leads outside the writable directories was left. Tenth pass, the
+// maintainer's decision "any link asks": that one asks too (test/c-tenth.test.mts).
+test("r4 21: a symbolic link at the top of the superproject's git directory that leads outside the writable directories makes a call in a submodule ask", () =>
   withModules((r, session, _g, at) => {
     fs.mkdirSync(`${r}-elsewhere`);
     fs.symlinkSync(`${r}-elsewhere`, path.join(at.dotGit, "lfs"));
     d.projectRoots(session);
-    const p = planFor(r, "git status", at.lib);
-    assert.equal(p.problem, undefined);
-    assert.notEqual(sandboxed(p, `echo planted > ${at.dotGit}/lfs/probe`, at.lib).status, 0, "written through the link");
-    // The link itself cannot be replaced: its directory is read-only.
-    assert.notEqual(sandboxed(p, `rm ${at.dotGit}/lfs && ln -s /tmp ${at.dotGit}/lfs`, at.lib).status, 0);
-    assert.equal(fs.readlinkSync(path.join(at.dotGit, "lfs")), `${r}-elsewhere`);
-    assert.equal(sandboxed(p, "git status --short", at.lib).status, 0);
+    const problem = planFor(r, "git status", at.lib).problem ?? "";
+    assert.match(problem, /symbolic link/);
+    assert.ok(problem.includes(path.join(at.dotGit, "lfs")), problem);
   }));
 
 test("r4 21: a module nested in a module: the call gets the inner one, with both git directories around it read-only whole", () =>

@@ -1,0 +1,177 @@
+# systemd-analyze security for the model service's unit, 2026-11-16, systemd 257 (257.13-1~deb13u1) (finding 34 of the round 4 review)
+
+## The repository's unit, analysed offline:
+## $ systemd-analyze security --user --offline=true --no-pager systemd/opencode-automode-kev.service
+  NAME                                                        DESCRIPTION                                                                                         EXPOSURE
+✓ SystemCallFilter=~@swap                                     System call allow list defined for service, and @swap is not included                               
+✗ SystemCallFilter=~@resources                                System call allow list defined for service, and @resources is included (e.g. ioprio_set is allowed)      0.2
+✓ SystemCallFilter=~@reboot                                   System call allow list defined for service, and @reboot is not included                             
+✓ SystemCallFilter=~@raw-io                                   System call allow list defined for service, and @raw-io is not included                             
+✗ SystemCallFilter=~@privileged                               System call allow list defined for service, and @privileged is included (e.g. chown is allowed)          0.2
+✓ SystemCallFilter=~@obsolete                                 System call allow list defined for service, and @obsolete is not included                           
+✓ SystemCallFilter=~@mount                                    System call allow list defined for service, and @mount is not included                              
+✓ SystemCallFilter=~@module                                   System call allow list defined for service, and @module is not included                             
+✓ SystemCallFilter=~@debug                                    System call allow list defined for service, and @debug is not included                              
+✓ SystemCallFilter=~@cpu-emulation                            System call allow list defined for service, and @cpu-emulation is not included                      
+✓ SystemCallFilter=~@clock                                    System call allow list defined for service, and @clock is not included                              
+✗ KeyringMode=                                                Service shares key material with other service                                                           0.2
+✗ RootDirectory=/RootImage=                                   Service runs within the host's root directory                                                            0.1
+  SupplementaryGroups=                                        Service runs as root, option does not matter                                                        
+  RemoveIPC=                                                  Service runs as root, option does not apply                                                         
+✗ User=/DynamicUser=                                          Service runs as root user                                                                                0.4
+✓ RestrictRealtime=                                           Service realtime scheduling access is restricted                                                    
+✓ CapabilityBoundingSet=~CAP_SYS_TIME                         Service processes cannot change the system clock                                                    
+✓ NoNewPrivileges=                                            Service processes cannot acquire new privileges                                                     
+✓ AmbientCapabilities=                                        Service process does not receive ambient capabilities                                               
+✗ CapabilityBoundingSet=~CAP_SYS_PACCT                        Service may use acct()                                                                                   0.1
+✗ CapabilityBoundingSet=~CAP_KILL                             Service may send UNIX signals to arbitrary processes                                                     0.1
+✗ ProtectKernelLogs=                                          Service may read from or write to the kernel log ring buffer                                             0.2
+✗ CapabilityBoundingSet=~CAP_(DAC_*|FOWNER|IPC_OWNER)         Service may override UNIX file/IPC permission checks                                                     0.2
+✗ CapabilityBoundingSet=~CAP_LINUX_IMMUTABLE                  Service may mark files immutable                                                                         0.1
+✗ CapabilityBoundingSet=~CAP_IPC_LOCK                         Service may lock memory into RAM                                                                         0.1
+✗ CapabilityBoundingSet=~CAP_BPF                              Service may load BPF programs                                                                            0.1
+✗ CapabilityBoundingSet=~CAP_SYS_TTY_CONFIG                   Service may issue vhangup()                                                                              0.1
+✗ CapabilityBoundingSet=~CAP_SYS_BOOT                         Service may issue reboot()                                                                               0.1
+✗ CapabilityBoundingSet=~CAP_SYS_CHROOT                       Service may issue chroot()                                                                               0.1
+✓ SystemCallArchitectures=                                    Service may execute system calls only with native ABI                                               
+✗ CapabilityBoundingSet=~CAP_BLOCK_SUSPEND                    Service may establish wake locks                                                                         0.1
+✗ MemoryDenyWriteExecute=                                     Service may create writable executable memory mappings                                                   0.1
+✗ CapabilityBoundingSet=~CAP_LEASE                            Service may create file leases                                                                           0.1
+✗ CapabilityBoundingSet=~CAP_(CHOWN|FSETID|SETFCAP)           Service may change file ownership/access mode/capabilities unrestricted                                  0.2
+✗ CapabilityBoundingSet=~CAP_SET(UID|GID|PCAP)                Service may change UID/GID identities/capabilities                                                       0.3
+✗ RestrictAddressFamilies=~AF_UNIX                            Service may allocate local sockets                                                                       0.1
+✗ CapabilityBoundingSet=~CAP_MAC_*                            Service may adjust SMACK MAC                                                                             0.1
+✓ ProtectSystem=                                              Service has strict read-only access to the OS file hierarchy                                        
+✗ CapabilityBoundingSet=~CAP_SYS_PTRACE                       Service has ptrace() debugging abilities                                                                 0.3
+✗ CapabilityBoundingSet=~CAP_SYS_(NICE|RESOURCE)              Service has privileges to change resource use parameters                                                 0.1
+✓ CapabilityBoundingSet=~CAP_SYS_RAWIO                        Service has no raw I/O access                                                                       
+✓ PrivateNetwork=                                             Service has no access to the host's network                                                         
+✓ PrivateTmp=                                                 Service has no access to other software's temporary files                                           
+✓ PrivateDevices=                                             Service has no access to hardware devices                                                           
+✗ CapabilityBoundingSet=~CAP_NET_ADMIN                        Service has network configuration privileges                                                             0.2
+✗ ProtectProc=                                                Service has full access to process tree (/proc hidepid=)                                                 0.2
+✗ ProcSubset=                                                 Service has full access to non-process /proc files (/proc subset=)                                       0.1
+✗ CapabilityBoundingSet=~CAP_NET_(BIND_SERVICE|BROADCAST|RAW) Service has elevated networking privileges                                                               0.1
+✗ CapabilityBoundingSet=~CAP_AUDIT_*                          Service has audit subsystem access                                                                       0.1
+✗ CapabilityBoundingSet=~CAP_SYS_ADMIN                        Service has administrator privileges                                                                     0.3
+✗ PrivateUsers=                                               Service has access to other users                                                                        0.2
+✗ CapabilityBoundingSet=~CAP_SYSLOG                           Service has access to kernel logging                                                                     0.1
+✗ ProtectHome=                                                Service has access to fake empty home directories                                                        0.1
+✗ DeviceAllow=                                                Service has a device ACL with some special devices: char-rtc:r                                           0.1
+✓ Delegate=                                                   Service does not maintain its own delegated control group subtree                                   
+✗ IPAddressDeny=                                              Service does not define an IP address allow list                                                         0.2
+✓ NotifyAccess=                                               Service child processes cannot alter service state                                                  
+✓ ProtectClock=                                               Service cannot write to the hardware clock or system clock                                          
+✓ CapabilityBoundingSet=~CAP_WAKE_ALARM                       Service cannot program timers that wake up the system                                               
+✓ ProtectControlGroups=                                       Service cannot modify the control group file system                                                 
+✓ ProtectKernelModules=                                       Service cannot load or read kernel modules                                                          
+✓ CapabilityBoundingSet=~CAP_SYS_MODULE                       Service cannot load kernel modules                                                                  
+✓ PrivateMounts=                                              Service cannot install system mounts                                                                
+✓ RestrictNamespaces=~user                                    Service cannot create user namespaces                                                               
+✓ RestrictNamespaces=~pid                                     Service cannot create process namespaces                                                            
+✓ RestrictNamespaces=~net                                     Service cannot create network namespaces                                                            
+✓ RestrictNamespaces=~uts                                     Service cannot create hostname namespaces                                                           
+✓ RestrictNamespaces=~mnt                                     Service cannot create file system namespaces                                                        
+✓ CapabilityBoundingSet=~CAP_MKNOD                            Service cannot create device nodes                                                                  
+✓ RestrictNamespaces=~cgroup                                  Service cannot create cgroup namespaces                                                             
+✓ RestrictNamespaces=~ipc                                     Service cannot create IPC namespaces                                                                
+✓ ProtectHostname=                                            Service cannot change system host/domainname                                                        
+✓ LockPersonality=                                            Service cannot change ABI personality                                                               
+✓ ProtectKernelTunables=                                      Service cannot alter kernel tunables (/proc/sys, …)                                                 
+✓ RestrictAddressFamilies=~AF_PACKET                          Service cannot allocate packet sockets                                                              
+✓ RestrictAddressFamilies=~AF_NETLINK                         Service cannot allocate netlink sockets                                                             
+✓ RestrictAddressFamilies=~…                                  Service cannot allocate exotic sockets                                                              
+✓ RestrictAddressFamilies=~AF_(INET|INET6)                    Service cannot allocate Internet sockets                                                            
+✓ RestrictSUIDSGID=                                           SUID/SGID file creation by service is restricted                                                    
+✓ UMask=                                                      Files created by service are accessible only by service's own user by default                       
+
+→ Overall exposure level for opencode-automode-kev.service: 3.6 OK :-)
+## exit status: 0
+
+## The unit installed on the machine this was recorded on (NOT the same file as the repository's: an older copy):
+## $ systemd-analyze security --user --no-pager opencode-automode-kev.service
+  NAME                                                        DESCRIPTION                                                                                         EXPOSURE
+✓ SystemCallFilter=~@swap                                     System call allow list defined for service, and @swap is not included                               
+✗ SystemCallFilter=~@resources                                System call allow list defined for service, and @resources is included (e.g. ioprio_set is allowed)      0.2
+✓ SystemCallFilter=~@reboot                                   System call allow list defined for service, and @reboot is not included                             
+✓ SystemCallFilter=~@raw-io                                   System call allow list defined for service, and @raw-io is not included                             
+✗ SystemCallFilter=~@privileged                               System call allow list defined for service, and @privileged is included (e.g. chown is allowed)          0.2
+✓ SystemCallFilter=~@obsolete                                 System call allow list defined for service, and @obsolete is not included                           
+✓ SystemCallFilter=~@mount                                    System call allow list defined for service, and @mount is not included                              
+✓ SystemCallFilter=~@module                                   System call allow list defined for service, and @module is not included                             
+✓ SystemCallFilter=~@debug                                    System call allow list defined for service, and @debug is not included                              
+✓ SystemCallFilter=~@cpu-emulation                            System call allow list defined for service, and @cpu-emulation is not included                      
+✓ SystemCallFilter=~@clock                                    System call allow list defined for service, and @clock is not included                              
+✗ KeyringMode=                                                Service shares key material with other service                                                           0.2
+✗ RootDirectory=/RootImage=                                   Service runs within the host's root directory                                                            0.1
+  SupplementaryGroups=                                        Service runs as root, option does not matter                                                        
+  RemoveIPC=                                                  Service runs as root, option does not apply                                                         
+✗ User=/DynamicUser=                                          Service runs as root user                                                                                0.4
+✓ RestrictRealtime=                                           Service realtime scheduling access is restricted                                                    
+✓ CapabilityBoundingSet=~CAP_SYS_TIME                         Service processes cannot change the system clock                                                    
+✓ NoNewPrivileges=                                            Service processes cannot acquire new privileges                                                     
+✓ AmbientCapabilities=                                        Service process does not receive ambient capabilities                                               
+✗ CapabilityBoundingSet=~CAP_SYS_PACCT                        Service may use acct()                                                                                   0.1
+✗ CapabilityBoundingSet=~CAP_KILL                             Service may send UNIX signals to arbitrary processes                                                     0.1
+✗ ProtectKernelLogs=                                          Service may read from or write to the kernel log ring buffer                                             0.2
+✗ CapabilityBoundingSet=~CAP_(DAC_*|FOWNER|IPC_OWNER)         Service may override UNIX file/IPC permission checks                                                     0.2
+✗ CapabilityBoundingSet=~CAP_LINUX_IMMUTABLE                  Service may mark files immutable                                                                         0.1
+✗ CapabilityBoundingSet=~CAP_IPC_LOCK                         Service may lock memory into RAM                                                                         0.1
+✗ CapabilityBoundingSet=~CAP_BPF                              Service may load BPF programs                                                                            0.1
+✗ CapabilityBoundingSet=~CAP_SYS_TTY_CONFIG                   Service may issue vhangup()                                                                              0.1
+✗ CapabilityBoundingSet=~CAP_SYS_BOOT                         Service may issue reboot()                                                                               0.1
+✗ CapabilityBoundingSet=~CAP_SYS_CHROOT                       Service may issue chroot()                                                                               0.1
+✓ SystemCallArchitectures=                                    Service may execute system calls only with native ABI                                               
+✗ CapabilityBoundingSet=~CAP_BLOCK_SUSPEND                    Service may establish wake locks                                                                         0.1
+✗ MemoryDenyWriteExecute=                                     Service may create writable executable memory mappings                                                   0.1
+✗ CapabilityBoundingSet=~CAP_LEASE                            Service may create file leases                                                                           0.1
+✗ CapabilityBoundingSet=~CAP_(CHOWN|FSETID|SETFCAP)           Service may change file ownership/access mode/capabilities unrestricted                                  0.2
+✗ CapabilityBoundingSet=~CAP_SET(UID|GID|PCAP)                Service may change UID/GID identities/capabilities                                                       0.3
+✗ RestrictAddressFamilies=~AF_UNIX                            Service may allocate local sockets                                                                       0.1
+✗ CapabilityBoundingSet=~CAP_MAC_*                            Service may adjust SMACK MAC                                                                             0.1
+✓ ProtectSystem=                                              Service has strict read-only access to the OS file hierarchy                                        
+✗ ProtectHome=                                                Service has read-only access to home directories                                                         0.1
+✗ CapabilityBoundingSet=~CAP_SYS_PTRACE                       Service has ptrace() debugging abilities                                                                 0.3
+✗ CapabilityBoundingSet=~CAP_SYS_(NICE|RESOURCE)              Service has privileges to change resource use parameters                                                 0.1
+✓ CapabilityBoundingSet=~CAP_SYS_RAWIO                        Service has no raw I/O access                                                                       
+✓ PrivateNetwork=                                             Service has no access to the host's network                                                         
+✓ PrivateTmp=                                                 Service has no access to other software's temporary files                                           
+✓ PrivateDevices=                                             Service has no access to hardware devices                                                           
+✗ CapabilityBoundingSet=~CAP_NET_ADMIN                        Service has network configuration privileges                                                             0.2
+✗ ProtectProc=                                                Service has full access to process tree (/proc hidepid=)                                                 0.2
+✗ ProcSubset=                                                 Service has full access to non-process /proc files (/proc subset=)                                       0.1
+✗ CapabilityBoundingSet=~CAP_NET_(BIND_SERVICE|BROADCAST|RAW) Service has elevated networking privileges                                                               0.1
+✗ CapabilityBoundingSet=~CAP_AUDIT_*                          Service has audit subsystem access                                                                       0.1
+✗ CapabilityBoundingSet=~CAP_SYS_ADMIN                        Service has administrator privileges                                                                     0.3
+✗ PrivateUsers=                                               Service has access to other users                                                                        0.2
+✗ CapabilityBoundingSet=~CAP_SYSLOG                           Service has access to kernel logging                                                                     0.1
+✗ DeviceAllow=                                                Service has a device ACL with some special devices: char-rtc:r                                           0.1
+✓ Delegate=                                                   Service does not maintain its own delegated control group subtree                                   
+✗ IPAddressDeny=                                              Service does not define an IP address allow list                                                         0.2
+✓ NotifyAccess=                                               Service child processes cannot alter service state                                                  
+✓ ProtectClock=                                               Service cannot write to the hardware clock or system clock                                          
+✓ CapabilityBoundingSet=~CAP_WAKE_ALARM                       Service cannot program timers that wake up the system                                               
+✓ ProtectControlGroups=                                       Service cannot modify the control group file system                                                 
+✓ ProtectKernelModules=                                       Service cannot load or read kernel modules                                                          
+✓ CapabilityBoundingSet=~CAP_SYS_MODULE                       Service cannot load kernel modules                                                                  
+✓ PrivateMounts=                                              Service cannot install system mounts                                                                
+✓ RestrictNamespaces=~user                                    Service cannot create user namespaces                                                               
+✓ RestrictNamespaces=~pid                                     Service cannot create process namespaces                                                            
+✓ RestrictNamespaces=~net                                     Service cannot create network namespaces                                                            
+✓ RestrictNamespaces=~uts                                     Service cannot create hostname namespaces                                                           
+✓ RestrictNamespaces=~mnt                                     Service cannot create file system namespaces                                                        
+✓ CapabilityBoundingSet=~CAP_MKNOD                            Service cannot create device nodes                                                                  
+✓ RestrictNamespaces=~cgroup                                  Service cannot create cgroup namespaces                                                             
+✓ RestrictNamespaces=~ipc                                     Service cannot create IPC namespaces                                                                
+✓ ProtectHostname=                                            Service cannot change system host/domainname                                                        
+✓ LockPersonality=                                            Service cannot change ABI personality                                                               
+✓ ProtectKernelTunables=                                      Service cannot alter kernel tunables (/proc/sys, …)                                                 
+✓ RestrictAddressFamilies=~AF_PACKET                          Service cannot allocate packet sockets                                                              
+✓ RestrictAddressFamilies=~AF_NETLINK                         Service cannot allocate netlink sockets                                                             
+✓ RestrictAddressFamilies=~…                                  Service cannot allocate exotic sockets                                                              
+✓ RestrictAddressFamilies=~AF_(INET|INET6)                    Service cannot allocate Internet sockets                                                            
+✓ RestrictSUIDSGID=                                           SUID/SGID file creation by service is restricted                                                    
+✓ UMask=                                                      Files created by service are accessible only by service's own user by default                       
+
+→ Overall exposure level for opencode-automode-kev.service: 3.6 OK :-)
+## exit status: 0

@@ -18,6 +18,17 @@ const ROOT = path.resolve(import.meta.dirname, "..");
 const home = os.homedir();
 const configFile = path.join(process.env.XDG_CONFIG_HOME!, "opencode", "automode.json");
 const stateDir = path.join(process.env.XDG_STATE_HOME!, "opencode-automode");
+// A resume as the user makes it: the resume file's time is set just ahead of every pause made so
+// far (a file system's clock can lag Date.now() by a tick), and the test waits until the clock has
+// passed it, so that a pause made after the resume is never read as resumed already. (It was set
+// seconds ahead before; on a fast machine a later pause fell within them.)
+function touchResume(file: string): void {
+  const at = Date.now() + 20;
+  fs.utimesSync(file, new Date(at), new Date(at));
+  while (Date.now() <= at + 1) {
+    // wait out the clock
+  }
+}
 const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "automode-plugin-")));
 const project = path.join(tmp, "project");
 // Lists reach lockwrite newline-separated.
@@ -107,6 +118,12 @@ before(() => {
 afterEach(async () => {
   for (const h of hosts.splice(0)) await h.stop();
   mock.timers.reset();
+  // B8-5: each test is a world of its own: no session of an earlier test was ever seen (the
+  // plugin keeps, per session id, the moment the session was first seen at).
+  fs.rmSync(path.join(stateDir, "moments"), { recursive: true, force: true });
+  // Nor a resume file an earlier test put ahead of the clock (resume() dates it seconds ahead,
+  // and on a fast machine the next test's pause falls within them and reads as resumed).
+  fs.rmSync(path.join(stateDir, "resume"), { force: true });
 });
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
@@ -246,6 +263,87 @@ describe("K1: edit and read only tighten", () => {
   test("J2: an edit of .git/config or a hook asks", async () => {
     assert.equal(await evaluate("edit", ".git/config"), "ask");
     assert.equal(await evaluate("edit", ".git/hooks/pre-commit"), "ask");
+  });
+  test("r4 21 (tenth pass): a hook linked to a script of the project: a call is allowed and cannot rewrite the script, and an edit of the script asks", async () => {
+    const script = path.join(project, "scripts", "pre-commit");
+    const hook = path.join(project, ".git", "hooks", "pre-commit");
+    fs.mkdirSync(path.dirname(script), { recursive: true });
+    fs.writeFileSync(script, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    fs.symlinkSync("../../scripts/pre-commit", hook);
+    try {
+      const { shell, permission } = await call(await start(), "echo planted >> scripts/pre-commit");
+      assert.equal(permission.effect, "allow", permission.message);
+      assert.ok(wrapped(shell));
+      assert.ok(list(shell.env, "AUTOMODE_RO").includes(script));
+      const r = spawnSync(shell.shell, ["-c", shell.command], { cwd: project, env: shell.env as NodeJS.ProcessEnv, encoding: "utf8" });
+      assert.notEqual(r.status, 0);
+      assert.equal(fs.readFileSync(script, "utf8"), "#!/bin/sh\nexit 0\n");
+      const permitted: any = { sessionID: "s1", action: "edit", resources: ["scripts/pre-commit"], effect: "allow" };
+      await (await start()).permission(permitted);
+      assert.equal(permitted.effect, "ask");
+      assert.match(permitted.message, /edit changes .*scripts\/pre-commit, which git or opencode runs or loads/);
+      assert.equal(await evaluate("edit", "src/a.ts"), "allow");
+    } finally {
+      fs.rmSync(hook);
+      fs.rmSync(path.join(project, "scripts"), { recursive: true, force: true });
+    }
+  });
+  test("r4 21 (eleventh pass): a checkout that would rewrite a linked hook's script asks, naming it; one that leaves it as it is, and a status, are allowed", async () => {
+    const script = path.join(project, "scripts", "pre-commit");
+    const hook = path.join(project, ".git", "hooks", "pre-commit");
+    const git = (...args: string[]) => execFileSync("git", ["-C", project, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    fs.mkdirSync(path.dirname(script), { recursive: true });
+    fs.writeFileSync(script, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    try {
+      git("add", "scripts/pre-commit");
+      git("commit", "-qm", "one");
+      git("branch", "same");
+      git("checkout", "-q", "-b", "other");
+      fs.writeFileSync(script, "#!/bin/sh\necho other >/dev/null\nexit 0\n");
+      git("commit", "-qam", "other");
+      git("checkout", "-q", "-");
+      fs.symlinkSync("../../scripts/pre-commit", hook);
+      const host = await start();
+      const other = await call(host, "git checkout other");
+      assert.equal(other.permission.effect, "ask");
+      assert.match(other.permission.message, /git checkout would rewrite .*scripts\/pre-commit, which the sandbox keeps read-only/);
+      for (const command of ["git switch same", "git status"]) assert.equal((await call(host, command)).permission.effect, "allow", command);
+    } finally {
+      fs.rmSync(hook, { force: true });
+      fs.rmSync(path.join(project, "scripts"), { recursive: true, force: true });
+      // The project as the other tests have it: a repository with no commit.
+      fs.rmSync(path.join(project, ".git"), { recursive: true, force: true });
+      execFileSync("git", ["init", "-q", project]);
+    }
+  });
+  test("r4 21 (twelfth pass): a merge after a fetch in the same call asks, saying why; the merge alone is allowed; a pull that asks says how to have it told", async () => {
+    const agents = path.join(project, "AGENTS.md");
+    const origin = `${project}-origin.git`;
+    const git = (...args: string[]) => execFileSync("git", ["-C", project, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    fs.writeFileSync(agents, "# one\n");
+    try {
+      git("add", "AGENTS.md");
+      git("commit", "-qm", "one");
+      execFileSync("git", ["clone", "-q", "--bare", project, origin]);
+      git("remote", "add", "origin", origin);
+      git("fetch", "-q", "origin");
+      git("branch", "-q", `--set-upstream-to=origin/${git("branch", "--show-current").trim()}`);
+      // (Each in a session of its own: after an ask, the next git command is the model's.)
+      const chained = await call(await start(), "git fetch && git merge --ff-only @{upstream}");
+      assert.equal(chained.permission.effect, "ask");
+      assert.match(chained.permission.message, /git merge may rewrite .*AGENTS\.md, which the sandbox keeps read-only.*git fetch in the same command/);
+      const alone = await call(await start(), "git merge --ff-only @{upstream}");
+      assert.equal(alone.permission.effect, "allow", alone.permission.message);
+      const pulled = await call(await start(), "git pull");
+      assert.equal(pulled.permission.effect, "ask");
+      assert.match(pulled.permission.message, /run `git fetch` first, then `git merge --ff-only @\{upstream\}` or `git rebase @\{upstream\}`, which can be told/);
+    } finally {
+      fs.rmSync(agents, { force: true });
+      fs.rmSync(origin, { recursive: true, force: true });
+      // The project as the other tests have it: a repository with no commit.
+      fs.rmSync(path.join(project, ".git"), { recursive: true, force: true });
+      execFileSync("git", ["init", "-q", project]);
+    }
   });
   test("J2: an edit of the project's opencode config asks", async () => {
     assert.equal(await evaluate("edit", "opencode.json"), "ask");
@@ -406,7 +504,7 @@ describe("C10: a pause is reported with what was found", () => {
       assert.match(paused.permission.message, /touch .*opencode-automode\/resume/);
       const resume = path.join(stateDir, "resume");
       fs.writeFileSync(resume, "");
-      fs.utimesSync(resume, new Date(Date.now() + 2000), new Date(Date.now() + 2000));
+      touchResume(resume);
       assert.equal((await call(host, "ls", { sessionID: "pause" })).permission.effect, "allow");
     } finally {
       fs.rmSync(path.join(project, "third_party"), { recursive: true, force: true });
@@ -658,7 +756,9 @@ describe("r2 33: the model server's unit", () => {
 // process still runs. Sessions in one directory (subagents) share the plugin.
 describe("r3 18/36: calls that run at the same time", () => {
   const origin = path.join(tmp, "r3-origin.git");
-  const bin = path.join(tmp, "r3-bin");
+  // (B9-8: the stand-in's directory lies in the throwaway home test/run.mjs makes, outside every
+  // temp directory: a PATH entry in one turns the safe list off after a session write.)
+  const bin = path.join(os.homedir(), `r3-bin-${process.pid}`);
   const pathBefore = process.env.PATH;
   const g = (...args: string[]) => execFileSync("git", ["-C", project, ...args], { stdio: ["ignore", "pipe", "pipe"] });
   before(() => {
@@ -676,6 +776,7 @@ describe("r3 18/36: calls that run at the same time", () => {
   after(() => {
     process.env.PATH = pathBefore;
     g("remote", "remove", "origin");
+    fs.rmSync(bin, { recursive: true, force: true });
   });
   const PUSH = "git push";
   const WRITER = "git checkout main";
@@ -1050,9 +1151,12 @@ describe("r3 18/36: calls that run at the same time", () => {
       assert.match(during.permission.message, /in a place where this session wrote files the guard cannot list/);
       g("checkout", "-q", "r4-d1");
       await checkout.over();
+      // (B8-3: what git changed is a write of the session in the project, so the script in the
+      // other directory goes to the model too. The record is now the file git changed, by name,
+      // and no longer the whole repository.)
       const same = await whole(host, "cd r4-a && ./same.sh");
-      assert.equal(same.permission.effect, "allow", same.permission.message);
-      await same.over();
+      assert.equal(same.permission.effect, "ask", same.permission.message);
+      assert.match(same.permission.message, /runs same\.sh after this session wrote \.\.\/r4-b\/changed\.sh/);
       // The changed file is caught by its change time (the first line) ...
       const changed = await whole(host, "cd r4-b && ./changed.sh");
       assert.equal(changed.permission.effect, "ask");
@@ -1117,6 +1221,44 @@ describe("r3 18/36: calls that run at the same time", () => {
       assert.match(next.permission.message, /paused.*r3-window2/);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  // B10-9: the other edit that asks (an approved command may be creating a repository there):
+  // approved, what it writes is the session's as well.
+  test("r4 B10-9: an edit asked about while an approved command may create a repository, once approved, is a session write", async () => {
+    fs.writeFileSync(path.join(project, "b10-window-run.sh"), "#!/bin/sh\n. ./r3-window3/b10.sh\n", { mode: 0o755 });
+    g("add", "b10-window-run.sh");
+    g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "b10 window script");
+    const host = await start({ useClassifier: false });
+    const dir = path.join(project, "r3-window3");
+    try {
+      const before = await whole(host, "./b10-window-run.sh", { sessionID: "b10w" });
+      assert.equal(before.permission.effect, "allow", before.permission.message);
+      await before.over();
+      const init = await whole(host, "git init r3-window3", { sessionID: "b10w" });
+      assert.equal(init.permission.effect, "ask");
+      await reply(host, init.id);
+      const target = path.join(dir, "b10.sh");
+      const id = `b10w-${++n}`;
+      const source = { type: "tool", messageID: "m10", id };
+      const edited: any = { sessionID: "b10w", action: "edit", resources: [target], source, effect: "allow" };
+      await host.permission(edited);
+      assert.equal(edited.effect, "ask");
+      assert.match(edited.message, /approved command may still be creating a repository/);
+      await host.emit({ type: "permission.asked", data: { id: `per_${id}`, sessionID: "b10w", action: "edit", resources: [target], source } });
+      await host.emit({ type: "permission.replied", data: { sessionID: "b10w", requestID: `per_${id}`, reply: "once" } });
+      execFileSync("git", ["init", "-q", dir]);
+      await init.over();
+      const after = await whole(host, "./b10-window-run.sh", { sessionID: "b10w" });
+      assert.equal(after.permission.effect, "ask", after.permission.message);
+      assert.match(after.permission.message, /leave this to the model/);
+      assert.match(after.permission.message, /b10\.sh/);
+      const other = await whole(host, "./b10-window-run.sh", { sessionID: "b10w-other" });
+      assert.equal(other.permission.effect, "allow", other.permission.message);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      g("rm", "-q", "b10-window-run.sh");
+      g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "b10 window script gone");
     }
   });
 });
@@ -1587,7 +1729,7 @@ describe("r4 fifth pass: the URL a command names, one walk per root, approvals a
   const resume = () => {
     const file = path.join(stateDir, "resume");
     fs.writeFileSync(file, "");
-    fs.utimesSync(file, new Date(Date.now() + 5000), new Date(Date.now() + 5000));
+    touchResume(file);
   };
   afterEach(() => {
     for (const name of ["config.worktree", "commondir", ...quarantined()]) fs.rmSync(path.join(dotGit, name), { force: true });
@@ -1685,7 +1827,7 @@ describe("r4 sixth pass: a local push with a hook, push hooks under a relative h
   const resume = () => {
     const file = path.join(stateDir, "resume");
     fs.writeFileSync(file, "");
-    fs.utimesSync(file, new Date(Date.now() + 5000), new Date(Date.now() + 5000));
+    touchResume(file);
   };
   afterEach(() => {
     for (const name of ["commondir", ".husky", ...quarantined()]) fs.rmSync(path.join(dotGit, name), { recursive: true, force: true });
@@ -1831,6 +1973,75 @@ describe("r4 sixth pass: a local push with a hook, push hooks under a relative h
       // shells counts for all of them from then on.
       const after = await call(await start({ useClassifier: false }), "cd src && ls", { sessionID: sid("cdpath-after") });
       assert.notEqual(after.permission.effect, "allow", "an instance that keeps CDPATH was started in this process");
+    } finally {
+      if (before === undefined) delete process.env.CDPATH;
+      else process.env.CDPATH = before;
+      guardModule.shellKeeps(undefined);
+    }
+  });
+
+  // Ninth pass (the reading of the eighth, F4): the guard reads this process's CDPATH, and
+  // opencode builds a shell's environment from its session's. Where `sandboxKeepEnv` names the
+  // variable the shell keeps its own, and a call that holds a `cd` is not run as decided when
+  // the two differ, whichever of them has one.
+  test("r4 21: a shell whose CDPATH is not the one the checks read (set, unset or another value) does not run a cd as decided: it asks, saying why", async () => {
+    const guardModule = await import("../guard.ts");
+    fs.mkdirSync(path.join(project, "src"), { recursive: true });
+    const elsewhere = path.join(home, "elsewhere");
+    const before = process.env.CDPATH;
+    guardModule.shellKeeps(undefined);
+    const cases: { own: string | undefined; shell: string | undefined; command: string; says: RegExp }[] = [
+      // The session has one, opencode has none: the checks followed `./src`.
+      { own: undefined, shell: elsewhere, command: "cd src && ls", says: /its shell has CDPATH=\S*elsewhere and opencode's own environment has none/ },
+      { own: undefined, shell: elsewhere, command: "ls && cd src && ls", says: /its shell has CDPATH=/ },
+      // opencode has one, the session has none or another: the checks did not follow the plain
+      // word, and what they did follow is not what this shell would do either way.
+      { own: elsewhere, shell: undefined, command: "cd ./src && ls", says: /its shell has no CDPATH and opencode's own environment has \S*elsewhere/ },
+      { own: elsewhere, shell: path.join(home, "third"), command: "cd ./src && ls", says: /its shell has CDPATH=\S*third and opencode's own environment has \S*elsewhere/ },
+    ];
+    try {
+      for (const sandbox of [true, false]) {
+        for (const [n, c] of cases.entries()) {
+          if (c.own === undefined) delete process.env.CDPATH;
+          else process.env.CDPATH = c.own;
+          const host = await start({ sandbox, sandboxKeepEnv: ["CDPATH"], useClassifier: false });
+          const { shell, permission } = await call(host, c.command, { env: { CDPATH: c.shell }, sessionID: sid(`cdpath-shell-${sandbox}-${n}`) });
+          assert.equal(permission.effect, "ask", `sandbox ${sandbox}: ${c.command} (${c.own} / ${c.shell})`);
+          assert.match(permission.message, /would be allowed/, c.command);
+          assert.match(permission.message, c.says, c.command);
+          assert.ok(!wrapped(shell), `${c.command} is left unwrapped`);
+          assert.equal(shell.command, c.command, "the shell's command is left as it is");
+          assert.equal(shell.env.CDPATH, c.shell, "the variable is the session's own, and stays");
+          // A call with no cd in it is none of its business: `git -C` is a chdir.
+          for (const other of ["ls", "git -C src status"]) {
+            const plain = await call(host, other, { env: { CDPATH: c.shell }, sessionID: sid(`cdpath-shell-${sandbox}-${n}`) });
+            assert.equal(plain.permission.effect, "allow", `sandbox ${sandbox}: ${other}: ${plain.permission.message}`);
+          }
+          // The same value on both sides is judged as it is (with one, a plain word is not followed).
+          const same = await call(host, "cd ./src && ls", { env: { CDPATH: c.own }, sessionID: sid(`cdpath-shell-${sandbox}-${n}`) });
+          assert.equal(same.permission.effect, "allow", `sandbox ${sandbox}, the same on both sides: ${same.permission.message}`);
+          await host.stop();
+          guardModule.shellKeeps(undefined);
+        }
+        // An instance that does not keep it, in a process where another does (one guard serves
+        // both, and reads this process's CDPATH from then on): its shell has none, the checks
+        // took it to have one and followed less, and its call stands as before.
+        process.env.CDPATH = elsewhere;
+        await start({ sandbox, sandboxKeepEnv: ["CDPATH"], useClassifier: false });
+        const beside = await call(await start({ sandbox, useClassifier: false }), "cd ./src && ls", { env: { CDPATH: elsewhere }, sessionID: sid(`cdpath-shell-beside-${sandbox}`) });
+        assert.equal(beside.permission.effect, "allow", `sandbox ${sandbox}: ${beside.permission.message}`);
+        assert.equal(beside.shell.env.CDPATH, undefined);
+        for (const h of hosts.splice(0)) await h.stop();
+        guardModule.shellKeeps(undefined);
+        // Not named in sandboxKeepEnv, the shell's is taken out, and the two agree as before.
+        delete process.env.CDPATH;
+        const host = await start({ sandbox, useClassifier: false });
+        const taken = await call(host, "cd src && ls", { env: { CDPATH: elsewhere }, sessionID: sid(`cdpath-shell-out-${sandbox}`) });
+        assert.equal(taken.permission.effect, "allow", `sandbox ${sandbox}: ${taken.permission.message}`);
+        assert.equal(taken.shell.env.CDPATH, undefined);
+        await host.stop();
+        guardModule.shellKeeps(undefined);
+      }
     } finally {
       if (before === undefined) delete process.env.CDPATH;
       else process.env.CDPATH = before;
@@ -2086,6 +2297,185 @@ describe("r4 sixth pass: a local push with a hook, push hooks under a relative h
       for (const name of ["r8lib", ".gitmodules"]) spawnSync("git", ["-C", project, "rm", "-q", "-f", "--cached", name], { stdio: "ignore" });
       for (const p of [path.join(project, "r8lib"), path.join(project, ".gitmodules"), path.join(dotGit, "modules"), upstream]) fs.rmSync(p, { recursive: true, force: true });
       spawnSync("git", ["-C", project, "config", "--remove-section", "submodule.r8lib"], { stdio: "ignore" });
+    }
+  });
+});
+
+// ---- round 4, group B, eighth pass (B8), what needs the hooks ----
+describe("r4 B8 (hooks)", () => {
+  const moments = path.join(stateDir, "moments");
+  const files = () => {
+    fs.writeFileSync(path.join(project, "b8-f"), "x\n");
+    execFileSync("tar", ["-cf", "b8.tar", "b8-f"], { cwd: project });
+    fs.writeFileSync(path.join(project, "b8.diff"), "--- a/b8-f\n+++ b/b8-f\n@@ -1 +1 @@\n-x\n+y\n");
+  };
+  const WRITES = ["tar -xf b8.tar", "tar xf b8.tar", "tar --extract -f b8.tar -C .", "unzip b8.zip", "unzip -o b8.zip -d out", "patch -p1 -i b8.diff", "patch -p1 < b8.diff", "git apply b8.diff", "git apply --stat --apply b8.diff", "git am b8.patch", "timeout 5 tar -xf b8.tar", "ls && tar -xf b8.tar"];
+  const READS = ["tar -tf b8.tar", "tar -cf b8-new.tar b8-f", "unzip -l b8.zip", "patch --dry-run -p1 -i b8.diff", "git apply --stat b8.diff", "git apply --check b8.diff", "ls", "cat b8.diff"];
+  test("r4 B8-9: with the sandbox off, a command that unpacks an archive or applies a patch asks", async () => {
+    files();
+    const host = await start({ sandbox: false, useClassifier: false });
+    for (const c of WRITES) {
+      const { permission } = await call(host, c, { sessionID: `b8-9-${ids}` });
+      assert.equal(permission.effect, "ask", c);
+      assert.match(permission.message ?? "", /named inside the file and cannot be seen without the sandbox/, c);
+    }
+    for (const c of READS) {
+      const { permission } = await call(host, c, { sessionID: `b8-9-${ids}` });
+      assert.equal(permission.effect, "allow", `${c}: ${permission.message}`);
+    }
+  });
+  test("r4 B8-9: with the sandbox on nothing changes: the same commands are allowed, in the sandbox", async () => {
+    files();
+    const host = await start({ useClassifier: false });
+    // (`git am` writes inside .git, and asks for that with the sandbox on, as before.)
+    for (const c of [...WRITES.filter((w) => !w.startsWith("git am")), ...READS]) {
+      const { permission, shell } = await call(host, c, { sessionID: `b8-9on-${ids}` });
+      assert.equal(permission.effect, "allow", `${c}: ${permission.message}`);
+      assert.ok(wrapped(shell), c);
+    }
+  });
+  test("r4 B8-5c: the plugin keeps, per session, the moment it was first seen at, and a restart measures from it", async () => {
+    const git = (...args: string[]) => execFileSync("git", ["-C", project, "-c", "user.name=t", "-c", "user.email=t@t", ...args], { stdio: ["ignore", "pipe", "pipe"] });
+    fs.mkdirSync(path.join(project, "b8s"), { recursive: true });
+    const script = path.join(project, "b8s", "tidy.sh");
+    const old = path.join(project, "b8s", "old.sh");
+    for (const f of [script, old]) fs.writeFileSync(f, "#!/bin/sh\necho old\n", { mode: 0o755 });
+    git("add", "b8s");
+    git("commit", "-qm", "two scripts");
+    try {
+      let host = await start({ useClassifier: false });
+      // The session is seen for the first time, then changes a script (the user approved it, say).
+      assert.equal((await call(host, "ls", { sessionID: "b8-restart" })).permission.effect, "allow");
+      const kept = fs.readdirSync(moments);
+      assert.equal(kept.length, 1);
+      assert.equal(fs.statSync(path.join(moments, kept[0])).mode & 0o777, 0o600);
+      assert.equal(fs.statSync(moments).mode & 0o777, 0o700);
+      await new Promise((r) => setTimeout(r, 20));
+      fs.writeFileSync(script, "#!/bin/sh\necho new\n", { mode: 0o755 });
+      // opencode is restarted: another instance of the plugin, the same session.
+      await host.stop();
+      host = await start({ useClassifier: false });
+      const again = await call(host, "sh b8s/tidy.sh", { sessionID: "b8-restart" });
+      assert.equal(again.permission.effect, "ask");
+      assert.match(again.permission.message ?? "", /changed since this session began/);
+      // What nobody changed since still runs, and a session seen for the first time now is
+      // measured from now.
+      const untouched = await call(host, "sh b8s/old.sh", { sessionID: "b8-restart" });
+      assert.equal(untouched.permission.effect, "allow", untouched.permission.message);
+      const other = await call(host, "sh ./b8s/tidy.sh", { sessionID: "b8-restart-other" });
+      assert.equal(other.permission.effect, "allow", other.permission.message);
+      assert.deepEqual(fs.readdirSync(moments).length, 2);
+    } finally {
+      git("rm", "-q", "-r", "-f", "b8s");
+      git("commit", "-qm", "scripts gone");
+    }
+  });
+});
+
+describe("r4 B9 (hooks)", () => {
+  test("r4 B9-1: with the sandbox off, unzip with a listing letter after the archive or in a -d value asks", async () => {
+    fs.writeFileSync(path.join(project, "b9.zip"), "");
+    const host = await start({ sandbox: false, useClassifier: false });
+    for (const c of ["unzip b9.zip '*' -l", "unzip b9.zip '*' -Z", "unzip b9.zip .git/hooks/pre-commit -t", "unzip b9.zip '*' -x -l", "unzip -o b9.zip -dlib", "unzip -o b9.zip -dtools"]) {
+      const { permission } = await call(host, c, { sessionID: `b9-1-${ids}` });
+      assert.equal(permission.effect, "ask", c);
+      assert.match(permission.message ?? "", /named inside the file and cannot be seen without the sandbox/, c);
+    }
+    for (const c of ["unzip -l b9.zip", "unzip -lv b9.zip", "unzip -Z b9.zip"]) {
+      const { permission } = await call(host, c, { sessionID: `b9-1-${ids}` });
+      assert.equal(permission.effect, "allow", `${c}: ${permission.message}`);
+    }
+  });
+});
+
+describe("r4 B10 (hooks)", () => {
+  test("r4 B10-3: with the sandbox off, unzip with -P, -O or -I asks: their value is no listing letter", async () => {
+    fs.writeFileSync(path.join(project, "b10.zip"), "");
+    const host = await start({ sandbox: false, useClassifier: false });
+    for (const c of ["unzip -Ptop b10.zip", "unzip -Psecret b10.zip", "unzip -o -Pinfected b10.zip", "unzip -Ocp437 b10.zip", "unzip -Ilatin1 b10.zip", "unzip -Pletmein -d lib b10.zip"]) {
+      const { permission } = await call(host, c, { sessionID: `b10-3-${ids}` });
+      assert.equal(permission.effect, "ask", c);
+      assert.match(permission.message ?? "", /named inside the file and cannot be seen without the sandbox/, c);
+    }
+    for (const c of ["unzip -l -Ptop b10.zip", "unzip -Ptop -l b10.zip"]) {
+      const { permission } = await call(host, c, { sessionID: `b10-3-${ids}` });
+      assert.equal(permission.effect, "allow", `${c}: ${permission.message}`);
+    }
+  });
+  // An edit that asks (here: a hook manager's file in the project), approved by the user, is the
+  // session's write as an allowed edit is: a script that sources it then goes to the model. The
+  // approval is learned from opencode's reply, or from the edit's completion.
+  const b10Script = () => {
+    const run = path.join(project, "b10-run.sh");
+    if (!fs.existsSync(run)) {
+      fs.writeFileSync(run, "#!/bin/sh\n. ./.husky/b10.sh\n", { mode: 0o755 });
+      execFileSync("git", ["-C", project, "add", "b10-run.sh"]);
+      execFileSync("git", ["-C", project, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "b10 script"]);
+    }
+    return path.join(project, ".husky", "b10.sh");
+  };
+  const b10Edit = async (host: Host, sessionID: string, id: string, target: string) => {
+    const source = { type: "tool", messageID: "m10", id };
+    await host.tool({ tool: "edit", sessionID, messageID: "m10", id, input: { filePath: target } });
+    const edit: any = { sessionID, action: "edit", resources: [target], source, effect: "allow" };
+    await host.permission(edit);
+    return { edit, source };
+  };
+  for (const via of ["reply", "completed"] as const) test(`r4 B10-9: an edit the user approves (${via}) is a session write`, async () => {
+    const target = b10Script();
+    const host = await start({ useClassifier: false });
+    const sessionID = `b10-9-${via}-${++ids}`;
+    const id = `edit-${ids}`;
+    assert.equal((await call(host, "./b10-run.sh", { sessionID })).permission.effect, "allow", "before the edit");
+    const { edit, source } = await b10Edit(host, sessionID, id, target);
+    assert.equal(edit.effect, "ask", edit.message);
+    // Asked and not yet approved: as before.
+    const waiting = (await call(host, "./b10-run.sh", { sessionID })).permission;
+    assert.equal(waiting.effect, "allow", `asked, not approved: ${waiting.message}`);
+    if (via === "reply") {
+      await host.emit({ type: "permission.asked", data: { id: `per_${id}`, sessionID, action: "edit", resources: [target], source } });
+      await host.emit({ type: "permission.replied", data: { sessionID, requestID: `per_${id}`, reply: "once" } });
+    } else {
+      await host.after({ tool: "edit", sessionID, messageID: "m10", id, status: "completed" });
+    }
+    const { permission } = await call(host, "./b10-run.sh", { sessionID });
+    assert.equal(permission.effect, "ask", permission.message);
+    assert.match(permission.message ?? "", /leave this to the model/);
+    assert.match(permission.message ?? "", /b10\.sh/);
+    // Another session wrote nothing.
+    assert.equal((await call(host, "./b10-run.sh", { sessionID: `${sessionID}-other` })).permission.effect, "allow");
+  });
+  test("r4 B10-9: an edit the user rejects is no session write", async () => {
+    const target = b10Script();
+    const host = await start({ useClassifier: false });
+    const sessionID = `b10-9-reject-${++ids}`;
+    const id = `edit-${ids}`;
+    const { edit, source } = await b10Edit(host, sessionID, id, target);
+    assert.equal(edit.effect, "ask");
+    await host.emit({ type: "permission.asked", data: { id: `per_${id}`, sessionID, action: "edit", resources: [target], source } });
+    await host.emit({ type: "permission.replied", data: { sessionID, requestID: `per_${id}`, reply: "reject" } });
+    await host.after({ tool: "edit", sessionID, messageID: "m10", id, status: "error" });
+    const after = (await call(host, "./b10-run.sh", { sessionID })).permission;
+    assert.equal(after.effect, "allow", after.message);
+  });
+});
+
+// B10's reading: the checks judge a program's name by opencode's own PATH; a shell whose PATH
+// holds an entry the session can write that opencode's does not asks, saying why.
+describe("r4 B10 checks: the shell's PATH", () => {
+  test("r4 B10 checks: a shell whose PATH holds a project, relative or empty entry opencode's does not asks", async () => {
+    const host = await start({ useClassifier: false });
+    const own = process.env.PATH ?? "";
+    for (const [n, bent] of [`${project}/bin:${own}`, `${own}:./node_modules/.bin`, `${own}:`, `bin:${own}`].entries()) {
+      const { permission, shell } = await call(host, "ls", { env: { PATH: bent }, sessionID: `r4-b10c-path-${n}` });
+      assert.equal(permission.effect, "ask", `${bent}: ${permission.message}`);
+      assert.match(permission.message, /its shell's PATH holds .*opencode's own PATH does not/);
+      assert.ok(!wrapped(shell), "left unwrapped");
+    }
+    // The same PATH, or one that differs only by fixed directories outside the project: as before.
+    for (const [n, plain] of [own, `/opt/none:${own}`].entries()) {
+      const { permission } = await call(host, "ls", { env: { PATH: plain }, sessionID: `r4-b10c-plain-${n}` });
+      assert.equal(permission.effect, "allow", `${plain}: ${permission.message}`);
     }
   });
 });
