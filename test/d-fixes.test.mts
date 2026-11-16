@@ -467,13 +467,14 @@ describe("r4 27: read into plain names and node -v", () => {
     "read -r -- x < f",
     "read -r 'a b'",
     "read -r LINE < f",
-    "read -r BASH_XTRACEFD < f",
     "read -r https_proxy < f",
     "read -r auto_resume < f",
     "./read -r x",
     "command read -r x",
     "env read -r x",
   ]);
+  // Council project review 1: bash evaluates a value given to BASH_XTRACEFD as arithmetic.
+  expect("ask", ["read -r BASH_XTRACEFD < f"]);
   // What was read is a value nobody has seen: it is not a command, a script or a file to trust.
   expect(REFUSED, [
     "read -r x y < f; $x",

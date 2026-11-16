@@ -172,7 +172,9 @@ For each shell tool call:
      makefile from standard input, a device or a pipe, also through a symbolic link, and
      `NAME=value` arguments of make on the environment's terms; `fd -x`; `rg --pre`;
      `man -P`, `-H` and `-C`); builtins that evaluate a value as arithmetic (`let`,
-     `declare -i`, `test -v` with a subscript); a glob, or an unquoted expansion whose
+     `declare -i`, `test -v` with a subscript), and a value given in any of those ways to
+     one of bash's integer variables (`RANDOM`, `SRANDOM`, `OPTIND`, `HISTCMD`,
+     `BASH_XTRACEFD`, `READLINE_MARK`, `READLINE_POINT`); a glob, or an unquoted expansion whose
      value the call does not set to plain text first (`ls $x`, `ls $(cmd)`), that matches a
      file whose name starts with `-` (`ls *` beside a file called `-rf`; a file named `-`
      alone does not count); a path with a part named like an option that is not there yet,
@@ -220,7 +222,8 @@ For each shell tool call:
      The moment a session began is kept across a restart of opencode, one small file per
      session in the state directory's `moments/`, removed thirty days after its last use.
      As a second line the plugin keeps what the session wrote, for the whole session,
-     approved commands and approved edits included: once the session has written a file
+     approved commands and approved edits included, in one record for every session of the
+     project (a subagent works in a session of its own): once the session has written a file
      anywhere in the project, every program goes to the model unless it is on a short safe
      list (shell syntax and builtins, text, file and archive tools, `curl` and `wget`, and
      git's commands that read, add, commit, switch or fetch, but not `pull`, `merge`
@@ -229,7 +232,10 @@ For each shell tool call:
      model, and the reason names the file; `ls`, `grep`, `git status` and `git commit` stay
      allows. That is about two everyday commands in five (141 of 364 after one edit). A name is on the list only as bash
      finds it: a builtin, or a file on `PATH` outside the project and the temp directories
-     (`/bin/cat`, `./cat` and a name the call defines a function under are not). A git
+     (`/bin/cat`, `./cat` and a name the call defines a function under are not). `less` is
+     on it only where `LESSOPEN` and `LESSCLOSE` are unset or name, by an absolute path, a
+     program outside every place a call can write (`| /usr/bin/lesspipe %s`), and `tar`
+     only where `TAR_OPTIONS` is unset. A git
      command is on it only where the repository's own configuration, and every file it
      includes whatever the condition, holds no key that may name a program
      (`core.hooksPath` as husky sets it, `credential.helper`, `alias.*`, a URL whose scheme
@@ -293,6 +299,9 @@ For each shell tool call:
    whose stdin, stdout or stderr is a terminal (exit 126; opencode gives its shell none):
    - **Writes** only beneath the project's checkouts, `allowedPaths`, temp dirs,
      `sandboxWritable`, `/dev/null`, `/dev/zero`, `/dev/full` and a private `/dev/shm`.
+     The code caches in the temp directories (`node-compile-cache`, which tsc turns on
+     itself, `tsx-<uid>` and `jiti`) are private and empty for each call, so nothing a call
+     writes there runs in a later node outside the sandbox.
      Everything else is mounted read-only as well, so `chmod`, `touch -d` and `setxattr` fail
      there too. Terminals (`/dev/tty`, `/dev/ptmx`, `/dev/pts`) are not writable and no device
      opened inside the sandbox accepts an ioctl. **No build cache is writable by default**:
@@ -765,6 +774,11 @@ message), which is why pushes and ssh use deterministic rules instead.
   protection: a git command that would rewrite one of those files (a `git switch` to a branch
   with another `.husky/pre-commit`) asks, and `git pull` asks in every repository that tracks
   one, or tracks `AGENTS.md`, `CLAUDE.md`, `opencode.json`, `.claude/` or `.agents/`.
+  opencode runs some project files itself, after an edit and outside the sandbox: with
+  `formatter` set in an opencode config, a formatter the project names (`./vendor/bin/pint`
+  for a `composer.json` that requires it, prettier and its config, `mix format` and
+  `.formatter.exs`), and with `lsp` set, the servers you name. Leave both unset where calls
+  are auto-allowed.
 - **Credentials are found by name.** A secret in a file the rules do not recognise is
   readable, and so is `.git/config` with a token in a remote URL, and a credential file that
   was committed to the repository: `git diff`, `git show` and `git log -p` read it from git's

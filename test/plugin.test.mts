@@ -1253,8 +1253,9 @@ describe("r3 18/36: calls that run at the same time", () => {
       assert.equal(after.permission.effect, "ask", after.permission.message);
       assert.match(after.permission.message, /leave this to the model/);
       assert.match(after.permission.message, /b10\.sh/);
+      // Council project review 1: another session of the project shares the record.
       const other = await whole(host, "./b10-window-run.sh", { sessionID: "b10w-other" });
-      assert.equal(other.permission.effect, "allow", other.permission.message);
+      assert.equal(other.permission.effect, "ask", other.permission.message);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
       g("rm", "-q", "b10-window-run.sh");
@@ -2313,22 +2314,26 @@ describe("r4 B8 (hooks)", () => {
   const READS = ["tar -tf b8.tar", "tar -cf b8-new.tar b8-f", "unzip -l b8.zip", "patch --dry-run -p1 -i b8.diff", "git apply --stat b8.diff", "git apply --check b8.diff", "ls", "cat b8.diff"];
   test("r4 B8-9: with the sandbox off, a command that unpacks an archive or applies a patch asks", async () => {
     files();
-    const host = await start({ sandbox: false, useClassifier: false });
+    // (Council project review 1: one plugin per command, since the sessions of one share the
+    // record of what was written.)
     for (const c of WRITES) {
+      const host = await start({ sandbox: false, useClassifier: false });
       const { permission } = await call(host, c, { sessionID: `b8-9-${ids}` });
       assert.equal(permission.effect, "ask", c);
       assert.match(permission.message ?? "", /named inside the file and cannot be seen without the sandbox/, c);
     }
     for (const c of READS) {
+      const host = await start({ sandbox: false, useClassifier: false });
       const { permission } = await call(host, c, { sessionID: `b8-9-${ids}` });
       assert.equal(permission.effect, "allow", `${c}: ${permission.message}`);
     }
   });
   test("r4 B8-9: with the sandbox on nothing changes: the same commands are allowed, in the sandbox", async () => {
     files();
-    const host = await start({ useClassifier: false });
-    // (`git am` writes inside .git, and asks for that with the sandbox on, as before.)
+    // (`git am` writes inside .git, and asks for that with the sandbox on, as before. One plugin
+    // per command, as with the sandbox off.)
     for (const c of [...WRITES.filter((w) => !w.startsWith("git am")), ...READS]) {
+      const host = await start({ useClassifier: false });
       const { permission, shell } = await call(host, c, { sessionID: `b8-9on-${ids}` });
       assert.equal(permission.effect, "allow", `${c}: ${permission.message}`);
       assert.ok(wrapped(shell), c);
@@ -2442,8 +2447,8 @@ describe("r4 B10 (hooks)", () => {
     assert.equal(permission.effect, "ask", permission.message);
     assert.match(permission.message ?? "", /leave this to the model/);
     assert.match(permission.message ?? "", /b10\.sh/);
-    // Another session wrote nothing.
-    assert.equal((await call(host, "./b10-run.sh", { sessionID: `${sessionID}-other` })).permission.effect, "allow");
+    // Council project review 1: another session of the project (a subagent's) shares the record.
+    assert.equal((await call(host, "./b10-run.sh", { sessionID: `${sessionID}-other` })).permission.effect, "ask");
   });
   test("r4 B10-9: an edit the user rejects is no session write", async () => {
     const target = b10Script();
@@ -2476,6 +2481,28 @@ describe("r4 B10 checks: the shell's PATH", () => {
     for (const [n, plain] of [own, `/opt/none:${own}`].entries()) {
       const { permission } = await call(host, "ls", { env: { PATH: plain }, sessionID: `r4-b10c-plain-${n}` });
       assert.equal(permission.effect, "allow", `${plain}: ${permission.message}`);
+    }
+  });
+});
+
+// Council project review 1: a subagent works in a session of its own, on the same project.
+describe("council project review 1: one record of what was written for every session", () => {
+  test("a session runs what another session wrote: it goes to the model", async () => {
+    const host = await start({ useClassifier: false });
+    const pkg = path.join(project, "package.json");
+    fs.writeFileSync(pkg, '{"name":"x","version":"1.0.0","scripts":{"test":"echo ok"}}\n');
+    try {
+      const before = await call(host, "npm test", { sessionID: "cp1-before" });
+      assert.equal(before.permission.effect, "allow", before.permission.message);
+      const wrote = await call(host, "sed -i 's/echo ok/echo changed/' package.json", { sessionID: "cp1-parent" });
+      assert.equal(wrote.permission.effect, "allow", wrote.permission.message);
+      for (const id of ["cp1-child", "cp1-before"]) {
+        const { permission } = await call(host, "npm test", { sessionID: id });
+        assert.equal(permission.effect, "ask", id);
+        assert.match(permission.message, /package\.json/);
+      }
+    } finally {
+      fs.rmSync(pkg, { force: true });
     }
   });
 });

@@ -315,7 +315,18 @@ export default Plugin.define({
     const session = (id: string) => {
       let s = sessions.get(id);
       // (B8-5: with its id, so that the moment it is measured from outlives a restart.)
-      if (!s) sessions.set(id, (s = new SessionState(project, id)));
+      if (!s) {
+        s = new SessionState(project, id);
+        // Council project review 1: one record of what was written for every session of the
+        // project. A subagent's session, or a second one, runs what another session wrote.
+        const first = sessions.values().next().value;
+        if (first) {
+          s.files = first.files;
+          s.touched = first.touched;
+          s.unlisted = first.unlisted;
+        }
+        sessions.set(id, s);
+      }
       return s;
     };
 

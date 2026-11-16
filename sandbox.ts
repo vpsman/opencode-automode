@@ -212,7 +212,9 @@ export interface GitResult {
 
 const GIT_SAFE = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.untrackedCache=false", "-c", "core.askPass=", "-c", "core.pager=cat"];
 export const gitEnv = (): NodeJS.ProcessEnv => {
-  const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0", GIT_ASKPASS: "", SSH_ASKPASS: "", SSH_ASKPASS_REQUIRE: "never", GIT_PAGER: "cat" };
+  // GIT_NO_LAZY_FETCH: a partial clone's missing object is not fetched from its promisor remote,
+  // whose `uploadpack` a repository's config names (council project review 1).
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0", GIT_ASKPASS: "", SSH_ASKPASS: "", SSH_ASKPASS_REQUIRE: "never", GIT_PAGER: "cat", GIT_NO_LAZY_FETCH: "1" };
   for (const name of ["GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_EXTERNAL_DIFF", "GIT_EDITOR"]) delete env[name];
   return env;
 };
@@ -225,9 +227,13 @@ export const gitArgs = (args: string[]) => [...GIT_SAFE, ...args];
 export const inGitDir = (gitDir: string) => ["--git-dir", gitDir, "--work-tree", gitDir];
 
 // git, with nothing from the repository able to run code in this process. A caller that grants
-// trust on the answer must look at `status`: no answer is not the same as an empty one.
+// trust on the answer must look at `status`: no answer is not the same as an empty one. These
+// are lookups: no transport may start (council project review 1: a lazy fetch ran a planted
+// `remote.<name>.uploadpack`), which `ls-remote --get-url` does not need. An empty
+// GIT_ALLOW_PROTOCOL allows none, and unlike `-c protocol.allow=never` it is not in the
+// configuration the checks list.
 export function gitRun(args: string[], timeout = 3000): GitResult {
-  const r = spawnSync("git", gitArgs(args), { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout, maxBuffer: 16 << 20, env: gitEnv() });
+  const r = spawnSync("git", gitArgs(args), { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout, maxBuffer: 16 << 20, env: { ...gitEnv(), GIT_ALLOW_PROTOCOL: "" } });
   if (r.error || r.status === null) return { status: undefined, out: "" };
   return { status: r.status, out: r.stdout ?? "" };
 }
@@ -375,7 +381,9 @@ function scanRoot(root: string, skip: Set<string>, secrets: boolean): Found {
     // own top, or the git directory of a work tree elsewhere, which is not: `core.bare` tells
     // them apart, once the walk is over (`standalone`). None of it depends on which of a
     // directory and its pointer file the walk reaches first.
-    const gitDirHere = names.has("HEAD") && names.has("objects") && names.has("refs") && !names.has(".git");
+    // (Council project review 1: `HEAD` and `commondir` are a git directory too, its objects and
+    // refs in the directory `commondir` names, as git reads it.)
+    const gitDirHere = names.has("HEAD") && ((names.has("objects") && names.has("refs")) || names.has("commondir")) && !names.has(".git");
     if (gitDirHere) {
       addGitDir(here);
       if (!inGit) standalone.add(here);
@@ -1627,6 +1635,27 @@ function opencodePaths(project: string | undefined, rwDirs: string[]): Protected
   return { ro, pin: [], problems, linkTops: held };
 }
 
+// Code caches in the temp directories (council project review 1): Node's compile cache, which
+// tsc and tsserver turn on themselves, and tsx's and jiti's. A later node outside the sandbox
+// runs what they hold, checked against its source by little more than its length. Each gets a
+// private, empty tmpfs for the call, and one that is missing is made first, so that a call
+// cannot make it.
+export const TEMP_CODE_CACHES = ["node-compile-cache", `tsx-${process.getuid?.() ?? 0}`, "jiti"];
+function codeCaches(): { tmpfs: string[]; problems: string[] } {
+  const tmpfs: string[] = [];
+  const problems: string[] = [];
+  for (const temp of new Set(["/tmp", "/var/tmp", os.tmpdir()].map(realpath))) {
+    if (!isDir(temp)) continue;
+    for (const name of TEMP_CODE_CACHES) {
+      const p = path.join(temp, name);
+      if (isSymlink(p) || (lexists(p) && !isDir(p))) problems.push(`${p}, where node keeps code it runs later, is not a directory and cannot be covered`);
+      else if (!lexists(p) && !ensureDir(p, [temp])) problems.push(`${p}, where node keeps code it runs later, does not exist and could not be made`);
+      else tmpfs.push(p);
+    }
+  }
+  return { tmpfs, problems };
+}
+
 const secretScope = makeScope("/", []);
 // The rules' own test for a credential file or directory.
 export const isSecretPath = (p: string) => readVerdict("read", p, secretScope) !== undefined;
@@ -1840,7 +1869,9 @@ export function plan(o: PlanOptions, scan?: Scan): Plan {
   // directories are the session's and its writable parents', temp ones included: round 8.)
   const followed = linkedInto([...(git.linkTops ?? []).filter((t) => own.some((o) => within(t, o))), ...(opencode.linkTops ?? [])], rwDirs);
   const ro = [...new Set([...git.ro, ...opencode.ro, ...followed.ro, ...closed])];
-  const problems = [...found.problems, ...lookupProblems, ...git.problems, ...opencode.problems, ...followed.problems];
+  const caches = codeCaches();
+  const tmpfs = ["/dev/shm", ...caches.tmpfs];
+  const problems = [...found.problems, ...lookupProblems, ...git.problems, ...opencode.problems, ...followed.problems, ...caches.problems];
   // ssh-using commands see known_hosts, config and public keys; private keys stay hidden.
   // Credential files in the project and the allowed paths, at any depth.
   const inProject = [...found.secrets];
@@ -1853,7 +1884,7 @@ export function plan(o: PlanOptions, scan?: Scan): Plan {
   // A directory that holds a protected path could be renamed and rebuilt without it: every
   // directory between a writable root and such a path is pinned.
   const pin = new Set<string>();
-  for (const p of [...ro, ...git.pin, ...hide]) {
+  for (const p of [...ro, ...git.pin, ...hide, ...caches.tmpfs]) {
     const roots = rwDirs.filter((d) => within(p, d) && p !== d);
     for (const root of roots) for (let dir = path.dirname(p); dir !== root && within(dir, root); dir = path.dirname(dir)) pin.add(dir);
   }
@@ -1878,9 +1909,9 @@ export function plan(o: PlanOptions, scan?: Scan): Plan {
   // project's nor an allowed path's: the temp directories and `sandboxWritable` (the cache
   // directories). An allowed path counts as the project: a git directory there is walked.
   problems.push(...linksOut([...(git.whole ?? []).map((dir) => ({ dir })), ...[...shutIn].map(([dir, only]) => ({ dir, only }))], found.gitDirs, own, rwDirs.filter((d) => !own.some((o) => within(d, o))), new Set(git.judged)));
-  const unexpressible = [...rwDirs, ...ro, ...reopen, ...pins, ...hide].filter((p) => !usable(p));
+  const unexpressible = [...rwDirs, ...ro, ...reopen, ...pins, ...hide, ...tmpfs].filter((p) => !usable(p));
   if (unexpressible.length) problems.push(`cannot protect a path containing a newline (${JSON.stringify(unexpressible[0])})`);
-  for (const [name, paths] of [["RW", rwDirs], ["RO", ro], ["REOPEN", reopen], ["PIN", pins], ["HIDE", hide], ["TMPFS", ["/dev/shm"]]] as const) {
+  for (const [name, paths] of [["RW", rwDirs], ["RO", ro], ["REOPEN", reopen], ["PIN", pins], ["HIDE", hide], ["TMPFS", tmpfs]] as const) {
     const tooLong = envStringProblem(`AUTOMODE_${name}`, paths.join("\n"));
     if (tooLong) problems.push(tooLong);
   }
@@ -1893,7 +1924,7 @@ export function plan(o: PlanOptions, scan?: Scan): Plan {
     reopen: reopen.filter(usable),
     pin: pins.filter(usable),
     hide: hide.filter(usable),
-    tmpfs: ["/dev/shm"],
+    tmpfs: tmpfs.filter(usable),
     ...(problems.length ? { problem: problems[0] } : {}),
   };
 }

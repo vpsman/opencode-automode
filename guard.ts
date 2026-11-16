@@ -1941,8 +1941,10 @@ export function alsoByName(m: Matcher): Matcher {
 // EXECIGNORE (which files a PATH search passes over, so which program a word runs) and
 // BASH_LOADABLES_PATH (where `enable -f` finds a builtin to load) are bash's own variables that
 // change what a word runs or a pattern matches, held as IFS and CDPATH are.
+// RANDOM, SRANDOM, OPTIND, HISTCMD, BASH_XTRACEFD and READLINE_MARK/_POINT: bash evaluates a value
+// given to them as arithmetic, where `a[$(...)]` runs a command (council project review 1).
 const ENV_DANGEROUS =
-  /^(PATH|HOME|IFS|CDPATH|GLOBIGNORE|GLOBSORT|EXECIGNORE|BASH_LOADABLES_PATH|SHELL|ENV|BASH_ENV|BASH_FUNC.*|BASHOPTS|SHELLOPTS|POSIXLY_CORRECT|BASH_COMPAT|BASH_ALIASES|BASH_CMDS|histchars|PROMPT_COMMAND|PS[0-4]|EDITOR|VISUAL|PAGER|BROWSER|TMPDIR|GIT_.*|SSH_.*|LD_.*|DYLD_.*|XDG_.*|PYTHON(PATH|STARTUP|HOME|USERBASE|WARNINGS|BREAKPOINT)|NODE_(OPTIONS|PATH)|PERL5(LIB|OPT|DB)|PERLLIB|RUBY(OPT|LIB)|GEM_(HOME|PATH)|GO(FLAGS|PATH|ROOT|BIN|PROXY|NOSUMDB|INSECURE|PRIVATE|TOOLCHAIN|ENV)|RUSTC.*|RUSTUP_.*|RUSTFLAGS|RUSTDOCFLAGS|CARGO_(HOME|BUILD_.*|TARGET_.*_(RUNNER|LINKER|RUSTFLAGS)|REGISTR.*|ENCODED_RUSTFLAGS)|CC|CXX|LD|AR|MAKEFLAGS|GNUMAKEFLAGS|MAKEFILES|npm_config_.*|NPM_CONFIG_.*|PIP_.*|UV_.*|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JAVA_HOME|MAVEN_OPTS|GRADLE_.*|OPENCODE.*|AUTOMODE_.*|TAR_OPTIONS|RIPGREP_CONFIG_PATH|GREP_OPTIONS|LESSOPEN|LESSCLOSE|MANOPT|MANPAGER|MANROFFOPT|MAN_DISABLE_SECCOMP|MANPATH|GROFF_.*|FZF_DEFAULT_(COMMAND|OPTS)|RSYNC_(RSH|CONNECT_PROG)|CURL_HOME|WGETRC|DOCKER_(HOST|CONFIG|CONTEXT|CERT_PATH)|KUBECONFIG|AWS_.*|GOOGLE_APPLICATION_CREDENTIALS|CLOUDSDK_.*|PWD|OLDPWD|VIRTUAL_ENV|LUA_.*|GCONV_PATH|SUDO_(EDITOR|ASKPASS)|SYSTEMD_(PAGER|EDITOR)|BAT_.*|GH_.*|BUNDLE_.*|POETRY_.*|PIPENV_.*|PDM_.*|HATCH_.*|YARN_.*|COREPACK_.*)$/;
+  /^(RANDOM|SRANDOM|OPTIND|HISTCMD|BASH_XTRACEFD|READLINE_(?:MARK|POINT)|PATH|HOME|IFS|CDPATH|GLOBIGNORE|GLOBSORT|EXECIGNORE|BASH_LOADABLES_PATH|SHELL|ENV|BASH_ENV|BASH_FUNC.*|BASHOPTS|SHELLOPTS|POSIXLY_CORRECT|BASH_COMPAT|BASH_ALIASES|BASH_CMDS|histchars|PROMPT_COMMAND|PS[0-4]|EDITOR|VISUAL|PAGER|BROWSER|TMPDIR|GIT_.*|SSH_.*|LD_.*|DYLD_.*|XDG_.*|PYTHON(PATH|STARTUP|HOME|USERBASE|WARNINGS|BREAKPOINT)|NODE_(OPTIONS|PATH)|PERL5(LIB|OPT|DB)|PERLLIB|RUBY(OPT|LIB)|GEM_(HOME|PATH)|GO(FLAGS|PATH|ROOT|BIN|PROXY|NOSUMDB|INSECURE|PRIVATE|TOOLCHAIN|ENV)|RUSTC.*|RUSTUP_.*|RUSTFLAGS|RUSTDOCFLAGS|CARGO_(HOME|BUILD_.*|TARGET_.*_(RUNNER|LINKER|RUSTFLAGS)|REGISTR.*|ENCODED_RUSTFLAGS)|CC|CXX|LD|AR|MAKEFLAGS|GNUMAKEFLAGS|MAKEFILES|npm_config_.*|NPM_CONFIG_.*|PIP_.*|UV_.*|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JAVA_HOME|MAVEN_OPTS|GRADLE_.*|OPENCODE.*|AUTOMODE_.*|TAR_OPTIONS|RIPGREP_CONFIG_PATH|GREP_OPTIONS|LESSOPEN|LESSCLOSE|MANOPT|MANPAGER|MANROFFOPT|MAN_DISABLE_SECCOMP|MANPATH|GROFF_.*|FZF_DEFAULT_(COMMAND|OPTS)|RSYNC_(RSH|CONNECT_PROG)|CURL_HOME|WGETRC|DOCKER_(HOST|CONFIG|CONTEXT|CERT_PATH)|KUBECONFIG|AWS_.*|GOOGLE_APPLICATION_CREDENTIALS|CLOUDSDK_.*|PWD|OLDPWD|VIRTUAL_ENV|LUA_.*|GCONV_PATH|SUDO_(EDITOR|ASKPASS)|SYSTEMD_(PAGER|EDITOR)|BAT_.*|GH_.*|BUNDLE_.*|POETRY_.*|PIPENV_.*|PDM_.*|HATCH_.*|YARN_.*|COREPACK_.*)$/;
 // Values of a dangerous variable that change nothing that runs (round 3, finding 28, signed
 // off): NODE_OPTIONS made only of options that load no code, `PAGER=cat`, `GIT_PAGER=cat`, a
 // bare compiler name for CC and CXX, and a PYTHONPATH whose every entry lies in the project.
@@ -1998,7 +2000,8 @@ const ENV_HARMLESS =
   /^(NODE_ENV|CI|DEBUG|VERBOSE|FORCE_COLOR|NO_COLOR|CLICOLOR(_FORCE)?|TERM|COLORTERM|COLUMNS|LINES|LANG|LANGUAGE|LC_[A-Z]+|TZ|RUST_BACKTRACE|RUST_LOG|CARGO_TERM_[A-Z_]+|CARGO_INCREMENTAL|PYTHONUNBUFFERED|PYTHONDONTWRITEBYTECODE|PYTHONHASHSEED|PYTEST_ADDOPTS|LOG_LEVEL|PORT|HOST|TEST_[A-Z0-9_]+|GOMAXPROCS|JOBS|NINJA_STATUS)$/;
 const ASSIGN = /^([A-Za-z_]\w*)\+?=/;
 const DECLARERS = new Set(["export", "declare", "typeset", "readonly", "local"]);
-const dangerous = (variable: string) => `sets ${variable}, which changes what programs run or load`;
+const ARITHMETIC_VARIABLE = /^(RANDOM|SRANDOM|OPTIND|HISTCMD|BASH_XTRACEFD|READLINE_(?:MARK|POINT))$/;
+const dangerous = (variable: string) => (ARITHMETIC_VARIABLE.test(variable) ? `sets ${variable}, whose value bash evaluates as arithmetic` : `sets ${variable}, which changes what programs run or load`);
 // Whether a variable of this name changes what programs run or load (for the callers outside).
 export const dangerousName = (name: string) => ENV_DANGEROUS.test(name);
 
@@ -6953,6 +6956,20 @@ const lexists = (p: string) => {
     return false;
   }
 };
+// Whether an absolute entry of PATH holds a program `name` at all (pathFinds' undefined is also
+// its answer for a name PATH does not find; council project review 1).
+export function pathHas(name: string): boolean {
+  return (process.env.PATH ?? "").split(":").some((entry) => {
+    if (!path.isAbsolute(entry)) return false;
+    const file = path.join(entry, name);
+    try {
+      fs.accessSync(file, fs.constants.X_OK);
+      return fs.statSync(file).isFile();
+    } catch {
+      return false;
+    }
+  });
+}
 // The names a call defines a function under, read off its text (`name ( ) { ... }`, `function
 // name`), wider than bash reads them: quoted text that looks like a definition counts.
 export function functionNames(text: string): Set<string> {
@@ -7022,12 +7039,25 @@ const DIFF_GIT = new Set(listed("diff log show blame describe shortlog whatchang
 const CAT_FILE_PLAIN = /^-[tsep]$|^--(batch|batch-check|batch-command|batch-all-objects|buffer|unordered|follow-symlinks|allow-unknown-type)(=.*)?$/;
 // bun's subcommands (bun 1.x `bun --help`): the word after `bun` is one of these, or a file.
 const BUN_SUBCOMMANDS = new Set(listed("run test x repl exec install add remove update audit outdated link unlink publish patch pm info build init create upgrade why"));
+function lessFilterPlain(value: string | undefined, ctx: ArgvContext): boolean {
+  if (!value) return true;
+  const m = /^\s*(?:\|\|?-?)?\s*(\/[\w./+-]+)(\s+%s){1,2}\s*$/.exec(value);
+  if (!m || !ctx.inProject) return false;
+  const real = walked(m[1]);
+  return real !== undefined && ![m[1], real].some((p) => !!ctx.inProject?.(p) || !!ctx.canWrite?.(p) || tempDirs().some((t) => within(p, t)));
+}
 // The answer: true (on the list), false, or for a git command whose repository's configuration
 // may name a program, what in it does (B8-2).
 function safeAfterWrite(name: string, args: string[], cmd: Simple, ctx: ArgvContext): boolean | string {
   // A shell is safe for the code it is handed (`bash -c`, whose commands are judged one by one);
   // with a script it is that script (`bash x.sh`, `source x`, `. x`), a program like any other.
   if (SHELLS.has(name)) return name !== "source" && name !== "." && shellScript(name, args) === undefined;
+  // Council project review 1: less runs the program LESSOPEN and LESSCLOSE name on what it shows,
+  // and TAR_OPTIONS can hand tar an option that runs one; both are inherited from your
+  // environment. less is on the list only where each is unset or names, by its absolute path, a
+  // program outside every place a call can write (`| /usr/bin/lesspipe %s`); tar where it is unset.
+  if (name === "less" || name === "more") return ["LESSOPEN", "LESSCLOSE"].every((n) => lessFilterPlain(process.env[n], ctx));
+  if (name === "tar" && process.env.TAR_OPTIONS) return false;
   if (SAFE_AFTER_WRITE.has(name)) return true;
   if (name === "rg") return !args.some((w) => w === "--pre" || w.startsWith("--pre="));
   // sed and awk with a program in their words that only edits or prints (sedProblem, awkProblem:

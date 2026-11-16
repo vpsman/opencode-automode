@@ -37,7 +37,7 @@ import {
 import { scoreCommand, type ClassifierConfig } from "./kev.ts";
 import { findGitEntries, gitArgs, Scan, gitEnv, gitReadsElsewhere, gitRun, inGitDir, located as followed, madeByPlan, pushHooksMissing, HOOK_MANAGER_FILES, OPENCODE_CONFIG_NAMES, OPENCODE_PROJECT_FILES, opencodeDirs, protectedPaths, realpath, safeGit, workTreeSubmodules } from "./sandbox.ts";
 import { canonical, type Printed } from "./canon.ts";
-import { PathWalkError, PWD_LEAD, fetchDestination, functionNames, pathFinds, procRelative, runsItsWords, tempDirs, unseenWriter } from "./guard.ts";
+import { PathWalkError, PWD_LEAD, fetchDestination, functionNames, pathFinds, pathHas, procRelative, runsItsWords, tempDirs, unseenWriter } from "./guard.ts";
 import { abbreviates, allCommands, arithmeticAssignments, braceWords, expandNames, expandWord, gitMessageWords, EDITOR_ASSIGNMENT, editorCommand, programs, withoutGlobals, alsoByName, argvGuards, dangerousName, envAssignmentsOk, expansionProblem, gitCall, gitProblem, inputReads, landing, linkedReads, literalTargets, located, physical, placedReads, present, cdTo, type Place, type Places, observer, protectedNameIn, runtimeReads, single, stricter, strict, strictCommands, textGuards, tilde, tildeMismatch, unmodelled, writesOf, writtenBy, type Single, type StrictCommand, getopt, GIT_OPTIONS, lastOf, type Getopt, unreadableGlob, withoutExpansions } from "./guard.ts";
 
 export type Effect = "allow" | "ask" | "deny";
@@ -5065,7 +5065,8 @@ export async function decideShell(guard: Guard, session: SessionState, cwd: stri
     const roots = projectRoots(session).map(realish);
     const writable = (p: string) => [...roots, ...guard.allowedPaths, ...(guard.writable ?? [])].some((d) => within(realish(p), realish(d)));
     // (A relative PATH entry is not placed: a `cd` in the call may come before the substitution.)
-    const odd = pathFinds("cat", undefined, writable, () => false);
+    // (Council project review 1: and a PATH that finds no `cat` at all runs none.)
+    const odd = pathFinds("cat", undefined, writable, () => false) ?? (pathHas("cat") ? undefined : { why: "PATH finds no cat" });
     if (odd) return withApproval(session, askBy(`the command's "$(cat <<EOF ...)" is printed as the text it stands for, and the cat it would run is not plainly the real one (${odd.why})`));
   }
   const decision = await decidePrinted(guard, session, cwd, printed, signal, scan);

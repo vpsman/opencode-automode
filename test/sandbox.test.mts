@@ -1052,3 +1052,30 @@ describe("r3 34: lockwrite refuses a terminal and root", () => {
     assert.deepEqual(r.stdout.trim().split("\n").map((l) => l.split(/\s+/)[1]), ["0000000000000000", "0000000000000000", "0000000000000000"], r.stdout);
   });
 });
+
+// Council project review 1: a later node outside the sandbox runs what these caches hold.
+describe("council project review 1: the code caches in the temp directories", () => {
+  const caches = () => [...new Set(["/tmp", os.tmpdir()].map((d) => fs.realpathSync(d)))].flatMap((d) => sandbox.TEMP_CODE_CACHES.map((n) => path.join(d, n)));
+  test("a call writes into private, empty copies of them, and nothing it writes stays", () => {
+    const r = attempt(caches().map((c) => `mkdir -p ${c}/x && echo planted > ${c}/x/entry`).join(" && "));
+    for (const c of caches()) {
+      assert.ok(r.plan.tmpfs.includes(c), c);
+      assert.ok(fs.statSync(c).isDirectory(), c);
+      assert.ok(!fs.existsSync(path.join(c, "x")), c);
+    }
+  });
+  test("node runs in the sandbox with its compile cache on", () => {
+    const r = attempt(`node -e 'console.log(require("node:module").enableCompileCache().status)'`);
+    assert.match(r.stdout, /^\d+\nran\n$/);
+  });
+  test("one that is a symbolic link is a problem", () => {
+    const link = path.join(fs.realpathSync(os.tmpdir()), "jiti");
+    fs.rmSync(link, { recursive: true, force: true });
+    fs.symlinkSync(repo, link);
+    try {
+      assert.match(planFor("ls").problem ?? "", /jiti.*not a directory/);
+    } finally {
+      fs.rmSync(link);
+    }
+  });
+});
