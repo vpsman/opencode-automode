@@ -539,8 +539,8 @@ getent hosts localhost
 ## r4 4: a project script run by a shell
 bash scripts/build.sh
 ====
-## r4 B7 2: a named write in one directory, then a project script that lives and runs in another
-sed -i 's/readme/README/' dir/readme.md && cd scripts && ./build.sh
+## r4 B8 3: a named write, then programs of the safe list (a project script after it goes to the model: any write in the project counts)
+sed -i 's/readme/README/' dir/readme.md && cat dir/readme.md && ls
 ====
 ## r4 4: a glob as a write target
 sed -i 's/export/export/' src/*.ts

@@ -34,10 +34,10 @@ import {
   type Verdict,
 } from "./rules.ts";
 import { scoreCommand, type ClassifierConfig } from "./kev.ts";
-import { findGitEntries, gitArgs, Scan, gitEnv, gitRun, inGitDir, madeByPlan, pushHooksMissing, HOOK_MANAGER_FILES, OPENCODE_CONFIG_NAMES, OPENCODE_PROJECT_FILES, opencodeDirs, protectedPaths, realpath, safeGit, workTreeSubmodules } from "./sandbox.ts";
+import { findGitEntries, gitArgs, Scan, gitEnv, gitReadsElsewhere, gitRun, inGitDir, located as followed, madeByPlan, pushHooksMissing, HOOK_MANAGER_FILES, OPENCODE_CONFIG_NAMES, OPENCODE_PROJECT_FILES, opencodeDirs, protectedPaths, realpath, safeGit, workTreeSubmodules } from "./sandbox.ts";
 import { canonical, type Printed } from "./canon.ts";
-import { PathWalkError, fetchDestination, procRelative, runsItsWords } from "./guard.ts";
-import { abbreviates, allCommands, arithmeticAssignments, braceWords, expandWord, gitMessageWords, EDITOR_ASSIGNMENT, editorCommand, programs, withoutGlobals, alsoByName, argvGuards, dangerousName, envAssignmentsOk, expansionProblem, gitCall, gitProblem, inputReads, landing, literalTargets, located, physical, placedReads, present, cdTo, type Place, type Places, observer, protectedNameIn, runtimeReads, single, stricter, strict, strictCommands, textGuards, tilde, tildeMismatch, unmodelled, writesOf, writtenBy, type Single, type StrictCommand, getopt, GIT_OPTIONS, lastOf, type Getopt, unreadableGlob } from "./guard.ts";
+import { PathWalkError, PWD_LEAD, fetchDestination, functionNames, pathFinds, procRelative, runsItsWords, tempDirs, unseenWriter } from "./guard.ts";
+import { abbreviates, allCommands, arithmeticAssignments, braceWords, expandNames, expandWord, gitMessageWords, EDITOR_ASSIGNMENT, editorCommand, programs, withoutGlobals, alsoByName, argvGuards, dangerousName, envAssignmentsOk, expansionProblem, gitCall, gitProblem, inputReads, landing, linkedReads, literalTargets, located, physical, placedReads, present, cdTo, type Place, type Places, observer, protectedNameIn, runtimeReads, single, stricter, strict, strictCommands, textGuards, tilde, tildeMismatch, unmodelled, writesOf, writtenBy, type Single, type StrictCommand, getopt, GIT_OPTIONS, lastOf, type Getopt, unreadableGlob, withoutExpansions } from "./guard.ts";
 
 export type Effect = "allow" | "ask" | "deny";
 
@@ -152,6 +152,9 @@ export interface Guard {
   configDirs: string[];
   // Extra directories where file changes count as local.
   allowedPaths: string[];
+  // The sandbox's other writable directories (`sandboxWritable`): for the checks that ask whether
+  // the session can write a place (a PATH entry: the closing reading, step 7 F5).
+  writable?: string[];
   classifier: ClassifierConfig;
   useClassifier: boolean;
   // ssh to these targets, written exactly as listed (`lab`, or `admin@lab` for a user), runs
@@ -176,11 +179,13 @@ export interface Guard {
 // process, taken when this module is loaded. A file about to run whose change time is at or after
 // it goes to the model. Per SessionState, and taken at the session's first call, it let a second
 // session (a subagent, a reload of the session list) read the first one's writes as old.
-// `at`: the moment on the clock of the temp directory's file system (0: no reading, which grants
-// no trust: every file then counts as changed); `dev`: that file system.
+// `at`: the moment on the clock of the file system it was read on (0: no reading, which grants
+// no trust: every file then counts as changed); `dev`: that file system; `dir`: the directory the
+// reading was made in, where that clock can be read again (B8-5).
 export interface Moment {
   at: bigint;
   dev: bigint | undefined;
+  dir?: string;
 }
 // What a file system's clock says now, read off a file made there (never Date.now(): two clocks
 // are not compared): a file without a name (O_TMPFILE: nothing appears in the directory, and no
@@ -216,61 +221,198 @@ function clockOn(dir: string, tick = false): { at: bigint; dev: bigint } | undef
     if (made) fs.rmSync(made, { recursive: true, force: true });
   }
 }
-export function takeMoment(): Moment {
-  const now = clockOn(os.tmpdir(), true);
-  return { at: now?.at ?? 0n, dev: now?.dev };
+// The plugin's state directory, as index.ts names it (STATE_DIR there): kept moments live in it
+// (B8-5), and it is one of the places a moment is taken in.
+const stateDirectory = () => path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "opencode-automode");
+const ownDirectory = (dir: string) => {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
+  return dir;
+};
+// B8-5: the moment, read in the first of `dirs` whose clock can be read. By default the temp
+// directory, then (a temp directory that is missing, read-only or under /proc gave no reading,
+// and every script then went to the model) the state directory the plugin keeps, then the home
+// directory. None: no reading.
+export function takeMoment(dirs?: string[]): Moment {
+  const places: (() => string)[] = dirs ? dirs.map((d) => () => d) : [() => os.tmpdir(), () => ownDirectory(stateDirectory()), () => os.homedir()];
+  for (const place of places) {
+    try {
+      const dir = place();
+      const now = clockOn(dir, true);
+      if (now) return { at: now.at, dev: now.dev, dir };
+    } catch {
+      // a directory that cannot be made: the next one
+    }
+  }
+  return { at: 0n, dev: undefined };
 }
 const MOMENT = takeMoment();
-// A file system's clock against the temp directory's (B7-1: the two differ on a network file
-// system, a shared folder of a virtual machine, a file system that keeps whole seconds). Read
-// once per file system, the first time a file on it is judged: the temp clock, that clock, the
-// temp clock again. `delta` is what that clock is ahead by, at the least (0 where the readings
-// cannot tell the two apart); `grain`: it keeps whole seconds (a reading that ends in nine
-// zeros), and a moment on it is then cut down to the second, as its files' times are.
-const offsets = new Map<bigint, { delta: bigint; grain: bigint } | null>();
-function offsetOf(dev: bigint, dirs: string[]): { delta: bigint; grain: bigint } | null {
-  const known = offsets.get(dev);
+// A file system's clock against the one the moment was read on (B7-1: the two differ on a
+// network file system, a shared folder of a virtual machine, a file system that keeps whole
+// seconds). Read once per pair of file systems, the first time a file on the other is judged:
+// the moment's clock, that clock, the moment's clock again. `delta`: what that clock is ahead
+// by, at the least: the lower bound of what the three readings allow (B8-5: zero was taken where
+// the readings could not tell the two apart, and a clock that trails by less than the readings
+// are apart then read a file changed just after the moment as older than it). `grain`: it keeps
+// whole seconds (a reading that ends in nine zeros), and a moment on it is then cut down to the
+// second, as its files' times are.
+// The readings go through `clocks`, which the tests replace: no second clock is at hand there.
+const offsets = new Map<string, { delta: bigint; grain: bigint }>();
+export const clocks = {
+  read: clockOn as (dir: string) => { at: bigint; dev: bigint } | undefined,
+  dev: (dir: string): bigint => fs.statSync(dir, { bigint: true }).dev,
+  forget: () => offsets.clear(),
+};
+function offsetOf(moment: Moment, dev: bigint, dirs: string[]): { delta: bigint; grain: bigint } | undefined {
+  if (moment.dir === undefined) return undefined;
+  const key = `${moment.dev}\0${moment.dir}\0${dev}`;
+  const known = offsets.get(key);
   if (known !== undefined) return known;
-  let found: { delta: bigint; grain: bigint } | null = null;
   for (const dir of dirs) {
     try {
-      if (fs.statSync(dir, { bigint: true }).dev !== dev) continue;
+      if (clocks.dev(dir) !== dev) continue;
     } catch {
       continue;
     }
-    const before = clockOn(os.tmpdir());
-    const there = clockOn(dir);
-    const after = clockOn(os.tmpdir());
-    if (!before || !there || !after || there.dev !== dev) continue;
-    const grain = there.at % 1_000_000_000n === 0n ? 1_000_000_000n : 1n;
-    const low = there.at - after.at;
-    const high = there.at - before.at + (grain > 1n ? grain : 0n);
-    found = { delta: low <= 0n && high >= 0n ? 0n : low, grain };
-    break;
+    const before = clocks.read(moment.dir);
+    const there = clocks.read(dir);
+    const after = clocks.read(moment.dir);
+    if (!before || !there || !after || there.dev !== dev || before.dev !== moment.dev || after.dev !== moment.dev) continue;
+    const found = { delta: there.at - after.at, grain: there.at % 1_000_000_000n === 0n ? 1_000_000_000n : 1n };
+    offsets.set(key, found);
+    return found;
   }
-  offsets.set(dev, found);
-  return found;
+  // (A failure is not kept: the next file judged there is measured again.)
+  return undefined;
 }
 // The moment on the clock of the file system `dev` (the one a judged file lives on). `dirs`:
 // directories that may lie on it (the file's own, the project's, the home directory), for the
-// reading. Where the plugin can make a file in none of them the temp directory's clock stands
-// (the kernel keeps one clock for its local file systems; a file system this user cannot write
-// to is not one the session's commands wrote to either).
+// reading. B8-5: where that clock cannot be measured against the moment's (the plugin can make a
+// file in none of them, or the moment's own directory is gone) there is no trust: 0, and the
+// file goes to the model. (The temp clock stood there before. That a directory cannot be
+// written into says nothing of a file in it that is already there.)
 export function momentOn(moment: Moment, dev: bigint, dirs: string[]): bigint {
   if (moment.at === 0n || dev === moment.dev) return moment.at;
-  const offset = offsetOf(dev, dirs);
-  if (!offset) return moment.at;
+  const offset = offsetOf(moment, dev, dirs);
+  if (!offset) return 0n;
   const at = moment.at + offset.delta;
-  return at - (at % offset.grain);
+  return at <= 0n ? 0n : at - (at % offset.grain);
+}
+
+// B8-5: a moment that outlives a restart. The moment above is one per process, so after a
+// restart of opencode everything the session wrote before it read as old. Per session id the
+// plugin keeps the moment of the process the session was first seen in: one small file in the
+// state directory (`moments/<sha256 of the id>`), made once (a link of a finished file: no
+// reader sees half of one), readable by the user alone. A session is measured from the earlier
+// of that and the process's own. A kept moment that cannot be read (not a file of this user's
+// with no access for others, not what was written, its clock gone) or that lies in the future of
+// its own clock is no trust. Where nothing can be kept, the process's own moment stands, as
+// before.
+// Cleaning up: a kept moment is renewed (its time set to now) each time a process sees its
+// session for the first time; one that no process renewed for thirty days is removed by the
+// first session a process sees. A session taken up again after that is measured from then: what
+// it wrote more than thirty days earlier reads as old.
+const MOMENT_DAYS = 30;
+const momentsDirectory = () => path.join(stateDirectory(), "moments");
+export const momentFile = (id: string) => path.join(momentsDirectory(), createHash("sha256").update(id).digest("hex"));
+const NO_MOMENT = (): Moment => ({ at: 0n, dev: undefined });
+function readMoment(file: string): Moment | "none" | "unreadable" {
+  let fd: number;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  } catch (e) {
+    // (Nothing there, or no directory to hold it: nothing was kept.)
+    return ["ENOENT", "ENOTDIR"].includes((e as NodeJS.ErrnoException).code ?? "") ? "none" : "unreadable";
+  }
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0 || st.size > 4096) return "unreadable";
+    const kept = JSON.parse(fs.readFileSync(fd, "utf8")) as Record<string, unknown>;
+    const { at, dev, dir } = kept;
+    if (typeof at !== "string" || !/^[1-9]\d{0,29}$/.test(at) || typeof dev !== "string" || !/^\d{1,30}$/.test(dev) || typeof dir !== "string" || !path.isAbsolute(dir)) return "unreadable";
+    const moment = { at: BigInt(at), dev: BigInt(dev), dir };
+    // Its own clock, now: a moment after it is not one this session was seen at.
+    const now = clockOn(dir);
+    if (!now || now.dev !== moment.dev || moment.at > now.at) return "unreadable";
+    return moment;
+  } catch {
+    return "unreadable";
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+function keepMoment(file: string, moment: Moment): void {
+  let made: string | undefined;
+  try {
+    ownDirectory(stateDirectory());
+    ownDirectory(momentsDirectory());
+    made = `${file}.${process.pid}.${randomUUID()}`;
+    fs.writeFileSync(made, JSON.stringify({ at: String(moment.at), dev: String(moment.dev), dir: moment.dir }), { flag: "wx", mode: 0o600 });
+    // Made once: where another process was first, its file stays.
+    fs.linkSync(made, file);
+  } catch {
+    // Nothing kept: the caller reads what is there.
+  } finally {
+    if (made) fs.rmSync(made, { force: true });
+  }
+}
+export function sweepMoments(): void {
+  const dir = momentsDirectory();
+  const before = Date.now() - MOMENT_DAYS * 86_400_000;
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    // Its own files only: a kept moment, or what a process that died left of making one.
+    if (!/^[0-9a-f]{64}(\.\d+\.[0-9a-f-]{36})?$/.test(name)) continue;
+    try {
+      if (fs.lstatSync(path.join(dir, name)).mtimeMs < before) fs.rmSync(path.join(dir, name), { force: true });
+    } catch {
+      // gone already
+    }
+  }
+}
+let swept = false;
+function sessionMoment(id: string, own: Moment): Moment {
+  if (!swept) {
+    swept = true;
+    sweepMoments();
+  }
+  const file = momentFile(id);
+  let kept = readMoment(file);
+  if (kept === "none") {
+    // First seen here: this process's moment is the session's. (Read back: another process may
+    // have been first.)
+    if (own.at > 0n && own.dir !== undefined) keepMoment(file, own);
+    kept = readMoment(file);
+    if (kept === "none") return own;
+  } else if (kept !== "unreadable") {
+    try {
+      const now = new Date();
+      fs.utimesSync(file, now, now);
+    } catch {
+      // not renewed: it is swept sooner
+    }
+  }
+  if (kept === "unreadable") return NO_MOMENT();
+  if (own.at === 0n) return kept;
+  // The earlier of the two, on the kept one's clock.
+  const mine = own.dev === kept.dev ? own.at : momentOn(own, kept.dev!, [kept.dir!]);
+  return mine > 0n && mine < kept.at ? { at: mine, dev: kept.dev, dir: kept.dir } : kept;
 }
 
 export class SessionState {
   // The one moment (see Moment). The tests make their files after this module is loaded, and
   // take a moment per state instead (`SessionState.moment = takeMoment`); nothing else sets it.
   static moment: () => Moment = () => MOMENT;
-  readonly moment = SessionState.moment();
+  // B8-5: with the session's id, the earlier of that and the moment kept for the session by the
+  // process that first saw it (sessionMoment).
+  readonly moment: Moment;
   // Compare only filesystem timestamps. Failure to take a baseline grants no trust.
-  readonly began = this.moment.at;
+  readonly began: bigint;
   readonly project: string;
   files: SessionFiles = new Map();
   // Files a command of this session wrote, appended to or edited in place. The rules' own list
@@ -304,8 +446,11 @@ export class SessionState {
   // it: once the call is over, the files git changed are marked (added to `touched`); until then,
   // its repository counts as marked.
   worktree: WorkTreeChange[] = [];
-  constructor(project: string) {
+  constructor(project: string, id?: string) {
     this.project = realpath(project);
+    const own = SessionState.moment();
+    this.moment = id === undefined ? own : sessionMoment(id, own);
+    this.began = this.moment.at;
   }
 }
 
@@ -691,20 +836,42 @@ interface Change {
 // a link's target, and for a directory which directory it is and everything in it that git reads
 // or runs (eighth pass: by identity and four control files alone, a `hooks/pre-push` or a
 // `git-rebase-todo` with an `exec` line added between the prompt and the touch joined the
-// baseline unseen). That is its tree of names, each entry with its kind, mode, size, inode and
-// change time (a link with its target), and the contents of every file up to `fileBytes` outside
-// an object store (the hooks, `config`, `HEAD`, todo lists, `info/`, refs; an object's name is
-// its contents' hash, and its size and change time are compared all the same). "missing": not
-// there.
+// baseline unseen). "missing": not there.
 //
-// The bound: `entries` entries of the tree, read top down (a directory's entries by name, the
-// directories below in the order they were met) with every `objects` directory last, so that
-// what git runs or takes its settings from comes first; and `bytes` of file contents in all.
-// A directory with more entries is compared by its first `entries` only (`over`): the pause says
-// so in its prompt (pause), and the session resumes like any other once what was compared is as
-// it was shown. What lies past the bound is then taken in uncompared, as the prompt said.
-export const fingerprintLimits = { entries: 20_000, fileBytes: 64 * 1024, bytes: 16 << 20 };
-function fingerprint(p: string): { held: string; over?: number } {
+// A directory is compared in the order that matters (ninth pass: read by name with one bound for
+// all of it, 20,100 empty files in `branches/`, at its top or in `hooks/` pushed its hooks,
+// config, info and refs past the bound, and a hook added before the touch was taken in; run by
+// a reviewer, xcheck/reviewers/c8-sonnet/x8-p6b.test.mts). The directory itself, and a `.git`
+// directory at its top, are each taken for a git directory, and of each:
+//
+//   first, what git reads or runs (FIRST), part by part, each with an allowance of its own
+//   (`first` entries, `firstBytes` of contents): the hooks directory and the directories a
+//   configured `core.hooksPath` names; `config`, `config.worktree` and the files they include;
+//   `HEAD`, `packed-refs` and the other files git keeps its state in at the top, the todo lists
+//   and the object store's `alternates` among them; `info/`; the state of a rebase, an `am` or a sequence; `refs/`; `logs/`; then of each git directory
+//   below (a module's, a linked worktree's) its hooks, config, state files, `info/` and the state
+//   of an operation (more such directories than the first part's allowance: the part does not
+//   fit). Every
+//   file of these is compared by its contents whatever its size. A part that does not fit its
+//   allowance is not compared in part: the directory then counts as changed at every resume
+//   (`unseen`), so nothing of that part is taken in unseen, and the prompt says which part.
+//
+//   then everything else, by name from the top down, with every `objects` directory and every
+//   directory at the top that git does not know (`branches/`, anything planted; of a work
+//   tree, its own directories) last: `entries`
+//   entries, each with its kind, mode, size, inode and change time (a link with its target), and
+//   the contents of a file that git reads or runs wherever it lies (CONTROL_FILE, up to
+//   `firstBytes`) or that is no larger than `fileBytes` and outside an object store, `bytes` in
+//   all. A directory with more is compared that far (`over`): the prompt says so, and the
+//   session resumes once what was compared is as it was shown; the rest is then taken in
+//   uncompared, as the prompt said.
+//
+// What is known by size, inode and change time alone: in that second part a file larger than
+// `fileBytes` or past `bytes`, and every file of an object store (an object's name is the hash
+// of its contents). One of those rewritten in place, to the same size, within the same tick of
+// the kernel's clock as its last change (about 4 ms here) is not told apart: the known rest.
+export const fingerprintLimits = { entries: 20_000, fileBytes: 64 * 1024, bytes: 16 << 20, first: 20_000, firstBytes: 64 << 20 };
+function fingerprint(p: string): { held: string; over?: number; unseen?: string } {
   try {
     const st = fs.lstatSync(p, { bigint: true });
     if (st.isSymbolicLink()) return { held: `link:${fs.readlinkSync(p)}` };
@@ -718,67 +885,249 @@ function fingerprint(p: string): { held: string; over?: number } {
     }
     if (!st.isDirectory()) return { held: `other:${st.dev}:${st.ino}` };
     const tree = treeHeld(p);
+    // Not compared whole where it matters: like nothing it was or will be (the time, counted in
+    // nanoseconds from when this process started, never comes twice).
+    if (tree.unseen) return { held: `dir:${st.dev}:${st.ino}:unseen:${process.hrtime.bigint()}`, unseen: tree.unseen };
     return { held: `dir:${st.dev}:${st.ino}:${tree.digest}${tree.over ? `:first-${tree.over}` : ""}`, ...(tree.over ? { over: tree.over } : {}) };
   } catch (e) {
     const code = (e as NodeJS.ErrnoException).code ?? "";
     return { held: ["ENOENT", "ENOTDIR"].includes(code) ? "missing" : `unknown:${code}` };
   }
 }
-// The tree below a directory, as one digest (see fingerprint). `over`: the bound, where the tree
-// has more entries than that.
-function treeHeld(root: string): { digest: string; over?: number } {
-  const limit = fingerprintLimits.entries;
+// The files at the top of a git directory that git reads its state from, and the todo lists of
+// an operation where the directory is that operation's own (`rebase-merge/` a pause named).
+const FIRST_FILES = [
+  ...["HEAD", "packed-refs", "shallow", "commondir", "gitdir", "objects/info/alternates", "objects/info/http-alternates", "ORIG_HEAD", "FETCH_HEAD", "MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "MERGE_AUTOSTASH", "MERGE_RR", "SQUASH_MSG", "AUTO_MERGE", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"],
+  ...["BISECT_LOG", "BISECT_START", "BISECT_TERMS", "BISECT_NAMES", "BISECT_EXPECTED_REV", "BISECT_ANCESTORS_OK", "BISECT_FIRST_PARENT", "BISECT_HEAD", "BISECT_RUN"],
+  ...["git-rebase-todo", "git-rebase-todo.backup", "todo", "done", "onto", "head-name", "orig-head", "opts", "strategy", "strategy_opts", "gpg_sign_opt"],
+];
+// The entries below each git directory's starts in a part that cost nothing of its allowance
+// (treeHeld): what a module made by git holds there (its sample hooks, info/exclude), and room.
+const NESTED_FREE = 16;
+// The parts of a git directory that are directories, in the order they are compared.
+const FIRST_DIRS: [string, string[]][] = [["info/", ["info"]], ["the state of an operation (rebase-merge/, rebase-apply/, sequencer/)", ["rebase-merge", "rebase-apply", "sequencer"]], ["refs/", ["refs"]], ["logs/", ["logs"]]];
+// A file git reads or runs, by its place: wherever it lies in the tree (a module's hooks, a
+// linked worktree's `HEAD`, `objects/info/alternates`).
+const CONTROL_FILE = /(^|\/)(hooks|info|rebase-merge|rebase-apply|sequencer)\/|(^|\/)(config|config\.worktree|HEAD|packed-refs|commondir|gitdir|git-rebase-todo|todo)$/;
+// The directories at the top of a git directory that git knows, besides the ones compared first
+// and its object store.
+const KNOWN_DIRS = new Set(["worktrees", "modules", "lfs", "rr-cache", "svn", "annex"]);
+// The tree below a directory, as one digest (see fingerprint). `over`: the bound of the second
+// part, where there is more than that. `unseen`: the part git reads or runs that was not
+// compared whole, with why.
+function treeHeld(root: string): { digest: string; over?: number; unseen?: string } {
+  const limits = fingerprintLimits;
   const hash = createHash("sha256");
-  const next: string[] = [""];
-  const stores: string[] = [];
-  let entries = 0;
-  let bytes = 0;
-  let over = false;
   const errno = (e: unknown) => (e as NodeJS.ErrnoException).code ?? "";
-  while ((next.length || stores.length) && !over) {
-    const rel = next.length ? next.shift()! : stores.shift()!;
+  const inside = (p: string) => p === root || p.startsWith(`${root}/`);
+  const named = (p: string) => (inside(p) ? path.relative(root, p) || "." : p);
+  let unseen: string | undefined;
+  // One entry as it is compared. `whole`: by its contents if it is a file, whatever its size
+  // (`large`: it has more than can be read). `store`: never by its contents.
+  let bytes = 0;
+  const entry = (full: string, whole: boolean, store = false): { line: string; dir?: boolean; size?: number; large?: boolean } => {
+    try {
+      const st = fs.lstatSync(full, { bigint: true });
+      if (st.isSymbolicLink()) return { line: `link:${fs.readlinkSync(full)}` };
+      if (st.isDirectory()) return { line: `dir:${st.mode}`, dir: true };
+      if (!st.isFile()) return { line: `other:${st.mode}:${st.ino}` };
+      const line = `file:${st.mode}:${st.size}:${st.ino}:${st.ctimeNs}`;
+      const size = Number(st.size);
+      if (whole ? size > limits.firstBytes : store || size > limits.fileBytes || bytes + size > limits.bytes) return { line, size, large: whole };
+      if (!whole) bytes += size;
+      try {
+        return { line: `${line}:${createHash("sha256").update(fs.readFileSync(full)).digest("hex")}`, size };
+      } catch (e) {
+        return { line: `${line}:unread:${errno(e)}`, size };
+      }
+    } catch (e) {
+      return { line: `unknown:${errno(e)}` };
+    }
+  };
+  // The first part: what is compared whole, and so is passed over by the second.
+  // `groups`: the starts, by what they belong to. Each group costs one entry of the part's
+  // allowance, whatever of its starts are there, and each entry found below them one more, past
+  // the first `free` of the group (eleventh pass: the git directories below a named one, each
+  // with the 39 names of its state files, counted every name, so that about 500 of them used up
+  // an allowance said to be 20,000; read by a reviewer, REVIEW-C10-OPUS F5). `byStat`: what is
+  // known by its size, inode and change time alone, and adds nothing to the bytes read.
+  const done = new Set<string>();
+  const first = (what: string, groups: string[][], free = 0, byStat?: (full: string) => boolean) => {
+    let entries = 0;
+    let held = 0;
+    const one = (full: string, counts: boolean): boolean | undefined => {
+      const stat = byStat?.(full) ?? false;
+      const e = entry(full, !stat, stat);
+      hash.update(`${named(full)}\0${e.line}\0`);
+      if (!stat) held += e.size ?? 0;
+      // (Outside the named directory, where a configured hooks path can lead anywhere, a file too
+      // large to read is known by its size, inode and change time.)
+      if (e.large && inside(full)) unseen ??= `${what} (${full} is larger than ${limits.firstBytes} bytes)`;
+      else if (counts && ++entries > limits.first) unseen ??= `${what} (more than ${limits.first} entries)`;
+      else if (held > limits.firstBytes) unseen ??= `${what} (more than ${limits.firstBytes} bytes in all)`;
+      return unseen === undefined ? !!e.dir : undefined;
+    };
+    for (const starts of groups) {
+      if (++entries > limits.first) return void (unseen ??= `${what} (more than ${limits.first} entries)`);
+      let left = free;
+      for (const start of starts) {
+        done.add(start);
+        const next = one(start, false) ? [start] : [];
+        while (next.length && unseen === undefined) {
+          const dir = next.shift()!;
+          let names: string[];
+          try {
+            names = fs.readdirSync(dir).sort();
+          } catch (e) {
+            hash.update(`${named(dir)}\0unlisted:${errno(e)}\0`);
+            continue;
+          }
+          for (const name of names) {
+            const below = one(path.join(dir, name), left-- <= 0);
+            if (below === undefined) break;
+            // A hooks directory outside the named one is compared by its own entries alone.
+            if (below && inside(dir)) next.push(path.join(dir, name));
+          }
+        }
+        if (unseen !== undefined) return;
+      }
+    }
+  };
+  // Each start a group of its own: every name costs one entry, there or not.
+  const alone = (starts: string[]) => starts.map((start) => [start]);
+  // (A path that is a link is compared as the link, and so is what it leads to.)
+  const both = (paths: string[]) => [...new Set(paths.flatMap((p) => [p, realpath(p)]))];
+  const gitDirs = [root, path.join(root, ".git")].filter((dir) => {
+    try {
+      return fs.lstatSync(dir).isDirectory();
+    } catch {
+      return false;
+    }
+  });
+  for (const gitDir of gitDirs) {
+    if (unseen !== undefined) break;
+    // What git reads from outside the directory's own `hooks/` and `config`. What git could not
+    // say is compared as that.
+    const elsewhere = gitReadsElsewhere(gitDir);
+    hash.update(`${named(gitDir)}\0reads:${elsewhere.problems.join("\n")}\0`);
+    first("its hooks", alone(both([path.join(gitDir, "hooks"), ...elsewhere.hooks])));
+    if (unseen === undefined) first("its config and what that includes", alone(both([path.join(gitDir, "config"), path.join(gitDir, "config.worktree"), ...elsewhere.includes])));
+    if (unseen === undefined) first("HEAD, packed-refs and the other state files", alone(FIRST_FILES.map((name) => path.join(gitDir, name))));
+    for (const [what, names] of FIRST_DIRS) if (unseen === undefined) first(what, alone(names.map((name) => path.join(gitDir, name))));
+  }
+  // Then the git directories below them (tenth pass: a module's hooks and config and a linked
+  // worktree's `config.worktree` and `HEAD` were in the second part, and files at the top of a
+  // rebuilt `.git`, in `modules/` before the module, or in `lfs/` pushed them past its bound; run
+  // by both reviewers, xcheck/reviewers/c9-opus/p3-nested.test.mts, c9-sonnet/x9-p3.test.mts):
+  // each directory below `modules/` that holds a `HEAD`, a `config`, `hooks`, `objects` or
+  // `refs` (a module's, at any depth of names, and the modules of a module; eleventh pass: one
+  // without `HEAD` was not one, and its config and hooks could be pushed past the bound; run by a
+  // reviewer, xcheck/reviewers/c10-sonnet/out10/p3b.log), and each directory of `worktrees/`,
+  // found by a walk of the directories alone, which counts under the first part's allowance
+  // (past it: `unseen`). A named directory that is none of these (a `.git` file can name
+  // `.git/modules` itself) is walked as a directory of modules. Of each git directory found: its
+  // hooks (and the directories its own core.hooksPath names), its config (and the files it
+  // includes), its state files, `info/` and the state of an operation, whole, each kind of part
+  // with an allowance of its own, counted by git directory (`first`). A hook whose name ends in
+  // `.sample`, which git never runs, is known by its size, inode and change time. (Their refs
+  // and logs are the second part's.)
+  const nested: string[] = [];
+  let counted = 0;
+  const holds = (dir: string, names: string[]) =>
+    names.some((name) => {
+      try {
+        fs.lstatSync(path.join(dir, name));
+        return true;
+      } catch {
+        return false;
+      }
+    });
+  const GIT_DIR_NAMES = ["HEAD", "config", "hooks", "objects", "refs"];
+  const dirsIn = (dir: string): string[] => {
+    try {
+      return fs
+        .readdirSync(dir, { withFileTypes: true })
+        .filter((e) => e.isDirectory())
+        .map((e) => e.name)
+        .sort();
+    } catch (e) {
+      hash.update(`${named(dir)}\0unlisted:${errno(e)}\0`);
+      return [];
+    }
+  };
+  // A directory below which git keeps modules by name (`modules/a/b` for the module `a/b`): the
+  // git directories in it, into `nested`. False past the allowance.
+  const modules = (dir: string): boolean => {
+    for (const name of dirsIn(dir)) {
+      if (++counted > limits.first) return false;
+      const at = path.join(dir, name);
+      if (holds(at, GIT_DIR_NAMES)) {
+        nested.push(at);
+        if (!below(at)) return false;
+      } else if (!modules(at)) return false;
+    }
+    return true;
+  };
+  // The git directories below `gitDir`, into `nested`. False past the allowance.
+  const below = (gitDir: string): boolean => {
+    if (!modules(path.join(gitDir, "modules"))) return false;
+    for (const name of dirsIn(path.join(gitDir, "worktrees"))) {
+      if (++counted > limits.first) return false;
+      nested.push(path.join(gitDir, "worktrees", name));
+      if (!below(path.join(gitDir, "worktrees", name))) return false;
+    }
+    return true;
+  };
+  // (A named directory that is no git directory itself is walked as a directory of modules.)
+  for (const gitDir of gitDirs) if (unseen === undefined && !(holds(gitDir, GIT_DIR_NAMES) ? below(gitDir) : modules(gitDir))) unseen = `the git directories below it (more than ${limits.first} entries)`;
+  if (unseen === undefined && nested.length) {
+    // What each reads elsewhere (eleventh pass: the named one's own was compared, those below it
+    // not; read by a reviewer, REVIEW-C10-OPUS F5). What git could not say is compared as that.
+    const reads = new Map(nested.map((dir) => [dir, gitReadsElsewhere(dir)]));
+    for (const [dir, elsewhere] of reads) hash.update(`${named(dir)}\0reads:${elsewhere.problems.join("\n")}\0`);
+    const hooksOf = (dir: string) => both([path.join(dir, "hooks"), ...reads.get(dir)!.hooks]);
+    const hookDirs = new Set(nested.flatMap(hooksOf));
+    const sample = (full: string) => full.endsWith(".sample") && hookDirs.has(path.dirname(full));
+    const each = (names: string[]) => nested.map((dir) => names.map((name) => path.join(dir, name)));
+    first("the hooks of the git directories below it", nested.map(hooksOf), NESTED_FREE, sample);
+    if (unseen === undefined) first("the config of the git directories below it", nested.map((dir) => both([path.join(dir, "config"), path.join(dir, "config.worktree"), ...reads.get(dir)!.includes])), NESTED_FREE);
+    if (unseen === undefined) first("the state files of the git directories below it", each(FIRST_FILES), NESTED_FREE);
+    if (unseen === undefined) first("info/ and the state of an operation of the git directories below it", each(["info", "rebase-merge", "rebase-apply", "sequencer"]), NESTED_FREE);
+  }
+  if (unseen !== undefined) return { digest: "", unseen };
+  // The second part: everything else.
+  const next: string[] = [""];
+  const last: string[] = [];
+  let entries = 0;
+  let over = false;
+  while ((next.length || last.length) && !over) {
+    const rel = next.length ? next.shift()! : last.shift()!;
+    const dir = path.join(root, rel);
     let names: string[];
     try {
-      names = fs.readdirSync(path.join(root, rel)).sort();
+      names = fs.readdirSync(dir).sort();
     } catch (e) {
       // Closed to this process, or gone since it was listed: said, and compared as that.
       hash.update(`${rel}\0unlisted:${errno(e)}\0`);
       continue;
     }
     for (const name of names) {
-      if (entries >= limit) {
+      const at = rel ? `${rel}/${name}` : name;
+      const full = path.join(root, at);
+      if (done.has(full)) continue;
+      if (entries >= limits.entries) {
         over = true;
         break;
       }
       entries++;
-      const at = rel ? `${rel}/${name}` : name;
-      const full = path.join(root, at);
-      let line: string;
-      try {
-        const st = fs.lstatSync(full, { bigint: true });
-        if (st.isSymbolicLink()) line = `link:${fs.readlinkSync(full)}`;
-        else if (st.isDirectory()) {
-          line = `dir:${st.mode}`;
-          (name === "objects" ? stores : next).push(at);
-        } else if (st.isFile()) {
-          line = `file:${st.mode}:${st.size}:${st.ino}:${st.ctimeNs}`;
-          const size = Number(st.size);
-          if (size <= fingerprintLimits.fileBytes && bytes + size <= fingerprintLimits.bytes && !/(^|\/)objects\//.test(at)) {
-            bytes += size;
-            try {
-              line += `:${createHash("sha256").update(fs.readFileSync(full)).digest("hex")}`;
-            } catch (e) {
-              line += `:unread:${errno(e)}`;
-            }
-          }
-        } else line = `other:${st.mode}:${st.ino}`;
-      } catch (e) {
-        line = `unknown:${errno(e)}`;
-      }
-      hash.update(`${at}\0${line}\0`);
+      const control = CONTROL_FILE.test(at);
+      const e = entry(full, control, !control && /(^|\/)objects\//.test(at));
+      // (lfs/ last too, tenth pass: files there are no part of what git reads or runs.)
+      if (e.dir) (name === "objects" || (gitDirs.includes(dir) && name !== ".git" && (name === "lfs" || !KNOWN_DIRS.has(name))) ? last : next).push(at);
+      hash.update(`${at}\0${e.line}\0`);
     }
   }
-  return { digest: hash.digest("hex"), ...(over ? { over: limit } : {}) };
+  return { digest: hash.digest("hex"), ...(over ? { over: limits.entries } : {}) };
 }
 // Pauses the session for what was found. The pause names what its reason shows, each with what
 // its path holds now (`also`: the pause this one follows; what that named and still holds
@@ -787,7 +1136,17 @@ function treeHeld(root: string): { digest: string; over?: number } {
 function pause(session: SessionState, found: Change[], also?: SessionState["tampered"]): string {
   const first = found.slice(0, SHOWN);
   const prints = first.map((c) => fingerprint(c.path));
-  const partly = [...new Set(first.flatMap((c, n) => (prints[n].over ? [`${c.path} holds more than ${prints[n].over} entries: only the first ${prints[n].over} of them (its hooks, config and refs before its object store) are compared with what is there when you resume`] : [])))];
+  const partly = [
+    ...new Set(
+      first.flatMap((c, n) =>
+        prints[n].unseen
+          ? [`${c.path} cannot be compared whole where it matters: ${prints[n].unseen}. Nothing of it is taken in unseen, so auto-allow stays paused for as long as that is so: remove what does not belong there (or the directory), then resume`]
+          : prints[n].over
+            ? [`${c.path} holds more than ${prints[n].over} entries besides what git reads or runs in it: its hooks, config, HEAD, info/, packed-refs, operation state, refs/ and logs/ are compared whole, and so are the hooks, config, state files and info/ of each module and worktree in it, and of everything else only the first ${prints[n].over} entries (object stores and directories git does not know last) are compared with what is there when you resume`]
+            : [],
+      ),
+    ),
+  ];
   const reason = shown(found.map((c) => c.text)) + (partly.length ? `. ${partly.join("; ")}` : "");
   const named = [...new Set([...(also?.named ?? []), ...first.map((c) => c.key ?? c.path)])];
   const held = { ...(also?.held ?? {}), ...Object.fromEntries(first.map((c, n) => [c.key ?? c.path, prints[n].held])) };
@@ -1230,7 +1589,7 @@ export function expectedRepos(command: string, cwd: string): string[] | undefine
     const bases = new Set<string>();
     for (const place of places ?? []) {
       let at: Place | undefined = place;
-      for (const d of call.dirs) at = at && chdirTo(at, d);
+      for (const d of call.dirs) at = at && gitChdir(at, d);
       if (at) bases.add(at.real);
       else bases.clear();
       if (!at) break;
@@ -1761,7 +2120,11 @@ function hookWouldRun(dir: string, sub: string, config: [string, string, string]
   if (configured && ((configured.startsWith("~") && configured !== "~" && !configured.startsWith("~/")) || configured.startsWith("%("))) return true;
   const base = configured ? safeGit(["-C", dir, "rev-parse", "--show-toplevel"])?.trim() : safeGit(["-C", dir, "rev-parse", "--git-common-dir"])?.trim();
   if (!base) return true; // cannot tell
-  const hooks = configured ? path.resolve(base, tilde(configured)) : path.resolve(dir, base, "hooks");
+  // Joined as git joins it and followed as the kernel follows it (eleventh pass: `path.resolve`
+  // took `<outside>/lnk/../h` for `<outside>/h`, where git runs the hooks of the directory beside
+  // the one `lnk` leads to, and said "no hook"; run by a reviewer, REVIEW-C10-OPUS F6).
+  const joined = (value: string, from: string) => (value.startsWith("/") ? value : `${from}/${value}`);
+  const hooks = configured ? followed(joined(tilde(configured), base)) : followed(`${joined(base, dir)}/hooks`);
   const wanted = HOOKS_RUN[sub] ?? "any";
   let names: string[];
   try {
@@ -2042,12 +2405,9 @@ export function gitOnlyRead(command: string): { cmds: string[][]; quoted: boolea
     shaped = all.map((c) => c.argv[0] === "cd" && c.argv.length === 2 && plain.words.has(c.argv[1]) && !c.assigns && !c.globbed);
     const placed = new Set(all.filter((_c, n) => shaped[n]).map((c) => c.argv[1]));
     const astray = [...plain.words].filter(([word]) => !placed.has(word));
-    if (!astray.length) {
-      // And nothing else of the call holds one (each stands in the text once).
-      const holds = (word: string) => plain.mark !== "" && word.includes(plain.mark);
-      if (all.some((c, n) => (c.assigns ?? []).some(holds) || c.argv.some((w, k) => holds(w) && !(shaped[n] && k === 1)))) return undefined;
-      break;
-    }
+    // (Nothing else of the call can hold one by then: each stands in the text once, and one that
+    // is not the word of such a `cd` is astray.)
+    if (!astray.length) break;
     for (const [, at] of astray) left.add(at);
   }
   // `pipes` lets `|` and `||` through the tokenizer; only the last command may follow one, as
@@ -2135,7 +2495,7 @@ function gitPlace(places: Places, dirs: string[]): string {
   const reals = new Set<string>();
   for (const place of places) {
     let at: Place | undefined = place;
-    for (const dir of dirs) at = at && chdirTo(at, dir);
+    for (const dir of dirs) at = at && gitChdir(at, dir);
     if (!at) throw new Error(`cannot tell which directory git -C ${dirs.join(" -C ")} leads to, so which repository git would work in`);
     reals.add(at.real);
   }
@@ -2151,25 +2511,13 @@ function gitPlace(places: Places, dirs: string[]): string {
   return first;
 }
 
-// Where `git -C <word>` leads from a place: a chdir(2), the kernel's walk from the real directory
-// (the word as bash hands it over; a leading `~` or `~/` is the home directory, as unquoted). An
-// empty word is no move at all (git: "the current working directory is left unchanged").
-// Undefined where it leads to no directory that is there now, and for `~user`.
-// Not guard.ts's `cdTo`, which gives up on a relative word whenever this process has a `CDPATH`:
-// bash's `cd` looks a word up there, git's chdir never does (eighth pass: with `CDPATH` exported
-// where opencode was started, `git -C src add a.txt` asked and an approved `git -C src init`
-// paused the session).
-function chdirTo(from: Place, word: string): Place | undefined {
-  if (word === "") return from;
-  if (/^~[^/]/.test(word)) return undefined;
-  const target = tilde(word);
-  try {
-    const real = fs.realpathSync.native(path.isAbsolute(target) ? target : `${from.real}/${target}`);
-    return fs.statSync(real).isDirectory() ? { logical: real, real } : undefined;
-  } catch {
-    return undefined;
-  }
-}
+// Where `git -C <word>` leads from a place: a chdir(2), which guard.ts's `cdTo` walks when it is
+// told `physical` (the kernel's walk from the real directory, no `CDPATH`, a leading `~` or `~/`
+// the home directory, nothing for `~user`, and nothing for a word that leads through
+// `/proc/self`, which is this process's own directory here and git's own there: ninth pass,
+// `git -C /proc/self/cwd commit` was placed in the plugin's directory by a walk of its own).
+// An empty word is no move at all (git: "the current working directory is left unchanged").
+const gitChdir = (from: Place, word: string): Place | undefined => (word === "" ? from : cdTo(from, word, true));
 
 // The commands of `argvs` (in their order) among the commands `located` lists for the call: the
 // same words, each further on than the one before. Undefined for one that is not found.
@@ -2496,7 +2844,9 @@ function submoduleDirs(dir: string, session: SessionState): { inModules: string[
     const tops = top.status === 0 ? [realpath(top.out.trim())] : [];
     for (const module of found) {
       const worktree = gitRun([...inGitDir(module), "config", "--get", "core.worktree"]);
-      if (worktree.status === 0) tops.push(realpath(path.resolve(module, worktree.out.trim())));
+      // As git takes it: joined, then followed as the kernel follows it (eleventh pass).
+      const value = worktree.out.replace(/\n$/, "");
+      if (worktree.status === 0) tops.push(realpath(followed(value.startsWith("/") ? value : `${module}/${value}`)));
     }
     const inTree = workTreeSubmodules(tops, session.snapshot?.inside.keys() ?? [], session.snapshot?.tops);
     if (inTree.problem) return undefined;
@@ -2782,10 +3132,440 @@ function submoduleBreak(c: { sub: string; rest: string[]; dir: string }, session
   return `git ${c.sub} goes into the cloned submodules here (${how}) and ${target === null ? "it cannot be told that it moves none of them" : `would move one to another commit (or ${target} could not be compared with HEAD)`}; moving a submodule rewrites its .git file or moves its git directory, both of which the sandbox keeps in place. Add --no-recurse-submodules to leave the submodules as they are; ${outside}`;
 }
 
+// The files of a work tree that the sandbox keeps read-only and git would rewrite (eleventh
+// pass, the maintainer's decision "ask on (a)"): the script a hook links to, the hook managers'
+// files, opencode's project files, a hooks directory or an included config in the work tree.
+// A git command that rewrites one of them cannot in the sandbox, and git goes on without it:
+// `git checkout other` where `other` has another version of the linked script exits 0, with the
+// script left as it was and `git status` showing it changed (run by a reviewer,
+// xcheck/reviewers/c10-opus/r3-hookscript.test.mts; and here, test/c-eleventh.test.mts). Such a
+// command asks instead, naming the file.
+//
+// What a git command (git 2.47) would leave the work tree holding, as far as it can be told
+// here (`specs`: the read-only paths of the work tree at `top`, as literal pathspecs):
+//   - `checkout`/`switch` to a commit and `reset --keep <commit>`: the commit's version, where
+//     it differs from HEAD's (`git diff HEAD <commit>`); no move, nothing (`checkout -b x`);
+//   - `merge <commit>`: what the commit changed since the merge base, and nothing else;
+//   - `cherry-pick`/`revert <commit>`: what that commit changed;
+//   - `rebase [<upstream>]`: the upstream's version where it differs from HEAD's, and whatever
+//     a commit it replays changes;
+//   - `stash` (push): the files with changes; `stash pop`/`apply`: what the stash changes;
+//   - `mv`: its operands; `rm`: the tracked files its pathspecs match; `restore --staged`,
+//     `rm --cached`, `apply --cached`, `clean -n`: nothing;
+//   - `worktree add`: a new work tree, which is written only where the read-only paths lie in it.
+// Anything else that may write the work tree (`pull`, a merge or rebase with options read here
+// as changing what it does, `--abort`/`--continue`, `bisect`, `reset --hard`/`--merge`,
+// `restore`, `apply`, `am`, `read-tree -u`, `checkout-index`, `sparse-checkout`, `clean`,
+// `submodule update`, a checkout of paths) cannot be told, and asks where a read-only file of
+// the work tree is tracked (or, for `clean`, there at all). Undefined: nothing to ask about.
+//
+// Twelfth pass (the maintainer's decisions "close misses, ease costs", after the two checks of
+// the eleventh: C11's reading F4 and F5, Sonnet's F-0 to F-4; each run under the wrapper by
+// them, allowed and then failing or leaving the file):
+//   - after an earlier git call of the same command line that may move a ref, the index or the
+//     work tree (`git fetch && git merge --ff-only origin/main`: the fetch moves `origin/main`
+//     after this was decided), a command cannot be told (`after`);
+//   - `merge.autoStash`/`rebase.autoStash` (true, or not a boolean git can read) make a merge or
+//     a rebase stash and put back the changed files, as `--autostash` does: cannot be told;
+//   - git follows renames: a file our side moved to a read-only path, which the other side
+//     changes, is rewritten there; a directory their side moves takes our read-only files in it
+//     along (`merges`);
+//   - in a sparse checkout git also writes or removes what the sparse patterns say: cannot be told;
+//   - `stash -u`/`-a` removes the read-only paths that are not tracked as well (the `.opencode`
+//     the plan makes); a stash's untracked part is what its pop writes besides;
+//   - `--output` onto a read-only path; `git svn`/`p4` rebase and the like, `filter-branch`,
+//     `lfs pull`/`checkout`/`migrate` cannot be told. (`mergetool`, `submodule`, `worktree`, `am`
+//     never come here: no plain git commands, they write .git, and sandboxBreaks asks before;
+//     but for `am`'s idle forms, thirteenth pass.)
+// And nothing is to be done, so nothing is asked, where that can be told from the repository
+// as it is: `--abort`/`--continue`/`--skip`/`--quit` with no operation in progress (git's own
+// state files), `bisect reset` with no bisect, `apply --check`/`--stat`/`--numstat`/`--summary`,
+// a merge or rebase onto HEAD or an ancestor of it ("Already up to date"; a rebase that has no
+// merge commit to make straight and nothing that forces it). A pull's ask says how to split it.
+const PLAIN_MERGE = new Set(["--ff", "--no-ff", "--ff-only", "--no-edit", "--edit", "-e", "-q", "--quiet", "-v", "--verbose", "--stat", "-n", "--no-stat", "--squash", "--no-squash", "--commit", "--no-commit", "--no-verify", "--verify", "--log", "--no-log", "--signoff", "--no-signoff", "--progress", "--no-progress", "--no-autostash", "--allow-unrelated-histories", "--rerere-autoupdate", "--no-rerere-autoupdate", "--no-gpg-sign"]);
+const PLAIN_PICK = new Set(["-x", "--no-edit", "-e", "--edit", "-n", "--no-commit", "-s", "--signoff", "--ff", "--allow-empty", "--allow-empty-message", "--keep-redundant-commits", "--rerere-autoupdate", "--no-rerere-autoupdate", "--no-gpg-sign"]);
+const PLAIN_REBASE = new Set(["-q", "--quiet", "-v", "--verbose", "--stat", "-n", "--no-stat", "--no-verify", "--verify", "--no-autostash", "--no-fork-point", "--fork-point", "--committer-date-is-author-date", "--ignore-date", "--signoff", "--reapply-cherry-picks", "--no-reapply-cherry-picks", "--keep-empty", "--no-keep-empty", "--no-gpg-sign"]);
+// The operands of a call whose options are all in `flags` (a message given by `-m`/`-F` too),
+// with no `--`; null otherwise.
+function plainOperands(rest: string[], flags: ReadonlySet<string>, messages = false): string[] | null {
+  const out: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    const w = rest[i];
+    if (w === "--") return null;
+    if (!w.startsWith("-") || w === "-") out.push(w);
+    else if (messages && /^(-m|-F|--message|--file)$/.test(w)) i++;
+    else if (!(flags.has(w) || (messages && /^(-m.|-F.|--message=|--file=)/.test(w)))) return null;
+  }
+  return out;
+}
+// Merges and rebases up to date run as long as nothing forces them: of PLAIN_REBASE, the options
+// that leave git's "Current branch is up to date" as it is (`--signoff`, `--ignore-date`,
+// `--committer-date-is-author-date` make it rebase all the same; `--fork-point` reads the
+// upstream's reflog for where to start).
+const UP_TO_DATE_REBASE = new Set(["-q", "--quiet", "-v", "--verbose", "--stat", "-n", "--no-stat", "--no-verify", "--verify", "--no-autostash", "--no-fork-point", "--no-gpg-sign"]);
+// git's state files of an operation in progress, in the git directory of the work tree: a merge,
+// a cherry-pick or revert (one or a sequence), a rebase, an `am`. Any of them there, and
+// `--abort`/`--continue` of any of these cannot be told.
+const OPERATION_FILES = ["MERGE_HEAD", "MERGE_AUTOSTASH", "CHERRY_PICK_HEAD", "REVERT_HEAD", "sequencer", "rebase-merge", "rebase-apply"];
+const BISECT_FILES = ["BISECT_START", "BISECT_LOG", "BISECT_HEAD"];
+// A path in the git directory of the work tree at `dir`, as git names it there; undefined where
+// git cannot say.
+function gitStatePaths(dir: string, names: string[]): string[] | undefined {
+  const r = gitRun(["-C", dir, "rev-parse", "--path-format=absolute", ...names.flatMap((n) => ["--git-path", n])]);
+  const out = r.out.split("\n").filter(Boolean);
+  return r.status === 0 && out.length === names.length ? out : undefined;
+}
+// `--abort`, `--continue`, `--skip`, `--quit` (and `-q`) alone with no operation in progress in
+// the work tree at `dir`: git says so and writes nothing (run with git 2.47.3: exit 128; for
+// `git am` too, "Resolve operation not in progress", thirteenth pass).
+function idleOperation(dir: string, rest: string[]): boolean {
+  if (!rest.some((w) => /^--(abort|continue|skip|quit)$/.test(w)) || !rest.every((w) => /^(--abort|--continue|--skip|--quit|-q|--quiet)$/.test(w))) return false;
+  const at = gitStatePaths(dir, OPERATION_FILES);
+  return at !== undefined && at.every((p) => !lexists(p));
+}
+// The git commands that take the diff options, `--output=<file>` among them.
+const DIFF_OUTPUT = new Set(["log", "show", "diff", "diff-tree", "diff-index", "diff-files", "whatchanged", "format-patch", "stash", "range-diff", "reflog"]);
+// Of `git svn` and `git p4`, what leaves the work tree as it is.
+const SVN_KEEPS = new Set(["info", "log", "find-rev", "show-ignore", "show-externals", "propget", "proplist", "propset", "blame", "fetch", "init", "clone", "help"]);
+// The git calls that move no ref, no index and no work tree (Sonnet's C11 F-0: what may come
+// before a command in the same line without making it one that cannot be told). Anything else
+// counts as one that may, wide: `fetch`, `commit`, `stash`, `add` and every one not known here.
+const MOVES_NOTHING = new Set(["status", "log", "show", "diff", "diff-tree", "diff-index", "diff-files", "ls-files", "ls-tree", "cat-file", "rev-parse", "rev-list", "describe", "blame", "annotate", "grep", "shortlog", "merge-base", "for-each-ref", "show-ref", "name-rev", "check-ignore", "check-attr", "check-ref-format", "check-mailmap", "help", "version", "var", "whatchanged", "count-objects", "ls-remote", "show-branch", "range-diff", "cherry", "verify-commit", "verify-tag", "fsck", "format-patch"]);
+function movesNothing(sub: string, rest: string[]): boolean {
+  if (MOVES_NOTHING.has(sub)) return true;
+  const first = rest.find((w) => !w.startsWith("-"));
+  switch (sub) {
+    case "stash":
+      return first === "list" || first === "show";
+    case "worktree":
+      return first === "list";
+    case "remote":
+      return first === undefined || first === "show" || first === "get-url";
+    case "branch":
+      return rest.every((w) => /^(-a|-r|-v|-vv|--all|--remotes|--verbose|--list|-l|--show-current|--no-color)$/.test(w));
+    case "tag":
+      return rest.length === 0 || ((rest.includes("-l") || rest.includes("--list")) && rest.every((w) => !w.startsWith("-") || /^(-l|--list|-n\d*)$/.test(w)));
+    case "bisect":
+      return ["log", "help", "visualize", "view", "terms"].includes(first ?? "");
+    default:
+      return false;
+  }
+}
+// `after`: the earlier git call of the same command line that may move a ref, the index or the
+// work tree (movesNothing), as `git <sub>`; the repository as it is now then says nothing of
+// what this one finds.
+function heldRewritten(c: { sub: string; rest: string[]; dir: string }, held: () => string[], after?: string): string | undefined {
+  const words = c.rest.filter((w) => !w.startsWith("-"));
+  const has = (...names: string[]) => c.rest.some((w) => names.includes(w));
+  // A stash's `-u`/`-a` in any spelling git takes: in a cluster of short options, a long one by
+  // any prefix (thirteenth pass; run with git 2.47.3: `-qu`, `push -ku`, `--incl`, `--al` stash
+  // the untracked files and remove the empty `.opencode` as `-u` does, and were read as none).
+  const stashFlag = (short: string, long: string) => c.rest.some((w) => (/^-[a-zA-Z]+$/.test(w) ? w.includes(short) : w.length > 2 && long.startsWith(w)));
+  // What can be read from the repository as it is.
+  const now = after === undefined;
+  // A boolean of the config: false where it is not set, null where git cannot read it as one.
+  // (A call's own `-c` of these keys never comes here: gitCall refuses it, and the rules ask.)
+  const bool = (key: string): boolean | null => {
+    const r = configBool(c.dir, key);
+    return r === undefined ? false : r;
+  };
+  const gitPaths = (names: string[]) => gitStatePaths(c.dir, names);
+  const absent = (names: string[]) => {
+    const at = gitPaths(names);
+    return at !== undefined && at.every((p) => !lexists(p));
+  };
+  const idle = () => now && idleOperation(c.dir, c.rest);
+  // A commit that HEAD holds already: a merge of it, or a rebase onto it, has nothing to do.
+  const contained = (commit: string) => now && gitRun(["-C", c.dir, "merge-base", "--is-ancestor", commit, "HEAD"]).status === 0;
+  // An autostash that the config asks for (and no `--no-autostash` on the line).
+  const autostash = (key: string) => !has("--no-autostash") && bool(key) !== false;
+  // `branch.<name>.mergeOptions` of the branch HEAD is on, which git merge reads before the
+  // words of the call (thirteenth pass; Sonnet's C12 F-4, run: `--autostash` there, a merge with
+  // AGENTS.md changed was allowed and failed with 128): a word git may take for `--autostash` (a
+  // prefix of it down to `--au`, quoted or not), or what cannot be read, is an autostash. On a
+  // detached HEAD git reads none.
+  const branchStash = (): boolean => {
+    const head = gitRun(["-C", c.dir, "symbolic-ref", "-q", "HEAD"]);
+    if (head.status === 1) return false;
+    if (head.status !== 0) return true;
+    const ref = head.out.trim();
+    const options = gitRun(["-C", c.dir, "config", "--get-all", `branch.${ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref}.mergeOptions`]);
+    if (options.status === 1) return false;
+    return options.status !== 0 || options.out.replace(/["'\\]/g, "").split(/\s+/).some((w) => w.length >= 4 && "--autostash".startsWith(w));
+  };
+  // What the command may write: "none", "cannot tell", a pair of commits whose difference it
+  // applies (`from`, `to`: the files where they differ; `merges`: git merges it into HEAD, from
+  // `from`, or from `to` for a revert, and follows renames; `untracked`: the untracked part of a
+  // stash, which it writes too), its own paths, the files with changes, the read-only paths that
+  // are not tracked (`clean`), or both those and the tracked ones (`all`).
+  type Writes = "none" | "cannot tell" | { from: string; to: string; replays?: string; merges?: "from" | "to"; untracked?: string } | { paths: string[]; pathspecs?: boolean } | "changed" | "clean" | "all";
+  const writes = ((): Writes => {
+    switch (c.sub) {
+      case "checkout":
+      case "switch":
+      case "reset": {
+        // (A `--` with nothing after it names no path. A reset that moves no work tree is none.)
+        const rest = c.rest.at(-1) === "--" ? c.rest.slice(0, -1) : c.rest;
+        const target = moveTarget(c.sub, rest);
+        return target === undefined ? "none" : target === null ? "cannot tell" : { from: "HEAD", to: target };
+      }
+      case "merge": {
+        if (has("--quit") || idle()) return "none";
+        const operands = plainOperands(c.rest, PLAIN_MERGE, true);
+        if (!operands || operands.length !== 1) return "cannot tell";
+        // (FETCH_HEAD is every head the fetch marked for merge, and git merges them all; read
+        // here as one commit only where it holds one.)
+        if (operands[0] === "FETCH_HEAD") {
+          const at = gitPaths(["FETCH_HEAD"]);
+          let heads: number | undefined;
+          try {
+            heads = at && fs.readFileSync(at[0], "utf8").split("\n").filter((line) => line && !line.includes("\tnot-for-merge\t")).length;
+          } catch {
+            heads = undefined;
+          }
+          if (heads !== 1) return "cannot tell";
+        }
+        // ("Already up to date" comes before an autostash: run, none is made.)
+        if (contained(operands[0])) return "none";
+        if (autostash("merge.autoStash") || (!has("--no-autostash") && branchStash())) return "cannot tell";
+        const base = gitRun(["-C", c.dir, "merge-base", "HEAD", operands[0]]);
+        return base.status === 0 ? { from: base.out.trim(), to: operands[0], merges: "from" } : "cannot tell";
+      }
+      case "cherry-pick":
+      case "revert": {
+        if (has("--quit") || idle()) return "none";
+        const operands = plainOperands(c.rest, PLAIN_PICK);
+        if (!operands || operands.length !== 1 || /\.\.|^\^/.test(operands[0])) return "cannot tell";
+        return { from: `${operands[0]}^`, to: operands[0], merges: c.sub === "revert" ? "to" : "from" };
+      }
+      case "rebase": {
+        if (has("--quit", "--show-current-patch") || idle()) return "none";
+        const operands = plainOperands(c.rest, PLAIN_REBASE);
+        if (!operands || operands.length > 1) return "cannot tell";
+        // (A rebase stashes before it finds it is up to date, and puts the stash back: run.)
+        if (autostash("rebase.autoStash")) return "cannot tell";
+        const upstream = operands[0] ?? "@{upstream}";
+        if (operands.length === 1 && c.rest.every((w) => !w.startsWith("-") || UP_TO_DATE_REBASE.has(w)) && contained(upstream)) {
+          const merges = gitRun(["-C", c.dir, "rev-list", "--merges", "-n", "1", `${upstream}..HEAD`, "--"]);
+          if (merges.status === 0 && !merges.out.trim()) return "none";
+        }
+        return { from: "HEAD", to: upstream, replays: `${upstream}..HEAD` };
+      }
+      case "stash": {
+        // (With an option first, it is a push: `git stash -m x`.)
+        const op = c.rest[0] === undefined || c.rest[0].startsWith("-") ? "push" : c.rest[0];
+        if (["list", "show", "drop", "clear", "create", "store"].includes(op)) return "none";
+        if (op === "pop" || op === "apply") {
+          const named = c.rest.slice(1).filter((w) => !w.startsWith("-"));
+          if (has("--index") || named.length > 1) return "cannot tell";
+          // (A number alone is the stash of that number, as git takes it.)
+          const stash = named[0] === undefined ? "stash@{0}" : /^\d+$/.test(named[0]) ? `stash@{${named[0]}}` : named[0];
+          // A stash that holds untracked files writes those too.
+          const third = gitRun(["-C", c.dir, "rev-parse", "-q", "--verify", `${stash}^3`]).status;
+          if (third !== 0 && third !== 1) return "cannot tell";
+          return { from: `${stash}^1`, to: stash, merges: "from", ...(third === 0 ? { untracked: `${stash}^3` } : {}) };
+        }
+        if ((op === "push" || op === "save") && !has("-p", "--patch")) return stashFlag("u", "--include-untracked") || stashFlag("a", "--all") ? "all" : "changed";
+        return "cannot tell";
+      }
+      case "mv": {
+        // (The closing runs, step 7: what a move writes is each source and its new name, not the
+        // whole destination directory: `git mv src/*.ts .` touches no `.opencode`.)
+        const named = words.filter((w) => w !== "--");
+        const dest = named.at(-1);
+        if (named.length < 2 || dest === undefined) return { paths: named };
+        const sources = named.slice(0, -1);
+        let isDir = false;
+        try {
+          isDir = fs.statSync(path.resolve(c.dir, tilde(dest))).isDirectory();
+        } catch {
+          // not there: the destination is the new name itself
+        }
+        return { paths: isDir ? [...sources, ...sources.map((w) => path.join(dest, path.basename(w)))] : named };
+      }
+      case "rm":
+        return has("--cached") ? "none" : { paths: words.filter((w) => w !== "--"), pathspecs: true };
+      case "restore":
+        return has("--staged", "-S") && !has("--worktree", "-W") ? "none" : "cannot tell";
+      case "apply":
+        // (`--apply` by any prefix git takes for it: `--ap` is no other option of apply.)
+        return has("--cached") || (has("--check", "--stat", "--numstat", "--summary") && !c.rest.some((w) => w.length >= 4 && "--apply".startsWith(w))) ? "none" : "cannot tell";
+      case "clean":
+        return has("-n", "--dry-run") ? "none" : "clean";
+      case "worktree":
+        return words[0] === "add" ? { paths: words.slice(1) } : "none";
+      case "read-tree":
+        return has("-u") ? "cannot tell" : "none";
+      case "sparse-checkout":
+        return words[0] === "list" ? "none" : "cannot tell";
+      case "bisect":
+        // (With no bisect, `git bisect reset <commit>` checks the commit out: thirteenth pass,
+        // Sonnet's C12 F-1, run: allowed, HEAD moved and AGENTS.md left as it was.)
+        if (words[0] === "reset" && words.length === 1 && now && absent(BISECT_FILES)) return "none";
+        return ["log", "help", "visualize", "view", "terms"].includes(words[0] ?? "") || (words[0] === "start" && words.length === 1) ? "none" : "cannot tell";
+      case "submodule":
+        return words[0] === "update" ? "cannot tell" : "none";
+      case "svn":
+      case "p4":
+        return SVN_KEEPS.has(words[0] ?? "") || (c.sub === "p4" && words[0] === "sync") ? "none" : "cannot tell";
+      case "lfs":
+        return ["pull", "checkout", "migrate"].includes(words[0] ?? "") ? "cannot tell" : "none";
+      case "am":
+        return idle() ? "none" : "cannot tell";
+      case "pull":
+      case "checkout-index":
+      case "filter-branch":
+        return "cannot tell";
+      default:
+        return "none";
+    }
+  })();
+  const why = "which the sandbox keeps read-only (a git hook runs it, or a hook manager or opencode loads it)";
+  const named = (files: string[]) => `${files.slice(0, 3).join(", ")}${files.length > 3 ? ` and ${files.length - 3} more` : ""}`;
+  // `--output` (and format-patch's `-o`, `--output-directory`), before any `--`: a file or a
+  // directory the command writes, whatever else it does; one that lies in a read-only path
+  // fails there with "Read-only file system" (Sonnet's C10 F-3 and C11 F-3).
+  if (DIFF_OUTPUT.has(c.sub)) {
+    const end = c.rest.indexOf("--");
+    const options = end < 0 ? c.rest : c.rest.slice(0, end);
+    const targets: string[] = [];
+    for (let i = 0; i < options.length; i++) {
+      const w = options[i];
+      const glued = /^--output(?:-directory)?=([^]*)$/.exec(w) ?? (c.sub === "format-patch" ? /^-o([^]+)$/.exec(w) : null);
+      if (glued) targets.push(glued[1]);
+      else if ((w === "--output" || w === "--output-directory" || (c.sub === "format-patch" && w === "-o")) && i + 1 < options.length) targets.push(options[++i]);
+    }
+    const onto = targets.map((t) => realish(path.resolve(c.dir, tilde(t)))).filter((t) => held().some((p) => within(t, p)));
+    if (onto.length) return `git ${c.sub} would write ${named(onto)}, ${why}: it would fail there with "Read-only file system"; an approved run happens outside the sandbox`;
+  }
+  if (writes === "none") return undefined;
+  const top = gitRun(["-C", c.dir, "rev-parse", "--show-toplevel"]);
+  if (top.status !== 0) return undefined; // no work tree: none to write
+  const tree = realpath(top.out.replace(/\n$/, ""));
+  const mine = held().filter((p) => within(p, tree, true) && !path.relative(tree, p).split("/").includes(".git"));
+  if (!mine.length) return undefined;
+  const specs = mine.map((p) => `:(literal)${path.relative(tree, p)}`);
+  const listed = (args: string[]) => {
+    const r = gitRun(["-C", tree, ...args, "--", ...specs]);
+    return r.status === 0 ? r.out.split("\0").filter(Boolean).map((name) => path.join(tree, name)) : null;
+  };
+  const outcome = "git goes on without it and exits 0, leaving it as it was and the work tree no longer what the command made; an approved run happens outside the sandbox";
+  const would = (files: string[]) => `git ${c.sub} would rewrite ${named(files)}, ${why}: ${outcome}`;
+  const may = (files: string[], because?: string) => `git ${c.sub} may rewrite ${named(files)}, ${why}, and that it will not cannot be told here${because ? ` (${because})` : ""}: ${outcome}`;
+  // Why it cannot be told, where that is something to say.
+  let because =
+    after !== undefined
+      ? `it comes after ${after} in the same command, which may move the commits or files it works from: run it as a command of its own, which can be told`
+      : c.sub === "pull"
+        ? "a pull merges what it fetches, which is not here yet: run `git fetch` first, then `git merge --ff-only @{upstream}` or `git rebase @{upstream}`, which can be told"
+        : undefined;
+  // Where it cannot be told: the tracked ones. (`clean`: the ones that are not tracked files,
+  // which it may remove: the empty `.opencode` the plan makes is one. `all`: both.)
+  const unsure = (): string | undefined => {
+    const tracked = listed(["ls-files", "-z", "--full-name"]);
+    if (tracked === null) return may(mine, because);
+    const untracked = mine.filter((p) => !tracked.includes(p));
+    // (`stash -u` leaves what git ignores; `-a` takes that too. 1: not ignored; anything else
+    // that is not 0, git could not say, and it counts.)
+    const kept = stashFlag("a", "--all") ? untracked : untracked.filter((p) => gitRun(["-C", tree, "check-ignore", "-q", "--", path.relative(tree, p)]).status !== 0);
+    const these = writes === "clean" ? untracked : writes === "all" ? [...tracked, ...kept] : tracked;
+    return these.length ? may(these, because) : undefined;
+  };
+  // `stash -u`/`-a` with nothing to stash: no change to a tracked file (the index or the work
+  // tree), and nothing untracked as git lists it (`-u` leaves out what is ignored; an empty
+  // directory, the `.opencode` the plan makes, is none): "No local changes to save", nothing
+  // written (thirteenth pass, the maintainer's decision; run: with a change, git stashes it and
+  // cleans with -d, which removes the empty `.opencode` as well). Not read where that runs a
+  // program of the project (a clean filter), as below.
+  if (writes === "all" && now && gitProgramsOutside(tree, false, (p) => within(realish(p), realish(tree)))) {
+    const others = gitRun(["-C", tree, "ls-files", "--others", "-z", ...(stashFlag("a", "--all") ? [] : ["--exclude-standard"])]);
+    const unchanged = (cached: string[]) => gitRun(["-C", tree, "diff", "--quiet", "--no-ext-diff", "--no-textconv", ...cached, "HEAD", "--"]).status === 0;
+    if (others.status === 0 && others.out === "" && unchanged([]) && unchanged(["--cached"])) return undefined;
+  }
+  if (writes === "cannot tell" || writes === "clean" || writes === "all" || after !== undefined) return unsure();
+  // A sparse checkout: git writes and removes by the sparse patterns as well (Sonnet's C11 F-2:
+  // `git checkout p1`, which changes none of them, removed AGENTS.md that the patterns leave out,
+  // and in the sandbox left it). Set, not a boolean git can read, or a sparse-checkout file there.
+  if (bool("core.sparseCheckout") !== false || bool("index.sparse") !== false || !absent(["info/sparse-checkout"])) {
+    because = "the work tree is a sparse checkout, which git writes by its patterns as well";
+    return unsure();
+  }
+  if (writes === "changed") {
+    // (C11's reading, F1: this diff reads the work tree, and git runs a clean filter for it in
+    // this process, outside the sandbox. Where the configuration names a program of the project
+    // for one, the work tree is not read here: the tracked files are named as ones it may
+    // rewrite, as worktreeStatus gives up for the same reason.)
+    if (!gitProgramsOutside(tree, false, (p) => within(realish(p), realish(tree)))) return unsure();
+    const changed = listed(["diff", "--name-only", "-z", "HEAD"]);
+    return changed === null ? unsure() : changed.length ? would(changed) : undefined;
+  }
+  if ("paths" in writes) {
+    if (writes.pathspecs) {
+      // As git matches them, among the tracked files.
+      const r = gitRun(["-C", c.dir, "ls-files", "-z", "--full-name", "--", ...writes.paths]);
+      if (r.status !== 0) return unsure();
+      const hit = r.out.split("\0").filter(Boolean).map((name) => path.join(tree, name)).filter((file) => mine.some((p) => within(file, p)));
+      return hit.length ? would(hit) : undefined;
+    }
+    const at = writes.paths.map((w) => path.resolve(c.dir, tilde(w)));
+    const hit = mine.filter((p) => at.some((w) => within(p, w) || within(w, p)));
+    return hit.length ? would(hit) : undefined;
+  }
+  const differ = listed(["diff", "--name-only", "-z", writes.from, writes.to]);
+  if (differ === null) return unsure();
+  if (differ.length) return would(differ);
+  if (writes.untracked) {
+    // The untracked part of a stash: every file of it is written (C11's check, m20).
+    const r = gitRun(["-C", tree, "ls-tree", "-r", "-z", "--name-only", "--full-tree", writes.untracked]);
+    if (r.status !== 0) return unsure();
+    const hit = r.out.split("\0").filter(Boolean).map((name) => path.join(tree, name)).filter((file) => mine.some((p) => within(file, p)));
+    if (hit.length) return would(hit);
+  }
+  if (writes.merges) {
+    // git merges by the three trees and follows renames (ort; C11's reading F4, run under the
+    // wrapper: `git merge side`, where our side moved `old/pre-commit` to the linked
+    // `scripts/pre-commit` and `side` changed `old/pre-commit`, failed with the script held).
+    // `base`: where both sides start; `theirs`: what is merged in; ours is HEAD.
+    const [base, theirs] = writes.merges === "from" ? [writes.from, writes.to] : [writes.to, writes.from];
+    const renames = (a: string, b: string): [string, string][] | null => {
+      const r = gitRun(["-C", tree, "diff", "-M", "--name-status", "-z", "--diff-filter=R", a, b, "--"]);
+      if (r.status !== 0) return null;
+      const f = r.out.split("\0");
+      const out: [string, string][] = [];
+      for (let i = 0; i + 2 < f.length; i += 3) out.push([f[i + 1], f[i + 2]]);
+      return out;
+    };
+    const ours = renames(base, "HEAD");
+    const theirsMoved = renames(base, theirs);
+    const touched = gitRun(["-C", tree, "diff", "--name-only", "-z", "--no-renames", base, theirs, "--"]);
+    if (ours === null || theirsMoved === null || touched.status !== 0) return unsure();
+    const changed = touched.out.split("\0").filter(Boolean);
+    // A directory, not the top: what git may take for one that was moved whole.
+    const dirOf = (name: string) => (path.dirname(name) === "." ? undefined : path.dirname(name));
+    // Ours moved a file to a read-only path, and theirs changes that file, or adds or changes
+    // one beside it (which git then moves into the same directory): git writes it there.
+    const into = ours
+      .filter(([src, dst]) => mine.some((p) => within(path.join(tree, dst), p)) && changed.some((name) => name === src || (dirOf(src) !== undefined && dirOf(src) !== dirOf(dst) && path.dirname(name) === dirOf(src))))
+      .map(([, dst]) => path.join(tree, dst));
+    if (into.length) return would([...new Set(into)]);
+    // Theirs moved a file out of a directory that holds a read-only path of ours: git may take
+    // the directory for moved, and our file along with it (directory rename detection).
+    const along = mine.filter((p) => theirsMoved.some(([src, dst]) => dirOf(src) !== undefined && dirOf(src) !== dirOf(dst) && within(p, path.join(tree, dirOf(src)!), true)));
+    if (along.length) return may(along, "the commits it brings move a directory that holds it, and git may move it along");
+  }
+  if (writes.replays) {
+    const replayed = listed(["log", "--full-history", "--no-merges", "--format=", "--name-only", "-z", writes.replays]);
+    if (replayed === null) return unsure();
+    if (replayed.length) return would([...new Set(replayed)]);
+  }
+  return undefined;
+}
+
 // `writable`: the directories the sandbox leaves writable besides the project's own and the temp
 // directories (the allowed paths and `sandboxWritable`), for the checks that ask whether git
-// could write a git directory.
-export function sandboxBreaks(command: string, cwd: string, session: SessionState, writable: string[] = []): string | undefined {
+// could write a git directory. `allowedPaths` and `scan`: for what the sandbox keeps read-only
+// (protectedPaths).
+export function sandboxBreaks(command: string, cwd: string, session: SessionState, writable: string[] = [], allowedPaths: string[] = [], scan?: Scan): string | undefined {
   // Each git call with the repository it names (round 4, finding 12): the directory its command
   // runs in (a plain `cd` followed) and then its `-C` words. Where that cannot be told the
   // project stands in, as before.
@@ -2811,7 +3591,10 @@ export function sandboxBreaks(command: string, cwd: string, session: SessionStat
           // and it is a `-C` word that leads nowhere, the directory is the one the words spell:
           // the checks below cannot read a repository there, and so ask (`git -C nowhere commit`).
           const from = where.cwd.get(cmd);
-          if (from !== undefined) dir = call.dirs.reduce((to, d) => path.resolve(to, tilde(d)), from);
+          // (Not a word that leads through `/proc/self`: that is this process's own directory to
+          // the lookups below, and the project stands in.)
+          const spelled = from === undefined ? undefined : call.dirs.reduce((to, d) => path.resolve(to, tilde(d)), from);
+          if (spelled !== undefined && !procRelative(spelled)) dir = spelled;
         }
       }
       const conf: string[] = [];
@@ -2824,8 +3607,61 @@ export function sandboxBreaks(command: string, cwd: string, session: SessionStat
     });
   }
   if (!calls.length) return undefined;
-  const writer = calls.find((c) => writesGit(c.sub, c.rest));
+  // (`git am` is no plain git command, but its `--abort`, `--continue`, `--skip`, `--quit` with
+  // nothing in progress, and no git call before it that may change that, write nothing, as the
+  // others' do: thirteenth pass, the maintainer's decision; Sonnet's C12 notes.)
+  const idleAm = (c: { sub: string; rest: string[]; dir: string }, n: number) => c.sub === "am" && calls.slice(0, n).every((b) => movesNothing(b.sub, b.rest)) && idleOperation(c.dir, c.rest);
+  const writer = calls.find((c, n) => writesGit(c.sub, c.rest) && !idleAm(c, n));
   if (writer && !read) return `git ${writer.sub} writes inside .git, which is read-only unless the tool call is made only of plain git commands`;
+  // A repository whose object store or refs lie elsewhere (`.git/objects` or `.git/refs` a link
+  // to a shared store): where that is outside every directory the sandbox leaves writable, a
+  // command that writes its git directory is allowed, planned, and fails there with "Read-only
+  // file system" (ninth pass; run by a reviewer in six layouts, and here: test/c-ninth.test.mts).
+  // What would only fail asks. The store is the common directory's (a linked worktree writes
+  // the main checkout's). A git directory that itself lies outside is the plan's to say.
+  const roots = [...projectRoots(session), ...writable, "/tmp", "/var/tmp", os.tmpdir()].map(realpath);
+  const inRoots = (p: string) => roots.some((root) => within(p, root));
+  // Which of the two a command writes: both, unless it is one of the few that plainly do not
+  // (each run under the wrapper with the store outside, xcheck/c9/everyday: on the tree before
+  // this pass `git branch`, a lightweight `git tag`, `git switch <branch>`, `git switch -c`,
+  // `git mv` and `git restore --staged` worked with `objects` outside, and `git add` with `refs`
+  // outside).
+  const plainWords = (rest: string[]) => rest.every((w) => !w.startsWith("-") || w === "--");
+  // A command that writes a ref appends to its reflog (`logs`) as well (tenth pass: with `logs`
+  // a link outside, `git commit`, `git switch`, `git fetch` and nine more were allowed and failed
+  // with "unable to append to '.git/logs/HEAD'", run by a reviewer, xcheck/reviewers/c9-sonnet/
+  // x9-deserved.test.mts); so does a switch of branch, which moves HEAD alone.
+  const storesWritten = (sub: string, rest: string[]): string[] => {
+    if (["mv", "rm", "restore", "update-index"].includes(sub)) return [];
+    // (With an option it may make a branch: a ref. `-m`, which can write objects, is not told
+    // apart. `git checkout [<tree>] -- <paths>` moves no HEAD; a `--` with no path after it
+    // takes none, and `git checkout -b x --` makes a branch (eleventh pass).)
+    if (sub === "checkout" && rest.includes("--") && rest.indexOf("--") < rest.length - 1) return [];
+    if (sub === "switch" || sub === "checkout") return plainWords(rest) ? ["logs"] : ["refs", "logs"];
+    if (sub === "add") return ["objects"];
+    if (sub === "branch" || sub === "reset" || (sub === "tag" && plainWords(rest))) return ["refs", "logs"];
+    return ["objects", "refs", "logs"];
+  };
+  for (const c of calls) {
+    if (!writesGit(c.sub, c.rest)) continue;
+    const common = gitRun(["-C", c.dir, "rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    if (common.status !== 0 || !inRoots(realpath(common.out.trim()))) continue;
+    for (const name of storesWritten(c.sub, c.rest)) {
+      const at = path.join(realpath(common.out.trim()), name);
+      if (!inRoots(realpath(at))) return `git ${c.sub} writes its git directory, and ${at} leads to ${realpath(at)}: that store lies outside what the sandbox lets the call write (the project, the allowed paths and the temp directories), so the command would fail there with "Read-only file system"; an approved run happens outside the sandbox`;
+    }
+  }
+  // A read-only file of the work tree that git would rewrite (heldRewritten).
+  let heldPaths: string[] | undefined;
+  const held = () => (heldPaths ??= protectedPaths({ projectRoots: projectRoots(session, scan), allowedPaths, project: session.project }, scan).paths.map(realpath));
+  // (Each judged as the repository is before the call runs: one after an earlier git call that
+  // may move a ref, the index or the work tree cannot be told. A loop, whose order is not that
+  // of its text, is never a git-only call, and asks above.)
+  for (const [n, c] of calls.entries()) {
+    const before = calls.slice(0, n).find((b) => !movesNothing(b.sub, b.rest));
+    const rewritten = heldRewritten(c, held, before && `git ${before.sub}`);
+    if (rewritten) return rewritten;
+  }
   // Signing and verifying need keys or keyrings the sandbox hides (round 3, finding 27): a set
   // config key (true, or one git could not read) asks. Read in the repository each call names,
   // by git itself with the call's own `-c` words, so that the command line counts as git counts
@@ -2839,9 +3675,30 @@ export function sandboxBreaks(command: string, cwd: string, session: SessionStat
     return v !== "false" && v !== undefined;
   };
   const signed = "git signs here, and the sandbox hides the keys and the agents that hold them";
+  // `--no-gpg-sign` countermands the config and every `-S` before it (git-commit(1)): such a
+  // call signs nothing, and was asked about all the same (ninth pass). It counts only where it
+  // is plainly an option of the call: before any `--`, not behind a word that may take it for
+  // its value (a message's `-m`, `-F`, `--author`: anything that begins with `-` and is neither
+  // one of the plain flags below nor an option with its value attached), and with no `-S`
+  // after it. Each in any spelling git takes: a long option by any prefix of it (tenth pass:
+  // `--gpg` and `--gpg-sig=KEY` are `--gpg-sign` to git, and signed after `--no-gpg-sign`, run by
+  // a reviewer, xcheck/reviewers/c9-opus/sign/probe3.out); `--no-gpg-sign` from `--no-gpg` on.
+  const SIGN_WORD = { test: (w: string) => /^-[a-zA-Z]*S/.test(w) || abbreviates(w, ["--gpg-sign"]) };
+  const NO_SIGN = /^--no-gpg(-(s(i(gn?)?)?)?)?$/;
+  const PLAIN_FLAG = /^(--(amend|no-edit|edit|allow-empty|allow-empty-message|all|quiet|verbose|signoff|no-signoff|no-verify|verify|gpg-sign|no-ff|ff|ff-only|squash|no-squash|commit|no-commit|stat|no-stat|rebase|no-rebase|continue|autostash|no-autostash|reset-author|include|only|keep-empty|allow-unrelated-histories)|--[a-z-]+=.*|-[aqvsneS]+)$/;
+  const unsigned = (c: { rest: string[] }) => {
+    // (Behind `--` it is a path: `git commit -- a.txt --no-gpg-sign` signs, the first word too.)
+    const end = c.rest.includes("--") ? c.rest.indexOf("--") : c.rest.length;
+    const at = c.rest.slice(0, end).findLastIndex((w) => NO_SIGN.test(w));
+    if (at < 0) return false;
+    const before = at > 0 ? c.rest[at - 1] : undefined;
+    if (before !== undefined && before.startsWith("-") && !PLAIN_FLAG.test(before)) return false;
+    return !c.rest.slice(at + 1).some((w) => SIGN_WORD.test(w));
+  };
   const commits = calls.filter((c) => ["commit", "merge", "rebase", "cherry-pick", "revert", "am", "pull"].includes(c.sub));
-  if (commits.some((c) => on(c, "commit.gpgsign") || on(c, "rebase.gpgsign"))) return "git signs commits here, and the sandbox hides the keys and the agents that hold them";
-  if (commits.some((c) => c.rest.some((w) => /^(-[a-zA-Z]*S|--gpg-sign)/.test(w)))) return signed;
+  const signing = commits.filter((c) => !unsigned(c));
+  if (signing.some((c) => on(c, "commit.gpgsign") || on(c, "rebase.gpgsign"))) return "git signs commits here, and the sandbox hides the keys and the agents that hold them";
+  if (signing.some((c) => c.rest.some((w) => SIGN_WORD.test(w)))) return signed;
   if (commits.some((c) => (c.sub === "merge" || c.sub === "pull") && (c.rest.includes("--verify-signatures") || on(c, "merge.verifysignatures")))) return "git checks signatures here, and the sandbox hides the keyrings it needs";
   const tags = calls.filter((c) => c.sub === "tag" && writesGit(c.sub, c.rest) && !c.rest.some((w) => /^(-d|--delete)$/.test(w)));
   if (tags.some((c) => c.rest.some((w) => /^(-[a-zA-Z]*[su]|--sign|--local-user)/.test(w)))) return signed;
@@ -2917,7 +3774,113 @@ const WRITER_OPERANDS: Record<string, "all" | "last"> = {
 
 // The writers that keep the name of a file that is already there (round 4, N3): they remove it,
 // change its mode or owner, or edit it in place. Every other write makes the file it names.
-const NAME_KEEPERS = new Set(["rm", "rmdir", "unlink", "shred", "chmod", "chown", "chgrp", "setfacl", "sed", "patch", "perl", "ruby", "yq", "jq"]);
+// N3b-2: `sed` stays, since its operands are its script and the files it edits where they are;
+// the one name it makes is the backup's, read on its own below; perl and ruby with -i likewise
+// (they are the model's). `patch` went: `-o` names a new file, and an operand that is not there
+// is made when the patch adds the file.
+const NAME_KEEPERS = new Set(["rm", "rmdir", "unlink", "shred", "chmod", "chown", "chgrp", "setfacl", "sed", "perl", "ruby"]);
+
+// Round 4, N3b-1: a word that names a path with a part named like an option (`--zz`; not `-`
+// alone) that is not there yet, whatever the program: the program may make it (`tar cf ./--x.tar
+// f`, `zip ./--x.zip f`, `mkdir -p ./--zz/x`), and a glob later in the call, which is judged
+// against the tree as it stands, hands it to a program as an option. Every word of every command
+// (a redirect's target too), the value behind an `=` in it and what is attached to an option's
+// letters (`-cf./--x.tar`), read as a path in every place the command may run. The parts are
+// walked from the front: the first such part that is not there, behind parts that are all
+// directories, asks. A word that is no path does not ask: its first part is no directory (`sed
+// 's/-foo/-bar/' f`, a URL, `origin/main..topic/-x`), or it begins with the part itself (an
+// option; a write target of that shape is writeProblem's). Where the program makes the
+// directories on the way (PARENT_MAKERS), any such part that is not there asks, whatever stands
+// before it, and so does the first part of an operand behind `--`. A glob that matches is the
+// names it matches, which are there; one that matches nothing is left as it is written. A part
+// known only when the command runs (where a name there begins as it does), or a place the check
+// cannot tell, with such a part behind it: the model. Also N3b-2: `sed -i` with a suffix that
+// holds a `*` (the file's name is put in its place) or a `/` names the backup itself, as does
+// one known only at run time.
+const PARENT_MAKERS: Record<string, RegExp> = {
+  mkdir: /^(-[^-]*p|--p)/,
+  install: /^(-[^-]*[dD]|--d)/,
+  curl: /^--cre/,
+  cp: /^--pa/,
+  // (rsync makes the last directory of its target, and more with -R, --mkpath or --files-from;
+  // wget makes the directories of -P and of the URL's path.)
+  rsync: /^/,
+  wget: /^/,
+};
+const dashPart = (part: string) => part.startsWith("-") && part !== "-";
+function optionNamedPath(cmds: Simple[], dirsOf: (cmd: Simple) => string[] | undefined): { action: "ask" | "classify"; reason: string } | undefined {
+  let model: string | undefined;
+  const isDir = (p: string) => {
+    try {
+      return fs.statSync(p).isDirectory();
+    } catch {
+      return false;
+    }
+  };
+  // Whether a name in `dir` begins with `lead` (a directory that cannot be listed may hold one).
+  const begins = (dir: string, lead: string) => {
+    try {
+      return fs.readdirSync(dir).some((n) => n.startsWith(lead));
+    } catch {
+      return true;
+    }
+  };
+  // One spelling of a path in one directory: the part that would be made, "model", or nothing.
+  const walk = (word: string, dir: string | undefined, all: boolean, front: boolean): string | undefined => {
+    // (Each expansion as one `$`: a `/` inside it parts nothing.)
+    const text = withoutExpansions(word.startsWith("~+/") ? `.${word.slice(2)}` : tilde(word), "$");
+    const parts = text.split("/");
+    // (The first part of a word is an option's own `-`, but for an operand behind `--`.)
+    const counts = (part: string, i: number) => dashPart(part) && (i > 0 || front);
+    if (!parts.some(counts)) return undefined;
+    if (/^~[^/]/.test(text)) return "model";
+    const absolute = path.isAbsolute(text);
+    if (!absolute && dir === undefined) return "model";
+    if (!/[$`]/.test(word) && /[*?]|\[.*\]/s.test(word) && expandNames(word, dir ?? "/")?.length) return undefined;
+    let at = absolute ? "/" : dir!;
+    let named = 0;
+    for (const [i, part] of parts.entries()) {
+      if (part === "" || part === ".") continue;
+      // A part known only at run time: the model's, unless nothing here begins as it does (the
+      // word is then no path: `awk '{print $1/-2}' f`). (A target of that kind for a program
+      // that makes the directories on the way is asked about as a write to a place unknown.)
+      if (/[$`]/.test(part)) return begins(at, part.slice(0, part.indexOf("$"))) ? "model" : undefined;
+      const next = path.join(at, part);
+      if (counts(part, i) && (all || !absolute || named > 0) && !present(next)) return part;
+      if (!all && !isDir(next)) return undefined;
+      at = next;
+      named++;
+    }
+    return undefined;
+  };
+  for (const cmd of cmds) {
+    const makers = programs(cmd.argv).filter((at) => Object.hasOwn(PARENT_MAKERS, path.basename(cmd.argv[at])) && cmd.argv.slice(at + 1).some((a) => PARENT_MAKERS[path.basename(cmd.argv[at])].test(a)));
+    for (const at of programs(cmd.argv)) {
+      if (path.basename(cmd.argv[at]) !== "sed") continue;
+      for (const arg of cmd.argv.slice(at + 1)) {
+        const suffix = /^-[nrEsuz]*i(.+)$/s.exec(arg)?.[1] ?? /^--i[a-z-]*=(.*)$/s.exec(arg)?.[1];
+        if (suffix !== undefined && /[*\/$`]/.test(suffix)) return { action: "ask", reason: `sed -i with a suffix that names the backup file itself (${suffix}): it can make a file named like an option, which a later glob hands to a program as one` };
+      }
+    }
+    for (const [k, word] of [...cmd.argv, ...cmd.out].entries()) {
+      const all = makers.some((at) => k > at);
+      const front = all && makers.some((at) => cmd.argv.slice(at + 1, k).includes("--"));
+      const spellings = [word];
+      if (word.includes("=")) spellings.push(word.slice(word.indexOf("=") + 1));
+      if (/^-[A-Za-z0-9]/.test(word)) for (let j = 2; j <= word.indexOf("/"); j++) spellings.push(word.slice(j));
+      for (const spelling of spellings) {
+        // (Braces are expanded where the command is printed: each word is one alternative.)
+        const dirs = dirsOf(cmd);
+        for (const dir of dirs?.length ? dirs : [undefined]) {
+          const part = walk(spelling, dir, all, front && spelling === word);
+          if (part === "model") model ??= `${word} may name a new file or directory that begins with -, by a path the check cannot tell: a later glob would hand it to a program as an option`;
+          else if (part !== undefined) return { action: "ask", reason: `${word} would make a file or directory named like an option (${part}): a later glob hands it to a program as one` };
+        }
+      }
+    }
+  }
+  return model === undefined ? undefined : { action: "classify", reason: model };
+}
 
 // A write the rules' Matchers do not see as one: into a path with a `.git` component (a new
 // repository, or a link named `.git`), opencode's project files or a hook manager's files. The
@@ -2933,7 +3896,7 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
   for (const cmd of cmds) {
     const targets = [...cmd.out, ...extra.filter((w) => w.cmd === cmd).map((w) => w.word)];
     // Round 4, N3: the targets that make a file (see NAME_KEEPERS), with the operands after `--`.
-    const made = [...cmd.out, ...extra.filter((w) => w.cmd === cmd && !NAME_KEEPERS.has(w.by ?? "")).map((w) => w.word)];
+    const made = extra.filter((w) => w.cmd === cmd && !NAME_KEEPERS.has(w.by ?? "")).map((w) => w.word);
     cmd.argv.forEach((word, at) => {
       const how = Object.hasOwn(WRITER_OPERANDS, path.basename(word)) ? WRITER_OPERANDS[path.basename(word)] : undefined;
       const args = cmd.argv.slice(at + 1);
@@ -2941,19 +3904,20 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       if (path.basename(word) === "sed" && !args.some((a) => /^(-[a-zA-Z]*i|--in-place)/.test(a))) return;
       if (path.basename(word) === "dd") targets.push(...args.filter((a) => a.startsWith("of=")).map((a) => a.slice(3)));
       else if (how) targets.push(...(how === "last" ? files.slice(-1) : files));
-      if (path.basename(word) === "dd") made.push(...args.filter((a) => a.startsWith("of=")).map((a) => a.slice(3)));
-      else if (how && !NAME_KEEPERS.has(path.basename(word))) {
+      if (how && !NAME_KEEPERS.has(path.basename(word))) {
         const end = args.indexOf("--");
         const operands = end < 0 ? files : [...files.filter((f) => args.indexOf(f) < end), ...args.slice(end + 1)];
-        made.push(...(how === "last" || path.basename(word) === "mv" ? operands.slice(-1) : operands));
+        made.push(...(how === "last" ? operands.slice(-1) : operands));
       }
     });
     // A file whose name begins with `-` is an option to the program a later glob hands it to
     // (round 4, N3: `touch ./--to-command=rec`, then `tar xf a.tar --to*` or `tar xf a.tar *` in
-    // this call, where the glob is judged before the file is there). `-` alone is no option.
+    // this call, where the glob is judged before the file is there). `-` alone is no option, and
+    // a name that is there already, in every place the command may run, is not made (N3b-1).
+    const there = (t: string) => (path.isAbsolute(tilde(t)) ? present(tilde(t)) : !!dirsOf?.(cmd)?.length && dirsOf(cmd)!.every((dir) => present(`${dir}/${t}`)));
     for (const target of made) {
-      const leaf = (braceWords(target) ?? [target]).map((t) => t.replace(/\/+$/, "").split("/").at(-1) ?? "").find((t) => t.startsWith("-") && t !== "-");
-      if (leaf !== undefined) return `makes a file named like an option (${leaf}): a later glob hands it to a program as one`;
+      const leaf = target.replace(/\/+$/, "").split("/").at(-1) ?? "";
+      if (dashPart(leaf) && !there(target)) return `makes a file named like an option (${leaf}): a later glob hands it to a program as one`;
     }
     // A name spelled with braces or a glob is the name it can expand to (round 3, finding 24).
     for (const target of targets) {
@@ -3430,8 +4394,11 @@ export interface WorkTreeChange {
 //   - every other word is an option, a placeholder (`%f`), or a word without `/` or `.` that
 //     names nothing in the top of the work tree (a subcommand: `clean`, `filter-process`).
 // Any other value may run a file the session can write: a filter that names a project file.
+// B8-2: an option is a word like any other here: `--to-command=./helper.sh` names a program of
+// the project as well as `./helper.sh` does. Every word after the program, with its leading
+// dashes off and cut at each `=`, is held to the same test.
 const PLAIN_COMMAND = /^[A-Za-z0-9_@%+=:,.\/ -]+$/;
-function outsideProgram(value: string, top: string, inside: (p: string) => boolean): boolean {
+export function outsideProgram(value: string, top: string, inside: (p: string) => boolean): boolean {
   if (!PLAIN_COMMAND.test(value)) return false;
   const [program, ...rest] = value.trim().split(/ +/);
   if (!program || runsItsWords(path.basename(program))) return false;
@@ -3460,7 +4427,7 @@ function outsideProgram(value: string, top: string, inside: (p: string) => boole
   }
   const temp = realish(os.tmpdir());
   if ([file, real].some((f) => inside(f) || within(f, temp))) return false;
-  return rest.every((w) => w.startsWith("-") || /^%[A-Za-z]$/.test(w) || (!/[\/.]/.test(w) && !lexists(path.join(top, w))));
+  return rest.every((w) => /^%[A-Za-z]$/.test(w) || w.replace(/^-+/, "").split("=").every((part) => !/[\/.]/.test(part) && (part === "" || !lexists(path.join(top, part)))));
 }
 function gitProgramsOutside(dir: string, diff: boolean, inside: (p: string) => boolean): boolean {
   const keys = diff ? "^(filter\\..*\\.(clean|smudge|process)|diff\\.external|diff\\..*\\.(command|textconv))$" : "^filter\\..*\\.(clean|smudge|process)$";
@@ -3473,6 +4440,367 @@ function gitProgramsOutside(dir: string, diff: boolean, inside: (p: string) => b
     return at >= 0 && outsideProgram(entry.slice(at + 1), top, inside);
   });
 }
+
+// B8-2: what in the configuration of the repository git works in at `dir` may name a program, or
+// undefined. After a session write a git command stays on the safe list only where every key of
+// the repository's own configuration (the scopes `local` and `worktree`, with the files they
+// include, in the repository itself and in each submodule cloned into it: git runs its status,
+// its diff and its fetch in those with their own) is one that names no program:
+//   - a key of REPO_CONFIG_OK (group C's list for the repository's layout) or of NO_PROGRAM_MORE
+//     (everyday keys that name a path, a name or a switch), with a value that is no transport
+//     of git's that runs a program (`ext::`, any `<helper>::`) for a URL, and one of git's own
+//     words for `submodule.<name>.update`;
+//   - a filter or a textconv whose value is exactly one of KNOWN_PROGRAM_LINES (git-lfs's lines,
+//     git-crypt's, `cat` as a textconv), where bash finds that program on PATH outside the
+//     project (pathFinds);
+//   - `include.path` and `includeIf.*.path` only where the file they name is inside a `.git`
+//     directory, or outside the project and the temp directories: a file of the work tree or
+//     of a temp directory is one the session can write, and what it then holds is read by git
+//     when the command runs, after this check.
+// Any other key goes to the model, named: `core.fsmonitor`, `core.sshCommand`, `core.gitProxy`,
+// `core.pager`, `core.editor`, `core.hooksPath`, `core.askPass`, `remote.<name>.uploadpack`,
+// `gpg.program`, `credential.helper`, `alias.*`, `diff.external`, a merge driver, and what
+// nobody has heard of.
+// The user's own configuration and the system's are not the project's, and are not read for
+// this; with the one exception the seventh pass built: a filter there (and with `diff` a diff
+// program) that outsideProgram cannot place outside the project.
+const NO_PROGRAM_MORE =
+  /^(core\.(worktree|excludesfile|attributesfile|whitespace|commentchar|checkstat|trustctime|protecthfs|protectntfs|hidedotfiles|fscache)|remote\..+\.(pushurl|push|mirror)|remote\.pushdefault|branch\..+\.pushremote|branch\.(autosetupmerge|autosetuprebase|sort)|push\.(autosetupremote|followtags)|rebase\.(autostash|autosquash|updaterefs|stat)|user\.signingkey|gpg\.format|status\.(showuntrackedfiles|submodulesummary|short|branch)|log\.(date|decorate|abbrevcommit|follow)|diff\..+\.(xfuncname|binary|cachetextconv|wordregex)|diff\.(colormoved|mnemonicprefix|submodule|context|ignoresubmodules)|filter\..+\.required|url\..+\.(insteadof|pushinsteadof)|http\.(.+\.)?(extraheader|sslverify|postbuffer|version|lowspeedlimit|lowspeedtime|useragent|followredirects)|submodule\..+\.(update|ignore|fetchrecursesubmodules|shallow)|submodule\.(fetchjobs|active)|commit\.(template|verbose|cleanup|status)|tag\.(sort|forcesignannotated)|merge\.(renames|renamelimit|log|stat|autostash|verbosity)|fetch\.(parallel|output|showforcedupdates|writecommitgraph)|checkout\.(guess|defaultremote|workers))$/;
+const KNOWN_PROGRAM_LINES: { key: RegExp; value: RegExp; program: string }[] = [
+  { key: /^filter\..+\.clean$/, value: /^git-lfs clean -- %f$/, program: "git-lfs" },
+  { key: /^filter\..+\.smudge$/, value: /^git-lfs smudge( --skip)? -- %f$/, program: "git-lfs" },
+  { key: /^filter\..+\.process$/, value: /^git-lfs filter-process( --skip)?$/, program: "git-lfs" },
+  { key: /^filter\..+\.clean$/, value: /^("git-crypt"|git-crypt) clean$/, program: "git-crypt" },
+  { key: /^filter\..+\.smudge$/, value: /^("git-crypt"|git-crypt) smudge$/, program: "git-crypt" },
+  { key: /^diff\..+\.textconv$/, value: /^("git-crypt"|git-crypt) diff$/, program: "git-crypt" },
+  { key: /^diff\..+\.textconv$/, value: /^cat$/, program: "cat" },
+];
+const URL_KEY = /^(remote\..+\.(url|pushurl)|url\..+\.(insteadof|pushinsteadof)|submodule\..+\.url)$/;
+const HELPER_URL = /^[A-Za-z0-9+.-]+::/;
+// B9-8: a URL `<scheme>://…` whose scheme is not one of git's own transports makes git run
+// `git-remote-<scheme>`, which it looks for on PATH after its own directory (transport.c). The
+// scheme is compared as git compares it, case and all: git 2.47 runs `git-remote-HTTPS` for
+// `HTTPS://…` (tried).
+// (Blanks around it are taken off: wider than git, which runs no helper for a URL that begins with
+// a blank, and runs one for a URL that ends in one; tried with 2.47.)
+const GIT_SCHEMES = new Set(["ssh", "git", "git+ssh", "ssh+git", "http", "https", "ftp", "ftps", "file"]);
+const helperScheme = (url: string): string | undefined => {
+  const m = /^([A-Za-z][A-Za-z0-9+.-]*):\/\//.exec(url.trim());
+  return m && !GIT_SCHEMES.has(m[1]) ? m[1] : undefined;
+};
+// Why git runs a program for a URL: `<helper>::…`, or a scheme none of git's own; or undefined.
+const urlProgram = (url: string): string | undefined => {
+  if (HELPER_URL.test(url.trim())) return "a URL that names a transport of git's which runs a program";
+  const scheme = helperScheme(url);
+  return scheme ? `a URL whose scheme ${scheme} is none of git's own: git runs git-remote-${scheme}, found by PATH` : undefined;
+};
+// B10-2: the keys whose value git takes as the name of a remote, and as its URL where no remote of
+// that name is configured (remote.c makes a URL of a name it does not know): git 2.47's
+// branch.<name>.remote, branch.<name>.pushRemote, remote.pushDefault and checkout.defaultRemote.
+// (`remotes.<group>` lists such names too, for `git remote update <group>`, and is on no list of
+// keys: the model's as it stands. `clone.defaultRemoteName` names the remote a clone makes, and git
+// takes no URL there.)
+const REMOTE_NAME_KEY = /^(branch\..+\.(remote|pushremote)|remote\.pushdefault|checkout\.defaultremote)$/;
+// B10-2: a URL on git's command line names a program as one in its configuration does: every word
+// of the subcommands that take a repository or a URL (`fetch`, `pull`, `push`, `ls-remote`,
+// `clone`, `remote add`/`set-url`, `submodule add`, `archive`), read as a URL (wide: a refspec that
+// reads as one counts). (An option's value after `=` is not read: every such option of these,
+// `push --repo=`, `archive --remote=`, `clone --reference=`, is on a call that asks or that is off
+// the safe list already.)
+const URL_SUBS = new Set(["fetch", "pull", "push", "ls-remote", "clone", "remote", "submodule", "archive"]);
+export function urlWordProblem(sub: string, rest: string[]): string | undefined {
+  if (!URL_SUBS.has(sub)) return undefined;
+  for (const w of rest) {
+    const why = urlProgram(w);
+    if (why) return `with ${w.trim()}, ${why}`;
+  }
+  return undefined;
+}
+const PROGRAM_KEY = (diff: boolean) => (diff ? /^(filter\..*\.(clean|smudge|process)|diff\.external|diff\..*\.(command|textconv))$/ : /^filter\..*\.(clean|smudge|process)$/);
+// B10-10: whether git skips an included file as one that is not there (config.c: access() fails
+// with ENOENT or ENOTDIR, and git reads nothing), and nothing on the way to it could lead elsewhere:
+// the deepest part of the path that is there is no symbolic link. (A link that leads nowhere is
+// read as before: a file the check cannot read.)
+const absentCode = (e: unknown) => ["ENOENT", "ENOTDIR"].includes((e as NodeJS.ErrnoException).code ?? "");
+function plainlyAbsent(file: string): boolean {
+  try {
+    fs.accessSync(file, fs.constants.F_OK);
+    return false;
+  } catch (e) {
+    if (!absentCode(e)) return false;
+  }
+  for (let p = file; ; p = path.dirname(p)) {
+    try {
+      return !fs.lstatSync(p).isSymbolicLink();
+    } catch (e) {
+      if (!absentCode(e) || p === path.dirname(p)) return false;
+    }
+  }
+}
+// B10-7: the configuration GIT_CONFIG_COUNT gives (git 2.47, config.c): a count of decimal digits
+// (strtoul; none is nought, more than INT_MAX is refused), then GIT_CONFIG_KEY_<n> and
+// GIT_CONFIG_VALUE_<n> for each n below it, every one required. The key as git lists it: its
+// section and its name lower-cased, a subsection as written. More than a thousand entries: past
+// what the check reads. The entries, or why they cannot be read.
+function envConfig(env: NodeJS.ProcessEnv = process.env): [string, string][] | string {
+  const count = env.GIT_CONFIG_COUNT;
+  if (count === undefined || /^0*$/.test(count)) return [];
+  if (!/^\d+$/.test(count) || Number(count) > 1000) return `GIT_CONFIG_COUNT=${count.slice(0, 40)}, a count the check cannot read`;
+  const out: [string, string][] = [];
+  for (let n = 0; n < Number(count); n++) {
+    const key = env[`GIT_CONFIG_KEY_${n}`];
+    const value = env[`GIT_CONFIG_VALUE_${n}`];
+    if (key === undefined || value === undefined) return `GIT_CONFIG_COUNT=${count}, whose entry ${n} lacks its key or its value: a configuration the check cannot read`;
+    const first = key.indexOf(".");
+    const last = key.lastIndexOf(".");
+    out.push([first < 0 ? key.toLowerCase() : key.slice(0, first).toLowerCase() + key.slice(first, last) + key.slice(last).toLowerCase(), value]);
+  }
+  return out;
+}
+// The `-c` entries every git call of the checks carries (sandbox.ts, GIT_SAFE), as git lists them.
+const CHECK_OWN_CONFIG = new Set(["core.fsmonitor=false", "core.hookspath=/dev/null", "core.untrackedcache=false", "core.askpass=", "core.pager=cat"]);
+function repoConfigProblem(dir: string, diff: boolean, inside: (p: string) => boolean, wrote: (dir: string, file: string) => boolean, session: SessionState): string | undefined {
+  const top = safeGit(["-C", dir, "rev-parse", "--show-toplevel"])?.trim() || dir;
+  const finds = (program: string) => pathFinds(program, [top], inside, wrote) === undefined;
+  // B9-4: the keys of every file an include of the repository's own names, whatever its condition
+  // (`git config --list --includes` lists an `includeIf` file only while its condition holds when
+  // the call is judged, and a command of the call can make it hold: `git switch dev && git
+  // status`). Each is read alone (`git config --file`), its own includes followed the same way,
+  // and held to the same list; a file that cannot be read, or a chain past git's own depth of ten
+  // (or fifty files in all), is a problem.
+  let includes = 0;
+  const included = (file: string, key: string, value: string, depth: number): string | undefined => {
+    if (depth >= 10 || ++includes > 50) return `${key}, which names ${value}: includes nested deeper than the check reads`;
+    const r = gitRun(["config", "--file", file, "--list", "-z"]);
+    const entries = r.out.split("\0");
+    if (r.status !== 0 || entries.pop() !== "") return `${key}, which names ${value}, a file the check cannot read`;
+    for (const entry of entries) {
+      const nl = entry.indexOf("\n");
+      const raw = nl < 0 ? entry : entry.slice(0, nl);
+      const problem = own(raw.toLowerCase(), nl < 0 ? "true" : entry.slice(nl + 1), `file:${file}`, "/", depth + 1, raw);
+      if (problem) return `${problem}, in ${value}, which ${key} names`;
+    }
+    return undefined;
+  };
+  // One key of the repository's own, where it stands (`origin`: the file git read it from).
+  // (`raw`: the key as git prints it, its subsection's case kept.)
+  const own = (key: string, value: string, origin: string, base: string, depth = 0, raw = key): string | undefined => {
+    if (/^(include\.path|includeif\..+\.path)$/.test(key)) {
+      if (!origin.startsWith("file:") || value === "" || (value.startsWith("~") && !value.startsWith("~/"))) return `${key}, which names a file the check cannot place`;
+      const from = path.resolve(base, origin.slice("file:".length));
+      const named = value.startsWith("~/") ? path.join(os.homedir(), value.slice(2)) : path.resolve(path.dirname(from), value);
+      let file: string;
+      try {
+        file = realish(named);
+      } catch {
+        return `${key}, which names a file the check cannot walk to`;
+      }
+      // (A file under a temp directory is the session's to write as well.)
+      const temp = tempDirs();
+      if ([named, file].some((f) => (inside(f) ? !f.split("/").includes(".git") : temp.some((t) => within(f, t))))) return `${key}, which names ${value}, a file the session can write`;
+      // B10-10: a file that is not there holds no keys: git skips it silently. (Not where a link
+      // on the way leads nowhere: it may lead where the session writes.)
+      if (plainlyAbsent(file)) return undefined;
+      return included(file, key, value, depth);
+    }
+    if (REPO_CONFIG_OK.test(key) || NO_PROGRAM_MORE.test(key)) {
+      // (For `url.<base>.insteadOf` the URL is in the key as well; B10-2: a remote's name may be
+      // a URL.)
+      const url = URL_KEY.test(key) ? (urlProgram(value) ?? urlProgram(raw.replace(/^url\./i, ""))) : REMOTE_NAME_KEY.test(key) ? urlProgram(value) : undefined;
+      if (url) return `${key}, ${url}`;
+      if (/^submodule\..+\.update$/.test(key) && !/^(checkout|rebase|merge|none)$/.test(value)) return `${key}, which names a command`;
+      return undefined;
+    }
+    const line = KNOWN_PROGRAM_LINES.find((l) => l.key.test(key) && l.value.test(value));
+    if (line) return finds(line.program) ? undefined : `${key}, whose program ${line.program} PATH finds where the session can write`;
+    return `${key}, a key that may name a program`;
+  };
+  const one = (lead: string[], base: string, where: string): string | undefined => {
+    const r = gitRun([...lead, "config", "--show-scope", "--show-origin", "--includes", "--list", "-z"]);
+    const fields = r.out.split("\0");
+    if (r.status !== 0 || fields.pop() !== "" || fields.length % 3) return `with a configuration${where} the check cannot read`;
+    for (let i = 0; i < fields.length; i += 3) {
+      const [scope, origin, entry] = [fields[i], fields[i + 1], fields[i + 2]];
+      const nl = entry.indexOf("\n");
+      const key = (nl < 0 ? entry : entry.slice(0, nl)).toLowerCase();
+      const value = nl < 0 ? "true" : entry.slice(nl + 1);
+      // B9-10: the user's own is the `system` and `global` scope, and the check's own is the
+      // `command` scope's entries it gives git itself (sandbox.ts, GIT_SAFE); every other entry
+      // (`local`, `worktree`, a `command` entry from GIT_CONFIG_PARAMETERS, which the shell
+      // inherits, `unknown`) is held to the repository's list.
+      if (scope === "command" && CHECK_OWN_CONFIG.has(`${key}=${value}`)) continue;
+      if (scope !== "system" && scope !== "global") {
+        const problem = own(key, value, origin, base, 0, nl < 0 ? entry : entry.slice(0, nl));
+        if (problem) return `with ${problem} in the repository's configuration${where}`;
+      } else if (PROGRAM_KEY(diff).test(key) && !KNOWN_PROGRAM_LINES.some((l) => l.key.test(key) && l.value.test(value) && finds(l.program)) && !outsideProgram(value, top, inside)) {
+        return `with ${key} in your own git configuration, which names a program the check cannot place outside the project`;
+      }
+    }
+    return undefined;
+  };
+  // B10-7: the entries GIT_CONFIG_COUNT, GIT_CONFIG_KEY_<n> and GIT_CONFIG_VALUE_<n> give, in the
+  // environment the shell inherits (opencode hands a shell `{...process.env, …}`): git reads them in
+  // the `command` scope, after every file, in every repository and submodule. The checks' own git
+  // does not (gitEnv takes GIT_CONFIG_COUNT out), so they are read here and held to the
+  // repository's list as GIT_CONFIG_PARAMETERS' entries are. A count git refuses, or a key or a
+  // value it lacks, is a configuration the check cannot read.
+  const counted = envConfig();
+  if (typeof counted === "string") return `with ${counted}`;
+  for (const [raw, value] of counted) {
+    const problem = own(raw.toLowerCase(), value, "command line:", "/", 0, raw);
+    if (problem) return `with ${problem} in GIT_CONFIG_COUNT's entries`;
+  }
+  const here = one(["-C", dir], dir, "");
+  if (here) return here;
+  const modules = clonedSubmodules(dir, session);
+  if (!modules) return "with submodules whose configuration the check cannot list";
+  for (const module of modules) {
+    const there = one(inGitDir(module), process.cwd(), ` of the submodule in ${module}`);
+    if (there) return there;
+  }
+  return undefined;
+}
+
+// B9-9, the maintainer's decision ("old hooks: model after a write"): a git command that would run a
+// hook that is in the repository's hooks directory goes to the model after a session write, as
+// every other program that may run the project's code does (a hook often runs the project's
+// scripts). The hooks each subcommand may run, from git 2.47's githooks(5), read wide where a
+// subcommand runs them only in some forms: the commit, merge and patch hooks, post-checkout,
+// post-merge, pre-rebase, post-rewrite and pre-push by their commands; reference-transaction for
+// every command that may update a ref, post-index-change for every one that may write the index
+// (`git status` and `git diff` refresh it), and pre-auto-gc for the ones that start `git gc
+// --auto` (and `git gc --auto` itself). The receiving side of a push to a local repository is
+// the push check's, as before. `--no-verify` skips what git says it skips: `commit` and `am` also
+// as `-n`; `merge` and `pull` the pre-merge-commit and commit-msg hooks; `push` pre-push.
+const COMMIT_HOOKS = ["pre-commit", "prepare-commit-msg", "commit-msg", "post-commit"];
+const HOOKS_OF: Record<string, string[]> = {
+  commit: [...COMMIT_HOOKS, "post-rewrite"],
+  merge: ["pre-merge-commit", "prepare-commit-msg", "commit-msg", "post-merge"],
+  pull: ["pre-merge-commit", "prepare-commit-msg", "commit-msg", "post-merge", "pre-rebase", "post-rewrite", "post-checkout"],
+  rebase: ["pre-rebase", "post-rewrite", "post-checkout", ...COMMIT_HOOKS],
+  "cherry-pick": [...COMMIT_HOOKS, "post-rewrite"],
+  revert: [...COMMIT_HOOKS, "post-rewrite"],
+  am: ["applypatch-msg", "pre-applypatch", "post-applypatch", "post-rewrite", "prepare-commit-msg"],
+  checkout: ["post-checkout"],
+  switch: ["post-checkout"],
+  restore: ["post-checkout"],
+  clone: ["post-checkout"],
+  worktree: ["post-checkout"],
+  bisect: ["post-checkout"],
+  push: ["pre-push"],
+  "send-email": ["sendemail-validate"],
+  p4: ["p4-changelist", "p4-prepare-changelist", "p4-post-changelist", "p4-pre-submit"],
+  // B10-4: `git submodule update` checks the submodules out (their own hooks, in
+  // .git/modules/<name>/hooks, are not read: wide here instead).
+  submodule: ["post-checkout"],
+};
+const REF_WRITERS = new Set("branch tag fetch push remote commit reset checkout switch stash gc symbolic-ref bisect merge pull rebase am cherry-pick revert clone worktree notes update-ref reflog pack-refs replace submodule".split(" "));
+const INDEX_WRITERS = new Set("status add rm mv reset restore checkout switch commit stash merge pull rebase am cherry-pick revert bisect clone worktree diff describe read-tree update-index apply sparse-checkout checkout-index submodule".split(" "));
+const AUTO_GC = new Set("commit fetch merge am rebase pull".split(" "));
+// B10-4: the words of the subcommands whose `--no-verify` skips a hook, read with their own options
+// (git 2.47's parse-options tables), so that an option's value (`git commit -F --no-verify`, `-t
+// -n`, `--trailer --no-verify`) is never taken for the flag. Short letters: flags, letters with a
+// value (the rest of the word or the next word), letters with an optional attached value; long
+// names by kind (a unique prefix is the name; every one takes `--no-`). An option outside its
+// table: the hooks all count.
+const hookTable = (flags: string, values: string, optional: string, long: { flag: string; value: string; optional: string }): Getopt => ({
+  flags,
+  values,
+  optional,
+  long: Object.fromEntries((["flag", "value", "optional"] as const).flatMap((kind) => long[kind].split(" ").map((n) => [n, kind]))),
+  negatable: (n: string) => !n.startsWith("no-"),
+});
+const HOOK_OPTIONS: Record<string, Getopt> = {
+  commit: hookTable("qvaiopnesz", "mFcCt", "uS", {
+    flag: "quiet verbose all include interactive patch only verify dry-run short branch ahead-behind porcelain long null amend post-rewrite status signoff edit reset-author allow-empty allow-empty-message pathspec-file-nul",
+    value: "message file reedit-message reuse-message author date fixup squash trailer template cleanup pathspec-from-file",
+    optional: "untracked-files gpg-sign",
+  }),
+  merge: hookTable("nevq", "sXmF", "S", {
+    flag: "stat summary squash commit edit ff ff-only rerere-autoupdate verify-signatures verbose quiet abort quit continue allow-unrelated-histories progress autostash overwrite-ignore signoff verify",
+    value: "cleanup strategy strategy-option message file into-name",
+    optional: "log gpg-sign",
+  }),
+  am: hookTable("i3qsukmcrn", "Cp", "S", {
+    flag: "interactive 3way quiet signoff utf8 keep keep-non-patch message-id keep-cr scissors ignore-space-change ignore-whitespace reject continue resolved skip abort quit allow-empty committer-date-is-author-date ignore-date rerere-autoupdate verify",
+    value: "quoted-cr empty whitespace directory exclude include patch-format resolvemsg",
+    optional: "show-current-patch gpg-sign",
+  }),
+  pull: GIT_OPTIONS.pull,
+  push: GIT_OPTIONS.push,
+};
+export function gitHooksRun(sub: string, rest: string[]): string[] {
+  const hooks = new Set(HOOKS_OF[sub] ?? []);
+  if (REF_WRITERS.has(sub)) hooks.add("reference-transaction");
+  if (INDEX_WRITERS.has(sub)) hooks.add("post-index-change");
+  const end = rest.indexOf("--");
+  const own = end < 0 ? rest : rest.slice(0, end);
+  const first = own.find((w) => !w.startsWith("-"));
+  // B10-4: `git remote update` and `git remote add -f` fetch, and a fetch starts `gc --auto`;
+  // so does `git maintenance run --auto`.
+  const fetches = sub === "remote" && (first === "update" || (first === "add" && own.some((w) => /^-[a-zA-Z]*f/.test(w) || w === "--fetch")));
+  if (AUTO_GC.has(sub) || fetches || ((sub === "gc" || sub === "maintenance") && rest.includes("--auto"))) hooks.add("pre-auto-gc");
+  // B10-4: `git stash` with `--keep-index` (also `-k` in a cluster, a prefix of it, and `--patch`,
+  // which implies it) checks the index's files out again, and `git stash branch` checks a branch
+  // out: post-checkout (tried by the variant check). Read wide: a letter in any cluster.
+  if (sub === "stash" && (first === "branch" || own.some((w) => /^-[a-zA-Z]*[kp]/.test(w) || (w.length > 2 && ("--keep-index".startsWith(w) || "--patch".startsWith(w)))))) hooks.add("post-checkout");
+  const table = HOOK_OPTIONS[sub];
+  if (!table) return [...hooks];
+  const got = getopt(rest, table);
+  if (got.unknown) return [...hooks];
+  // (B10's reading, H2: opencode runs the command with `bash -c` and no positional parameters, so
+  // a quoted `"$@"` or an empty array's `"${a[@]}"` is no word at all, and git takes the next word
+  // as an option's value: `git commit -m "$@" --no-verify` runs the hook. A word with an expansion
+  // among the command's own words: every hook counts.)
+  if (own.some((w) => /[$`]/.test(w))) return [...hooks];
+  const skip = got.opts.filter((o) => o.name === "--verify" || o.name === "--no-verify" || (o.name === "-n" && (sub === "commit" || sub === "am"))).at(-1);
+  if (skip !== undefined && skip.name !== "--verify") {
+    const skipped = sub === "commit" ? ["pre-commit", "commit-msg"] : sub === "merge" || sub === "pull" ? ["pre-merge-commit", "commit-msg"] : sub === "push" ? ["pre-push"] : sub === "am" ? ["applypatch-msg", "pre-applypatch"] : [];
+    for (const h of skipped) hooks.delete(h);
+  }
+  return [...hooks];
+}
+// The hooks directory git uses where `dir` is: the last `core.hooksPath` of the user's or the
+// repository's configuration (not the checks' own `-c`), relative to the top of the work tree,
+// or `$GIT_COMMON_DIR/hooks`. Undefined where it cannot be told.
+function hooksDirectory(dir: string): string | undefined {
+  const r = gitRun(["-C", dir, "config", "--show-scope", "--includes", "--list", "-z"]);
+  const fields = r.out.split("\0");
+  if (r.status !== 0 || fields.pop() !== "" || fields.length % 2) return undefined;
+  let configured: string | undefined;
+  for (let i = 0; i < fields.length; i += 2) {
+    const nl = fields[i + 1].indexOf("\n");
+    if (fields[i] !== "command" && nl > 0 && fields[i + 1].slice(0, nl).toLowerCase() === "core.hookspath") configured = fields[i + 1].slice(nl + 1);
+  }
+  if (configured !== undefined) {
+    if (configured === "" || (configured.startsWith("~") && configured !== "~" && !configured.startsWith("~/")) || configured.startsWith("%(")) return undefined;
+    const top = safeGit(["-C", dir, "rev-parse", "--show-toplevel"])?.trim();
+    return top ? path.resolve(top, tilde(configured)) : undefined;
+  }
+  const common = safeGit(["-C", dir, "rev-parse", "--git-common-dir"])?.trim();
+  return common ? path.resolve(dir, common, "hooks") : undefined;
+}
+// The first hook of `names` that is in the hooks directory and that git would run (a file it
+// may execute; a `.sample` is never one of the names), or why that cannot be told.
+function hookThere(dir: string, names: string[]): string | undefined {
+  if (!names.length) return undefined;
+  const hooks = hooksDirectory(dir);
+  if (hooks === undefined) return "in a repository whose hooks directory the check cannot tell";
+  for (const name of names) {
+    try {
+      fs.accessSync(path.join(hooks, name), fs.constants.X_OK);
+      return `which runs the ${name} hook in ${hooks}`;
+    } catch {
+      // not there, or git would not run it
+    }
+  }
+  return undefined;
+}
+
+// B8-9: the reading of a command that unpacks an archive or applies a patch (guard.ts,
+// unseenWriter), for the plugin's hook: with the sandbox off such a command asks. `command` is
+// the text that would run (the printed one).
+export const unseenWrites = (command: string): string | undefined => unseenWriter(allCommands(command));
 
 // Decisions that require git's interpretation, in each command's actual directory.
 function placedGitIssue(cmds: Simple[], cwdOf: (c: Simple) => string | undefined): string | undefined {
@@ -3824,7 +5152,14 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   const known = () => new Set([...session.files.keys(), ...scope.pending.keys(), ...session.touched]);
   // The file a word names where `cmd` runs. Where that directory is unknown a relative word
   // cannot be placed: it then stands for any file of that name this session wrote.
-  const resolve = (word: string, cmd?: Simple): string | undefined => {
+  // B9-5: `$PWD/…` (or `${PWD}`) is the directory the command runs in, where that is known.
+  const pwdPlaced = (word: string, cmd?: Simple): string => {
+    const dir = cmd ? where.cwd.get(cmd) : cwdKnown ? here : undefined;
+    const m = PWD_LEAD.exec(word);
+    return m && dir !== undefined ? `${dir}${word.slice(m[0].length)}` : word;
+  };
+  const resolve = (raw: string, cmd?: Simple): string | undefined => {
+    const word = pwdPlaced(raw, cmd);
     if (/[$`]/.test(word)) return undefined;
     const p = tilde(word);
     const dir = cmd ? where.cwd.get(cmd) : cwdKnown ? here : undefined;
@@ -3928,7 +5263,7 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   const written = () => new Set([...known(), ...writes]);
   // A write the check cannot place (after `mkdir x && cd x`, through a variable) is a file it
   // cannot name either: what runs by its path afterwards may be that file.
-  const unplacedAll = found.writes.filter((w) => /[$`]/.test(w.word) || (!path.isAbsolute(tilde(w.word)) && cwdOf(w.cmd) === undefined));
+  const unplacedAll = found.writes.filter((w) => /[$`]/.test(pwdPlaced(w.word, w.cmd)) || (!path.isAbsolute(tilde(w.word)) && cwdOf(w.cmd) === undefined));
   const unplaced = unplacedAll[0];
   for (const w of unplacedAll) project(w.cmd);
   const unknownWrite = found.unknown ?? (unplaced ? `writes ${unplaced.word} where the check cannot place it` : undefined);
@@ -3954,32 +5289,60 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
     }
     return known;
   };
-  const gitFiltersAbsent = (cmd: Simple, args: string[], diff = false) => {
+  // B8-2: what in the configuration of the repository a git command works in may name a program
+  // (repoConfigProblem), where the command runs and its `-C` options lead.
+  const gitConfigProblem = (cmd: Simple, args: string[], diff = false): string | undefined => {
     const call = gitCall(args);
     let dir = cwdOf(cmd);
-    if (typeof call === "string") return false;
+    if (typeof call === "string") return "in a form the check cannot read";
     for (const d of call.dirs) dir = dir === undefined || /[$`]/.test(d) ? undefined : path.isAbsolute(d) ? d : `${dir}/${d}`;
-    if (dir === undefined) return false;
-    // Status/add can run clean filters; checkout/reset/restore can run smudge/process filters;
-    // a diff can run an external diff, a driver's command or its textconv. A fixed command in
-    // read-only config may still name a script the project can change (gitProgramsOutside).
-    return gitProgramsOutside(dir, diff, inProject);
+    if (dir === undefined) return "in a directory the check cannot tell";
+    const theirs = others(cmd);
+    return repoConfigProblem(dir, diff, inProject, (at, file) => theirs.written.has(file) || theirs.unlisted.some((m) => within(at, m) || within(m, at)), session);
+  };
+  // B9-9: after a session write a git command of the safe list is also held to the hooks it would
+  // run that are there (the safe list's own question only: runtimeReads keeps gitConfigProblem).
+  const gitAfterWrite = (cmd: Simple, args: string[], diff = false): string | undefined => {
+    const problem = gitConfigProblem(cmd, args, diff);
+    if (problem) return problem;
+    const call = gitCall(args);
+    if (typeof call === "string") return "in a form the check cannot read";
+    // B10-2: a URL on the command line that names a program.
+    const url = urlWordProblem(call.sub ?? "", call.rest);
+    if (url) return url;
+    let dir = cwdOf(cmd);
+    for (const d of call.dirs) dir = dir === undefined || /[$`]/.test(d) ? undefined : path.isAbsolute(d) ? d : `${dir}/${d}`;
+    if (dir === undefined) return "in a directory the check cannot tell";
+    return hookThere(dir, gitHooksRun(call.sub ?? "", call.rest));
   };
   const dirsOf = (c: Simple) => {
     const places = where.places.get(c);
     return places && [...new Set(places.map((p) => p.real))];
   };
   // B7-1: the moment on the clock of the file system the judged file lives on.
-  const began = (file: string, dev: bigint) => momentOn(session.moment, dev, [path.dirname(file), ...roots, os.homedir()]);
-  const context = { gitFiltersAbsent, others, began, cwd: here, cwdKnown, scope, written, resolve, inProject, cwdOf, dirsOf, pattern: (c: Simple) => where.patterns.has(c), envOk: envAssignmentsOk(cmds, cwdOf, inProject), unknownWrite, unlisted, npx: (c: Simple) => everyday.npx.get(cmds.indexOf(c)) };
+  // (B8-5: with more directories the plugin can usually write in: where none lies on the file's
+  // file system its clock cannot be measured, and the file goes to the model.)
+  const began = (file: string, dev: bigint) => momentOn(session.moment, dev, [path.dirname(file), ...roots, os.homedir(), os.tmpdir(), "/var/tmp", "/tmp", "/dev/shm"]);
+  // (The closing reading, step 7 F5: what the session can write beyond the project: the allowed
+  // paths and sandboxWritable, as the sandbox lets it.)
+  const canWrite = (p: string) => [...guard.allowedPaths, ...(guard.writable ?? [])].some((d) => within(realish(p), realish(d)));
+  const context = { canWrite, gitConfigProblem: gitAfterWrite, functions: functionNames(text), others, began, cwd: here, cwdKnown, scope, written, resolve, inProject, cwdOf, dirsOf, pattern: (c: Simple) => where.patterns.has(c), envOk: envAssignmentsOk(cmds, cwdOf, inProject), unknownWrite, unlisted, npx: (c: Simple) => everyday.npx.get(cmds.indexOf(c)) };
   const fromText = textGuards(watch.pairs(), context);
   // Each command judged by the rules where it runs, as bash goes there (B3c: `( cd .aws; cat zzz )`),
   // its words as the parser has them: plain ones bare (so that the allows above, which compare
   // texts, read them as before), others quoted.
   const shellWord = (w: string) => (/^[A-Za-z0-9_@%+=:,.\/-]+$/.test(w) ? w : `'${w.replace(/'/g, "'\\''")}'`);
   const judgeAt = (dir: string, words: string[]) => bashVerdict(words.map(shellWord).join(" "), scopeFor(guard, session, dir, rulesAt));
-  const fromPlaces = stricter(placedReads(where, scope, judgeAt), inputReads(printed.inputs, text, where, here, scope, printed.judgedInputs));
-  const fromWords = stricter(stricter(stricter(argvGuards(cmds, context), expansionProblem(text)), stricter(runtimeReads(text, where, scope), fromPlaces)), arithmeticAssignments(arithmeticSets));
+  // B8-4: a protected place a word names by the directory's other name (`/proc/self/cwd`, `~+`),
+  // where it lands: read from the project's top down, as writeProblem reads a landed write.
+  const landedProtected = (file: string): string | undefined => {
+    const top = roots.map(realish).find((r) => within(file, r));
+    const at = protectedNameIn(top === undefined ? file : path.relative(top, file), PROTECTED_NAMES);
+    return at === ".git" ? "a path inside or named .git, where git finds hooks and config, which the command may write" : at ? "a file opencode or a git hook loads and runs, which the command may write" : undefined;
+  };
+  // B11: what a word reads, judged where it leads, and a link made to a credential location.
+  const fromPlaces = stricter(stricter(placedReads(where, scope, judgeAt, landedProtected), inputReads(printed.inputs, text, where, here, scope, printed.judgedInputs)), linkedReads(where, scope, judgeAt));
+  const fromWords = stricter(stricter(stricter(argvGuards(cmds, context), expansionProblem(text)), stricter(runtimeReads(text, where, scope, (c, args, diff) => gitConfigProblem(c, args, diff) === undefined, printed), fromPlaces)), stricter(arithmeticAssignments(arithmeticSets), optionNamedPath(cmds, (c) => where.places.get(c)?.map((p) => p.real))));
   const combined = !fromText ? fromWords : !fromWords ? fromText : fromText.action === "ask" ? fromText : fromWords.action === "ask" ? fromWords : (fromWords.files ? fromWords : fromText);
   // The rules read a quoted `~` as the home directory, bash does not: their verdict is about other
   // paths than the ones bash uses.
@@ -4101,13 +5464,24 @@ export function decideFile(guard: Guard, session: SessionState, cwd: string, tar
   // opencode reports edit, write and patch alike, so an edit could be a one-line change: a
   // downloaded file stays a downloaded file.
   for (const p of scope.pending.keys()) if (session.files.get(p) === "fetched") scope.pending.delete(p);
+  // B10-9: an edit that asks carries its record, as a shell call's ask does: once the user approves
+  // it (index.ts), what it writes is the session's, and the checks after a write see it.
+  // (B10's variant check, F10-1: where the rules ask before they note the file (AGENTS.md,
+  // CLAUDE.md, the guard's own files), nothing was pending and an approval recorded nothing: the
+  // file is the write once approved.)
+  const file = path.resolve(cwd, target);
+  const approve = () => {
+    commitWrites(scope);
+    if (![file, realish(file)].some((p) => scope.files.has(p))) scope.files.set(file, "other");
+  };
   if (verdict.action === "allow") {
     const reason = protectedFile(guard, session, path.resolve(cwd, target), scan);
-    if (reason) return { effect: "ask", by: "rules", rule: "ask", reason: `edit ${reason}` };
+    if (reason) return { effect: "ask", by: "rules", rule: "ask", reason: `edit ${reason}`, approve };
     commitWrites(scope);
     return undefined;
   }
-  return fromRules(verdict);
+  const decision = fromRules(verdict);
+  return decision.effect === "ask" ? { ...decision, approve } : decision;
 }
 
 // read: asks for credential files, otherwise leaves opencode's verdict alone.

@@ -175,9 +175,11 @@ export interface PlanOptions {
   project?: string;
 }
 
+// The kernel's answer (realpath(3)): Node's own fs.realpathSync takes `..` away by the text before
+// it follows the link in front of it (tenth pass).
 export function realpath(p: string): string {
   try {
-    return fs.realpathSync(p);
+    return fs.realpathSync.native(p);
   } catch {
     return p;
   }
@@ -418,10 +420,13 @@ function scanRoot(root: string, skip: Set<string>, secrets: boolean): Found {
           }
           const m = /^gitdir:\s*(.+)$/m.exec(text);
           if (m) {
-            const gitdir = realpath(path.resolve(dir, m[1].trim()));
+            // Followed as git follows it, link by link (tenth pass: by path.resolve,
+            // `<outside>/lnk/../admin` was taken for `<outside>/admin` before `lnk` was followed).
+            const named = (text: string, base: string) => located(text.startsWith("/") ? text : `${base}/${text}`);
+            const gitdir = named(m[1].trim(), dir);
             addGitDir(gitdir, here);
             try {
-              found.gitDirs.add(realpath(path.resolve(gitdir, fs.readFileSync(path.join(gitdir, "commondir"), "utf8").trim())));
+              found.gitDirs.add(named(fs.readFileSync(path.join(gitdir, "commondir"), "utf8").trim(), gitdir));
             } catch {
               // not a linked worktree
             }
@@ -605,7 +610,14 @@ export function workTreeSubmodules(tops: string[], gitDirs: Iterable<string>, to
   return { dirs: [...dirs] };
 }
 
-const expandGitPath = (value: string, base: string) => path.resolve(base, value.replace(/^~(?=\/|$)/, HOME));
+// A path in git's config as git takes it: from `base` when it is relative, `~/` your home.
+// Joined, not resolved: git hands the string to the kernel, which takes a `..` in it after the
+// link in front of it (tenth pass: `<outside>/lnk/../h` is `lnk`'s parent's `h`, not
+// `<outside>/h`). `settle` walks it as the kernel does; `located` says where it ends.
+const expandGitPath = (value: string, base: string) => {
+  const v = value.replace(/^~(?=\/|$)/, HOME);
+  return v.startsWith("/") ? v : `${base}/${v}`;
+};
 
 // A config value as git itself reads it in the repository whose git directory is `gitDir`
 // (round 4, findings 21 and 25, seventh pass): from every file git reads there, your own and
@@ -658,23 +670,93 @@ function hooksDir(value: string, base: string): string | undefined {
 // condition holds right now, as deep as git follows them (it gives up at ten). A listing git
 // cannot give is a problem: it is not the same as "includes nothing".
 const GIT_INCLUDE_DEPTH = 10;
-function includedFiles(configFile: string, problems: string[], seen = new Set<string>(), depth = 0): string[] {
-  if (depth > GIT_INCLUDE_DEPTH || !fs.existsSync(configFile) || seen.has(realpath(configFile))) return [];
-  seen.add(realpath(configFile));
-  const out: string[] = [];
-  const listed = gitRun(["config", "--file", configFile, "--get-regexp", "^include(if\\..*)?\\.path$"]);
+function includedFiles(configFile: string, problems: string[]): string[] {
+  return includeTree(configFile, problems).map((i) => i.file);
+}
+// The same, each with whether git reads it only under a condition: an `includeIf`, or a file
+// that one of those includes (twelfth pass). Keys and values as git hands them over (`--null`:
+// a condition may hold a space, `gitdir:~/my work/`), each path as git expands it (`--type=path`:
+// `~/`, `~<user>/` from the password file, `%(prefix)/`; a relative one is left as it is, and is
+// the including file's). Thirteenth pass: `~<you>/` was read as `<HOME>/~<you>/`, and the file it
+// names went unread and unprotected (Opus's C12 F1, run under the wrapper). A user git does not
+// know stops git (status 128): it could not say.
+function includeTree(configFile: string, problems: string[], seen = new Set<string>(), depth = 0, conditional = false): { file: string; conditional: boolean }[] {
+  // (The closing reading, step 7 F3: a file reached plainly and again under a condition is walked
+  // under the condition too, so a core.hooksPath below it is read as conditional.)
+  const key = `${realpath(configFile)}\0${conditional}`;
+  if (depth > GIT_INCLUDE_DEPTH || !fs.existsSync(configFile) || seen.has(key)) return [];
+  seen.add(key);
+  const out: { file: string; conditional: boolean }[] = [];
+  const listed = gitRun(["config", "--file", configFile, "--null", "--type=path", "--get-regexp", "^include(if\\..*)?\\.path$"]);
   // 1: no such key.
   if (listed.status !== 0 && listed.status !== 1) {
     problems.push(`git could not say what ${configFile} includes, so those files cannot be protected`);
     return [];
   }
-  for (const line of listed.out.split("\n").filter(Boolean)) {
-    const value = line.slice(line.indexOf(" ") + 1).trim();
+  for (const entry of listed.out.split("\0").filter(Boolean)) {
+    const at = entry.indexOf("\n");
+    const value = at < 0 ? "" : entry.slice(at + 1);
     if (!value) continue;
-    const file = expandGitPath(value, path.dirname(configFile));
-    out.push(file, ...includedFiles(file, problems, seen, depth + 1));
+    // (Joined, not resolved: expandGitPath.)
+    const file = value.startsWith("/") ? value : `${path.dirname(configFile)}/${value}`;
+    const under = conditional || /^includeif\./i.test(entry);
+    out.push({ file, conditional: under }, ...includeTree(file, problems, seen, depth + 1, under));
   }
   return out;
+}
+// The user's configuration git reads, as its own environment names it (the closing reading, step 7
+// F1): the file GIT_CONFIG_GLOBAL names where it is set (git then reads neither of the two others),
+// `$XDG_CONFIG_HOME/git/config` and `~/.gitconfig` otherwise.
+export function globalGitConfigs(): string[] {
+  const named = process.env.GIT_CONFIG_GLOBAL;
+  if (named !== undefined) return named === "" || named === "/dev/null" ? [] : [named];
+  return [path.join(XDG_CONFIG, "git", "config"), path.join(HOME, ".gitconfig")];
+}
+// The system configuration git reads, as its own environment names it (the shell's git gets the
+// same: gitElsewhere): `GIT_CONFIG_SYSTEM` where set, `/etc/gitconfig` otherwise, none under
+// `GIT_CONFIG_NOSYSTEM` (a boolean to git; only a plain "yes" spelling of it is taken here, so
+// that what is not read is never one git reads).
+export function systemGitConfig(): string | undefined {
+  if (/^\s*(1|true|yes|on)\s*$/i.test(process.env.GIT_CONFIG_NOSYSTEM ?? "")) return undefined;
+  return process.env.GIT_CONFIG_SYSTEM ?? "/etc/gitconfig";
+}
+
+// A core.hooksPath that a file read only under a condition sets (twelfth pass, the maintainer's
+// decision "ask whenever a conditional include sets core.hooksPath"; C11's reading F2, run under
+// the wrapper: `includeIf "onbranch:feature"` naming `.hooks-feature`, on `main` nothing named
+// it, a call wrote `.hooks-feature/pre-commit`, `git switch -c feature` was allowed, and your
+// next commit ran it). Which directory git runs hooks from then depends on the branch, the
+// directory or the remote it is in, so it cannot be protected: each such file is a problem.
+// Read from that file alone (what it includes is a file of its own here).
+function conditionalHooks(included: { file: string; conditional: boolean }[], say: (text: string, at: string) => void) {
+  for (const { file } of included.filter((i) => i.conditional && lexists(i.file))) {
+    const r = gitRun(["config", "--file", file, "--null", "--get-all", "core.hooksPath"]);
+    if (r.status === 1) continue;
+    say(r.status === 0 ? `${file} sets core.hooksPath and git reads it only under a condition (includeIf): where git runs hooks from then cannot be told here, so it cannot be protected` : `git could not read core.hooksPath in ${file}, which git reads under a condition (includeIf)`, file);
+  }
+}
+
+// What git reads its hooks and its settings from for a git directory, besides the directory's
+// own `hooks/` and `config`: the directories a configured core.hooksPath names (as the git that
+// runs in its work tree reads the key and as the git that receives a push does; a relative one
+// from the git directory and, where that is a `.git`, from the directory around it), and the
+// files its config includes. For the comparison of a directory a pause named (decide.ts,
+// treeHeld). `problems`: what git could not say.
+export function gitReadsElsewhere(gitDir: string): { hooks: string[]; includes: string[]; problems: string[] } {
+  const problems: string[] = [];
+  const hooks = new Set<string>();
+  const bases = [gitDir, ...(path.basename(gitDir) === ".git" ? [path.dirname(gitDir)] : [])];
+  for (const receiving of [false, true]) {
+    const value = hooksPathOf(gitDir, problems, receiving);
+    if (value === undefined) continue;
+    for (const base of bases) {
+      const dir = hooksDir(value, base);
+      if (dir === undefined) problems.push(unfollowedHooks(value, gitDir));
+      else hooks.add(located(dir));
+    }
+  }
+  const includes = [...includedFiles(path.join(gitDir, "config"), problems), ...includedFiles(path.join(gitDir, "config.worktree"), problems)].map(located);
+  return { hooks: [...hooks], includes: [...new Set(includes)], problems: [...new Set(problems)] };
 }
 
 // The directories a plan made (ensureDir), each by the device, inode number and time of birth it
@@ -726,28 +808,60 @@ function ensureDir(target: string, roots: string[]): boolean {
 // The path with every symbolic link on the way to it resolved, for as far as it exists. A link
 // inside a writable directory is returned as `link`: a sandboxed command can replace it, so
 // nothing behind it can be protected (a mount holds a directory in place, not a link).
-function settle(p: string, rwDirs: string[]): { real: string; link?: string } {
-  let cur = path.resolve(p);
-  for (let hops = 0; hops < 40; hops++) {
-    let link: string | undefined;
-    let at = "/";
-    for (const part of cur.split("/").filter(Boolean)) {
-      at = path.join(at, part);
-      if (isSymlink(at)) {
-        link = at;
-        break;
-      }
-      if (!lexists(at)) break;
+// `replaceable`: the caller's own test of that. A chain that does not end, or a link that cannot
+// be read, comes back as a `link` too.
+// Walked as the kernel walks it, one name at a time from a place that holds no link: a link's
+// text is put in front of what is left of the path, and `..` steps up from the place reached so
+// far (tenth pass: built with `path.resolve` over the link's text, `<outside>/lnk/../d` was
+// taken for `<outside>/d` before `lnk` was followed, where the kernel goes to `d` beside where
+// `lnk` leads; run by a reviewer, xcheck/reviewers/c9-opus/p1-dotdot.test.mts). Where the whole
+// path is there, the kernel's own answer (realpath(3)) must be the same, or it counts as a link
+// that cannot be followed. Where a part is not there, the rest is taken as its text says; a `..`
+// after a missing name a call could make into a link is a link that cannot be followed.
+function settle(p: string, rwDirs: string[], replaceable = (link: string) => rwDirs.some((d) => within(link, d))): { real: string; link?: string } {
+  let at = "/";
+  let rest = (p.startsWith("/") ? p : `${process.cwd()}/${p}`).split("/").filter(Boolean);
+  let hops = 0;
+  while (rest.length) {
+    const part = rest.shift()!;
+    if (part === ".") continue;
+    if (part === "..") {
+      at = path.dirname(at);
+      continue;
     }
-    if (!link) return { real: cur };
-    if (rwDirs.some((d) => within(link, d))) return { real: cur, link };
+    const next = path.join(at, part);
+    let st: fs.Stats;
     try {
-      cur = path.resolve(path.dirname(link), fs.readlinkSync(link), path.relative(link, cur));
+      st = fs.lstatSync(next);
     } catch {
-      return { real: cur, link };
+      const real = path.join(next, ...rest);
+      return rest.includes("..") && replaceable(next) ? { real, link: next } : { real };
     }
+    if (!st.isSymbolicLink()) {
+      at = next;
+      continue;
+    }
+    if (replaceable(next) || ++hops > 40) return { real: path.join(next, ...rest), link: next };
+    let text: string;
+    try {
+      text = fs.readlinkSync(next);
+    } catch {
+      return { real: path.join(next, ...rest), link: next };
+    }
+    if (text.startsWith("/")) at = "/";
+    rest = [...text.split("/").filter(Boolean), ...rest];
   }
-  return { real: cur, link: cur };
+  try {
+    if (fs.realpathSync.native(p) !== at) return { real: at, link: at };
+  } catch {
+    // gone meanwhile: what was walked stands
+  }
+  return { real: at };
+}
+// Where a path git names leads, every link on the way followed as the kernel follows it.
+// (decide.ts too, for `core.hooksPath` and `core.worktree`: eleventh pass.)
+export function located(p: string): string {
+  return settle(p, [], () => false).real;
 }
 
 interface Protected {
@@ -760,6 +874,66 @@ interface Protected {
   whole?: string[];
   // Paths that are not there and must not appear while the call runs (Plan.gitWatch).
   watch?: string[];
+  // The links directly in a hooks directory that gitPaths judged (hookLinks): linksOut leaves them.
+  judged?: string[];
+}
+
+// The script a hook that is a symbolic link runs, where the link has the one shape whose end can
+// be held (tenth pass, the maintainer's decision "protect the script"): it lies directly in a
+// hooks directory, and its text names a regular file inside `own` (the project and the allowed
+// paths) that has no other name, reached through no symbolic link at all: the hooks directory is
+// where it lies, and none of the names of the link's text is a link (so none of the directories
+// above the file is: each is the hooks directory's, or one of those names). The kernel's own
+// answer (realpath(3) of the link) must then be the path its text names. That file is made
+// read-only like the hook (gitPaths); a call could otherwise rewrite what the hook runs, at the
+// next commit of whoever commits, outside the sandbox. Undefined for any other shape: the link then asks.
+function hookScript(link: string, own: string[]): string | undefined {
+  try {
+    // (`link` lies in a hooks directory protect gave: where it lies, with no link on the way.)
+    const dir = path.dirname(link);
+    const text = fs.readlinkSync(link);
+    let at = text.startsWith("/") ? "/" : dir;
+    for (const part of text.split("/").filter(Boolean)) {
+      if (part === ".") continue;
+      if (part === "..") {
+        at = path.dirname(at);
+        continue;
+      }
+      at = path.join(at, part);
+      if (fs.lstatSync(at).isSymbolicLink()) return undefined;
+    }
+    const st = fs.lstatSync(at);
+    if (!st.isFile() || st.nlink > 1 || fs.realpathSync.native(link) !== at) return undefined;
+    return own.some((d) => within(at, d)) ? at : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// The regular files below `dir` (or `dir` itself, a file), at any depth, to `limit` entries:
+// undefined past it.
+function filesBelow(dir: string, limit = 10_000): string[] | undefined {
+  const out: string[] = [];
+  let seen = 0;
+  const visit = (at: string): boolean => {
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(at);
+    } catch {
+      return true;
+    }
+    if (++seen > limit) return false;
+    if (st.isFile()) out.push(at);
+    if (!st.isDirectory()) return true;
+    let names: string[];
+    try {
+      names = fs.readdirSync(at);
+    } catch {
+      return true;
+    }
+    return names.every((name) => visit(path.join(at, name)));
+  };
+  return visit(dir) ? out : undefined;
 }
 
 // The hooks git runs in a repository that is pushed into (githooks(5)).
@@ -795,24 +969,101 @@ function gitPaths(found: Found, searchDirs: string[], rwDirs: string[], gitWrita
   const whole: string[] = [];
   const all: string[] = [];
   const problems = { push: (text: string, at: string) => void (own.some((d) => within(at, d)) && all.push(text)) };
+  // The shared directories: every writable one that is not the project's or an allowed path's
+  // (the temp directories and `sandboxWritable`). Every program on the machine writes them.
+  const shared = rwDirs.filter((d) => !own.some((o) => within(d, o)));
+  const sharedPlace = (p: string) => !own.some((o) => within(p, o)) && shared.some((d) => within(p, d));
+  // What the checks of the hooks, config and info/ git reads for a git directory (`place`) find:
+  // said wherever the file lies, unless the git directory lies in a shared directory, where it
+  // is said only for a file in the project or an allowed path, as before (eleventh pass: keyed
+  // to where the file lies, a hook of a bare repository beside the project, outside every
+  // writable directory, hard-linked to the project's script, was found and dropped, and so was
+  // an included file outside the project; run by a reviewer, xcheck/reviewers/c10-opus/
+  // r1-outside.test.mts).
+  const sayFor = (place: string) => (text: string, at: string) => (sharedPlace(place) ? problems.push(text, at) : void all.push(text));
   for (const link of found.links) problems.push(`${link} is a symbolic link, which cannot be made read-only: a command could point it at a repository of its own making`, link);
   // A path that must stay as it is. `create`: it must exist too, and is made when that is safe.
-  const protect = (p: string, what: string, create = false) => {
+  // What was made read-only, by where it lies. `missing`: where one that does not exist is said
+  // (an included config file: for the config that includes it, a shared temp directory too).
+  const protect = (p: string, what: string, create = false, missing: (text: string, at: string) => void = problems.push): string | undefined => {
     const { real, link } = settle(p, rwDirs);
     if (link) return void problems.push(`${what} ${p} leads through the symbolic link ${link}, which a command could replace`, link);
     if (!insideRw(real) && !insideRw(realpath(path.dirname(real)))) return; // not writable: nothing to plant
     if (!lexists(real)) {
-      if (!create) return void problems.push(`${what} ${p} does not exist inside a writable directory, so it cannot be protected`, real);
+      if (!create) return void missing(`${what} ${p} does not exist inside a writable directory, so it cannot be protected`, real);
       if (!own.some((d) => within(real, d))) return; // nothing is created in a shared temp directory
       if (!ensureDir(real, rwDirs)) return void problems.push(`${what} ${p} does not exist and could not be created safely`, real);
     }
     ro.push(real);
+    return real;
   };
-  const listing = (configFile: string) => {
+  // The links directly in a hooks directory git runs from (`dir`, where it lies): one that
+  // leads to a script of the project (hookScript) has the script made read-only, pinned like a
+  // hook; any other asks, whatever it leads to, for every call (tenth pass: judged by where it
+  // ends, it was judged by its text). Each is `judged`: linksOut does not say it again. Every
+  // such directory, wherever it lies, whether or not the plan could make it read-only (eleventh
+  // pass: one outside every writable directory, your global core.hooksPath in your home, was
+  // never looked at, and a link there to the project's script let a call rewrite what every
+  // commit runs; run by a reviewer, xcheck/reviewers/c10-opus/r1-outside.test.mts).
+  const judged = new Set<string>();
+  // (Not the root directory, where git looks for hooks under an empty core.hooksPath: only root
+  // can put a file or a link there, and the links it holds, `/bin` and the like, are the
+  // system's and no hooks.)
+  const notRoot = (dir: string) => dir !== "/";
+  const hookLinks = (dir: string, say: (text: string, at: string) => void) => {
+    let list: fs.Dirent[];
+    try {
+      list = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of list) {
+      if (!e.isSymbolicLink()) continue;
+      const link = path.join(dir, e.name);
+      judged.add(link);
+      const script = hookScript(link, own);
+      if (script) ro.push(script);
+      else say(`${link} is a symbolic link among the hooks in ${dir}, and not one that leads straight to a script of the project with no other link on the way and no other name: what git runs through it cannot be protected`, link);
+    }
+  };
+  // A file git reads or runs from a git directory that is read-only for the call, with another
+  // name (a hard link): what the read-only mount holds can be rewritten through that name, which
+  // may lie where the call writes (tenth pass, the maintainer's decision "ask on hard links"; a
+  // hook hard-linked to `scripts/pre-commit` was rewritten by any call, run by a reviewer,
+  // xcheck/reviewers/c9-sonnet/x9-hardlink.test.mts). A call cannot make one across the mount
+  // (EXDEV); only one that is there already matters. git's own files with more than one name
+  // (objects and packs a `clone --local` shares, an index) are not read or run as code or settings.
+  // Nor is a hook whose name ends in `.sample`, directly in a hooks directory (`hooks`): git never
+  // runs one (eleventh pass, the maintainer's decision "skip .sample"; a `cp -al` copy of a
+  // repository made every call in either ask for them; run by a reviewer, xcheck/reviewers/
+  // c10-sonnet/out10/cpal.log). Its `config` and `info/exclude` with two names still ask.
+  const hardLinked = (paths: string[], what: string, say: (text: string, at: string) => void, hooks: string[]) => {
+    for (const p of paths) {
+      const files = filesBelow(p);
+      if (!files) {
+        say(`${p} holds too many entries to look for hard links among them`, p);
+        continue;
+      }
+      for (const file of files) {
+        if (file.endsWith(".sample") && hooks.includes(path.dirname(file))) continue;
+        try {
+          const links = fs.lstatSync(file).nlink;
+          if (links > 1) say(`${file} (${what}) has ${links} hard links: what git reads or runs from it can be rewritten through another name, which may lie where the call can write`, file);
+        } catch {
+          // gone
+        }
+      }
+    }
+  };
+  // (Twelfth pass: what git could not list, and a conditional include that sets core.hooksPath,
+  // are said for the git directory, `say`, as everything else of it is; keyed to the config
+  // file they were dropped for a git directory outside every writable directory, C11's reading F3.)
+  const listing = (configFile: string, say: (text: string, at: string) => void) => {
     const failed: string[] = [];
-    const files = includedFiles(configFile, failed);
-    for (const text of failed) problems.push(text, configFile);
-    return files;
+    const tree = includeTree(configFile, failed);
+    for (const text of failed) say(text, configFile);
+    conditionalHooks(tree, say);
+    return tree.map((i) => i.file);
   };
   // Your own core.hooksPath as git reads it outside any repository: an absolute one is made
   // where it is missing (below). Each repository's own reading, your config included, follows.
@@ -824,9 +1075,25 @@ function gitPaths(found: Found, searchDirs: string[], rwDirs: string[], gitWrita
     // A linked worktree's admin directory has no hooks of its own (git takes them from the
     // directory its `commondir` names): one that is there is protected, none is made.
     const ownHooks = !lexists(path.join(gitDir, "commondir"));
-    if (insideRw(gitDir) && lexists(gitDir) && (ownHooks || lexists(hooks))) protect(hooks, "the hooks directory", ownHooks);
+    // What is found among them is said unless this git directory lies in a shared directory.
+    const say = sayFor(gitDir);
+    // The hooks directories of this repository, where they lie: the ones that are protected
+    // (`held`), and every one git runs from (`located`), wherever it lies, whether or not it
+    // could be made read-only here (it is not writable). Their links and hard links are looked
+    // at below.
+    const runFrom = new Set<string>();
+    const held = (real: string | undefined) => {
+      if (real !== undefined) runFrom.add(real);
+    };
+    if (insideRw(gitDir) && lexists(gitDir) && (ownHooks || lexists(hooks))) held(protect(hooks, "the hooks directory", ownHooks));
+    if (ownHooks && lexists(gitDir)) runFrom.add(located(hooks));
     // Keep the specific unreadable include path ahead of a failed effective-config lookup.
-    for (const file of [...listing(path.join(gitDir, "config")), ...listing(path.join(gitDir, "config.worktree"))]) protect(file, "git config includes");
+    const includes = [...listing(path.join(gitDir, "config"), say), ...listing(path.join(gitDir, "config.worktree"), say)];
+    // (One that is not there yet is said as the rest of the git directory is, in a shared temp
+    // directory too: a call could make it there, and git would read it, conditional or not
+    // (thirteenth pass; Sonnet's C12 F-2, run: a call wrote the hook, the next made the include
+    // that names it, and your commit ran it).)
+    for (const file of includes) protect(file, "git config includes", false, say);
     // A relative core.hooksPath is resolved by git in whichever worktree it runs: every one of
     // them is protected, so a pointer file planted elsewhere cannot draw the protection away.
     // The value is the one git uses in this repository (`configured`).
@@ -835,12 +1102,14 @@ function gitPaths(found: Found, searchDirs: string[], rwDirs: string[], gitWrita
     if (hooksPath !== undefined) {
       for (const top of tops) {
         const dir = hooksDir(hooksPath, top);
-        if (dir !== undefined) protect(dir, "core.hooksPath", true);
+        if (dir === undefined) continue;
+        held(protect(dir, "core.hooksPath", true));
+        runFrom.add(located(dir));
       }
       // A value git expands in a way that is not followed here names a directory nobody looked
       // at: it may lie in the project, where every call can write (eighth pass; a user's own
       // `~<name>/` leads into their home directory). Giving up is a verdict: the call asks.
-      if (hooksDir(hooksPath, gitDir) === undefined) problems.push(unfollowedHooks(hooksPath, gitDir), gitDir);
+      if (hooksDir(hooksPath, gitDir) === undefined) say(unfollowedHooks(hooksPath, gitDir), gitDir);
     }
     const inside = gitWritable instanceof Set ? [...gitWritable].filter((w) => w !== gitDir && within(w, gitDir) && selected(w)) : [];
     // The hooks of a push into the repository run in its git directory (git changes into the
@@ -851,12 +1120,16 @@ function gitPaths(found: Found, searchDirs: string[], rwDirs: string[], gitWrita
     // watched, and the layout check names it when it appears, for any call. A value that climbs
     // out (`../receive`) leads into the work tree, where every call can write (seventh pass).
     const receiving = lexists(gitDir) ? hooksPathOf(gitDir, failed, true) : undefined;
-    const pushHooks = receiving !== undefined && !absoluteHooks(receiving) ? hooksDir(receiving, gitDir) : undefined;
+    const pushDir = receiving !== undefined && !absoluteHooks(receiving) ? hooksDir(receiving, gitDir) : undefined;
+    const pushHooks = pushDir === undefined ? undefined : located(pushDir);
     // (The receiving git may read another value than the one above: `configured`.)
-    if (receiving !== undefined && receiving !== hooksPath && hooksDir(receiving, gitDir) === undefined) problems.push(unfollowedHooks(receiving, gitDir), gitDir);
-    for (const text of new Set(failed)) problems.push(text, gitDir);
+    if (receiving !== undefined && receiving !== hooksPath && hooksDir(receiving, gitDir) === undefined) say(unfollowedHooks(receiving, gitDir), gitDir);
+    for (const text of new Set(failed)) say(text, gitDir);
     if (pushHooks !== undefined && pushHooks !== gitDir) {
-      if (lexists(pushHooks)) protect(pushHooks, "core.hooksPath for a push into the repository");
+      if (lexists(pushHooks)) {
+        held(protect(pushDir!, "core.hooksPath for a push into the repository"));
+        runFrom.add(pushHooks);
+      }
       else if (insideRw(firstMissing(pushHooks)) && !within(firstMissing(pushHooks), gitDir)) watch.push(firstMissing(pushHooks));
       else if (within(pushHooks, gitDir) && insideRw(gitDir) && selected(gitDir)) watch.push(firstMissing(pushHooks));
     }
@@ -877,13 +1150,15 @@ function gitPaths(found: Found, searchDirs: string[], rwDirs: string[], gitWrita
       // call's are made writable again within it (lockwrite, AUTOMODE_REOPEN; round 4, finding
       // 21, seventh pass). Nothing can then be made at its top or on the way: no `packed-refs`,
       // `shallow`, `index` or `info/` that the superproject's git would trust, no new module.
-      // Each of them, the ones inside another too (eighth pass): a git directory the call may
-      // write is a mount of its own (a pin), which keeps the read-only flag it got with the
-      // directory around it when only that one is made writable again (`git -C inner add` from
-      // the outer module failed on `index.lock`).
+      // The outermost of them here: a git directory the call may write inside another is a
+      // mount of its own (a pin), which keeps the read-only flag it got with the directory
+      // around it, and `plan` makes every such pin writable again with the directory it lies in
+      // (eighth pass: `git -C inner add` from the outer module failed on `index.lock`), unless
+      // it lies in a path that is read-only there. Naming the inner ones here as well opened one
+      // that lies under the outer one's `hooks/` (ninth pass).
       ro.push(gitDir);
       whole.push(gitDir);
-      reopen.push(...inside);
+      reopen.push(...inside.filter((w) => !inside.some((o) => o !== w && within(w, o))));
     } else if (own.some((d) => within(gitDir, d))) {
       // No repository, only named as one (a `.git` file that points at a directory around the
       // call's repository): it is not granted, and cannot be read-only around it either.
@@ -892,11 +1167,39 @@ function gitPaths(found: Found, searchDirs: string[], rwDirs: string[], gitWrita
       ro.push(gitDir);
       whole.push(gitDir);
     }
+    const looked = [...runFrom].filter(notRoot);
+    for (const dir of looked) hookLinks(dir, say);
+    // What git reads or runs from a git directory that is read-only for the call: no file of it
+    // may have another name. (A call that may write the directory is a git-only call, and git
+    // writes a work tree's files anew, never in place through another name.)
+    if (!selected(gitDir)) hardLinked([...looked, path.join(gitDir, "config"), path.join(gitDir, "config.worktree"), ...includes.map(located), path.join(gitDir, "info")], `read or run by git for ${gitDir}`, say, looked);
   }
-  if (globalHooks && absoluteHooks(globalHooks)) protect(expandGitPath(globalHooks, HOME), "your global core.hooksPath", true);
-  // Your own config: a listing git cannot give counts wherever the file is.
+  if (globalHooks && absoluteHooks(globalHooks)) {
+    const real = protect(expandGitPath(globalHooks, HOME), "your global core.hooksPath", true);
+    // Where git runs every repository's hooks from, wherever it lies (eleventh pass): its links
+    // and hard links are said whatever place it is, a shared directory too, since git runs it
+    // for every repository.
+    const runFrom = [...new Set([...(real === undefined ? [] : [real]), located(hooksDir(globalHooks, HOME) ?? expandGitPath(globalHooks, HOME))])].filter(notRoot);
+    const say = (text: string) => void all.push(text);
+    for (const dir of runFrom) hookLinks(dir, say);
+    hardLinked(runFrom, "your global core.hooksPath", say, runFrom);
+  }
+  // Your own config, and the system's (thirteenth pass: Opus's C12 F3 and Sonnet's F-3, run: an
+  // `includeIf "onbranch:…"` there set a hooks path in the project unseen): what they include is
+  // protected, and a listing git cannot give, a conditional hooks path or an include that is not
+  // there yet counts wherever the file is.
   const globalProblems: string[] = [];
-  for (const file of includedFiles(path.join(XDG_CONFIG, "git", "config"), globalProblems).concat(includedFiles(path.join(HOME, ".gitconfig"), globalProblems))) protect(file, "your git config includes");
+  const sayGlobal = (text: string) => void globalProblems.push(text);
+  const system = systemGitConfig();
+  const systemIncludes = system === undefined ? [] : includeTree(system, globalProblems);
+  const globals = globalGitConfigs();
+  const globalIncludes = globals.flatMap((file) => includeTree(file, globalProblems));
+  // (The closing reading, step 7 F1: the file itself too, where a call could write it, as git
+  // reads it for every command run outside the sandbox.)
+  for (const file of globals) if (lexists(file)) protect(file, "your git config", false, sayGlobal);
+  for (const { file } of globalIncludes) protect(file, "your git config includes", false, sayGlobal);
+  for (const { file } of systemIncludes) protect(file, "the system git config includes", false, sayGlobal);
+  conditionalHooks([...globalIncludes, ...systemIncludes], sayGlobal);
   // Hook managers, at the top of every checkout.
   const tops = [...found.tops.values()].flatMap((set) => [...set]);
   for (const top of new Set([...tops, ...searchDirs.filter((d) => !["/tmp", "/var/tmp", realpath(os.tmpdir())].includes(d))])) {
@@ -905,80 +1208,97 @@ function gitPaths(found: Found, searchDirs: string[], rwDirs: string[], gitWrita
       if (lexists(p)) protect(p, "the hook manager file");
     }
   }
-  return { ro: [...new Set(ro)].filter(lexists), pin: [...new Set(pin)], problems: [...all, ...globalProblems], reopen: [...new Set(reopen)], watch: [...new Set(watch)], whole: [...new Set(whole)] };
+  return { ro: [...new Set(ro)].filter(lexists), pin: [...new Set(pin)], problems: [...all, ...globalProblems], reopen: [...new Set(reopen)], watch: [...new Set(watch)], whole: [...new Set(whole)], judged: [...judged] };
 }
 
-// The symbolic links git follows inside a git directory: every one at its top, the ones on the
-// way to its modules (below `modules/`, down to each module's own directory: that one holds a
-// `HEAD` and is a git directory of its own, looked at as itself) and the entries of `worktrees/`.
-// `only`: of the top, these names alone. `full`: there was more below `modules/` than is listed.
-const LINK_ENTRIES = 20_000;
-function gitLinks(dir: string, only?: string[]): { links: string[]; full: boolean } {
+// The symbolic links inside a git directory, at any depth (ninth pass: the eighth looked at the
+// top, below `modules/` and at the entries of `worktrees/`, and `.git/refs/heads` as a link into
+// the project let a call in a submodule write the superproject's `main`; run by both reviewers,
+// xcheck/reviewers/c8-sonnet/x8-p1d.test.mts). Every directory below `dir` is listed, down to
+// each git directory of its own that the walk found (`stops`: a module's, a linked worktree's
+// admin directory; each is looked at as itself, where it is read-only for the call).
+// `only`: of the top, these names alone.
+//
+// The bound (`linkLimits`). `entries`: the directories, the links, and the files outside an
+// object store that are listed. `objects`: the files below a directory named `objects` (git's
+// own store, and those of lfs and annex), which are listed and passed over: a loose object or a
+// pack is a file, and only a link or a directory among them matters here, so a store of any
+// ordinary size costs nothing of the first bound. `depth`: how many directories down.
+// `over`: what was not looked at, where a bound was passed or a directory could not be listed.
+// That is a problem for the caller, not silence.
+export const linkLimits = { entries: 100_000, objects: 1_000_000, depth: 40 };
+function gitLinks(dir: string, stops: ReadonlySet<string>, only?: string[]): { links: string[]; over?: string } {
   const links: string[] = [];
-  let left = LINK_ENTRIES;
-  const entries = (at: string) => {
+  let entries = 0;
+  let objects = 0;
+  let over: string | undefined;
+  const visit = (at: string, depth: number, store: boolean) => {
+    let list: fs.Dirent[];
     try {
-      return fs.readdirSync(at, { withFileTypes: true });
-    } catch {
-      return [];
+      list = fs.readdirSync(at, { withFileTypes: true });
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      // Gone since it was listed, or no directory at all (the top of a git directory that is not there).
+      if (code !== "ENOENT" && code !== "ENOTDIR") over ??= `${at} cannot be listed (${code}), so the symbolic links in it cannot be looked for`;
+      return;
     }
-  };
-  const modules = (at: string, depth: number) => {
-    for (const e of entries(at)) {
-      if (left-- <= 0) return;
+    for (const e of list) {
+      if (over) return;
+      if (at === dir && only && !only.includes(e.name)) continue;
       const p = path.join(at, e.name);
+      const kept = e.isSymbolicLink() || e.isDirectory();
+      if (!kept && store) {
+        if (++objects > linkLimits.objects) over = `${dir} holds more than ${linkLimits.objects} objects, too many to look for symbolic links among them`;
+        continue;
+      }
+      if (++entries > linkLimits.entries) return void (over = `${dir} holds more than ${linkLimits.entries} entries, too many to look for symbolic links among them`);
       if (e.isSymbolicLink()) links.push(p);
-      else if (e.isDirectory() && depth < 8 && !lexists(path.join(p, "HEAD"))) modules(p, depth + 1);
+      else if (e.isDirectory() && !stops.has(p)) {
+        if (depth >= linkLimits.depth) over = `${p} lies more than ${linkLimits.depth} directories deep in ${dir}, deeper than symbolic links are looked for`;
+        else visit(p, depth + 1, store || e.name === "objects");
+      }
     }
   };
-  for (const e of entries(dir)) {
-    if (only && !only.includes(e.name)) continue;
-    const p = path.join(dir, e.name);
-    if (e.isSymbolicLink()) links.push(p);
-    else if (e.isDirectory() && e.name === "modules") modules(p, 0);
-    else if (e.isDirectory() && e.name === "worktrees") for (const w of entries(p)) if (w.isSymbolicLink()) links.push(path.join(p, w.name));
-  }
-  return { links, full: left < 0 };
+  visit(dir, 0, false);
+  return { links, ...(over ? { over } : {}) };
 }
 
 // A git directory that is read-only whole is a mount over the directory, and a symbolic link in
-// it is not held by that: what git reads through the link lies wherever the link leads. Where
-// that is a place the call may write (inside a writable directory, and in no read-only path
-// there, or in a directory made writable again), the call could write what git takes for a part
-// of the git directory: the superproject's refs through `.git/refs`, a module of any name
-// through `.git/modules/<name>` (round 4, finding 21, eighth pass; run by a reviewer,
-// xcheck/reviewers/c7-sonnet/y-p2d.test.mts: `main` forged from a call in a submodule). Each
-// such link is a problem, and the call asks. A link that leads outside the writable directories,
-// or into a path that is read-only for the call, changes nothing: the link itself cannot be
-// replaced (its directory is read-only), and neither can what it leads to.
-// `dirs`: the directories to look in, each whole or for the names `only` (a linked worktree's
-// common directory, of which `modules/` and `worktrees/` alone are closed). `own`: the caller's
-// own directories; a link from a repository in a shared temp directory to another place there
-// is left, as everything else in such a repository that cannot be protected is (gitPaths).
-function linksOut(dirs: { dir: string; only?: string[] }[], ro: string[], reopen: string[], rwDirs: string[], own: string[]): string[] {
+// it is not held by that: what git reads through the link lies wherever the link leads, and the
+// place it leads to is not part of the mount: the superproject's refs through `.git/refs` or
+// `.git/refs/heads`, a hook through `.git/hooks/pre-commit`, a module of any name through
+// `.git/modules/<name>` (round 4, finding 21, eighth and ninth pass). The rule (tenth pass, the
+// maintainer's decision "any link asks"): every symbolic link at any depth of such a directory
+// is a problem, whatever it leads to, and the call asks. Nothing is judged by where a link goes:
+// judged so, link by link, by the text of each, `<outside>/lnk/../d` was taken for a place
+// outside where the kernel goes into the project (run by a reviewer, xcheck/reviewers/c9-opus/
+// p1-dotdot.test.mts), and before that a chain was taken for its end (c8-opus). What it costs:
+// a repository whose objects, refs or logs are a link to a store elsewhere asks for every call
+// that has it read-only (every call that is not git-only in it, and a call in its submodules).
+// The one exception is a hook that is a link to a script of the project (`judged`: gitPaths
+// makes the script read-only, and says every other link among the hooks itself).
+// A link in a git directory the call may write (a git-only call in its own repository) is the
+// call's own, as the rest of that directory is, and not looked at here. Where only some names of
+// a directory are closed (`only`: a linked worktree's common directory, of which `modules/` and
+// `worktrees/` are), a link below them asks the same.
+// `dirs`: the directories to look in, each whole or for the names `only`. `stops`: the git
+// directories the walk found. `own`: the caller's own directories (the project and the allowed
+// paths). `shared`: the temp directories, which every program on the machine writes: a git
+// directory there is left, as everything else in such a repository that cannot be protected is
+// (gitPaths); whatever a call could do through a link of it, it can do there anyway. One outside
+// every writable directory (the main checkout of a linked worktree that is the project) is
+// read-only for every call, and its links ask like any other; so does passing the bound there
+// (eleventh pass: said only for the caller's own directories, a link past it in a bare
+// repository beside the project went unseen and unsaid; run by a reviewer,
+// xcheck/reviewers/c10-opus/r1-outside.test.mts).
+function linksOut(dirs: { dir: string; only?: string[] }[], stops: ReadonlySet<string>, own: string[], shared: string[], judged: ReadonlySet<string>): string[] {
   const out: string[] = [];
-  // The innermost read-only path or reopened directory around a place decides.
-  const mayWrite = (p: string) => {
-    if (!rwDirs.some((d) => within(p, d))) return false;
-    let best = -1;
-    let open = true;
-    for (const dir of ro) if (within(p, dir) && dir.length > best) [best, open] = [dir.length, false];
-    for (const dir of reopen) if (within(p, dir) && dir.length >= best) [best, open] = [dir.length, true];
-    return open;
-  };
+  const owned = (p: string) => own.some((d) => within(p, d));
   for (const { dir, only } of dirs) {
-    const { links, full } = gitLinks(dir, only);
-    if (full && own.some((d) => within(dir, d))) out.push(`${dir} holds more than ${LINK_ENTRIES} entries below modules/, too many to look for symbolic links among them`);
-    for (const link of links) {
-      let target: string;
-      try {
-        target = fs.realpathSync(link);
-      } catch {
-        // It leads to nothing that is there: the place a command could make.
-        target = settle(link, []).real;
-      }
-      if (own.some((d) => within(dir, d) || within(target, d)) && mayWrite(target)) out.push(`${link} is a symbolic link in a git directory that is read-only for this call, and it leads to ${target}, which the call may write: what git reads through it cannot be protected`);
-    }
+    if (!owned(dir) && shared.some((d) => within(dir, d))) continue;
+    const { links, over } = gitLinks(dir, stops, only);
+    if (over) out.push(over);
+    for (const link of links) if (!judged.has(link)) out.push(`${link} is a symbolic link in a git directory that is read-only for this call: what git reads or runs through it lies wherever the link leads, which the sandbox does not hold, so it cannot be protected`);
   }
   return out;
 }
@@ -995,7 +1315,8 @@ export function pushHooksMissing(gitDirs: Iterable<string>, tops?: ReadonlyMap<s
     if (tops?.get(gitDir)?.has(gitDir)) continue;
     const hooksPath = hooksPathOf(gitDir, unused, true);
     if (hooksPath === undefined || absoluteHooks(hooksPath)) continue;
-    const pushHooks = hooksDir(hooksPath, gitDir);
+    const dir = hooksDir(hooksPath, gitDir);
+    const pushHooks = dir === undefined ? undefined : located(dir);
     if (pushHooks !== undefined && pushHooks !== gitDir && !lexists(pushHooks)) out.set(gitDir, firstMissing(pushHooks));
   }
   return out;
@@ -1015,7 +1336,8 @@ function receiveHook(gitDir: string, common: string): string | undefined {
     if (value == null || (key === "core.fsmonitor" && /^(true|false|yes|no|on|off|1|0|)$/i.test(value))) continue;
     return `${key} set to a program (${JSON.stringify(value)})`;
   }
-  const dir = hooksPath == null ? path.join(common, "hooks") : hooksDir(hooksPath, gitDir);
+  const named = hooksPath == null ? path.join(common, "hooks") : hooksDir(hooksPath, gitDir);
+  const dir = named === undefined ? undefined : located(named);
   if (dir === undefined) return `a core.hooksPath that cannot be followed here (${hooksPath})`;
   let names: string[];
   try {
@@ -1147,7 +1469,8 @@ export function protectedPaths(o: Pick<PlanOptions, "projectRoots" | "allowedPat
   const found = discover(searchDirs, { scan });
   const git = gitPaths(found, searchDirs, searchDirs, false, searchDirs);
   const opencode = opencodePaths(o.project, searchDirs);
-  const links = linksOut((git.whole ?? []).map((dir) => ({ dir })), git.ro, [], searchDirs, searchDirs);
+  // An edit asks where a call would (ninth pass).
+  const links = linksOut((git.whole ?? []).map((dir) => ({ dir })), found.gitDirs, searchDirs, ["/tmp", "/var/tmp", os.tmpdir()].map(realpath), new Set(git.judged));
   return { paths: [...git.ro, ...opencode.ro], problems: [...found.problems, ...git.problems, ...links, ...opencode.problems] };
 }
 
@@ -1311,8 +1634,11 @@ export function plan(o: PlanOptions, scan?: Scan): Plan {
     for (const kept of pins) if (kept !== dir && within(kept, dir) && isDir(kept) && !isSymlink(kept) && !ro.some((p) => within(kept, p) && within(p, dir))) reopened.add(kept);
   }
   const reopen = [...reopened].sort((a, b) => a.length - b.length);
-  // A link in a git directory that is read-only for the call, into a place it may write (linksOut).
-  problems.push(...linksOut([...(git.whole ?? []).map((dir) => ({ dir })), ...[...shutIn].map(([dir, only]) => ({ dir, only }))], ro, reopen, rwDirs, own));
+  // A link in a git directory that is read-only for the call, on the way to a place it may write
+  // (linksOut). The shared directories it leaves are the writable ones that are not the
+  // project's nor an allowed path's: the temp directories and `sandboxWritable` (the cache
+  // directories). An allowed path counts as the project: a git directory there is walked.
+  problems.push(...linksOut([...(git.whole ?? []).map((dir) => ({ dir })), ...[...shutIn].map(([dir, only]) => ({ dir, only }))], found.gitDirs, own, rwDirs.filter((d) => !own.some((o) => within(d, o))), new Set(git.judged)));
   const unexpressible = [...rwDirs, ...ro, ...reopen, ...pins, ...hide].filter((p) => !usable(p));
   if (unexpressible.length) problems.push(`cannot protect a path containing a newline (${JSON.stringify(unexpressible[0])})`);
   for (const [name, paths] of [["RW", rwDirs], ["RO", ro], ["REOPEN", reopen], ["PIN", pins], ["HIDE", hide], ["TMPFS", ["/dev/shm"]]] as const) {

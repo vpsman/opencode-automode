@@ -14,21 +14,25 @@ Anything that breaks a guarantee the README states, for example:
 - an allowed command whose printed text (the text that runs) does something else than the
   command as the agent wrote it;
 - an auto-allowed command writing outside the directories the sandbox allows, changing git
-  hooks or config, reaching a hidden socket or credential, or signalling a process outside;
+  hooks or config or a script a hook links to, reaching a hidden socket or credential, or
+  signalling a process outside;
 - something planted by a sandboxed command that later runs outside the sandbox, including a
   `commondir` or `config.worktree` that is still in place after the call that made it is over;
 - a file the session changed, or a build, test or script in a project the session wrote
   into, running without going to the model: a bypass of the change-time check, of the record
-  of what the session wrote, or of the safe list;
+  of what the session wrote, or of the safe list (a program found under a safe name that is
+  not the tool the list means, a writable `PATH` entry or a hook the check misses);
 - an ssh agent handed to a git command that goes into cloned submodules;
 - the plugin failing open: an error, timeout or unexpected input ending in "allow".
 
 The limits listed under "Known gaps" in the README (network access, data typed literally into
 a URL or a DNS name, reads of files that are not hidden, a credential file read through a name
-made earlier in the same call or by a program that reads a whole directory, project files that
-run later, builds and tests in a session that has written nothing, values bash evaluates as
-arithmetic in a script or program the command runs, allowed programs judged by name, a file
-named like an option that an archive or a checkout brings, a planted git file for as long as
+another program made earlier in the same call or by a program that reads a whole directory, options that read
+a file of names beyond the table, a file name an `awk` program builds, project files that
+run later, builds and tests in a session that has written nothing in the project, values bash
+evaluates as arithmetic in a script or program the command runs, allowed programs judged by
+name for their options, a file named like an option that an archive or a checkout brings in a
+call the model allows, a planted git file for as long as
 the call that made it runs, the ssh agent for ssh commands, remote read-only checks that read
 only the words, abstract unix sockets on Linux 6.10 and 6.11, a bash older than 5.2, shared
 `/tmp`, two opencode processes on one checkout, an `opencode.json` created mid-session,

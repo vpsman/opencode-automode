@@ -24,6 +24,15 @@ npm run build:sandbox
 npm test                 # uses a throwaway $HOME; needs no model
 ```
 
+`npm test` runs the test files in parallel: `AUTOMODE_TEST_JOBS` of them at a time (default
+half the processors, at most 8), each in a process of its own with its own throwaway home and
+temp directory. Each file's output is printed whole when it is over; the counts for the whole
+suite are the block after the line `── all N files, J at a time ──`. `AUTOMODE_TEST_JOBS=1`
+runs them one after another. Options such as `--test-name-pattern=...` go to every file's run.
+`TMPDIR` must be on the same file system as the test home (`~/.cache/automode-tests`, or
+`$AUTOMODE_TEST_BASE`); otherwise some of the `test/c-*.test.mts` tests fail with `EXDEV`
+(a rename across file systems).
+
 A few things keep the plugin trustworthy, so please keep them true:
 
 - **Fail closed.** Errors, timeouts, missing files and anything unexpected must end in "ask",

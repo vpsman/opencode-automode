@@ -19,10 +19,13 @@ For each shell tool call:
    prompt shows the command as the agent issued it; the decision log holds both where they
    differ (`command` and `runs`). A command that cannot be printed asks, and what you approve
    runs as issued. The cost is a prompt on text that bash accepts and the printer does not
-   print: `$'...'` and `$"..."` quoting; `${x@P}`, `${!x}`, quotes, a blank or an operator
-   inside `${...}`, and `${...}` nested deeply; `$[...]`; an array assignment (`a=(1 2)`) or
-   an array element where an assignment may stand (`a[0]=1`); braces where bash expands none
-   or reads the word first (the word that names a command, a redirect's target, an
+   print: `$'...'` and `$"..."` quoting; `${x@P}`, `${!x}`, quotes or an operator inside `${...}`
+   (a blank before an offset, `${x: -1}`, prints), and `${...}` nested deeply; `$[...]`; a word that holds arithmetic and
+   other text (`$((-1))d`, `id_ed$((25519))`: the rules read `0` in its place; an assignment's
+   own `x=$((i+1))` is as before); a pipe, `&&` or `||` with no command after it, and a word
+   straight after a subshell's `)` (syntax errors bash refuses); an array
+   assignment (`a=(1 2)`) or an array element where an assignment may stand (`a[0]=1`);
+   braces where bash expands none or reads the word first (the word that names a command, a redirect's target, an
    assignment, a function's name, a loop's variable, a `case` word or pattern, inside
    `[[ ]]`); a word with both an expansion and a brace expansion (`$e{-delete,}`) or a `$`
    in a word with braces (`{$,a}x`); a private-use character in a word with braces, and a
@@ -58,10 +61,12 @@ For each shell tool call:
      POSIX classes included (`cp x .g[[:alpha:]]t/config`; an equivalence class or a
      collating symbol counts as any character, and a glob the matcher cannot read asks), and
      braces are expanded by the printer. `cp -t`, `sort -o`, git's `--output`,
-     `format-patch -o`, `tar -C`, `unzip -d`, `find -fprint0` and rsync's `--log-file`,
-     `--write-batch`, `--backup-dir`, `--temp-dir` and `--partial-dir` are held to the same
-     test, and so is a write that lands in a `.git` where the command runs
-     (`cd .git/hooks && echo x > pre-commit`).
+     `format-patch -o`, `tar -C`, `unzip -d`, `find -fprint0`, rsync's `--log-file`,
+     `--write-batch`, `--backup-dir`, `--temp-dir` and `--partial-dir`, the archive
+     `tar -c` writes and its `--index-file`, `-g` and `--volno-file`, zip's archive and
+     `-O`, and the output of `zstd -o` (and `--trace`), brotli, lzip, lzop and lz4 are held
+     to the same test (`tar czf ../a.tgz .` asks as `cp x ../y` does), and so is a write that
+     lands in a `.git` where the command runs (`cd .git/hooks && echo x > pre-commit`).
      Plus this plugin's additions (`DEFAULT_ASK` in `decide.ts`, and `guard.ts`): tokens on a
      `curl` line, hunting for credential files, git's own `-c` overrides outside a short
      list, `GIT_*`/`SSH_*`/`LD_*` environment however it is set (`NAME=`, `export`,
@@ -121,8 +126,9 @@ For each shell tool call:
      `fetch` or `pull` that can move a local branch or tag backwards or delete one: a `+`
      refspec, `--force` (the last of `--force` and `--no-force` decides), `--refmap`,
      `--update-head-ok`, `--prune-tags`, `--stdin`, `--prune` with a destination, and a
-     refspec whose destination is not a plain branch name or `refs/heads/<name>` without a
-     wildcard. `git apply --unsafe-paths` asks. A file an option makes git write (`--output`
+     refspec whose destination is not a plain branch name, `refs/heads/<name>` or a
+     remote-tracking ref `refs/remotes/<remote>/<name>` without a wildcard (a remote-tracking
+     ref moves no branch of yours, and without `+` git moves it forward only). `git apply --unsafe-paths` asks. A file an option makes git write (`--output`
      of the diff and log family, `format-patch -o`, `apply --build-fake-ancestor`) is held
      to the same checks as any other write; `archive -o` and `bundle create` go to the
      model. The text of a message of `git commit`, `git tag` or `git merge` (`-m`,
@@ -163,14 +169,20 @@ For each shell tool call:
      makefile from standard input, a device or a pipe, also through a symbolic link, and
      `NAME=value` arguments of make on the environment's terms; `fd -x`; `rg --pre`;
      `man -P`, `-H` and `-C`); builtins that evaluate a value as arithmetic (`let`,
-     `declare -i`, `test -v` with a subscript); a glob that matches a file whose name
-     starts with `-` (`ls *` beside a file called `-rf`), and a command that makes such a
-     file (`touch ./--x`, `echo x > --x`); `/dev/tcp/...` and `/dev/udp/...` as the target
+     `declare -i`, `test -v` with a subscript); a glob, or an unquoted expansion whose
+     value the call does not set to plain text first (`ls $x`, `ls $(cmd)`), that matches a
+     file whose name starts with `-` (`ls *` beside a file called `-rf`; a file named `-`
+     alone does not count); a path with a part named like an option that is not there yet,
+     whatever the program (`touch ./--x`, `echo x > --x`, `mkdir -p ./--x/y`, `cat ./-o`),
+     and `sed -i` with a suffix that holds a `*` or a `/`; a path through `/proc` with a glob
+     (`ls /proc/self/fd/*`; one built at run time, `/proc/$$/fd/*`, goes to the model); `/dev/tcp/...` and `/dev/udp/...` as the target
      of an input redirect; and a credential file named by a glob or braces (`cat .env*`), handed
      to a command by an input redirect at any depth (`exec < F`, `$(< F)`), entered with
      `cd`, or read as a list of names, patterns or code (`file -f`, `grep -f`,
-     `wc --files0-from`). `set -x` asks only together with `PS4` or `BASH_XTRACEFD`. Your own
-     `ask`/`deny`/`classify` rules also match a program named by path.
+     `wc --files0-from`, `rsync --files-from`, `git commit -F`, `git config -f`). That table
+     of options is not complete: the sandbox is what hides credential files. `set -x` asks
+     only together with `PS4` or `BASH_XTRACEFD`. Your own `ask`/`deny`/`classify` rules
+     also match a program named by path.
    - **`npx`** is never allowed by rule. `npx X` (also with `--no-install` or `--no`) goes
      to the model when the project has `node_modules/.bin/X`, and asks otherwise: npx would
      download a package of that name, or run a program from outside the project. An `npx`
@@ -178,7 +190,8 @@ For each shell tool call:
      string, a redirect. Only the words after the tool's name may spell it. Nothing else
      about the other commands of the call is read; what they do to the installed tool
      without spelling that name is the model's to judge, and the model is shown the whole
-     call. The cost: `npx tsc --noEmit 2>&1 | grep -v node_modules` and
+     call. The cost: `npx tsc --noEmit 2>&1 | grep -v node_modules`,
+     `rm -rf node_modules/.cache && npx vite build`, `du -sh node_modules; npx tsc` and
      `ls node_modules/.bin; npx tsc` ask.
    - **Where a command runs.** Relative paths are judged in the directory the command runs
      in, and that directory counts as known only in one shape of call: every `cd` is
@@ -189,27 +202,51 @@ For each shell tool call:
      followed by its text, as bash follows it (`cd sub/link && cd ..` is `sub`). A call
      with any other `cd`, a `pushd` or a `popd` goes to the model whole
      (`cd $dir && ls`, `cd -`), or asks where the rules themselves would judge a relative
-     path in the wrong directory (`if ...; then cd x; fi; cat f`). `~+` is read as the
-     directory the command runs in; a path through `~-` goes to the model.
+     path in the wrong directory (`if ...; then cd x; fi; cat f`). `~+`, and `$PWD` after a
+     `cd`, are read as the directory the command runs in (`cd src && echo x > $PWD/out.txt`
+     writes `src/out.txt`; a write through `~+` after a `cd` asks); another form of `$PWD` after a `cd` (`${PWD%/*}`) and a path
+     through `~-` go to the model, or ask where a write through them would leave the
+     project.
    - **To the model instead of an allow**: running a file the session may have changed. A
      file that is about to run is judged by its own change time: one changed at or after the
-     moment the plugin was loaded goes to the model, whoever changed it, and so does one
-     whose change time cannot be read (`sh x.sh` after `printf ... > x.sh`, `./build.sh`
-     after `sed -i`; the model is shown the start of the file). That covers a shell or an
-     interpreter given the file, the file run by its path, `awk -f`, `sed -f`, `make -f`,
-     `go run` and `pytest` when they name it. As a second line the plugin keeps what the
-     session wrote, for the whole session, approved commands included: once the session has
-     written a file into the project, every program run there goes to the model unless it
-     is on a short safe list (shell syntax and builtins, text and archive tools, `curl` and
-     `wget`, git's readers). So after `echo x > notes.txt`, `make`, `npm test`,
-     `cargo build`, `pytest`, `tsc`, `eslint` and `./build.sh` all go to the model, and the
-     reason names the file; `ls`, `grep` and `git status` stay allows. A write to `/tmp`
-     does not count for the project. A write the check cannot place (an archive
-     extraction, `patch`, `git apply`, a recursive copy) marks the directory it ran in;
-     after a git command that writes the work tree (`pull`, `merge`, `checkout`, `rebase`,
-     `stash pop`, `reset`) only the files git changed count, once the call is over. In a
-     session that has written nothing where they run, `make`, `npm test` and `cargo build`
-     are allows and run the project's code without the model seeing it. Also to the model:
+     moment the session began goes to the model, whoever changed it, and so does one whose
+     change time cannot be read or whose file system's clock the plugin cannot measure
+     (`sh x.sh` after `printf ... > x.sh`, `./build.sh` after `sed -i`; the model is shown
+     the start of the file). That covers a shell or an interpreter given the file, the file
+     run by its path, `awk -f`, `sed -f`, `make -f`, `go run` and `pytest` when they name it.
+     The moment a session began is kept across a restart of opencode, one small file per
+     session in the state directory's `moments/`, removed thirty days after its last use.
+     As a second line the plugin keeps what the session wrote, for the whole session,
+     approved commands and approved edits included: once the session has written a file
+     anywhere in the project, every program goes to the model unless it is on a short safe
+     list (shell syntax and builtins, text, file and archive tools, `curl` and `wget`, and
+     git's commands that read, add, commit, switch or fetch, but not `pull`, `merge`
+     or `rebase`). So after `echo x > docs/notes.txt`, `make`, `npm test`,
+     `cargo build`, `cargo fmt`, `tsc`, `eslint`, `./build.sh` and `git pull` all go to the
+     model, and the reason names the file; `ls`, `grep`, `git status` and `git commit` stay
+     allows. That is about two everyday commands in five (141 of 364 after one edit). A name is on the list only as bash
+     finds it: a builtin, or a file on `PATH` outside the project and the temp directories
+     (`/bin/cat`, `./cat` and a name the call defines a function under are not). A git
+     command is on it only where the repository's own configuration, and every file it
+     includes whatever the condition, holds no key that may name a program
+     (`core.hooksPath` as husky sets it, `credential.helper`, `alias.*`, a URL whose scheme
+     is not git's own: then every git command goes to the model after a write), no URL on
+     the command line names one, and no hook of the repository would run (with the
+     pre-commit framework's hook, `git commit` goes to the model after a write). Where
+     `PATH` holds an entry the session can write, anywhere in it (one in the project or a
+     temp directory, an empty one, `.` or a relative one, as direnv's `PATH_add` or a
+     trailing `./node_modules/.bin` makes), the list does not apply: after a write every
+     program but bash's own words goes to the model, `ls`, `cat` and `git status` too
+     (more than four in five of the everyday commands). The checks read opencode's own `PATH`; a
+     call whose shell has such an entry where opencode's `PATH` has none asks, and says why.
+     A write to `/tmp` does not count for the project, except for a git command whose
+     configuration, hook or URL names a program, and for a program whose place the check
+     cannot tell (`npm --version`, `cargo --version`: to the model). A write the check cannot place (an archive
+     extraction, `patch`, `git apply`, a recursive copy) marks the directory it ran in; after a git command that writes the work tree
+     (`pull`, `merge`, `checkout`, `rebase`, `stash pop`, `reset`) only the files git
+     changed count, once the call is over. In a session that has written nothing in the
+     project, `make`, `npm test` and `cargo build` are allows and run the project's code
+     without the model seeing it. Also to the model:
      a `sed` script with more than substitutions, prints and deletes (sed can run commands
      and write files); an `awk` program with `system`, `getline` or `@` (gawk's indirect
      call), or with a `>` or a `|` anywhere after its first `print`, checked in every `-e`
@@ -220,7 +257,15 @@ For each shell tool call:
      in `sed -n '5,$p' f`, names nothing) or a variable the call itself plainly sets to a
      literal at its start (`name=foo; grep "$name" src` is judged as `grep foo src`); a
      word that could become an option once bash expands it, for a program whose options
-     are checked (`git diff $BASE`, `find "$dir" -name x`, `make $target`); a `~` that bash
+     are checked (`git diff $BASE`, `find "$dir" -name x`, `make $target`), `wc`, `du`,
+     `file`, `grep` and `jq` among them, which have options that read a file of names
+     (`wc -l "$f"`, `wc -l $(git ls-files)`, `du -sh "$dir"`; not behind `--`); a glob, or
+     an unquoted expansion, that could match a name that begins with `-`, in a call where
+     another command may write files before bash expands it (`make && ls *.so`,
+     `npm test && cat *.log`, `make && echo $x`) or in a loop that runs it again, unless it
+     stands behind `--` for `ls`, `grep`, git's readers or another program that ends its
+     options there, after options known to take no value (`make && ls -la -- *` passes,
+     `make && cut -c1 -- *` goes to the model); a `~` that bash
      leaves as it is and the rules read as your home directory (`ls ~'/x'`; quoted text
      that merely holds a `~`, as in `grep '~' f`, goes too); `make NAME=value` whose value
      is not a plain word; `read` into a name that is not plain lower case (`read X`);
@@ -260,8 +305,9 @@ For each shell tool call:
      repository's `core.hooksPath` (a relative one, global or not, in every worktree that
      leads to the repository, and under the git directory itself, where a push into the
      repository runs its hooks; where that place does not exist yet, its appearance pauses
-     the session), files that `.git/config` includes (as deep as git follows
-     them), the known hook-manager files (`.husky/`, `lefthook.yml` and its variants,
+     the session), files that `.git/config`, your own git config and the system's
+     (`/etc/gitconfig`, or `GIT_CONFIG_SYSTEM`) include, read as git expands their paths
+     (`~/`, `~user/`, `%(prefix)/`) and as deep as git follows them, the known hook-manager files (`.husky/`, `lefthook.yml` and its variants,
      `.pre-commit-config.yaml`, `.overcommit.yml`) and opencode's project files
      (`opencode.json[c]`, `.opencode/`, `.claude/`, `.agents/`, `AGENTS.md`, `CLAUDE.md`, in
      the session directory and each writable parent). The plugin creates an empty `.opencode/` in the
@@ -269,9 +315,24 @@ For each shell tool call:
      rather than appear later with a plugin in it. Every directory between a writable root and
      a protected or hidden path is pinned, so no parent can be renamed and rebuilt. A mount
      holds a directory in place, not a symbolic link: when a link lies on the way to a
-     protected path, or a `.git` is itself a link, the command asks; so does a symbolic link
-     inside a git directory that is read-only for the command when it leads to a place the
-     command may write (`.git/refs` linked into the project). A tool call made only of
+     protected path, or a `.git` is itself a link, the command asks; so does any symbolic
+     link at any depth inside a git directory that is read-only for the command, wherever it
+     leads, and a hook, `config`, an included file or a file of `info/` there that has more
+     than one hard link (hooks whose names end in `.sample` aside). The one exception is a
+     hook that is a symbolic link straight to a regular file of the project, with no link on
+     the way and no other name: that file is made read-only like the hook. The same holds
+     for every hooks directory git runs from, wherever it lies (your global
+     `core.hooksPath`, a repository's absolute one, a bare repository beside the project).
+     A `core.hooksPath` set in a file git reads only under a condition (`includeIf`), in any
+     repository's configuration, in yours or in the system's, makes every call ask, because
+     where git runs hooks from then cannot be told; so does an included config file that does
+     not exist yet where a command could create it (a shared temp directory included), or
+     one whose path git cannot expand. The costs: a repository whose `objects`, `refs` or
+     `logs` is a link to a store elsewhere (some monorepo layouts) asks for every call that
+     is not git-only in it; a global hooks directory whose hooks are links (as GNU stow makes
+     them) asks for every call; a `cp -al` copy of a repository (its `config` and `info/`
+     hard-linked) asks; and with such an `includeIf` in your global configuration every
+     command and every edit asks, in every project. A tool call made only of
      plain git commands in plain words (`add`, `commit`, `checkout`, `rebase`, `fetch`,
      `push`, `remote update`, `bisect start`, `apply --index`, ..., no variables, `--output`
      or `--exec`) may write inside the git directories of the repositories it works in,
@@ -286,8 +347,7 @@ For each shell tool call:
      operand of `git add`, `rm`, `mv` and `restore` when it starts with a plain path segment
      (`git add src/*.ts`) or stands after `--` (`git add -- *.ts`); `!` may stand in double
      quotes (`-m "feat!: x"`); a commit message may come from `"$(cat <<'EOF' ... EOF)"`
-     whatever the body holds (also `<<"EOF"`, and `<<EOF` when the body has no `$`, backtick
-     or backslash); a `cd` may go
+     whatever the body holds (also `<<"EOF"`, and `<<EOF` when the body has no `$` or backtick); a `cd` may go
      to a literal directory, `"$HOME"`, `"$PWD"`, `"$(pwd)"` or
      `"$(git rev-parse --show-toplevel)"`; and `GIT_EDITOR=true` (or `:`),
      `GIT_SEQUENCE_EDITOR=true` or `GIT_MERGE_AUTOEDIT=no` may stand before `git commit`,
@@ -319,7 +379,8 @@ For each shell tool call:
      branch, a tag or stored data, so a branch called `secrets.json` works), the four
      stores whose names are hashes are not walked (`objects`, `rr-cache`, `lfs/objects`,
      `annex/objects`), and `annex/creds` is hidden by name. `/dev/mqueue` is hidden too. A
-     hidden file reads as empty and cannot be written; `sandboxShowPaths` brings one back (a
+     hidden file reads as empty, and what is written to it does not reach the real file (the
+     command may still exit 0); `sandboxShowPaths` brings one back (a
      test fixture called `server.key`, say). **Environment**: a
      variable passes only if its name is a well-known harmless one (`PATH`, `HOME`, `LANG`,
      toolchain directories, ...) or its value plainly is no secret (short, a number, a list of
@@ -366,8 +427,9 @@ For each shell tool call:
    zsh or any other shell every command that would be allowed asks and the prompt says so:
    set opencode's shell to bash), the sandbox self-test failed at startup, a protection
    cannot be put in place (a `core.hooksPath` behind a symlink or one git expands in a way
-   the plugin does not follow, such as `~user/...`; a `.git` that is a link; a link in a
-   read-only git directory that leads into a writable place), or the scan of the writable
+   the plugin does not follow, such as `~user/...`, or one set under a condition; a `.git`
+   that is a link; a symbolic or hard link in a read-only git directory, as above; a git
+   directory too large to look through for links), or the scan of the writable
    directories hit its limit or met a directory it cannot list. So does an allowed command
    that could only fail in the sandbox: `gh`, `docker` and the bus clients (`systemctl`,
    `loginctl`, `busctl`, `hostnamectl`, `timedatectl`, `localectl`, `resolvectl`,
@@ -375,10 +437,26 @@ For each shell tool call:
    hides (only `--version` and `--help` run without a prompt; an approved run happens
    outside the sandbox); git writing `.git` from a call that is not made only of plain git
    commands (`npm test && git commit`); a git command that writes a repository whose git
-   directory lies outside the writable directories; git signing commits, tags or pushes,
-   or checking signatures (`commit.gpgSign`, `tag.gpgSign`, `push.gpgSign`, `-S`, also
-   switched on in the call with `-c commit.gpgsign=true`; the settings are read in the
-   repository the command names); git needing the ssh agent without getting it; a pull
+   directory lies outside the writable directories, or whose object store, refs or
+   reflogs (`logs`) are a link to a place there; a git command that would rewrite a
+   tracked file the sandbox keeps read-only (a hook's linked script, a hook manager's file,
+   `AGENTS.md`, a hooks directory in the work tree), naming it; in a repository that
+   tracks such a file, a git command whose writes cannot be told: `git pull` (the prompt
+   says to run `git fetch`, then `git merge --ff-only @{upstream}` or
+   `git rebase @{upstream}`, which can be told), a git command after another that may move
+   a ref in the same call (`git fetch && git checkout -b fix origin/main`), a merge or
+   rebase under `merge.autoStash` or `rebase.autoStash`, `git apply` of a patch, a sparse
+   checkout, a merge on a branch whose `branch.<name>.mergeOptions` holds `--autostash`,
+   `git bisect reset <commit>` (a switch to a commit with the same version of the file,
+   `--abort`, `--continue`, `--skip` or `--quit` of a merge, rebase, cherry-pick, revert or
+   `git am` with nothing in progress, `git bisect reset` with no bisect, and `git apply
+   --check` run); `git stash -u` or `-a` when there is something to stash, in any
+   repository, because it would also remove the empty `.opencode/` the plugin makes
+   (unless git ignores it);
+   git signing commits, tags or pushes, or checking signatures (`commit.gpgSign`,
+   `tag.gpgSign`, `push.gpgSign`, `-S`, also switched on in the call with `-c commit.gpgsign=true`; the settings are read in the
+   repository the command names; `--no-gpg-sign` on the command line is read, and such a
+   commit does not ask); git needing the ssh agent without getting it; a pull
    that would update cloned submodules kept under `.git/modules`, a switch or checkout
    that would move a submodule, and `reset --keep`/`--merge`, `merge`, `cherry-pick` and
    `revert --abort` under `submodule.recurse` with cloned submodules; a push to a
@@ -454,9 +532,14 @@ To resume after you have looked, run
 `touch ~/.local/state/opencode-automode/resume` in your own terminal; a sandboxed command
 cannot. A resume takes in what the prompt showed, as it was then: what the pause named joins
 the baseline, and anything else that changed meanwhile, or a shown file that holds something
-else by now, is named in a new prompt first. A directory the prompt named is compared by
-everything in it, up to 20,000 entries; for a larger one the prompt says that only the first
-20,000 are compared. `lockwrite` is written in Rust with one dependency, the `libc` crate, pinned by
+else by now, is named in a new prompt first. A directory the prompt named is compared whole
+where git reads or runs something from it (its hooks, config and what that includes, `HEAD`,
+`packed-refs`, `info/`, operation state, `refs/` and `logs/`, and the hooks, config, state
+files and `info/` of each module and worktree inside it), and by the first 20,000 entries of
+everything else; where there is more, the prompt says so (a superproject with more than about
+2,200 modules reaches that). Where one of the parts git reads or runs from is too large to
+compare whole, the prompt says which, and auto-allow stays paused until it fits.
+`lockwrite` is written in Rust with one dependency, the `libc` crate, pinned by
 `Cargo.lock` and built with `--locked`. The plugin's own git calls run with fsmonitor, hooks,
 pagers and askpass programs disabled, and a git answer it cannot read in full (an error, a
 timeout, too much output) counts as "ask", never as "nothing configured".
@@ -464,10 +547,12 @@ timeout, too much output) counts as "ask", never as "nothing configured".
 **The edit tool.** opencode allows edits by default. The plugin makes an edit ask when it is
 outside the project, or touches the plugin, opencode's config (global or project-level), a
 file inside any git directory (a bare repository included, also for a first edit before any
-shell command), a `core.hooksPath` directory, a file git config includes, or a
-hook manager's files; when the scan that finds those reports a problem (it stopped at its
-limit, met a directory it cannot list, or found a `core.hooksPath` behind a symbolic link or
-one it cannot follow, or a link in a git directory that leads into the project),
+shell command), a `core.hooksPath` directory, the script a hook links to, a file git config
+includes, or a hook manager's files; when the scan that finds those reports a problem (it
+stopped at its limit, met a directory it cannot list, or found a `core.hooksPath` behind a
+symbolic link,
+one it cannot follow or one set under a condition, or a symbolic or hard link in a git
+directory, as the sandbox section says),
 as a shell command would ask; and when it lies where an approved command may still be
 creating a repository. For `read` it asks for credential files. It never turns an ask into an
 allow.
@@ -497,12 +582,12 @@ defaults would silently drop `enabled: false` and your own ask and deny rules.
 | `sshHosts` | none | `ssh` to these targets runs when it is the whole tool call, in plain words, and the remote command only uses read-only programs with options from a per-program allowlist (`cat`, `df`, `journalctl`, `systemctl status`, `ip addr`, ...), with no variables, substitutions or redirects except to `/dev/null` (no recursive `grep`, `rg` only to list files, no `printf -v` or `test -v`: they print or run more than the words say; `ps` only with field names and sort keys from a list, so no `environ` and no BSD `e`; `journalctl`/`systemctl` `-o` only with an output format's name; no raw reads of `/dev` or `/proc` apart from a short list of `/proc` files such as `meminfo` and `<pid>/status`, and no `..` in an absolute path), and ssh itself only uses harmless options (`-q`, `-T`, `-p`, `-l`, `-o BatchMode/ConnectTimeout/...`). A target matches as listed: `lab` covers `ssh lab ...` only; list `admin@lab` to allow that user. |
 | `sshReadOnlySudo` | `false` | On `sshHosts`: also allow `sudo [-n] <read-only command>`. |
 | `allowFeatureBranchPush` | `false` | `git push` runs when it is the whole tool call, in plain words, from the top of one of the project's checkouts. The plugin asks git itself what the push would do (`git push --dry-run --porcelain`, hooks off) and allows it when every URL git would connect to belongs to a remote the session started with, unchanged since (all of its URLs), and every ref goes from a branch to a non-protected branch (not `main`/`master`/`release*`/`develop`/... nor the default branch the remote reports) without force or delete. So git's own precedence decides (`branch.*.pushRemote`, `remote.pushDefault`, `remote.*.push`, `push.default`), in any config scope; a push that would only fail (no upstream) asks. The repository's own config must hold only keys from a list of harmless ones (no `pushurl`, `mirror`, `insteadOf`, `sshCommand`, `askPass`, hooks, helpers, ...; `push.followTags` and `remote.*.mirror` ask in any scope), and no `pre-push` hook may exist. Every push URL of every remote, after git's own rewriting, must be an `https://`, `ssh://` or `[user@]host:path` URL: a local path, `file://` or a transport helper asks without a dry run, since for those git would run code from that repository (or a program) before you are asked. The default branch is asked of each URL the push goes to (`ls-remote`), not of the fetch URL. The plugin's own git runs with no controlling terminal, and ssh in batch mode unless your git config names an ssh command, so nothing prompts on opencode's terminal. A user in an ssh URL (`git@host:o/r.git`) is fine. A push that recurses into submodules, force, deletes, tags and `--no-verify` ask. The dry run and the `ls-remote` cost extra round trips to the remote. |
-| `sandbox` | `true` | Off: auto-allowed commands run unsandboxed (still as their printed text), and `gh`, `docker` and the bus clients are not asked about for the sandbox's sake. Not recommended. |
+| `sandbox` | `true` | Off: auto-allowed commands run unsandboxed (still as their printed text), and `gh`, `docker` and the bus clients are not asked about for the sandbox's sake. `tar -x`, `unzip` (but its listing options), `patch`, `git apply` and `git am` then ask: what they write is named inside the file, and no command line shows it. Not recommended. |
 | `sandboxWritable` | none | More directories auto-allowed commands may write to, for example a build cache. What lands there may run outside the sandbox later. |
 | `sandboxKeepSockets` | none | Sockets to leave visible (e.g. your ssh agent for all commands). |
 | `sandboxShowPaths` | none | Credential locations to leave visible. |
 | `sandboxHidePaths` | none | More files or directories to hide from sandboxed commands. |
-| `sandboxKeepEnv` | none | Environment variables to pass through even though their name or value looks like a credential, and bash's own variables (`BASH_ENV`, `CDPATH`, `IFS`, ...) that are otherwise taken out of every shell. Naming `CDPATH` here makes the checks stop following a relative `cd`. |
+| `sandboxKeepEnv` | none | Environment variables to pass through even though their name or value looks like a credential, and bash's own variables (`BASH_ENV`, `CDPATH`, `IFS`, ...) that are otherwise taken out of every shell. Naming `CDPATH` here makes the checks stop following a relative `cd`, and a call with a `cd` asks where a session's shell has another `CDPATH` than opencode's own. |
 | `log` | `true` | Log every decision, with the full command, to `~/.local/state/opencode-automode/decisions.jsonl` (mode 0600 in a 0700 directory, hidden from sandboxed commands). |
 
 "Always allow" in an opencode prompt is mirrored per project into
@@ -551,8 +636,10 @@ npm run build:sandbox && npm test && npm run typecheck
 `npm test` runs `test/run.mjs`, which gives the tests a throwaway `$HOME`, XDG directories,
 runtime directory and git config under `~/.cache/automode-tests` (or `$AUTOMODE_TEST_BASE`;
 it cannot be in `/tmp`, which the rules treat as project space, and its name must not hold
-`opencode-automode`, which a default ask rule matches) and removes it afterwards. No model is
-needed: tests that involve one start a local stub server.
+`opencode-automode`, which a default ask rule matches) and removes it afterwards. It runs
+several files at once, each with a home and a temp directory of its own (see
+[CONTRIBUTING.md](CONTRIBUTING.md)). No model is needed: tests that involve one start a local
+stub server.
 
 - `test/differential.test.mts`: the desync class, held from the under-asking side. Each input
   runs in real shells inside the sandbox wrapper, as the text the plugin would run (the
@@ -604,13 +691,18 @@ needed: tests that involve one start a local stub server.
   merely left the command to the (absent) model.
 - `test/sandbox.test.mts`: commands through the real wrapper, including the git-write mode.
   A "cannot" test also checks that the command ran.
-- `test/c-second.test.mts` to `test/c-eighth.test.mts`: trust and protection outside the
+- `test/c-second.test.mts` to `test/c-thirteenth.test.mts`: trust and protection outside the
   shell text, one file per pass of the round that added it: the sandbox plan, the session's
   check of the git layout, the per-call check for planted git files and their quarantine,
   the credential walk inside git directories, which repositories a git-only call may write,
   the ssh agent and submodules, pushes to a repository on this machine, the hooks path as
-  git reads it, what a resume takes in, and git's variables in the environment. Each test
-  builds a repository of its own under the throwaway home.
+  git reads it, what a resume takes in, git's variables in the environment, symbolic and
+  hard links in git directories, every hooks directory git runs from, conditional
+  includes, and the git commands that would rewrite a read-only file. Each test builds a
+  repository of its own under the throwaway home. `test/c-closing.test.mts` holds the closing
+  review's two configuration fixes (`GIT_CONFIG_GLOBAL`, a file included twice).
+- `test/b11-links.test.mts`: reads and writes judged by where a symbolic link leads (a `..`
+  after a link, a link the same call makes), and links to credential locations.
 - `test/plugin.test.mts`: `index.ts` behind a stand-in for opencode's hooks: queueing, shell
   wrapping, the printed text handed to the wrapper, "allowed but not wrapped asks", dash,
   schedules, the "Always allow" mirror, environment scrubbing, settings, model errors.
@@ -657,24 +749,34 @@ message), which is why pushes and ssh use deterministic rules instead.
   known files are read-only (`.husky/`, lefthook, pre-commit, overcommit), but only where they
   already exist, and a hook that calls `npm run lint` or a script in the repository runs
   whatever that has become. Read the diff before you run or commit. The other side of that
-  protection: a `git switch` or `git merge` that brings tracked files into a protected hooks
-  directory cannot write them in the sandbox, and fails there.
+  protection: a git command that would rewrite one of those files (a `git switch` to a branch
+  with another `.husky/pre-commit`) asks, and `git pull` asks in every repository that tracks
+  one, or tracks `AGENTS.md`, `CLAUDE.md`, `opencode.json`, `.claude/` or `.agents/`.
 - **Credentials are found by name.** A secret in a file the rules do not recognise is
-  readable, and so is `.git/config` with a token in a remote URL. `cat "$(printf .env)"` is
+  readable, and so is `.git/config` with a token in a remote URL, and a credential file that
+  was committed to the repository: `git diff`, `git show` and `git log -p` read it from git's
+  object store, which is not searched. `cat "$(printf .env)"` is
   not an ask by rule: it goes to the model, and the sandbox hides the file. Credential files in
   the temp directories are not searched for, nor are sockets elsewhere under `$HOME`.
-  **Names are judged as the tree stands before the call.** A link or a directory that an
-  earlier command of the same call makes (an archive extracted, `ln -s`, `git checkout` of a
-  branch that holds a link) is not seen: `tar -xf a.tar; cat out/x` is judged by `out/x` as it
-  is now. In two calls the second is judged on the changed tree. **A program that reads a
+  **Names are judged as the tree stands before the call.** A path is judged where the kernel's
+  walk leads, a `..` after a link included, for reads and for writes; a link `ln` or `cp -s`
+  makes in the same call, or one `cp -P` copies or `mv` moves, is walked as made; a link to a
+  credential location counts as a read of it. A link or a directory that another program of
+  the same call makes (an archive extracted, `git checkout` of a branch that holds a link, a
+  directory of links copied or moved whole) is not seen: `tar -xf a.tar; cat out/x` is judged
+  by `out/x` as it is now. In two calls the second is judged on the changed tree. **A program that reads a
   whole directory reads the credential files in it:** `grep -r KEY .`, `git grep --no-index`
   and `git add -A && git diff --cached` are not asks by rule. In both cases the sandbox hides
-  the credential files it found, whatever path leads to them.
-- **Names like options.** A glob that would hand a program a file whose name begins with `-`
-  asks, and so does `touch` or a redirect that makes such a file. A file of that kind that a
-  call brings in another way (an archive, a script, a `git checkout`, `mkdir`, a copy of a
-  file already named so) is not seen by a glob later in the same call:
-  `tar xf a.tar && ls *` can hand `ls` an option the archive brought.
+  the credential files it found, whatever path leads to them. **The options that read a file
+  of names, patterns or code** (`grep -f`, `wc --files0-from`, ...) are a table that is not
+  complete, and a file name an `awk` program builds is not read at all; there too it is the
+  sandbox that hides the file.
+- **Names like options.** A glob, or an unquoted expansion, that would hand a program a file
+  whose name begins with `-` asks, and so does a command that makes such a file by a name on
+  its command line. A file of that kind that a call could bring in another way (an archive, a
+  script, a `git checkout`, a copy) is not decided by rule: where another command of the call
+  may write files first, such a word sends the call to the model, which may still allow it.
+  In the next call the glob is judged on the changed tree and asks.
 - **The scan has a budget.** Before every allowed command the writable directories are walked
   in full: the project, `allowedPaths` and the temp directories (about 0.2 s for 176,000
   entries in `/tmp` on the test machine). Each is walked once per tool call (an allowed path
@@ -686,7 +788,10 @@ message), which is why pushes and ssh use deterministic rules instead.
   directory in the project or `allowedPaths` that you can enter or write but not list asks
   too, and a nested `.git` that cannot be read (`chmod 000`) makes every decision ask, with
   the reason; an unlistable directory in the temp directories or under `/run` is covered
-  whole instead. A walk that stopped also leaves the layout snapshot short: if the session's
+  whole instead. A git directory that is read-only for a call is also looked through for
+  links, to 100,000 entries outside its object stores and 1,000,000 files in them; past that
+  (a large git-annex store, say) every such call asks. A walk that stopped also leaves the
+  layout snapshot short: if the session's
   first snapshot was taken then, repositories that were there all along can pause auto-allow
   later, once a walk reaches them. The layout record holds one open descriptor per git
   directory for the length of the session.
@@ -699,11 +804,14 @@ message), which is why pushes and ssh use deterministic rules instead.
 - **Programs are judged by name.** Apart from the options listed above (git, tar, sort, make,
   fd, rg, man, sed, awk, curl, wget, the package managers and the wrappers and runners), an
   allowed program is not checked for options that make it run another program or read a
-  script. Whatever it starts runs inside the sandbox.
-- **Builds and tests run the project's code.** In a session that has written nothing where
-  they run, `make`, `npm test`, `cargo build` and project scripts are allows, and run what
+  script. Whatever it starts runs inside the sandbox. (After a session write the safe list
+  is asked about the file bash would run, not about the name; but a program put into a
+  `PATH` directory outside the project and the writable directories by something the plugin
+  did not see, `~/bin/ls` written by hand or by another tool, counts as the user's own.)
+- **Builds and tests run the project's code.** In a session that has written nothing in the
+  project, `make`, `npm test`, `cargo build` and project scripts are allows, and run what
   the repository holds without the model seeing it. Once the session has written there, or
-  the file that would run has changed since the plugin was loaded, they go to the model, which
+  the file that would run has changed since the session began, they go to the model, which
   sees the command and the start of a named file, not everything a build runs.
 - **Shells.** The checks model bash 5.2, and only bash, or an `sh` that is bash, is wrapped.
   Under dash, zsh, fish or any other shell every command that would be allowed asks; set
@@ -738,9 +846,11 @@ message), which is why pushes and ssh use deterministic rules instead.
   `systemctl cat` print a unit's configuration, environment settings included.
 - **`/tmp` is shared.** It stays writable and shared with other processes, because agents and
   opencode's own tools pass files through it, and it is walked before every allowed command
-  (see the scan budget above). A repository there has its existing hooks and config made
-  read-only; what cannot be protected in it (a missing include, a link) is left, where the
-  same thing in the project would make the command ask.
+  (see the scan budget above). A repository there, or in a `sandboxWritable` directory, has
+  its existing hooks and config made read-only; what cannot be protected in it (a missing
+  include, a symbolic or hard link) is left, where the same thing in the project or an
+  `allowedPaths` directory would make the command ask. Your global hooks directory is
+  checked wherever it lies.
 - **Calls running at the same time** are tracked within one opencode process. Two opencode
   processes on one checkout do not see each other's calls: a push one of them checked and a
   git-only call of the other do not hold each other back, and an approval in one opens no

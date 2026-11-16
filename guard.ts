@@ -1515,7 +1515,13 @@ function gitCallProblem(call: GitCall, exists?: (word: string) => boolean, more 
     // A patch may write anywhere once this is given (round 4, finding 20).
     if (lastOf(got, "unsafe-paths") !== undefined) return "git apply --unsafe-paths lets the patch write outside the work tree";
   }
-  if ((sub === "rebase" || sub === "difftool") && rest.some((w) => /^-[a-zA-Z]*[xi]/.test(w))) return `git ${sub} with -x or -i runs a command or an editor`;
+  // (The closing runs, step 7: the long spellings too, as git reads them by any unambiguous
+  // prefix: `--interactive`, `--edit-todo`, `--exec`, difftool's `--extcmd`, and a pull's
+  // `--rebase=interactive` or `=i`.)
+  const longOf = (w: string, names: string[]) => names.some((l) => w.split("=")[0].length > 4 && l.startsWith(w.split("=")[0]));
+  const runners = sub === "rebase" ? ["--interactive", "--edit-todo", "--exec"] : sub === "difftool" ? ["--extcmd"] : [];
+  if ((sub === "rebase" || sub === "difftool") && rest.some((w) => /^-[a-zA-Z]*[xi]/.test(w) || longOf(w, runners))) return `git ${sub} with -x or -i runs a command or an editor`;
+  if (sub === "pull" && rest.some((w) => /^--rebase=(i|interactive)$/.test(w) || (longOf(w, ["--rebase"]) && /=(i|interactive)$/.test(w)))) return "git pull --rebase=interactive runs an editor";
   const keyed = GIT_KEYED_OPTIONS[sub] ?? [];
   const short = rest.find((w) => abbreviates(w, keyed) && !keyed.includes(w.split("=")[0]));
   if (short) return `git ${sub} ${short} is a shortened option, which git accepts and the rules do not read`;
@@ -2347,10 +2353,11 @@ export interface TextContext {
   // fresh session is not a program run after a write). Not by the order of the text: a command
   // written later runs earlier in a loop, from a function, or beside (`a & b`, `a | b`).
   others?: (cmd: Simple) => { written: Set<string>; unlisted: string[] };
-  // B7-3: whether the configuration of the repository a git command works in names no program of
-  // the project for a filter (clean, smudge, process) and, with `diff`, none for a diff either
-  // (diff.external, diff.<driver>.command, diff.<driver>.textconv).
-  gitFiltersAbsent?: (cmd: Simple, args: string[], diff?: boolean) => boolean;
+  // B8-2: what in the configuration of the repository a git command works in may name a program
+  // (decide.ts, repoConfigProblem: a key of the repository's own configuration that is not on the
+  // list of keys that name none, with the key named; with `diff`, the user's own diff programs
+  // too), or undefined where nothing does.
+  gitConfigProblem?: (cmd: Simple, args: string[], diff?: boolean) => string | undefined;
   cwd: string;
   // False when the command changes directory, so a relative word cannot be placed.
   cwdKnown: boolean;
@@ -2359,6 +2366,8 @@ export interface TextContext {
   written: () => Set<string>;
   // Whether an absolute path lies inside the project (PYTHONPATH, finding 28).
   inProject?: (p: string) => boolean;
+  // A place outside the project the session can write too (allowedPaths, sandboxWritable).
+  canWrite?: (p: string) => boolean;
   // Whether every `NAME=value` word of the call (the real words) gives NAME a value from the
   // signed-off list (finding 28).
   envOk?: (name: string) => boolean;
@@ -2456,47 +2465,311 @@ export function textGuard(raw: string, bare: string, ctx: TextContext): GuardVer
 // A word bash globs into a name that begins with `-` (round 4, N3): the program reads the name as
 // an option, and the option checks, which read the word as written, never see it (`tar xf a.tar
 // --to*` beside a file named `--to-command=rec`). The whole word is expanded, wherever a `-` or an
-// `=` stands in it, against the tree as it stands where the command runs. Only a result that
-// begins with `-` counts: `src/--ch*` and `./-*` name files. Returns the name; "unplaced" where
-// the place is not known; undefined when no result begins with `-`. Where the word cannot be read
-// (a form the matcher reads by the locale, an expansion in it, a `..` after the glob) the answer
-// is taken from the text before its first glob or expansion: only a name that begins with that
-// text can come of it, so a directory that holds no such name beginning with `-` passes. A word
-// that begins with an expansion is left to the checks that hold it today. `shown` is the word
-// with markExpansions' marks where `marked`; otherwise every `$` and backtick counts as one.
+// `=` stands in it, against the tree as it stands where the command runs, each name as bash
+// spells it (a link named like an option is one, wherever it leads). Only a result that begins
+// with `-` counts: `src/--ch*` and `./-*` name files, and `-` alone is no option. Returns the
+// name; "unplaced" where the place is not known; undefined when no result begins with `-`. Where
+// the word cannot be read (a form the matcher reads by the locale, an expansion in it, a `..`
+// after the glob) the answer is taken from the text before its first glob or expansion: only a
+// name that begins with that text can come of it, so a directory that holds no such name
+// beginning with `-` passes. N3b-3: a word that begins with an expansion has no such text (`x=;
+// wc $x--f*`): any name that begins with `-` can come of it, and where its glob stands behind a
+// `/`, any directory of such a name. `shown` is the word with markExpansions' marks where
+// `marked`; otherwise every `$` and backtick counts as an expansion.
+const GLOB = /[*?]|\[.*\]/s;
+const optionName = (n: string) => n.startsWith("-") && n !== "-";
 function optionGlob(shown: string, marked: boolean, cwd: string | undefined): { name: string; sure: boolean } | "unplaced" | undefined {
-  const word = unmark(shown);
-  if (!/[*?]|\[.*\]/s.test(word)) return undefined;
   const expansion = marked ? MARKS : /[$`]/;
-  const alternatives = expansion.test(shown) ? undefined : braceWords(word);
-  for (const alt of alternatives ?? [shown]) {
-    if (/^[/~]/.test(alt)) continue;
-    const first = alt.split("/")[0];
-    const firstGlob = /[*?[{]/.test(first);
-    if (alternatives && !/[*?]|\[.*\]/s.test(alt)) continue;
-    if (!firstGlob && !first.startsWith("-")) continue;
-    if (cwd === undefined) return "unplaced";
-    const found = !alternatives || unreadableGlob(alt) || alt.split("/").includes("..") ? undefined : expandWord(alt, cwd);
-    // (A pattern that ends in `/` matches directories only.)
-    const files = alt.endsWith("/") ? found?.filter((f) => fs.statSync(f, { throwIfNoEntry: false })?.isDirectory() ?? true) : found;
-    if (files) {
-      const name = !files.length ? undefined : !firstGlob ? first : files.map((f) => path.relative(cwd, f).split("/")[0]).find((n) => n.startsWith("-"));
-      if (name) return { name, sure: true };
+  // A glob bash sees: not one inside an expansion (`$?`, `"${a[@]}"`, `$(ls *.ts)`). (Braces
+  // are expanded where the command is printed: each word here is one alternative.)
+  const bare = expansion.test(shown) ? withoutExpansions(unmark(shown)) : shown;
+  if (!GLOB.test(bare)) return undefined;
+  const first = bare.split("/")[0];
+  const firstGlob = /[*?[{]/.test(first);
+  if (!firstGlob && !first.startsWith("-") && !expansion.test(shown[0])) return undefined;
+  if (cwd === undefined) return "unplaced";
+  const found = unreadableGlob(shown) || shown.split("/").includes("..") ? undefined : expandNames(shown, cwd);
+  // (A pattern that ends in `/` matches directories only.)
+  const files = shown.endsWith("/") ? found?.filter((f) => fs.statSync(f, { throwIfNoEntry: false })?.isDirectory() ?? true) : found;
+  if (files) {
+    const name = files.map((f) => path.relative(cwd, f)).find(optionName);
+    return name ? { name, sure: true } : undefined;
+  }
+  const at = shown.search(marked ? /[*?[{\u000e\u000f]/ : /[*?[{$`]/);
+  const lead = shown.slice(0, at < 0 ? shown.length : at);
+  let name: string | undefined;
+  try {
+    if (lead.includes("/")) name = fs.existsSync(path.join(cwd, lead.split("/")[0])) ? lead.split("/")[0] : undefined;
+    else name = fs.readdirSync(cwd).find((n) => optionName(n) && n.startsWith(lead) && (firstGlob || fs.statSync(path.join(cwd, n), { throwIfNoEntry: false })?.isDirectory()));
+  } catch {
+    return "unplaced";
+  }
+  return name ? { name, sure: false } : undefined;
+}
+// A word without the expansions in it (`$x`, `${a[@]}`, `$?`, `$(...)`; backticks are printed as
+// `$(...)`), for the glob characters and the `/` bash sees outside them, with `put` where each
+// stood. One it cannot close is left as it is.
+export function withoutExpansions(word: string, put = ""): string {
+  let out = "";
+  for (let i = 0; i < word.length; i++) {
+    const c = word[i];
+    const next = word[i + 1] ?? "";
+    if (c === "$" && (next === "(" || next === "{")) {
+      const close = next === "(" ? ")" : "}";
+      let depth = 0;
+      let end = -1;
+      for (let j = i + 1; j < word.length && end < 0; j++) {
+        if (word[j] === next) depth++;
+        else if (word[j] === close && --depth === 0) end = j;
+      }
+      if (end < 0) return word;
+      i = end;
+      out += put;
+    } else if (c === "$" && /[A-Za-z_@*#?$!0-9-]/.test(next)) {
+      i += /^(\w+|.)/.exec(word.slice(i + 1))![0].length;
+      out += put;
+    } else out += c;
+  }
+  return out;
+}
+
+// ---- a glob beside a command that may write (round 4, N3c) ----
+//
+// The maintainer's decision: a glob is judged against the tree as it stands before the call
+// (optionGlob), and where another command of the same call may write files first, that is not
+// the tree bash globs; the ways a command can make a file are an open list. So in such a call a
+// word whose glob could match a name that begins with `-` is not decided by rule: the call goes
+// to the model. Such a word: bash globs it (an unquoted `*`, `?` or `[...]`: MARK_GLOB in the
+// marked reading), and its first character is a glob character, `-` or an expansion (`*`,
+// `*.log`, `--to*`, `$x*`, `*/x`): a word that begins with any other character begins with a
+// plain name, which no `-` can come before (`src/*`, `./*`, `a*`, `/tmp/*`). Not a word behind
+// a `--` that ends the options of its program (DASH_DASH). "Another command that may write":
+// any other command of the call, at any depth and wherever it stands in the text, that is not
+// known to make, move and remove nothing (writesNothing). The glob's own command, and its own
+// redirects (bash expands the words before it opens them), do not count against it.
+
+// Programs that end their options at the first `--`, each with the short options known to take
+// no value (`ls -I -- *` hands `--` to `-I`). N3d: the table grants trust, so it lists what is
+// known rather than what is feared: the letters each installed binary takes with no value, read
+// off it (xcheck/n3d/letters.mts: `P -L` is no error and asks for no value, `P -L -- -Q` takes
+// `-Q` for a name, `P -LQ` rejects Q: L takes nothing, attached or not). GNU coreutils 9, GNU
+// grep 3 (and egrep, fgrep, which reject the other matchers), ripgrep 14 (its own reading of
+// `--`); git 2.47 after one of the subcommands in GIT_DASH_DASH, each with its own letters, and
+// no other subcommand. Not `echo` (prints `--`), `test` and `[` (an operand), `find` (any word
+// that begins with `-` starts its expression), nor tar (its first word can be a cluster whose
+// values are the words after it).
+const DASH_DASH: Record<string, string> = {
+  ls: "abcdfghiklmnopqrstuvxABCDFGHLNQRSUXZ1", cat: "benstuvAET", head: "qvz0123456789", tail: "fqvzF", wc: "clmwL",
+  grep: "abchilnoqrsuvwxyzEFGHILPRTUVZ0123456789", egrep: "abchilnoqrsuvwxyzEHILRTUVZ0123456789", fgrep: "abchilnoqrsuvwxyzFHILRTUVZ0123456789",
+  rg: "abchilnopqsuvwxzFHILNPSUV0", rm: "dfirvIR", cp: "abdfilnprsuvxHLPRTZ", mv: "bfinuvTZ", ln: "bdfinrsvFLPT", du: "abchklmsxDHLPS0",
+  stat: "ftL", sort: "bcdfghimnrsuzCMRV", cut: "nsz", touch: "acfhm", chmod: "cfhvHLPR", mkdir: "pvZ", git: "",
+};
+const GIT_DASH_DASH: Record<string, string> = {
+  add: "efinpuvAN", rm: "fnqr", mv: "fknv", "ls-files": "cdfikmostuvz", grep: "achilnopqrvwzEFGHILPW0123456789",
+  log: "abcgimpqrstuvwzDEFPRWX", diff: "abcghimpqrstuvwzDEFPRWX", show: "abcgimpqrstuvwzDEFPRWX", blame: "abcefgilmnprstuvwzDEFPRWX",
+  checkout: "dflmpq23", restore: "mpqSW23", status: "bsuvz", shortlog: "abcegimnprstuvzDEFPRWX",
+};
+// Whether word k of a command stands behind a `--` that ends the options of the program at p:
+// the first plain `--` after the program (for git, after its subcommand), where the word before
+// it is the program (or git's subcommand), an operand, a long option with `=`, or a cluster made
+// only of letters on the program's list, and holds no expansion or glob that could make an
+// option.
+export function behindDashDash(argv: string[], marked: string[] | undefined, p: number, k: number): boolean {
+  const name = path.basename(argv[p]);
+  if (!Object.hasOwn(DASH_DASH, name)) return false;
+  let from = p + 1;
+  let letters = DASH_DASH[name];
+  if (name === "git") {
+    const call = gitCall(argv.slice(p + 1, k));
+    if (typeof call === "string" || call.sub === undefined || !Object.hasOwn(GIT_DASH_DASH, call.sub)) return false;
+    from = k - call.rest.length;
+    letters = GIT_DASH_DASH[call.sub];
+  }
+  let at = -1;
+  for (let i = from; i < k && at < 0; i++) if (argv[i] === "--") at = i;
+  if (at < 0) return false;
+  if (at === from) return true;
+  const before = argv[at - 1];
+  if (marked === undefined ? /[$`*?[]/.test(before) : /[\u000e\u000f\u0010]/.test(marked[at - 1])) return false;
+  if (before.startsWith("--")) return before.includes("=");
+  if (!before.startsWith("-")) return true;
+  return [...before.slice(1)].every((l) => letters.includes(l));
+}
+// Whether bash globs a word into names that may begin with `-` (above). `marked`: the word in
+// the glob-marked reading; undefined where that reading does not line up with the commands, and
+// then every glob character counts as unquoted and every `$` and backtick as an expansion.
+// `arith` (N3d): a word of the call begins with an arithmetic expansion (Printed.arithLed), which
+// the judged text spells `0`: a word that begins with `0` then counts as one that begins with an
+// expansion (`ls $((-1))*` globs `-1*`).
+export function optionLedGlob(word: string, marked: string | undefined, arith = false): boolean {
+  if (marked === undefined) return GLOB.test(withoutExpansions(word)) && (/^[-*?[$`]/.test(word) || (arith && word.startsWith("0")));
+  return GLOB_MARKED.test(marked) && (/^[-\u000e\u000f\u0010]/.test(marked) || (arith && marked.startsWith("0")));
+}
+
+// N3d (the maintainer's decision, consult 14): a bare unquoted expansion counts as a glob word.
+// Its value is unknown, and bash splits it into words and globs each (`x='*'; ls $x`,
+// `ls ${x:-*}`, `ls $(echo '*')`), wherever it stands in the word (`a$x` with x=' -*'). Not
+// counted: an expansion inside double quotes (MARK_QUOTED), and these, whose value cannot be a
+// glob: the special parameters `$?`, `$#`, `$$`, `$!`, `$-`, `$0` (`${?}` too); the positional
+// parameters `$1`..`$9`, `$*`, `$@` unless `positional` (the call sets them: `set -- '*'`, a
+// function, or a nested shell's code, which gets them, and `$0`, from the words after it); and
+// a `$name` or `${name}` that `known` names (a variable the call plainly sets to a literal
+// first, Printed.literals). Any operator inside `${...}` counts (`${x:-*}`, `${x#a}`), and so
+// does every substitution. `marked`: the word in the marked reading; undefined where it does not
+// line up, and then every `$` and backtick counts, quoted or not, but a special parameter.
+const SPECIAL = /^[?#$!-]$/;
+const POSITIONAL = /^([0-9]+|[*@])$/;
+export function unknownExpansion(word: string, marked: string | undefined, known: (name: string) => boolean, positional: boolean): boolean {
+  const text = marked ?? word;
+  for (let i = 0; i < text.length; i++) {
+    if (marked === undefined ? !/[$`]/.test(text[i]) : text[i] !== MARK_UNQUOTED) continue;
+    const at = marked === undefined ? i : i + 1;
+    const c = text[at];
+    const next = text[at + 1] ?? "";
+    if (c === "`" || (c === "$" && next === "(")) return true;
+    if (c !== "$") continue;
+    let inner: string;
+    if (next === "{") {
+      let depth = 0;
+      let end = -1;
+      for (let j = at + 1; j < text.length && end < 0; j++) {
+        if (text[j] === "{") depth++;
+        else if (text[j] === "}" && --depth === 0) end = j;
+      }
+      if (end < 0) return true;
+      inner = text.slice(at + 2, end);
+      i = end;
+    } else if (/[A-Za-z_]/.test(next)) {
+      inner = /^\w+/.exec(text.slice(at + 1))![0];
+      i = at + inner.length;
+    } else if (/[?#$!*@0-9-]/.test(next)) {
+      inner = next;
+      i = at + 1;
+    } else continue;
+    if (SPECIAL.test(inner)) continue;
+    if (POSITIONAL.test(inner)) {
+      if (positional) return true;
       continue;
     }
-    const at = alt.search(marked ? /[*?[{\u000e\u000f]/ : /[*?[{$`]/);
-    if (at === 0 && expansion.test(alt[0])) continue;
-    const lead = alt.slice(0, at < 0 ? alt.length : at);
-    let name: string | undefined;
-    try {
-      if (lead.includes("/")) name = lead.startsWith("-") && fs.existsSync(path.join(cwd, lead.split("/")[0])) ? lead.split("/")[0] : undefined;
-      else name = fs.readdirSync(cwd).find((n) => n.startsWith("-") && n.startsWith(lead));
-    } catch {
-      return "unplaced";
-    }
-    if (name) return { name, sure: false };
+    if (marked !== undefined && /^[A-Za-z_]\w*$/.test(inner) && known(inner)) continue;
+    return true;
   }
-  return undefined;
+  return false;
+}
+const GLOB_MARKED = /\u0010[*?]|\u0010\[.*\]/s;
+
+// N3d: the commands a loop may run more than once (by index in `cmds`, the call's commands as
+// `located` lists them, the top-level `top` first): the head of a `for`, `while`, `until` or
+// `select` (after any keyword before it: `do for`, `if while`, `time while`, `! until`), every
+// command up to its `done` (at any depth: a group, a subshell, a pipeline, `&`, a substitution,
+// a nested loop), and a substitution in the head itself, which the parser lists just before it
+// (the run of commands before it that stand in a subshell, a pipeline's among them, which is the
+// safe side). A loop left open holds everything after it. A nested shell's code, listed after
+// the top-level commands, counts as in a loop wherever the call holds a loop at all.
+const LOOP_HEADS = new Set(["for", "while", "until", "select"]);
+const BEFORE_HEAD = new Set(["do", "then", "else", "elif", "if", "!", "time", "-p", "{"]);
+export function loopCommands(cmds: Simple[], top: number): Set<number> {
+  const out = new Set<number>();
+  let depth = 0;
+  let any = false;
+  const opens = (argv: string[]) => {
+    let heads = 0;
+    for (let k = 0; k < argv.length && (BEFORE_HEAD.has(argv[k]) || LOOP_HEADS.has(argv[k])); k++) if (LOOP_HEADS.has(argv[k])) heads++;
+    return heads;
+  };
+  for (let n = 0; n < top; n++) {
+    const argv = cmds[n].argv;
+    if (argv[0] === "done") {
+      if (depth > 0) depth--;
+      continue;
+    }
+    const heads = opens(argv);
+    if (heads) {
+      any = true;
+      depth += heads;
+      if (argv.some((w) => w.includes("$()"))) for (let b = n - 1; b >= 0 && cmds[b].subshell; b--) out.add(b);
+    }
+    if (depth > 0) out.add(n);
+  }
+  if (any || cmds.slice(top).some((c) => opens(c.argv) > 0)) for (let n = top; n < cmds.length; n++) out.add(n);
+  return out;
+}
+
+// Commands held to make, move and remove nothing (N3c), each without an output redirect to a
+// file (one to /dev/null, /dev/stdout or /dev/stderr is none). An allowlist: anything else may
+// write. The shell's builtins that change no file (a `cd` changes where later commands run, and
+// they are judged there; `read`, `printf -v` and `set` change variables and options only).
+const QUIET_BUILTINS = new Set("cd pushd popd dirs pwd echo printf true false : test [ read type set exit return break continue shift wait".split(" "));
+// Programs that only read files and print: GNU coreutils' readers, grep and its kin, file, diff,
+// cmp, find, and jq (whose language has no way to write a file or run a program); each but for
+// the options below that write or run a program. (N3d: and `date` and `id`, which print, so that
+// `echo $(date)` is no writer beside its own expansion; `date -s` sets the clock, not a file.)
+const READS_ONLY = new Set("ls cat head tail wc grep egrep fgrep rg stat du file diff cmp sort cut tr basename dirname realpath readlink find jq date id".split(" "));
+const QUIET_TARGET = /^\/dev\/(null|stdout|stderr)$/;
+// A long option as GNU getopt_long reads it: any prefix of one of `names` from `--x` on.
+const longOf = (w: string, names: string[]) => {
+  const n = w.split("=")[0];
+  return n.length >= 3 && n.startsWith("--") && names.some((x) => x.startsWith(n));
+};
+// A short option in a cluster, before any letter that takes the rest as its value (`-uo f`).
+const shortOf = (w: string, letter: string, values: string) => {
+  if (!/^-[^-]/.test(w)) return false;
+  for (const l of w.slice(1)) {
+    if (l === letter) return true;
+    if (values.includes(l)) return false;
+  }
+  return false;
+};
+// git's subcommands that write nothing in the work tree: these read objects and refs only (N3d:
+// each run with a `core.fsmonitor` hook: none ran it, xcheck/n3d/fsmon.out); `rev-parse` (`:f`)
+// and `rev-list` (`--indexed-objects`) read the index in some forms, which runs that hook, and
+// are held to the configuration like `ls-files`;
+// `status` (and `ls-files` with a work-tree option) may run a clean filter, and those that show
+// a diff (and `grep`, and `cat-file` with a work-tree option) a diff program or a textconv too,
+// so they count only where the configuration names no program of the project for those
+// (`gitQuiet`: decide.ts, no key of git's configuration that may name a program, gitConfigProblem). `branch` only to list. None with an option that
+// writes a file or runs a program (`--output`, `-O`).
+const GIT_READS = new Set("ls-tree merge-base show-ref for-each-ref count-objects".split(" "));
+const GIT_DIFF_READS = new Set("diff log show blame describe shortlog whatchanged grep".split(" "));
+const GIT_BRANCH_LIST = /^(-[arv]+|--(list|all|remotes|verbose|show-current|no-color|color|merged|no-merged|contains=.*|sort=.*))$/;
+export type GitQuiet = (cmd: Simple, args: string[], diff?: boolean) => boolean;
+export function writesNothing(cmd: Simple, gitQuiet: GitQuiet | undefined): boolean {
+  if (cmd.out.some((t) => !QUIET_TARGET.test(t))) return false;
+  const argv = cmd.argv;
+  let k = 0;
+  while (k < argv.length && (KEEPS_COMMAND.has(argv[k]) || ["}", "fi", "done", "esac"].includes(argv[k]))) k++;
+  // Assignments alone; not to PATH, which makes `ls` another program.
+  for (; k < argv.length && ASSIGN.test(argv[k]); k++) if (ASSIGN.exec(argv[k])![1] === "PATH") return false;
+  if (k === argv.length || ["for", "select", "case"].includes(argv[k])) return true;
+  const name = argv[k];
+  const args = argv.slice(k + 1);
+  // A shell handed code (`bash -c '...'`, `eval`): what the code runs is a command of the call.
+  if (["bash", "sh", "dash"].includes(name)) return args.length >= 2 && CODE_FLAG.test(args[0]);
+  if (name === "eval") return true;
+  if (QUIET_BUILTINS.has(name)) return true;
+  if (name === "command") return /^-[vV]+$/.test(args[0] ?? "");
+  if (name === "sort") return !args.some((w) => longOf(w, ["--output", "--compress-program"]) || shortOf(w, "o", "STkt"));
+  if (name === "find") return !args.some((w) => /^-(delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$/.test(w));
+  if (name === "file") return !args.some((w) => longOf(w, ["--compile"]) || shortOf(w, "C", "FPefm"));
+  if (name === "rg") return process.env.RIPGREP_CONFIG_PATH === undefined && !args.some((w) => /^--(pre|hostname-bin)(=|$)/.test(w));
+  if (READS_ONLY.has(name)) return true;
+  if (name !== "git") return false;
+  const call = gitCall(args);
+  if (typeof call === "string" || call.sub === undefined) return false;
+  const { sub, rest } = call;
+  if (rest.some((w) => longOf(w, ["--output", "--output-directory", "--open-files-in-pager"]) || (sub === "grep" && shortOf(w, "O", "ABCefm")))) return false;
+  // (N3d's reading, F1: a revision written `:path` (`:f`, `:0:f`, `--contains=:f`) is read from
+  // the index, and reading the index runs core.fsmonitor: such a word holds these readers to the
+  // configuration too.)
+  const fromIndex = rest.some((w) => /(^|=):/.test(w));
+  if (GIT_READS.has(sub)) return fromIndex ? (gitQuiet?.(cmd, args, false) ?? false) : true;
+  if (sub === "branch") return rest.every((w) => GIT_BRANCH_LIST.test(w)) && (!fromIndex || (gitQuiet?.(cmd, args, false) ?? false));
+  // (B8-2: `ls-files` and a plain `cat-file` are held to the repository's configuration like
+  // `status`: `core.fsmonitor` runs for whatever reads the index.)
+  if (sub === "cat-file" && rest.every((w) => !w.startsWith("-") || CAT_FILE_PLAIN.test(w))) return gitQuiet?.(cmd, args, false) ?? false;
+  if (["status", "ls-files", "rev-parse", "rev-list"].includes(sub)) return gitQuiet?.(cmd, args, false) ?? false;
+  if (GIT_DIFF_READS.has(sub) || sub === "cat-file") return gitQuiet?.(cmd, args, true) ?? false;
+  return false;
 }
 
 // Files a command is handed that bash names when it runs (round 3, finding 14): a glob or braces,
@@ -2508,8 +2781,10 @@ function optionGlob(shown: string, marked: boolean, cwd: string | undefined): { 
 // an enclosing `for NAME in <words>` loop whose words name files here (loopValues): each of those
 // files is then tested as if it had been written out. Where the commands cannot be lined up with
 // the marked reading (or inside a nested shell's code, which an outer expansion can rewrite)
-// every `$` and backtick counts as an expansion, as before.
-export function runtimeReads(command: string, where: Located, scope: Scope): GuardVerdict | undefined {
+// every `$` and backtick counts as an expansion, as before. N3c: a glob beside a command that may
+// write (above); `gitQuiet` says where git's configuration names no program of the project.
+// N3d: `printed` is what the printer says of the call (Printed.arithLed, Printed.literals).
+export function runtimeReads(command: string, where: Located, scope: Scope, gitQuiet?: GitQuiet, printed?: { arithLed?: boolean; literals?: string[] }): GuardVerdict | undefined {
   let verdict: GuardVerdict | undefined;
   const add = (action: "ask" | "classify", reason: string) => void (verdict = stricter(verdict, { action, reason }));
   const pairs = markedCommands(command);
@@ -2522,20 +2797,97 @@ export function runtimeReads(command: string, where: Located, scope: Scope): Gua
   const literalCode = !!pairs && pairs.every(([real, mark]) => !nestedBodies([real]).length || !mark.argv.some((w) => MARKS.test(w)));
   const marked = (n: number) => (aligned && (n < top || literalCode) ? pairs![n][1].argv : undefined);
   const loops = aligned ? loopValues(command, pairs!.slice(0, top), (n) => where.cwd.get(where.cmds[n])) : new Map<number, LoopVars>();
+  // N3c: the same reading with the glob characters bash sees marked, held as `marked` is.
+  const globPairs = markedCommands(command, 0, true);
+  const globAligned = !!globPairs && globPairs.length === where.cmds.length && globPairs.every(([real], n) => real.argv.join("\0") === where.cmds[n].argv.join("\0"));
+  const globCode = !!globPairs && globPairs.every(([real, mark]) => !nestedBodies([real]).length || !mark.argv.some((w) => MARKS.test(w)));
+  const globbed = (n: number) => (globAligned && (n < top || globCode) ? globPairs![n][1].argv : undefined);
+  // A command of the call that may write, other than the glob's own (N3d: or the glob's own,
+  // where a loop runs it again: its first pass makes the names its next one globs). Every
+  // command is looked at, each once.
+  const loopRuns = loopCommands(where.cmds, top);
+  const quiet = new Map<Simple, boolean>();
+  const writes = (c: Simple) => {
+    if (!quiet.has(c)) quiet.set(c, writesNothing(c, gitQuiet));
+    return !quiet.get(c);
+  };
+  const writer = (cmd: Simple, n: number) => where.cmds.find((c) => (c !== cmd || loopRuns.has(n)) && writes(c));
+  // N3d: what the printer says (a word that begins with `$((`, the variables it reads as literals),
+  // and whether the call sets the positional parameters (`set` with a word that is no option, or
+  // a function, whose body gets its own).
+  const arith = !!printed?.arithLed;
+  const literals = new Set(printed?.literals ?? []);
+  let positionals: boolean | undefined;
+  const setsPositionals = () =>
+    (positionals ??=
+      /(^|[\s;&|(){}])function\s|[^\s;&|()<>$`=]\s*\(\s*\)/.test(command) ||
+      where.cmds.some((c) => {
+        const { at } = traverse(c.argv);
+        return at.some((p) => {
+          if (c.argv[p] !== "set") return false;
+          for (let j = p + 1; j < c.argv.length; j++) {
+            if (/^[-+]o$/.test(c.argv[j])) j++;
+            else if (!/^[-+][A-Za-z]*$/.test(c.argv[j])) return true;
+          }
+          return false;
+        });
+      }));
   where.cmds.forEach((cmd, n) => {
     const words = marked(n);
+    const globs = globbed(n);
     const cwd = where.cwd.get(cmd);
     const { at, chain } = traverse(cmd.argv);
     for (const p of at) {
       const name = path.basename(cmd.argv[p]);
       const end = chain.find((q) => q > p) ?? cmd.argv.length;
+      // Round 4, N3b-4: a program with an option that reads a list (LIST_OPTIONS) whose options
+      // are not held by expansionProblem already: a word bash builds when the command runs can be
+      // that option (`x=--files0-from=.env; wc $x`), and goes to the model as it does for tar.
+      // Not a word behind `--`, nor the variable of a loop over names the check knows, none of
+      // which begins with `-`. (A variable the call plainly sets to a name is printed as that
+      // name before the checks read the command: `f=notes.txt; wc -l "$f"`.)
+      if (Object.hasOwn(LIST_OPTIONS, name) && !Object.hasOwn(KEYED, name)) {
+        const seen = (words ?? cmd.argv.map((w) => w.replace(/[$`]/g, `${MARK_UNQUOTED}$&`))).slice(p + 1, end);
+        const safe = (w: string) => !!words && (loopUse(w, loops.get(n), cwd)?.every((v) => !v.text.startsWith("-")) ?? false);
+        const found = riskyWord({ letters: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" }, seen, safe);
+        if (found !== undefined) add("classify", `${name} ${found}: a word that can become an option once bash expands it, and ${name}'s options are checked by name`);
+      }
       for (let k = p + 1; k < end; k++) {
         const word = cmd.argv[k];
         // Round 4, N3: a glob in any word, one that begins with `-` too, can become an option.
         // (Not the patterns of a `case`, which name no files.)
-        const becomes = name === "case" ? undefined : optionGlob(words?.[k] ?? word, !!words, cwd);
+        // (N3c: a quoted pattern is no glob: `echo '-*'`.)
+        // (N3d: a word that begins with an arithmetic expansion is judged as one that begins with
+        // an expansion: `0*` in the judged text stands for `$((-1))*`.)
+        const arithFirst = arith && word.startsWith("0");
+        const seen = arithFirst ? (words ? `${MARK_QUOTED}\${_}${words[k].slice(1)}` : `\${_}${word.slice(1)}`) : (words?.[k] ?? word);
+        const becomes = name === "case" || (globs && !GLOB_MARKED.test(globs[k])) ? undefined : optionGlob(seen, !!words, cwd);
         if (becomes === "unplaced") add("classify", `${word} is a glob that can match a name that begins with -, in a place the check cannot tell`);
         else if (becomes) add("ask", `${word} ${becomes.sure ? "matches" : "can match"} ${becomes.name}, which ${name} would read as an option`);
+        if (name !== "case" && !behindDashDash(cmd.argv, globs, p, k)) {
+          const led = optionLedGlob(word, globs?.[k], arith);
+          // N3d: a bare unquoted expansion is a glob nobody has seen (unknownExpansion): judged
+          // against the tree as `*` is, and to the model beside a command that may write. Not a
+          // loop's variable over names the check knows (loopUse), which is judged as those. Also
+          // in a word that is a glob already: bash splits the value into words of its own
+          // (`--zq$x*` with x=' *').
+          const looped = !!words && loopUse(words[k], loops.get(n), cwd) !== undefined;
+          const expanded = !looped && unknownExpansion(word, globs?.[k], (v) => n < top && literals.has(v), n >= top || setsPositionals());
+          const other = led || expanded ? writer(cmd, n) : undefined;
+          const shown = other && [...other.argv, ...other.out.map((t) => `> ${t}`)].join(" ");
+          const by = shown && `another command of the call (${shown.length > 60 ? `${shown.slice(0, 59)}…` : shown}) may make such a name before bash expands it`;
+          if (by) add("classify", led ? `${word} is a glob that can match a name that begins with -, and ${by}` : `${word} holds an expansion that bash splits and globs, which can match a name that begins with -, and ${by}`);
+          if (expanded) {
+            let here: string | undefined;
+            try {
+              here = cwd === undefined ? undefined : fs.readdirSync(cwd).find(optionName);
+            } catch {
+              here = undefined;
+            }
+            if (cwd === undefined) add("classify", `${word} holds an expansion that bash splits and globs, in a place the check cannot tell`);
+            else if (here) add("ask", `${word} holds an expansion that bash splits and globs, which can match ${here}, a name here that ${name} would read as an option`);
+          }
+        }
         if (word.startsWith("-") && !word.includes("=")) continue;
         const strip = (w: string) => w.replace(/^-[^=]*=/, "").replace(/^@/, "");
         const text = strip(word);
@@ -2578,7 +2930,7 @@ export function runtimeReads(command: string, where: Located, scope: Scope): Gua
           continue;
         }
         // A file called `-rf` or `--to-command=x` becomes an option once the glob is expanded.
-        const option = !text.includes("/") && text === word ? files.find((f) => path.basename(f).startsWith("-")) : undefined;
+        const option = !text.includes("/") && text === word ? files.find((f) => optionName(path.basename(f))) : undefined;
         if (option) add("ask", `${word} matches ${path.basename(option)}, which ${name} would read as an option`);
         const secret = NAMES_ONLY.has(name) ? undefined : files.find((f) => readVerdict("read", f, scope));
         if (secret) add("ask", `${name} reads a credential file: ${word} matches ${secret}`);
@@ -3188,7 +3540,7 @@ function traverse(argv: string[]): Traversal {
 export const programs = (argv: string[]): number[] => traverse(argv).at;
 // The programs bash really runs in a command, wrapper by wrapper; the last is the main program
 // unless the command runs none or is a `find` with `-exec`.
-const chainOf = (argv: string[]): number[] => traverse(argv).chain;
+export const chainOf = (argv: string[]): number[] => traverse(argv).chain;
 // Why the programs a command runs cannot be read, or undefined.
 export const traversalProblem = (argv: string[]): string | undefined => traverse(argv).problem;
 
@@ -3908,7 +4260,14 @@ function fetcherWrites(name: string, args: string[]): { named: { word: string; c
     const at = whole.search(/[\/\\]/);
     const spellings = [at < 0 ? "" : whole.slice(at)];
     try { spellings.push(decodeURIComponent(spellings[0])); } catch { /* the percent spelling alone */ }
-    return spellings.flatMap((p) => {
+    // B8-6: each `%XX` on its own, whatever stands beside it (`%ff` is no UTF-8, and the whole
+    // path then had no decoded spelling at all); and for wget a second time: wget 1.25 decodes a
+    // path when it reads the URL and again when it makes the file name (`AGENTS%252emd` is saved
+    // as `AGENTS.md`; a third level stays, `%25252e` is saved as `%2e`).
+    const percent = (p: string) => p.replace(/%([0-9a-fA-F]{2})/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)));
+    spellings.push(percent(spellings[0]));
+    if (name === "wget") spellings.push(percent(percent(spellings[0])));
+    return [...new Set(spellings)].flatMap((p) => {
       const parts: string[] = [];
       for (const part of p.split(/[\/\\]/)) {
         if (part === "" || part === "." || /^%2e$/i.test(part)) continue;
@@ -4105,6 +4464,8 @@ export interface ArgvContext extends TextContext {
   dirsOf?: (cmd: Simple) => string[] | undefined;
   // B7-3: the command is a pattern of a `case` (the parser lists `*)` as a command of one word).
   pattern?: (cmd: Simple) => boolean;
+  // B8-1: the names the call defines a function under (functionNames of its text).
+  functions?: Set<string>;
   // Set when the call writes files the guard cannot name or place (an archive, a patch, a git
   // checkout, a recursive copy): the reason.
   unknownWrite?: string;
@@ -4240,6 +4601,176 @@ function tarWords(args: string[]): string[] {
   }
   return [...out, ...args.slice(k)];
 }
+// B9-6: the archive tar writes when it makes one or changes one (`-c`, `-r`, `-u`, `-A`, `--create`,
+// `--append`, `--update`, `--catenate`, `--delete`, in any spelling): every `-f`/`--file` value but
+// `-`. GNU tar 1.35 opens the archive in the directory it starts in, wherever a `-C` stands (`tar
+// -C sub -cf x.tar f` makes ./x.tar: tried), so the word is placed where the command runs. With an
+// option tar's table does not hold, the plain reading: any word of `-` letters with one of those,
+// and every `-f` value.
+// B10-8: and in every mode, the other files tar writes by an option: `--index-file` (the listing),
+// `-g`/`--listed-incremental` (the snapshot), `--volno-file` (the volume number), in any
+// abbreviation tar takes. GNU tar 1.35 writes each in the directory it starts in, wherever a `-C`
+// stands, when it creates, lists and extracts (tried; the snapshot when it creates). With an option
+// tar's table does not hold, the plain reading: every `-g` value and every word that is a prefix
+// of one of those names. (`-F`/`--info-script` and `--new-volume-script` run a program: they ask
+// by the rules.)
+const TAR_OUTPUTS = ["--index-file", "-g", "--listed-incremental", "--volno-file"];
+function tarArchiveWrites(args: string[]): string[] {
+  const words = tarWords(args);
+  const got = getopt(words, TAR_OPTIONS);
+  const outputs = got.unknown ? tarOutputsPlain(words) : got.opts.filter((o) => TAR_OUTPUTS.includes(o.name)).map((o) => o.value ?? "");
+  const CHANGES = ["-c", "-r", "-u", "-A", "--create", "--append", "--update", "--catenate", "--concatenate", "--delete"];
+  const changes = got.unknown ? words.some((w) => /^-[a-zA-Z]*[cruA]/.test(w) || /^--(cr|ap|up|cat|con|del)/.test(w)) : got.opts.some((o) => CHANGES.includes(o.name));
+  const files = !changes ? [] : got.unknown ? valued(words, "f", "--file") : got.opts.filter((o) => o.name === "-f" || o.name === "--file").map((o) => o.value ?? "");
+  return [...files, ...outputs].filter((f) => f !== "-");
+}
+function tarOutputsPlain(words: string[]): string[] {
+  const out = valued(words, "g", "--listed-incremental");
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    if (w === "--") break;
+    const eq = w.indexOf("=");
+    const name = (eq < 0 ? w : w.slice(0, eq)).slice(2);
+    if (!w.startsWith("--") || !((name.length >= 3 && ("index-file".startsWith(name) || "volno-file".startsWith(name))) || (name.length >= 5 && "listed-incremental".startsWith(name)))) continue;
+    out.push(eq < 0 ? (words[++i] ?? "") : w.slice(eq + 1));
+  }
+  return out;
+}
+// B9-6: the files and directories a compressor writes by an option (or, for lz4, its second
+// operand): zstd's `-o FILE` (also `-o=FILE`, which zstd 1.5 takes; tried), `--output-dir-flat` and
+// `--output-dir-mirror`; brotli's, lzip's and lzop's `-o`/`--output`; lzop's `-p`/`--path`; lz4's
+// output operand; zip's archive (its first operand; zip adds `.zip` to a name with no ending,
+// which only moves the write within the same directory) and `-O`/`--output-file`. Read wide: a cluster that ends in the letter
+// takes the next word, and the letter with more after it takes the rest (an `=` dropped). (zstd's
+// own reading: B10-6 below.)
+function compressorWrites(name: string, args: string[]): { files: string[]; dirs: string[] } {
+  const files: string[] = [];
+  const dirs: string[] = [];
+  const short = (letter: string, into: string[]) => {
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (a === "--") break;
+      if (a.startsWith("--") || !a.startsWith("-")) continue;
+      const at = a.indexOf(letter, 1);
+      if (at < 0 || !/^[a-zA-Z0-9]*$/.test(a.slice(1, at))) continue;
+      into.push(at === a.length - 1 ? (args[++i] ?? "") : a.slice(at + 1).replace(/^=/, ""));
+    }
+  };
+  const long = (option: string, into: string[]) => {
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === "--") break;
+      if (args[i] === option) into.push(args[++i] ?? "");
+      else if (args[i].startsWith(`${option}=`)) into.push(args[i].slice(option.length + 1));
+    }
+  };
+  if (/^(zstd|unzstd|zstdcat|zstdmt|pzstd)$/.test(name)) {
+    // B10-6: zstd 1.5 reads `-o` and `-D` (the dictionary) in a cluster as NEXT_FIELD does: after
+    // an `=` the rest of the word is the value; otherwise the value is the next word, and the
+    // cluster goes on, each such letter taking the next word in turn (`-oq OUT IN`, `-dof OUT IN`,
+    // `-Do DICT OUT IN`: tried with 1.5.7). What follows `o` without an `=` (`-oFILE`, which zstd
+    // refuses) is read as an output too, as before.
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (a === "--") break;
+      if (a.startsWith("--") || !a.startsWith("-")) continue;
+      for (let j = 1; j < a.length; j++) {
+        if (a[j] !== "o" && a[j] !== "D") continue;
+        if (a[j + 1] === "=") {
+          if (a[j] === "o") files.push(a.slice(j + 2));
+          break;
+        }
+        const value = args[++i] ?? "";
+        if (a[j] === "D") continue;
+        files.push(value);
+        if (j + 1 < a.length) files.push(a.slice(j + 1));
+        break;
+      }
+    }
+    // (B10's reading, Z2: `--trace FILE` logs into FILE, a write. The closing reading, step 7 F4:
+    // zstd takes these by their leading text (longCommandWArg): `--output-dir-flatx DIR` is
+    // `--output-dir-flat DIR`; the value follows an `=` right after the option's text, or is the
+    // next word.)
+    const zstdLong = (option: string, into: string[]) => {
+      for (let i = 0; i < args.length; i++) {
+        const a = args[i];
+        if (a === "--") break;
+        if (!a.startsWith(option)) continue;
+        const rest = a.slice(option.length);
+        // (Read wide: an `=` further on names a value too; without one right after the option's
+        // text, zstd takes the next word.)
+        if (rest.includes("=")) into.push(rest.slice(rest.indexOf("=") + 1));
+        if (!rest.startsWith("=")) into.push(args[++i] ?? "");
+      }
+    };
+    zstdLong("--output-dir-flat", dirs);
+    zstdLong("--output-dir-mirror", dirs);
+    zstdLong("--trace", files);
+  } else if (/^(brotli|lzip|plzip|lzop)$/.test(name)) {
+    short("o", files);
+    long("--output", files);
+    if (name === "lzop") {
+      short("p", dirs);
+      long("--path", dirs);
+    }
+  } else if (name === "lz4" || name === "lz4c") {
+    const operands = args.filter((a) => !a.startsWith("-"));
+    if (!args.some((a) => /^(-[a-zA-Z0-9]*m|--multiple)$/.test(a)) && operands.length > 1) files.push(operands[1]);
+  } else if (name === "zip") {
+    const VALUED = /^-(b|n|t|tt|O|P|s|sp|Z|ds)$|^--(output-file|temp-path|suffixes|from-date|before-date|password|split-size|compression-method)$/;
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (VALUED.test(a)) {
+        if (a === "-O" || a === "--output-file") files.push(args[i + 1] ?? "");
+        i++;
+      } else if (a.startsWith("--output-file=")) files.push(a.slice("--output-file=".length));
+      // B10-10: `-O` with its value attached (`-Oout.zip`), or last in a cluster (`-qO out.zip`):
+      // read wide (zip 3.0 is not installed here; its letters with a value take the rest of the
+      // word or the next word).
+      else if (/^-[a-zA-Z0-9]*O/.test(a) && !a.startsWith("--")) {
+        const rest = a.slice(a.indexOf("O") + 1).replace(/^=/, "");
+        files.push(rest || (args[++i] ?? ""));
+      } else if (!a.startsWith("-")) {
+        files.push(a);
+        break;
+      }
+    }
+  }
+  return { files: files.filter((f) => f !== "-"), dirs };
+}
+// B9-1: unzip's words, as Info-ZIP unzip 6.0 reads them (unzip.c: uz_opts, then the loop over the
+// words after the archive). Its options stand before the archive only, letter by letter: `-d`
+// takes the rest of the word or the next word, and a `-` inside a word negates the letter after
+// it. The first other word is the archive. After it a word that begins with `-d` names the
+// directory (the rest of the word, or the next word), unless a `-d` came before; `-x` alone
+// starts the names to leave out, and every other word is a member's name or pattern (`unzip a.zip
+// '*' -l` extracts everything). It writes unless a leading option lists, tests, prints or helps
+// (`-l -t -p -c -z -v -Z -h`), or there is no archive; a negation anywhere among the leading
+// options is read as writing. `dir`: the directory it writes in (undefined: where it runs).
+// B10-3: `-P` (the password) takes a value as `-d` does, and so do `-O` and `-I` (the archive's and
+// the system's character sets, of the iconv patch the distributions carry; a build without them
+// refuses the letter, and writes nothing): their value is no option and names no place.
+export function unzipWords(args: string[]): { writes: boolean; dir?: string } {
+  let k = 0;
+  let lists = false;
+  let negated = false;
+  let dir: string | undefined;
+  for (; k < args.length && args[k].startsWith("-") && args[k] !== "-"; k++) {
+    const w = args[k];
+    for (let i = 1; i < w.length; i++) {
+      if (w[i] === "-") negated = true;
+      else if ("dPOI".includes(w[i])) {
+        if (w[i] === "d") dir ??= i + 1 < w.length ? w.slice(i + 1) : (args[k + 1] ?? "");
+        if (i + 1 === w.length) k++;
+        break;
+      } else if ("lptczvhZ".includes(w[i])) lists = true;
+    }
+  }
+  if (k >= args.length) return { writes: false };
+  for (let j = k + 1; j < args.length; j++) {
+    if (dir === undefined && args[j].startsWith("-d")) dir = args[j].length > 2 ? args[j].slice(2) : (args[++j] ?? "");
+  }
+  return { writes: !lists || negated, ...(dir !== undefined ? { dir } : {}) };
+}
 // Writers whose output names are not on the command line (finding 23).
 // `filesOnly`: for an `mv`, whether every source is a file that is there now and that nothing
 // else in the call touches (B7-11: then the move brings in no directory of files).
@@ -4250,7 +4781,7 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
     const first = args[0] ?? "";
     if (longOption(args, ["--extract", "--get"]) || args.some((a) => /^-[a-zA-Z]*x/.test(a) && !a.startsWith("--")) || /^[a-zA-Z]*x/.test(first)) return `${name} -x writes the files the archive names`;
   }
-  if ((name === "unzip" && !args.some((a) => /^-[a-zA-Z]*[lptvZ]/.test(a))) || name === "7z" || name === "cpio" || name === "rar" || name === "unrar") return `${name} writes the files the archive names`;
+  if ((name === "unzip" && unzipWords(args).writes) || name === "7z" || name === "cpio" || name === "rar" || name === "unrar") return `${name} writes the files the archive names`;
   if (/^(gunzip|unxz|unzstd|bunzip2|uncompress)$/.test(name) || (/^(gzip|xz|zstd|bzip2)$/.test(name) && args.some((a) => /^(-[a-zA-Z]*d|--decompress|--uncompress)$/.test(a)))) return `${name} -d writes files next to its input`;
   if (name === "patch") {
     const got = getopt(args, PATCH_OPTIONS);
@@ -4308,7 +4839,10 @@ function unnamedWriteDirs(name: string, args: string[]): (string | undefined)[] 
     const before = got.operands.some((o) => o.at < dirs[0].at);
     return place([...(before ? ["."] : []), dirs[0].value ?? ""]);
   }
-  if (name === "unzip") return place(valued(args, "d", "--never"));
+  if (name === "unzip") {
+    const dir = unzipWords(args).dir;
+    return place(dir === undefined ? [] : [dir]);
+  }
   if (name === "patch") {
     const got = getopt(args, PATCH_OPTIONS);
     // Backups under a prefix (`-B`, `-Y`) land where the prefix leads.
@@ -4402,8 +4936,34 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       // write listed here where it lands: what the rules say of the program's place outside the
       // project stands (`tar -xf a.tar -C /tmp` is the model's, as before).
       const place = (word: string | undefined, dir: boolean) => void (word !== undefined && plainWord(word) && add(word, true, dir ? { dir: true } : {}));
-      if (blind && (name === "tar" || name === "gtar" || name === "bsdtar")) for (const o of getopt(tarWords(args), TAR_OPTIONS).opts) if (o.name === "-C" || o.name === "--directory") place(o.value, true);
-      if (blind && name === "unzip") valued(args, "d", "--never").forEach((d) => place(d, true));
+      if (blind && (name === "tar" || name === "gtar" || name === "bsdtar")) {
+        const opts = getopt(tarWords(args), TAR_OPTIONS).opts;
+        for (const o of opts) if (o.name === "-C" || o.name === "--directory") place(o.value, true);
+        // B8-7: `--one-top-level=DIR` names a place as `-C` does (GNU tar 1.35: under the
+        // directory its `-C` options lead to, wherever they stand among the words), and without
+        // a value the directory is named after the archive (`.git.tar` unpacks into `.git`):
+        // every name the archive's own gives with its endings taken off, one by one.
+        let base = "";
+        for (const o of opts) if (o.name === "-C" || o.name === "--directory") base = base === "" || path.isAbsolute(tilde(o.value ?? "")) ? (o.value ?? "") : `${base}/${o.value ?? ""}`;
+        const under = (w: string) => (base === "" || path.isAbsolute(tilde(w)) ? w : `${base}/${w}`);
+        for (const o of opts) {
+          if (o.name !== "--one-top-level") continue;
+          if (o.value) place(under(o.value), true);
+          else for (const archive of opts.filter((f) => f.name === "-f" || f.name === "--file").map((f) => f.value ?? "")) {
+            for (let stem = path.basename(archive); /.\.[^.\/]*$/.test(stem); ) {
+              stem = stem.replace(/\.[^.\/]*$/, "");
+              place(under(stem), true);
+              if (archive.includes("/")) place(under(`${path.dirname(archive)}/${stem}`), true);
+            }
+          }
+        }
+      }
+      if (blind && name === "unzip") place(unzipWords(args).dir, true);
+      // B9-6: the archive tar makes or changes, and what a compressor's output option names.
+      if (name === "tar" || name === "gtar" || name === "bsdtar") tarArchiveWrites(args).forEach((f) => add(f, false));
+      const compressed = compressorWrites(name, args);
+      compressed.files.forEach((f) => add(f, false));
+      compressed.dirs.forEach((d) => add(d, false, { dir: true }));
       if (name === "find") args.forEach((a, k) => void (/^-(fprint0?|fprintf|fls)$/.test(a) && place(args[k + 1], false)));
       if (name === "rsync") for (const o of getopt(args, COPY_OPTIONS.rsync).opts) {
         if (["--log-file", "--write-batch", "--only-write-batch"].includes(o.name)) place(o.value, false);
@@ -4562,7 +5122,11 @@ export function shellAlsoKeeps(names: Iterable<string> | undefined): void {
   if (names === undefined) keepsEverything = true;
   else keptByShell = new Set([...(keptByShell ?? []), ...names]);
 }
-const shellCdpath = (): string | undefined => (keepsEverything || keptByShell === undefined || keptByShell.has("CDPATH") ? process.env.CDPATH || undefined : undefined);
+// That is the plugin's own CDPATH, and opencode builds a shell's environment from its session's,
+// which need not be this process's (C8 review, F4): the plugin's shell hook compares this answer
+// with the CDPATH of the shell it is about to start, and a call that holds a `cd` does not run
+// as decided where they differ (index.ts, create.before).
+export const shellCdpath = (): string | undefined => (keepsEverything || keptByShell === undefined || keptByShell.has("CDPATH") ? process.env.CDPATH || undefined : undefined);
 
 // The place a tool call starts in.
 export function startPlace(dir: string): Place {
@@ -5379,7 +5943,11 @@ function placeAll(command: string, starts: Places, depth: number, out: Located, 
 // name). B5: a call outside the shape (Located.unfollowed) is the model's, whole: no reading of
 // its commands' operands. A word that names the directory a command runs in by another name
 // (hereWord) is judged as the path under each place the command runs in, in every call.
-export function placedReads(where: Located, scope: Scope, judgeAt: (dir: string, words: string[]) => { action: string; reason: string }): GuardVerdict | undefined {
+// B8-4: `landed`: what is wrong with a write to a path (a protected place: decide.ts). A word
+// that names the directory by another name may be what the program writes (`cp -t/proc/self/cwd`,
+// `sort -o /proc/self/cwd/x`, `echo x > /proc/self/cwd/x` after a `cd .git/hooks`): which word a
+// program writes is its own table, so each such word is held to it, where it lands.
+export function placedReads(where: Located, scope: Scope, judgeAt: (dir: string, words: string[]) => { action: string; reason: string }, landed?: (file: string) => string | undefined): GuardVerdict | undefined {
   let verdict: GuardVerdict | undefined;
   const add = (action: "ask" | "classify", reason: string) => void (verdict = stricter(verdict, { action, reason }));
   if (where.moves) {
@@ -5407,13 +5975,32 @@ export function placedReads(where: Located, scope: Scope, judgeAt: (dir: string,
     let k = 0;
     while (k < cmd.argv.length && RULES_KEYWORDS.has(cmd.argv[k])) k++;
     const own = cmd.argv.slice(k);
+    const onlyReads = programs(cmd.argv).every((at) => ONLY_READ.has(cmd.argv[at]));
     // B5: the words that name the directory the command runs in (or another process's) by
     // another name: its operands, an option's value after `=`, its redirects' targets.
-    const named: { word: string; here: HereWord; write: boolean }[] = [];
+    const named: { word: string; here: HereWord; write: boolean | "both" }[] = [];
     const look = (w: string, write: boolean) => {
+      // B9-2: a word of one `-` too long to read every tail of is given up on, and giving
+      // up is a verdict: the model (for the tails of both loops below).
+      if (/^-[^-]/.test(w) && w.length > ATTACHED_MAX) add("classify", `${w.slice(0, 40)}… is a word of options longer than ${ATTACHED_MAX} characters, whose attached values the check does not read`);
       const value = /^-[^=]*=/.test(w) ? w.slice(w.indexOf("=") + 1) : w;
       const here = hereWord(value);
-      if (here) named.push({ word: value, here, write });
+      // (B8-4: an option's value, `--output=/proc/self/cwd/x`, may be what the program writes.)
+      if (here) named.push({ word: value, here, write: value === w ? write : "both" });
+      // B9-5: `$PWD` after a cd: read and written where the command runs (`cd .git/hooks && echo x
+      // > $PWD/pre-commit`), or, in a form the check does not place, the model's.
+      const pwd = where.moves ? pwdWord(value) : undefined;
+      if (pwd === "unplaced") add("classify", `${w} names the directory a command runs in by $PWD in a form the check cannot place after a cd`);
+      else if (pwd) named.push({ word: value, here: pwd, write: value === w ? write : "both" });
+      // B8-4: a value attached to a short option, behind any number of others (`-t/proc/self/cwd`,
+      // `-vt/proc/self/cwd`): every tail of the word that begins a path. Whether the program reads
+      // or writes there the word does not say: judged as both. (bash expands no `~` inside a word.)
+      if (/^-[^-=]/.test(w) && w.length <= ATTACHED_MAX) {
+        for (let k = 2; k < w.length; k++) {
+          const tail = w[k] === "/" ? hereWord(w.slice(k)) : undefined;
+          if (tail) named.push({ word: w.slice(k), here: tail, write: "both" });
+        }
+      }
     };
     own.forEach((w) => look(w, false));
     (cmd.in ?? []).forEach((w) => look(w, false));
@@ -5423,8 +6010,30 @@ export function placedReads(where: Located, scope: Scope, judgeAt: (dir: string,
     // to one, in each place the command may run in: relative to the process that walks it.
     // (Not a pattern of a `case`: it names no file.)
     for (const w of where.patterns.has(cmd) ? [] : [...own, ...(cmd.in ?? []), ...cmd.out]) {
-      const values = !w.startsWith("-") ? [w] : [...(w.includes("=") ? [w.slice(w.indexOf("=") + 1)] : []), ...(/^-[A-Za-z]./.test(w) ? [w.slice(2)] : [])];
-      for (const value of values) if (throughProc(value, places)) add("classify", `${value.slice(0, 80)} is a path through /proc that is relative to the process that walks it: the check reads its own`);
+      // B8-4: for a word that begins with one `-`, every tail of it: the value of a short option
+      // stands behind any number of others (`cp -vt../mylink`: `vt../mylink`, `t../mylink`,
+      // `../mylink`), and which letters take a value is each program's own table.
+      const values = !w.startsWith("-") ? [w] : [...(w.includes("=") ? [w.slice(w.indexOf("=") + 1)] : []), ...(/^-[^-]/.test(w) && w.length <= ATTACHED_MAX ? Array.from({ length: w.length - 1 }, (_, k) => w.slice(k + 1)) : [])];
+      for (const value of new Set(values)) {
+        // B9-7: such a path with a glob in it asks (the maintainer's decision): the glob is
+        // matched where the plugin's process walks the path, not where the shell does (`cd src
+        // && cat /proc/self/cwd/../.e*`). Any spelling: the directory's own names (hereWord, other
+        // processes' too), and any path whose walk enters /proc/self, /proc/thread-self or
+        // /proc/<n> (throughProc: a link to there as well).
+        const through = throughProc(value, places);
+        if (/[*?]|\[.*\]/s.test(value) && (hereWord(value)?.tilde === false || through === true)) {
+          add("ask", `${value.slice(0, 80)} leads through /proc to a process's own directory and holds a glob, which the check would match in its own process and not where the command runs`);
+          break;
+        }
+        // (B10-5: an expansion the check does not walk in full: giving up is a verdict.)
+        if (through === "unknown") {
+          add("classify", `${value.slice(0, 80)} holds a glob or braces whose expansion the check does not walk in full: whether it leads through /proc cannot be told`);
+          break;
+        }
+        if (!through) continue;
+        add("classify", `${value.slice(0, 80)} is a path through /proc that is relative to the process that walks it: the check reads its own`);
+        break;
+      }
     }
     if (!own.length && !named.length) continue;
     if (!places) {
@@ -5440,10 +6049,20 @@ export function placedReads(where: Located, scope: Scope, judgeAt: (dir: string,
       for (const n of named) {
         if (n.here.elsewhere) continue;
         for (const text of hereTexts(n.here, p)) {
+          // B8-4: as a write, where it may be one: a redirect's target, an option's value, and a
+          // word of any program but the ones that only read what their words name. (A glob is
+          // read as written: `landed` takes it for every name it can match.)
+          if (landed && (n.write !== false || !onlyReads)) {
+            for (const file of new Set([text, physical(text)])) {
+              const protectedPlace = landed(file);
+              if (protectedPlace) add("ask", `${n.word}, which is ${file} where it runs: ${protectedPlace}`);
+            }
+          }
           for (const file of new Set([text, physical(text)])) {
-            const f = n.write ? fileVerdict("edit", file, scope) : judgeAt(p.real, ["cat", file]);
-            if (f.action === "ask" || f.action === "deny") add("ask", `${n.word}, which is ${file} where it runs: ${f.reason}`);
-            else if (f.action === "classify") add("classify", `${n.word}, which is ${file} where it runs: ${f.reason}`);
+            for (const f of [...(n.write !== false ? [fileVerdict("edit", file, scope)] : []), ...(n.write !== true ? [judgeAt(p.real, ["cat", file])] : [])]) {
+              if (f.action === "ask" || f.action === "deny") add("ask", `${n.word}, which is ${file} where it runs: ${f.reason}`);
+              else if (f.action === "classify") add("classify", `${n.word}, which is ${file} where it runs: ${f.reason}`);
+            }
           }
         }
       }
@@ -5452,23 +6071,398 @@ export function placedReads(where: Located, scope: Scope, judgeAt: (dir: string,
   return verdict;
 }
 
+// ---- reads judged by where they lead (B11) ----
+//
+// The rules judge a read of a credential by the word's text, and resolve the links on the way by
+// realpath after the text is normalised: a link before a `..` is dropped with it, where the kernel
+// follows the link first (`pl -> ~/.config/plain`: `cat pl/../gh/hosts.yml` reads
+// ~/.config/gh/hosts.yml). And a link made in the call itself does not exist when the call is
+// judged (`ln -s ~/.config/gh g1; cat g1/hosts.yml`). The maintainer's decision (consult 19):
+// around the vendored rules, every word of a command that exists as a path and leads, as the
+// kernel walks it from where the command runs, somewhere else than its text says is judged again
+// by the rules as that physical path (the whole command, the word replaced: which words a program
+// reads is the rules' own reading); an ask of theirs for a credential read asks, naming both
+// spellings. And `ln` (any form) or `cp -s` whose target is a credential location counts as a
+// read of it: the target itself as the rules judge it (by its text or its physical path), or a
+// directory that holds one of the places the rules know by more than one name (`~/.config/gh`
+// holds `hosts.yml`, `/etc` holds `shadow`), which a path through the link no longer shows.
+// The links ln and `cp -s` make in the call are walked as made, wherever the walk meets their
+// name and finds nothing there yet (`ln -s ~/.config/plain pl; cat pl/../gh/hosts.yml`), and so
+// is a link `cp -P`/`-d`/`-a` copies or `mv` moves (the closing check's S4). A `<` input is walked
+// too, for the links the call makes (inputReads judges its physical path as the tree stands).
+// Writes (the F6 writer's finding, and the closing check's S5, S6): a written word or redirect
+// target is judged again where the walk leads, a leading `$PWD` taken as where the command runs;
+// an expansion before a `..` goes to the model.
+// Not here: a read through a word with an expansion or a glob (the rules match a glob where the
+// kernel walks it), what a program reads that its words do not name (`grep -r`, `tar -C`), a link
+// a program other than ln, cp or mv makes (`tar x`, `git checkout`), and a link inside a
+// directory that cp or mv copies or moves whole.
+export function linkedReads(where: Located, scope: Scope, judgeAt: (dir: string, words: string[]) => { action: string; reason: string }): GuardVerdict | undefined {
+  let verdict: GuardVerdict | undefined;
+  const add = (reason: string) => void (verdict = stricter(verdict, { action: "ask", reason }));
+  const classify = (reason: string) => void (verdict = stricter(verdict, { action: "classify", reason }));
+  // The commands as they are read here: their words after bash's own (`if`, `!`) and the
+  // directories they may run in.
+  const read: { own: string[]; dirs: string[]; argv: string[]; out: string[]; inputs: string[] }[] = [];
+  for (const cmd of where.cmds) {
+    const places = where.places.get(cmd);
+    if (!places || where.patterns.has(cmd)) continue;
+    let k = 0;
+    while (k < cmd.argv.length && RULES_KEYWORDS.has(cmd.argv[k])) k++;
+    const own = cmd.argv.slice(k);
+    if (own.length >= 2 || cmd.out.length || cmd.in?.length) read.push({ own, dirs: [...new Set(places.map((p) => p.real))], argv: cmd.argv, out: cmd.out, inputs: cmd.in ?? [] });
+  }
+  // The links the call makes: where each lands (its name, with the directory it is in walked) and
+  // what it may lead to.
+  const made = new Map<string, string[]>();
+  const links: { prog: string; t: string; dir: string; to: string[] }[] = [];
+  // (The names each command lands its own links at: it writes the link, it does not follow it.)
+  const ownLinks = new Map<string[], Set<string>>();
+  for (const { argv, dirs } of read) {
+    for (const n of programs(argv)) {
+      const prog = path.basename(argv[n]);
+      if (prog !== "ln" && prog !== "cp" && prog !== "mv") continue;
+      const args = argv.slice(n + 1);
+      const opts = prog === "mv" ? [] : getopt(args, COPY_OPTIONS[prog]).opts.map((o) => o.name);
+      // (S4: cp copies a link as a link with -P, -d, -a and, for a link named on its command line,
+      // never with -r alone; mv moves it. The copy leads where the link led.)
+      const symbolic = prog === "cp" && opts.some((o) => o === "-s" || o === "--symbolic-link");
+      const copies = prog === "mv" || (prog === "cp" && !symbolic && opts.some((o) => ["-P", "-d", "-a", "--no-dereference", "--archive"].includes(o)) && !opts.some((o) => ["-L", "-H", "--dereference"].includes(o)));
+      if (prog === "cp" && !symbolic && !copies) continue;
+      const { target, operands } = copyWords(prog, args);
+      const targets = target !== undefined || operands.length === 1 ? operands : operands.slice(0, -1);
+      const last = operands[operands.length - 1];
+      const plain = (w: string | undefined) => w !== undefined && !/[$`]/.test(w) && !/^~(?![/+]|$)/.test(w) && !/^~\+[^/]/.test(w) && w.length <= ATTACHED_MAX;
+      for (const dir of dirs) {
+        // (Joined as text: the kernel's walk takes a `..` after a link, path.join does not.)
+        const abs = (w: string) => homeOrHere(w, dir);
+        for (const t of targets.filter(plain)) {
+          // Where the link lands: in the `-t` directory, here for one operand, or the last operand
+          // itself or (a directory) in it. (C1: not under a name of `.` or `..`, which no link
+          // takes: `ln -s ../.. x` makes `x`.)
+          const base = path.basename(t);
+          const named = (d: string) => (base === "." || base === ".." || base === "" ? [] : [`${d}/${base}`]);
+          const names = target !== undefined ? (plain(target) ? named(abs(target)) : []) : operands.length === 1 ? named(dir) : plain(last) ? [abs(last), ...named(abs(last))] : [];
+          let to: string[];
+          if (copies) {
+            // What the source is as a link: one the call makes, or one there now (its text read
+            // from where the copy lands, and from where it stood).
+            const from = landed(abs(t));
+            const known = from !== undefined ? made.get(from) : undefined;
+            let text: string | undefined;
+            try {
+              if (from !== undefined && fs.lstatSync(from).isSymbolicLink()) text = fs.readlinkSync(from);
+            } catch {}
+            if (!known && text === undefined) continue;
+            to = [...(known ?? []), ...(text === undefined ? [] : path.isAbsolute(text) ? [text] : [`${path.dirname(from!)}/${text}`, ...names.map((m) => `${path.dirname(m)}/${text}`)])];
+          } else {
+            // A symbolic link's target is read from the link's own directory (with `-r`, and for
+            // a hard link or `cp -s`, from where the command runs): each.
+            to = path.isAbsolute(tilde(t)) || t === "~+" || t.startsWith("~+/") ? [homeOrHere(t, dir)] : [`${dir}/${t}`, ...names.map((m) => `${path.dirname(m)}/${t}`)];
+            links.push({ prog, t, dir, to });
+          }
+          for (const m of names) {
+            const at = landed(m);
+            if (at === undefined) continue;
+            made.set(at, [...new Set([...(made.get(at) ?? []), ...to])]);
+            ownLinks.set(argv, new Set([...(ownLinks.get(argv) ?? []), at]));
+          }
+        }
+      }
+    }
+  }
+  // A link made to a credential location.
+  for (const { prog, t, to } of links) {
+    for (const file of new Set(to)) {
+      const held = credentialLocation(file, scope, made);
+      if (held) add(`${prog} makes a link to ${t}, which leads to ${held}: a link to a credential location counts as a read of it`);
+    }
+  }
+  // Each word as the rules read a path in it: after a `name=` and curl's `@`.
+  for (const { own, dirs, argv, inputs } of read) {
+    const mine = ownLinks.get(argv);
+    const madeHere = mine ? new Map([...made].filter(([at]) => !mine.has(at))) : made;
+    // (mv, rm and unlink act on a link itself, not where it leads: a link the call made, named as
+    // the word, is not followed for them. `ln -s <dir> pa && mv pa pb` writes nothing outside.)
+    const onLink = own.length > 0 && ["mv", "rm", "unlink"].includes(path.basename(own[0]));
+    for (const dir of dirs) {
+      // S2: a `<` input, through a link the call makes or a `..` after one.
+      for (const w of inputs) {
+        if (w.length > ATTACHED_MAX) continue;
+        for (const led of leadsTo(w, dir, made)) {
+          const v = judgeAt(dir, ["cat", led]);
+          if ((v.action === "ask" || v.action === "deny") && CREDENTIAL_READ.test(v.reason)) add(`the input ${w} leads to ${led}: ${v.reason}`);
+        }
+      }
+      // (The command as written, judged once: a write the rules ask about already is theirs.)
+      let asWritten: { action: string } | undefined;
+      const written = () => (asWritten ??= judgeAt(dir, own)).action;
+      const writtenAsks = () => written() === "ask" || written() === "deny";
+      for (let i = 1; i < own.length; i++) {
+        const w = own[i];
+        if (w.length > ATTACHED_MAX) continue;
+        const lead = /^[^=/]*=/.exec(w)?.[0] ?? "";
+        const at = w.slice(lead.length).startsWith("@") ? "@" : "";
+        const value = w.slice(lead.length + at.length);
+        const again = (led: string) => judgeAt(dir, own.map((x, j) => (j === i ? `${lead}${at}${led}` : x)));
+        for (const led of leadsTo(value, dir, made)) {
+          const v = again(led);
+          if ((v.action === "ask" || v.action === "deny") && CREDENTIAL_READ.test(v.reason)) add(`${path.basename(own[0])} reads ${w}, which leads to ${led}: ${v.reason}`);
+        }
+        // A write there (the F6 writer's finding): the word as the kernel walks it, the last name
+        // possibly not there yet, judged again by the rules; an ask of theirs that the word as
+        // written does not get (a credential read is the loop above's) asks.
+        if (expandedBeforeUp(value)) classify(`${w} holds an expansion before a \`..\`: where it leads cannot be walked`);
+        const self = onLink ? landed(homeOrHere(value, dir)) : undefined;
+        const madeFor = self !== undefined && madeHere.has(self) ? new Map([...madeHere].filter(([at]) => at !== self)) : madeHere;
+        for (const led of writesTo(value, dir, madeFor)) {
+          const v = again(led);
+          if ((v.action === "ask" || v.action === "deny") && !CREDENTIAL_READ.test(v.reason) && !writtenAsks()) add(`${path.basename(own[0])} names ${w}, which leads to ${led}: ${v.reason}`);
+          // S6: an answer of the model's for the walked path, where the written one is an allow.
+          else if (v.action === "classify" && written() === "allow") classify(`${path.basename(own[0])} names ${w}, which leads to ${led}: ${v.reason}`);
+        }
+      }
+    }
+  }
+  // A redirect's target, the same way: the file the shell opens, as the kernel walks it.
+  for (const { out, dirs } of read) {
+    for (const dir of dirs) {
+      for (const t of out) {
+        if (t.length > ATTACHED_MAX) continue;
+        if (expandedBeforeUp(t)) classify(`a redirect to ${t}, which holds an expansion before a \`..\`: where it leads cannot be walked`);
+        for (const led of writesTo(t, dir, made)) {
+          const v = fileVerdict("edit", led, scope);
+          if (v.action === "ask" || v.action === "deny") add(`a redirect to ${t}, which leads to ${led}: ${v.reason}`);
+          else if (v.action === "classify") classify(`a redirect to ${t}, which leads to ${led}: ${v.reason}`);
+        }
+      }
+    }
+  }
+  return verdict;
+}
+// The rules' reason for a credential read (rules.ts: `<name> reads a credential file: <word>`).
+const CREDENTIAL_READ = /\breads a credential file\b/;
+// A path whose last name may be made: its directory walked as the kernel walks it, the name joined.
+function landed(abs: string): string | undefined {
+  const w = kernelWalk(path.dirname(abs));
+  return w.problem ? undefined : path.join(path.resolve(w.at, ...w.rest), path.basename(abs));
+}
+// Where a path leads as the kernel walks it (each link followed before a `..` after it), each
+// place it reaches that exists. A link the call makes (`made`) is taken where the walk meets its
+// name, besides what is there now (`ln -sf` replaces it); a name that is not there yet is walked
+// as a directory the call may make, for the links made below it.
+function walks(abs: string, made: Map<string, string[]>, missingToo = false): string[] {
+  return linkWalk(abs, made, missingToo).map((x) => x.at);
+}
+// The same, each place with whether the walk took a link the call makes, or a link before a `..`
+// (where the rules' reading, which normalises the text first, parts from the kernel's).
+function linkWalk(abs: string, made: Map<string, string[]>, missingToo: boolean): { at: string; parted: boolean }[] {
+  const out = new Map<string, boolean>();
+  const split = (p: string) => p.split("/").filter((s) => s !== "" && s !== ".");
+  const queue: { rest: string[]; parted: boolean }[] = [{ rest: split(abs), parted: false }];
+  for (let n = 0; queue.length && n < 32; n++) {
+    const { rest, parted: from } = queue.shift()!;
+    let parted = from;
+    let linked = false;
+    let cur = "/";
+    let missing = false;
+    // (The last place that exists before a name that does not, yet: a `..` back to it or above it
+    // is on existing ground again, `mkdir d; ln -s ../../x d/g` (the Sonnet check's S1).)
+    let ground: string | undefined;
+    for (let hops = 0; rest.length; ) {
+      const part = rest.shift()!;
+      if (part === "..") {
+        if (linked) parted = true;
+        cur = path.dirname(cur);
+        if (ground !== undefined && (cur === ground || !cur.startsWith(`${ground}/`))) {
+          missing = false;
+          ground = undefined;
+        }
+        continue;
+      }
+      const next = path.join(cur, part);
+      for (const to of made.get(next) ?? []) queue.push({ rest: [...split(to), ...rest], parted: true });
+      if (missing) {
+        cur = next;
+        continue;
+      }
+      let st: fs.Stats;
+      try {
+        st = fs.lstatSync(next);
+      } catch {
+        missing = true;
+        ground = cur;
+        cur = next;
+        continue;
+      }
+      if (st.isSymbolicLink()) {
+        let target: string;
+        try {
+          if (++hops > 40) throw new Error("links that do not end");
+          target = fs.readlinkSync(next);
+        } catch {
+          missing = true;
+          cur = next;
+          continue;
+        }
+        rest.unshift(...split(target));
+        if (path.isAbsolute(target)) cur = "/";
+        linked = true;
+        continue;
+      }
+      cur = next;
+    }
+    if (!missing || missingToo) out.set(cur, (out.get(cur) ?? false) || parted);
+  }
+  return [...out].map(([at, parted]) => ({ at, parted }));
+}
+// The physical paths a word names from `dir` that differ from the path its text names; none for
+// an expansion, a glob, `~user`, nothing there or a walk the check cannot make.
+function leadsTo(value: string, dir: string, made: Map<string, string[]>): string[] {
+  if (!value || value.startsWith("-") || /[$`*?[]/.test(value) || /^~(?![/+]|$)/.test(value) || /^~\+[^/]/.test(value)) return [];
+  const abs = homeOrHere(value, dir);
+  return walks(abs, made).filter((p) => p !== path.normalize(abs));
+}
+// The places a written word leads to where the rules' reading misses it: through a link before a
+// `..`, or a link the call makes. (A link the rules can see, `pl/x` with `pl` there before the
+// call, they resolve themselves: judged again it gets the same answer, so it is left out for cost,
+// and no test holds that filter.) Not /proc or /dev, whose links name a process's own files.
+function writesTo(value: string, dir: string, made: Map<string, string[]>): string[] {
+  // (S5: `$PWD` and `${PWD}` at the start are where the command runs.)
+  const here = /^\$(?:PWD|\{PWD\})(?=\/|$)/.exec(value);
+  if (here) value = `${dir}${value.slice(here[0].length)}`;
+  if (!value || value.startsWith("-") || /[$`*?[]/.test(value) || /^~(?![/+]|$)/.test(value) || /^~\+[^/]/.test(value)) return [];
+  const abs = homeOrHere(value, dir);
+  if (/^\/(?:proc|dev)(?:\/|$)/.test(path.normalize(abs))) return [];
+  return linkWalk(abs, made, true).filter((p) => p.parted && p.at !== path.resolve(abs)).map((p) => p.at);
+}
+// A path as the shell gives it: `~` and `~/` the home, `~+` where the command runs, a relative
+// one joined to `dir` as text (the kernel takes a `..` after a link, path.join would not).
+function homeOrHere(w: string, dir: string): string {
+  if (w === "~+" || w.startsWith("~+/")) return `${dir}${w.slice(2)}`;
+  const text = tilde(w);
+  return path.isAbsolute(text) ? text : `${dir}/${text}`;
+}
+// A written path with an expansion (other than a leading `$PWD`) before a `..`: the walk cannot be
+// made (S5: `d=$PWD; echo x > $d/od/../victim`).
+function expandedBeforeUp(value: string): boolean {
+  const rest = value.replace(/^\$(?:PWD|\{PWD\})(?=\/|$)/, "");
+  const up = rest.search(/(?:^|\/)\.\.(?:\/|$)/);
+  return up > 0 && /[$`]/.test(rest.slice(0, up));
+}
+// The places the rules know a credential by more than one name (rules.ts SECRET_PLACES), each as
+// the names below a directory that ends in the rest: `.config/gh/hosts.yml` is `gh/hosts.yml`
+// below a `.config` and `hosts.yml` below a `.config/gh`. The places anchored at the root count
+// from `/` too. Each candidate is judged by the rules themselves (readVerdict): the list only says
+// where to look. (A credential known by a single name, `.ssh`, `.env`, keeps that name in any path
+// through a link to the directory it is in.)
+const PLACE_TAILS = [
+  ...[".config/gcloud", ".config/op", ".config/gh/hosts.yml", ".docker/config.json", ".cargo/credentials", ".cargo/credentials.toml", ".terraform.d/credentials.tfrc.json", ".local/share/keyrings", "Library/Keychains"].flatMap((p) => p.split("/").slice(1).map((_, n, parts) => parts.slice(n).join("/"))),
+  ...["etc/shadow", "etc/gshadow", "etc/shadow-", "etc/gshadow-", "etc/ssl/private", "etc/ssh/ssh_host_*_key", "proc/self/environ"].flatMap((p) => p.split("/").map((_, n, parts) => parts.slice(n).join("/"))),
+];
+// Whether `file` (a link's target) is a credential location: one as the rules judge it, by its
+// text or by where the kernel's walk leads, or an existing directory with one of the places above
+// in it. The credential's path, or undefined.
+function credentialLocation(file: string, scope: Scope, made: Map<string, string[]>): string | undefined {
+  const reals = walks(file, made);
+  for (const f of new Set([path.normalize(file), ...reals])) if (readVerdict("read", f, scope)) return f;
+  for (const real of reals) {
+    const held = placeIn(real, scope);
+    if (held) return held;
+  }
+  return undefined;
+}
+// One of the places above in an existing directory.
+function placeIn(real: string, scope: Scope): string | undefined {
+  for (const tail of PLACE_TAILS) {
+    let names = [path.join(real, tail)];
+    if (tail.includes("*")) {
+      const parent = path.dirname(names[0]);
+      const re = new RegExp(`^${path.basename(tail).split("*").map((s) => s.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`);
+      try {
+        names = fs.readdirSync(parent).filter((f) => re.test(f)).map((f) => path.join(parent, f));
+      } catch {
+        continue;
+      }
+    }
+    for (const f of names) if (lexists(f) && readVerdict("read", f, scope)) return f;
+  }
+  return undefined;
+}
+
+// The longest word whose every tail is read as an attached value (B8-4).
+const ATTACHED_MAX = 4096;
+// B8-4: programs that write none of the files their words name (bash's own words among them), by
+// the bare name: for these a word that names the directory by another name is a read.
+const ONLY_READ = new Set("ls cat head tail wc stat file grep egrep fgrep rg diff cmp test [ [[ du nl tac md5sum sha1sum sha256sum readlink realpath basename dirname echo printf cd pushd if then elif else fi do done while until for select in case esac time ! { }".split(" "));
 // B7-9: whether a word of a command, as a path in any of the places the command may run in, is
 // relative to the process that walks it (procRelative), in any expansion of its braces and
 // globs. The two direct spellings of the directory itself (hereWord: `~+`, `/proc/self/cwd`) are
 // read as the path under each place first, and only what follows them is walked.
-function throughProc(word: string, places: Places): boolean {
-  if (word === "" || /[$`\n]/.test(word) || /^~[^/+]/.test(word)) return false;
+// B10-5: "unknown" where the expansion is not walked in full (see globWalksProc).
+function throughProc(word: string, places: Places): boolean | "unknown" {
+  // (The closing runs, step 7: a /proc path built at run time with a glob in it, `/proc/$$/fd/*`:
+  // where it leads cannot be walked here.)
+  if (/[$`]/.test(word) && /^\/+proc\//.test(word) && /[*?]|\[.*\]/s.test(word)) return "unknown";
+  if (word === "" || /[$`\n]/.test(word)) return false;
+  // (B10's reading, G2: `~user` is a home bash looks up (getpwnam) and the check does not; with a
+  // glob in it, where it leads cannot be walked here: `cat ~daemon/../../proc/self/cwd/../.e*`,
+  // `cat ~me/.npmr?`.)
+  if (/^~[^/+]/.test(word)) return /[*?]|\[.*\]/s.test(word) ? "unknown" : false;
   const here = hereWord(word);
   if (here?.elsewhere) return false;
   const t = tilde(word);
   const texts = here ? (places ?? []).flatMap((p) => hereTexts(here, p)) : path.isAbsolute(t) ? [t] : (places ?? []).map((p) => `${p.real}/${t}`);
+  let unknown = false;
   for (const text of new Set(texts)) {
     const glob = /[*?]|\[.*\]/s.test(text);
     // What the glob's fixed front leads to, then every name it matches.
     const front = glob ? text.split("/").slice(0, text.split("/").findIndex((part) => /[*?[]/.test(part))).join("/") || "/" : text;
     if (!/[{]/.test(front) && procRelative(front)) return true;
     if (!glob && !text.includes("{")) continue;
-    for (const name of expandNames(text, "/") ?? []) if (procRelative(name)) return true;
+    // B10-5: every directory the expansion walks, not only the names it ends in: a glob before the
+    // part that reaches /proc/self (`/pro?/self/cwd/../.e*`, `../m?/../.e*` with `m` a link to
+    // /proc/self/cwd) is matched in this process first, and what follows it is this process's
+    // own. Braces the check cannot list: not walked.
+    const alternatives = braceWords(text);
+    if (!alternatives) unknown = true;
+    for (const alt of alternatives ?? []) {
+      const walked = /[*?]|\[.*\]/s.test(alt) ? globWalksProc(alt) : procRelative(alt);
+      if (walked === true) return true;
+      if (walked === "unknown") unknown = true;
+    }
+  }
+  return unknown ? "unknown" : false;
+}
+// B10-5: whether the expansion of an absolute glob, as this process walks it segment by segment,
+// enters a directory that is relative to the process (procRelative) at any step: after each fixed
+// segment and among the names each glob segment matches. A name bash may or may not match (by the
+// locale) is taken as matched; more names at one step than the check walks: "unknown".
+function globWalksProc(abs: string): boolean | "unknown" {
+  let dirs = ["/"];
+  const join = (d: string, n: string) => (d === "/" ? `/${n}` : `${d}/${n}`);
+  for (const segment of abs.split("/").filter(Boolean)) {
+    if (!/[*?[]/.test(segment)) dirs = dirs.map((d) => join(d, segment));
+    else {
+      const glob = globMatcher(segment);
+      const next: string[] = [];
+      for (const d of dirs) {
+        let names: string[];
+        try {
+          names = fs.readdirSync(d);
+        } catch {
+          continue;
+        }
+        for (const n of names) {
+          // A leading dot is only matched by a pattern that starts with one.
+          if (!segment.startsWith(".") && n.startsWith(".")) continue;
+          if (glob(n).match) next.push(join(d, n));
+        }
+        if (next.length > 5000) return "unknown";
+      }
+      dirs = next;
+    }
+    if (dirs.some(procRelative)) return true;
   }
   return false;
 }
@@ -5503,6 +6497,19 @@ function hereWord(word: string): HereWord | undefined {
   if (/^\/proc\/(self|thread-self)\/root(\/|$)/.test(w)) return undefined;
   if (/^\/proc\/[^/]+\/(task\/[^/]+\/)?(cwd|root)(\/|$)/.test(w) || w.split("/").includes("..")) return { elsewhere: true, tilde: false, rest: "" };
   return undefined;
+}
+// B9-5: a word that holds `$PWD` or `${PWD}` (the parser has taken its quotes off): after a cd in
+// the call it is the directory the command runs in, not the one the call starts in, which is how
+// the rules read it. `$PWD` or `${PWD}` before a plain rest (`/…` or nothing) is that directory, by
+// each text bash may hold for it (as `~+`); any other form ("unplaced": `${PWD%/*}`, `x$PWD`,
+// `${PWD:-.}`, another expansion after it) is a place the check does not read.
+export const PWD_HELD = /\$PWD(?![A-Za-z0-9_])|\$\{[#!]?PWD(?![A-Za-z0-9_])/;
+export const PWD_LEAD = /^(?:\$PWD(?![A-Za-z0-9_])|\$\{PWD\})(?=\/|$)/;
+function pwdWord(word: string): HereWord | "unplaced" | undefined {
+  if (!PWD_HELD.test(word)) return undefined;
+  const m = PWD_LEAD.exec(word);
+  const rest = m ? word.slice(m[0].length) : "";
+  return !m || /[$`]/.test(rest) ? "unplaced" : { elsewhere: false, tilde: true, rest };
 }
 // The paths such a word is at a place: `~+` by each text $PWD may hold, `/proc/self/cwd` by the
 // real directory (the kernel's link).
@@ -5609,6 +6616,9 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
   };
   const began = ctx.began;
   const beganFor = (file: string, dev: bigint) => (typeof began === "function" ? began(file, dev) : began!);
+  // (B8-5: the null device holds no code and nobody changes it: `make -f /dev/null`. Its file
+  // system is one the plugin cannot make a file on, so its clock cannot be measured.)
+  const nullDevice = (st: fs.BigIntStats) => st.isCharacterDevice() && st.rdev === 259n;
   const runPath = (p: string | undefined, word: string, placed = word, checkTime: boolean | "file" = true) => {
     if (checkTime === "file" && began !== undefined) {
       try {
@@ -5620,7 +6630,7 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
     } else if (checkTime && began !== undefined) {
       try {
         const st = p ? fs.statSync(p, { bigint: true }) : undefined;
-        if (!st || st.ctimeNs >= beganFor(p!, st.dev)) {
+        if (!st || (!nullDevice(st) && st.ctimeNs >= beganFor(p!, st.dev))) {
           if (p) timeChanged.add(p);
           else blindWhy.set(word, `runs ${word}, whose path or change time cannot be read`);
           return;
@@ -5655,7 +6665,7 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
     // B7-5: an option that reads a file of names, patterns or code is a read of that file, in
     // every place the command may run (listOptions).
     for (const f of listOptions(name, args)) {
-      const why = listProblem(name, f, ctx.dirsOf ? ctx.dirsOf(cmd) : ctx.cwdOf?.(cmd) === undefined ? undefined : [ctx.cwdOf(cmd)!], ctx.scope);
+      const why = listProblem(name, f, listDirs(name, args, ctx.dirsOf ? ctx.dirsOf(cmd) : ctx.cwdOf?.(cmd) === undefined ? undefined : [ctx.cwdOf(cmd)!]), ctx.scope);
       if (why) add(why);
     }
 
@@ -5764,20 +6774,64 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
   for (const reason of blindWhy.values()) add({ action: "classify", reason });
   if (timeChanged.size) add({ action: "classify", reason: `runs ${[...timeChanged].map((p) => path.basename(p)).join(", ")}, changed since this session began`, files: [...timeChanged].filter(isFile) });
   // After a session write every program goes to the model unless it is on the safe list (round 4,
-  // decision D3 turned round; B7-2). The trigger and the places are the runner check's: a file the
-  // session wrote where the program runs, where it lives when a path names it, in what its words
-  // name, or above. A program run by a path inside the project, a shell with a script and an
+  // decision D3 turned round; B7-2). The trigger is the runner check's (runnerTouched): a file the
+  // session wrote anywhere in the project (B8-3); for a write outside every root, one where the
+  // program runs, where it lives when a path names it, in what its words name, or above (and any
+  // write at all for a git command whose configuration, a hook or a URL names a program: B10-2).
+  // A program run by a path inside the project, a shell with a script and an
   // interpreter with a file are programs like any other here: an untouched script may source or
   // import what the session wrote. Under `npx X` and `npx --no-install X` the program is X.
   // The writes are the session's and those of the call's other commands, wherever they stand in
   // the text (ctx.others).
+  // B8-1: the safe list is asked about the program that really runs. A name is on it only as bash
+  // would find it (asBashFinds): a word with a `/` in it is the file at that path, whatever its
+  // name (`./cat` is a program of the project).
+  // B9-8, the maintainer's decision: where PATH holds an entry the session can write, a safe name
+  // may find the project's program, or run one that does (zcat runs gzip by PATH, egrep grep, tar
+  // its compressors, git ssh, gpg and git-remote-<scheme>, patch ed): after a session write every
+  // program goes to the model, naming the entry. Bash's own words find nothing on PATH. (B10-1:
+  // wherever in PATH the entry stands, bentPath.)
+  const bent = bentPath((p) => !!ctx.inProject?.(p) || !!ctx.canWrite?.(p));
   if (!ctx.pattern?.(cmd)) for (const at of npx?.program !== undefined ? [...programs(cmd.argv), npx.program] : programs(cmd.argv)) {
     const word = cmd.argv[at];
     const name = path.basename(word);
     const args = cmd.argv.slice(at + 1);
     if (ASSIGN.test(word)) continue;
-    if (safeAfterWrite(name, args, cmd, ctx)) continue;
+    const other = ctx.others?.(cmd);
+    const wrote = other?.written ?? written;
+    const marks = other?.unlisted ?? unlisted;
+    // (Nothing written: nothing to ask, and no walk of PATH or read of git's configuration.)
+    if (!wrote.size && !marks.length) continue;
+    if (bent !== undefined && !(!word.includes("/") && SHELL_OWN.has(name) && asBashFinds(name, cmd, ctx, wrote, marks) === undefined)) {
+      add({ action: "classify", reason: `runs ${name} after this session wrote files, and PATH holds ${bent}, a directory the session can write: a program found there, or one a program runs by PATH, may be the session's` });
+      continue;
+    }
     const places = runnerPlaces(name, args, ctx.cwdOf?.(cmd), (w) => ctx.resolve(w, cmd)) ?? [];
+    let note: string | undefined;
+    // (B10-2: a git command whose configuration, hooks or URL name a program: every write counts.)
+    let anywhere = false;
+    if (!word.includes("/")) {
+      const safe = safeAfterWrite(name, args, cmd, ctx);
+      if (safe === true) {
+        const odd = asBashFinds(name, cmd, ctx, wrote, marks);
+        if (!odd) continue;
+        note = odd.why;
+        if ("place" in odd) places.push(odd.place);
+      } else if (typeof safe === "string") {
+        note = safe;
+        anywhere = true;
+      } else if (name === "git") {
+        // (B10's variant check, F10-2: a git command off the safe list runs what the repository's
+        // configuration, a hook or a URL names as well (`git merge` with `core.hooksPath` or
+        // `core.sshCommand` in a temp directory): every write counts for it too, a temp-only one
+        // included.)
+        const problem = ctx.gitConfigProblem?.(cmd, args, true);
+        if (problem) {
+          note = problem;
+          anywhere = true;
+        }
+      }
+    } else if (SAFE_AFTER_WRITE.has(name) || SHELL_OWN.has(name)) note = `the file ${word} and not the tool of that name`;
     if (word.includes("/")) {
       // Where it lives: for a glob, where each file it matches does (`./scripts/b*.sh`).
       const at = ctx.cwdOf?.(cmd);
@@ -5789,10 +6843,112 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
         places.push(p === undefined ? undefined : path.dirname(p));
       }
     }
-    const other = ctx.others?.(cmd);
-    add(runnerTouched(name, places, other?.written ?? written, other?.unlisted ?? unlisted, ctx));
+    add(runnerTouched(name, places, wrote, marks, ctx, note, anywhere));
   }
   return verdict;
+}
+
+// ---- which program a bare name is (B8-1) ----
+//
+// A name is on the safe list only as bash would find it: a function of that name comes first (one
+// the call defines, or one the environment hands over as `BASH_FUNC_name%%`), then bash's own
+// words (reserved words and builtins), then the first executable file of that name in the
+// directories of PATH. (An alias, `hash -p`, `enable -n` and an assignment of PATH ask on their
+// own: unmodelled, ENV_DANGEROUS.) The file must lie outside the project and outside the temp
+// directories, by its own path and by what it links to; and no directory of PATH before it may
+// be one the session can write in where a file of that name is, was written by this session or
+// by this call, or may have been (a write the checks cannot list there). An entry of PATH that
+// is empty, `.` or relative is the directory the command runs in. A name found nowhere runs
+// nothing: bash prints that it is not found.
+// The answer: undefined for the tool the safe list means; otherwise why not, and for a file the
+// session can write the directory it lies in (`place`; undefined: one the check cannot tell).
+const walked = (p: string): string | undefined => {
+  try {
+    return physical(p);
+  } catch {
+    return undefined;
+  }
+};
+// B9-8: the first entry of PATH that the session can write in: one in a project root or a temp
+// directory (by its path or where it leads), and an empty, `.` or other relative one (the directory
+// the command runs in). bash expands a leading `~/` in an entry; `~user` is read as relative (not
+// placed). Undefined where there is none, or no PATH (bash's own then ends in `.`, after the
+// system's).
+// B10-1, the maintainer's decision ("anywhere in PATH"): wherever the entry stands. One after the
+// system's directories is where PATH finds a name the machine lacks (patch runs `ed`, tar `lzip`,
+// git `git-remote-<scheme>`), and some names no machine has.
+export function bentPath(inProject: (p: string) => boolean, list = process.env.PATH): string | undefined {
+  if (list === undefined) return undefined;
+  const temp = tempDirs();
+  const home = os.homedir();
+  for (const e of list.split(":")) {
+    const t = e === "~" ? home : e.startsWith("~/") ? path.join(home, e.slice(2)) : e;
+    if (!path.isAbsolute(t)) return e === "" ? "an empty entry" : e;
+    if ([t, walked(t) ?? t].some((p) => inProject(p) || temp.some((d) => within(p, d)))) return e;
+  }
+  return undefined;
+}
+export const tempDirs = () => [...new Set(["/tmp", "/var/tmp", "/dev/shm", os.tmpdir()].flatMap((d) => [d, walked(d) ?? d]))];
+export function asBashFinds(name: string, cmd: Simple, ctx: ArgvContext, wrote: Set<string>, marks: string[]): { why: string; place?: string | undefined } | undefined {
+  if (ctx.functions?.has(name)) return { why: "a function this call defines" };
+  if (Object.keys(process.env).some((k) => k === `BASH_FUNC_${name}%%` || k === `BASH_FUNC_${name}()`)) return { why: "a function the environment hands to bash" };
+  if (SHELL_OWN.has(name)) return undefined;
+  // B9-10: bash runs this function for a name PATH does not find (one the safe list names and the
+  // machine lacks: `tree`, `xxd`). Read for every name: wider, and it is seldom set.
+  if (Object.keys(process.env).some((k) => k === "BASH_FUNC_command_not_found_handle%%" || k === "BASH_FUNC_command_not_found_handle()")) return { why: "with a function the environment hands to bash for a name PATH does not find" };
+  const dirs = ctx.dirsOf ? ctx.dirsOf(cmd) : ctx.cwdOf?.(cmd) === undefined ? undefined : [ctx.cwdOf(cmd)!];
+  return pathFinds(name, dirs, (p) => !!ctx.inProject?.(p) || !!ctx.canWrite?.(p), (dir, file) => wrote.has(file) || marks.some((m) => within(dir, m) || within(m, dir)));
+}
+// The walk of PATH for `name`, from the directories `dirs` (undefined: not known). `inProject`:
+// whether a path lies in the project; `wrote(dir, file)`: whether the session or the call wrote
+// `file`, or files the checks cannot list in `dir`, above it or below it.
+export function pathFinds(name: string, dirs: string[] | undefined, inProject: (p: string) => boolean, wrote: (dir: string, file: string) => boolean): { why: string; place?: string | undefined } | undefined {
+  const temp = tempDirs();
+  const writable = (p: string) => inProject(p) || temp.some((t) => within(p, t));
+  const list = process.env.PATH;
+  if (list === undefined) return { why: "found by a PATH the environment does not set", place: undefined };
+  for (const entry of list.split(":")) {
+    const fixed = path.isAbsolute(entry);
+    if (!fixed && dirs === undefined) return { why: `found through ${entry === "" ? "an empty entry" : entry} in PATH, in a directory the check cannot tell`, place: undefined };
+    let found = 0;
+    const bases = fixed ? [entry] : dirs!.map((d) => path.resolve(d, entry || "."));
+    for (const base of bases) {
+      const file = path.join(base, name);
+      const dir = walked(base);
+      const real = walked(file);
+      if (dir === undefined || real === undefined) return { why: `found through ${base} in PATH, a path the check cannot walk`, place: undefined };
+      if ([base, dir, file, real].some(writable)) {
+        if (lexists(file)) return { why: `which PATH finds at ${file}, a file the session can write`, place: dir };
+        if (wrote(dir, real)) return { why: `which PATH looks for in ${base}, where this session wrote files`, place: dir };
+        continue;
+      }
+      try {
+        fs.accessSync(file, fs.constants.X_OK);
+        if (fs.statSync(file).isFile()) found++;
+      } catch {
+        // not here, or not a program: bash looks on
+      }
+    }
+    if (found === bases.length) return undefined;
+  }
+  return undefined;
+}
+const lexists = (p: string) => {
+  try {
+    fs.lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+};
+// The names a call defines a function under, read off its text (`name ( ) { ... }`, `function
+// name`), wider than bash reads them: quoted text that looks like a definition counts.
+export function functionNames(text: string): Set<string> {
+  const out = new Set<string>();
+  const plain = (w: string) => w.replace(/['"\\]/g, "");
+  for (const m of text.matchAll(/(?:^|[\s;&|(){}'"])function\s+([^\s;&|(){}<>]+)/g)) out.add(plain(m[1]));
+  for (const m of text.matchAll(/([^\s;&|(){}<>]+)\s*\(\s*\)/g)) out.add(plain(m[1]));
+  return out;
 }
 
 // ---- the safe list (round 4, decision D3 turned round; B7-3) ----
@@ -5803,16 +6959,22 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
 // option of one of them that runs a program asks or goes to the model on its own
 // (programProblem, sedProblem, awkProblem, fetcherOptionProblem, the rules).
 const listed = (s: string) => s.split(/\s+/).filter(Boolean);
-const SAFE_AFTER_WRITE = new Set([
+// B8-1: bash's own words, which no file on PATH stands for (asBashFinds).
+const SHELL_OWN = new Set([
   // Not programs at all: bash's reserved words where the parser lists one as a command's first
   // word (`for ... done`, `if ... fi`, `while`, `case ... esac`, a group, `[[`). What stands in
   // their bodies is a command of its own, with every guard. (Not `function` and `coproc`: the
   // parser lists the command after them among their own words, so it is read nowhere else.)
-  ...listed("if then elif else fi for select in while until do done case esac { } ! [[ ]]"),
+  ...listed("if then elif else fi for select in while until do done case esac { } ! [[ ]] time"),
   // Builtins that steer the shell or its variables and run no file: bash implements them itself.
   ...listed("cd pushd popd pwd true false : read set unset export local declare typeset readonly wait exit return break continue shift type echo printf test ["),
+  // ... and the two that run the program after them, a program position of its own (programs()).
+  ...listed("command exec"),
+]);
+const SAFE_AFTER_WRITE = new Set([
+  ...SHELL_OWN,
   // Wrappers: the program they run is a program position of its own (programs()), judged there.
-  ...listed("env timeout nice time nohup command exec"),
+  ...listed("env timeout nice nohup"),
   // They print or compare bytes, names and metadata of what they are given, and load no code:
   // coreutils and their kin.
   ...listed("ls cat head tail wc sort uniq cut tr diff cmp comm stat file nl tac rev fold paste join column tee less more"),
@@ -5831,23 +6993,26 @@ const SAFE_AFTER_WRITE = new Set([
 // git's subcommands that read objects, refs or the index, or write refs: no filter, driver or
 // alias runs for them, and their hooks and config are read-only in the sandbox. (`push` among
 // them, as `fetch` is: it sends objects, and whether it may run at all is the push check's.)
+// B8-2: each of the three groups is on the list only where the repository's own configuration
+// names no program (gitConfigProblem): the groups differ in what of the user's own is read.
 const SAFE_GIT = new Set(listed("branch tag fetch push rev-parse ls-tree rev-list remote mv rm gc ls-remote merge-base show-ref symbolic-ref for-each-ref count-objects reflog"));
 // ... that touch the work tree or the index, and so may run a clean, smudge or process filter:
-// safe where the configuration names no program of the project for one (gitFiltersAbsent).
+// safe where the user's own configuration names no program of the project for one either.
 // (`git stash` is one of them: see below.)
 const FILTER_GIT = new Set(listed("status add commit reset restore checkout switch"));
 // ... that show a diff, and so may also run diff.external, a diff driver's command or its
 // textconv: safe where the configuration names no program of the project for those either.
 const DIFF_GIT = new Set(listed("diff log show blame describe shortlog whatchanged"));
-// The options with which `git ls-files` and `git cat-file` read only the index and the objects.
-// With any other (`ls-files -m` compares the work tree through the clean filter, `cat-file
-// --textconv` and `--filters` run a textconv or a smudge filter: B7-2) they are held to the
-// configuration check.
-const LS_FILES_PLAIN = /^(-[cosz]+|--(cached|others|stage|exclude-standard|full-name|error-unmatch|deduplicate|abbrev(=\d+)?|exclude=.*|directory|no-empty-directory))$/;
+// The options with which `git cat-file` reads only the objects. With any other (`--textconv` and
+// `--filters` run a textconv or a smudge filter: B7-2) it is held to the user's own diff programs
+// too. (B8-2: every git command is held to the repository's own configuration, `ls-files` among
+// them: `core.fsmonitor` runs for whatever reads the index.)
 const CAT_FILE_PLAIN = /^-[tsep]$|^--(batch|batch-check|batch-command|batch-all-objects|buffer|unordered|follow-symlinks|allow-unknown-type)(=.*)?$/;
 // bun's subcommands (bun 1.x `bun --help`): the word after `bun` is one of these, or a file.
 const BUN_SUBCOMMANDS = new Set(listed("run test x repl exec install add remove update audit outdated link unlink publish patch pm info build init create upgrade why"));
-function safeAfterWrite(name: string, args: string[], cmd: Simple, ctx: ArgvContext): boolean {
+// The answer: true (on the list), false, or for a git command whose repository's configuration
+// may name a program, what in it does (B8-2).
+function safeAfterWrite(name: string, args: string[], cmd: Simple, ctx: ArgvContext): boolean | string {
   // A shell is safe for the code it is handed (`bash -c`, whose commands are judged one by one);
   // with a script it is that script (`bash x.sh`, `source x`, `. x`), a program like any other.
   if (SHELLS.has(name)) return name !== "source" && name !== "." && shellScript(name, args) === undefined;
@@ -5866,20 +7031,24 @@ function safeAfterWrite(name: string, args: string[], cmd: Simple, ctx: ArgvCont
   const call = gitCall(args);
   if (typeof call === "string") return false;
   const sub = call.sub ?? "";
-  const filters = (diff: boolean) => ctx.gitFiltersAbsent?.(cmd, args, diff) ?? false;
-  if (SAFE_GIT.has(sub)) return true;
-  if (FILTER_GIT.has(sub)) return filters(false);
-  if (DIFF_GIT.has(sub)) return filters(true);
+  // B8-2: every git command of the list is held to the repository's own configuration: git runs
+  // what it names for far more than filters and diffs (`core.fsmonitor` for every command that
+  // reads the index, `core.sshCommand` and `remote.<name>.uploadpack` for a fetch, `gpg.program`
+  // for a commit or a tag). `diff`: the command may also run the user's own diff programs.
+  const config = (diff: boolean): true | string => (ctx.gitConfigProblem ? ctx.gitConfigProblem(cmd, args, diff) : "with a configuration the check was not given") ?? true;
+  if (SAFE_GIT.has(sub)) return config(false);
+  if (FILTER_GIT.has(sub)) return config(false);
+  if (DIFF_GIT.has(sub)) return config(true);
   // `git stash` in every form saves and restores files of the work tree (a smudge filter may
   // run); `list` and `show` print a log or a diff.
-  if (sub === "stash") return filters(["list", "show"].includes(call.rest[0] ?? ""));
-  if (sub === "ls-files") return call.rest.every((w) => !w.startsWith("-") || w === "--" || LS_FILES_PLAIN.test(w)) || filters(false);
-  if (sub === "cat-file") return call.rest.every((w) => !w.startsWith("-") || CAT_FILE_PLAIN.test(w)) || filters(true);
-  if (sub === "bisect" && ["start", "reset", "good", "bad", "new", "old", "skip", "terms", "log"].includes(call.rest[0] ?? "")) return filters(false);
+  if (sub === "stash") return config(["list", "show"].includes(call.rest[0] ?? ""));
+  if (sub === "ls-files") return config(false);
+  if (sub === "cat-file") return config(!call.rest.every((w) => !w.startsWith("-") || CAT_FILE_PLAIN.test(w)));
+  if (sub === "bisect" && ["start", "reset", "good", "bad", "new", "old", "skip", "terms", "log"].includes(call.rest[0] ?? "")) return config(false);
   // `git clean -n` lists what a clean would remove, and removes nothing.
-  if (sub === "clean") return call.rest.some((w) => /^(-[a-zA-Z]*n[a-zA-Z]*|--dry-run)$/.test(w));
-  if (sub === "config") return !configWrite(call.rest, false);
-  if (sub === "worktree") return call.rest[0] === "list";
+  if (sub === "clean") return call.rest.some((w) => /^(-[a-zA-Z]*n[a-zA-Z]*|--dry-run)$/.test(w)) && config(false);
+  if (sub === "config") return !configWrite(call.rest, false) && config(false);
+  if (sub === "worktree") return call.rest[0] === "list" && config(false);
   return false;
 }
 // Whether a program is one that runs what its words name (a shell, an interpreter, a wrapper, a
@@ -5896,6 +7065,13 @@ export const runsItsWords = (name: string): boolean => SHELLS.has(name) || INTER
 // letters (in a cluster, the value attached or the next word), the long names (GNU: any prefix
 // that is no other option's name, the value after `=` or as the next word), find's
 // single-dash name. `split`: the value is a list (`file -m a:b`).
+//
+// B8-8, the maintainer's decision: the table is an inventory and not complete. It lists the
+// options that were found to hand a file's lines to the user's screen, one program at a time, and
+// a program or an option it does not list is not read here. The sandbox is what hides credential
+// files: this table only moves an ask in front of the forms it knows. A name an awk program builds
+// (`awk 'BEGIN{ARGV[1]=".env";ARGC=2}1'`) is a known gap: no table of options reads it (pinned in
+// test/decide.test.mts, "KNOWN GAP").
 interface ListSpec {
   short?: string;
   long?: string[];
@@ -5904,8 +7080,45 @@ interface ListSpec {
   exact?: boolean;
   single?: string[];
   split?: string;
+  // B8-8: the short letters that take a value of their own (`date -d`, `hexdump -e`): in a
+  // cluster the rest of the word is that value. Where it is given (empty: no such letter is
+  // told apart, which reads wider), the cluster is read letter by letter and stops there.
+  valued?: string;
+  // B8-8: options whose value is an rsync filter rule: `merge FILE` and `. FILE` (and
+  // `dir-merge FILE`, `: FILE`), with modifiers, name a file of rules.
+  rule?: { short: string; long: string[] };
 }
+const TAR_LISTS: ListSpec = { short: "TX", long: ["--files-from", "--exclude-from"], not: ["--exclude"] };
+// git's, by subcommand: the short letters with a value attached (`git ls-files -X.env`, `git grep
+// -f.env`, `git blame -S.env`, `git commit -F.env`). Their long names, `--exclude-from`,
+// `--exclude-per-directory`, `--pathspec-from-file`, `--ignore-revs-file`, `--file`, and every
+// separate value are words the rules already read as a path of git's, in each spelling probed
+// (xcheck/b8/probe/p4.head.out): no line here for those.
+const GIT_LIST_OPTIONS: Record<string, ListSpec> = {
+  "ls-files": { short: "X", valued: "x" },
+  grep: { short: "f", valued: "eABCmO" },
+  blame: { short: "S", valued: "LCM" },
+  commit: { short: "Ft", valued: "mCcSu" },
+  // B9-3: the other subcommands of git 2.47 with a short option that reads a message or a list
+  // from a file, attached: `tag -F` (`-m`, `-u` and `-n` take a value of their own), `notes
+  // add|append|edit -F` (read in any of its subcommands: wider), `merge -F`, `commit-tree -F`,
+  // `fmt-merge-msg -F`, and `config -f`, whose file git reads as configuration and prints.
+  // Checked and left: `am` (its mailboxes are operands; no short option reads a file), `rebase`
+  // (`-x` runs a command and is read as one; no file), `apply`, `interpret-trailers` and
+  // `hash-object` (files as operands, which the rules read as paths).
+  tag: { short: "F", valued: "mun" },
+  notes: { short: "F", valued: "mcC" },
+  merge: { short: "F", valued: "msXS" },
+  "commit-tree": { short: "F", valued: "pmS" },
+  "fmt-merge-msg": { short: "F", valued: "m" },
+  config: { short: "f", valued: "" },
+};
+const RSYNC_RULE = /^(?:(?:merge|dir-merge)(?:,[^ _]*)?|[.:][^ _]*)[ _]+(.+)$/;
 const LIST_OPTIONS: Record<string, ListSpec> = {
+  rsync: { long: ["--files-from", "--exclude-from", "--include-from", "--read-batch", "--password-file"], not: ["--exclude", "--include"], valued: "", rule: { short: "f", long: ["--filter"] } },
+  // (`date --file` and `hexdump --format-file` are words the rules already read as a path.)
+  date: { short: "f", valued: "drsI" },
+  hexdump: { short: "f", valued: "ensL" },
   file: { short: "fm", long: ["--files-from", "--magic-file"], split: ":" },
   grep: { short: "f", long: ["--file", "--exclude-from"], not: ["--exclude"] },
   egrep: { short: "f", long: ["--file", "--exclude-from"], not: ["--exclude"] },
@@ -5915,16 +7128,22 @@ const LIST_OPTIONS: Record<string, ListSpec> = {
   wc: { long: ["--files0-from"] },
   sort: { long: ["--files0-from"] },
   du: { short: "X", long: ["--files0-from", "--exclude-from"], not: ["--exclude"] },
-  tar: { short: "TX", long: ["--files-from", "--exclude-from"], not: ["--exclude"] },
-  gtar: { short: "TX", long: ["--files-from", "--exclude-from"], not: ["--exclude"] },
-  bsdtar: { short: "TX", long: ["--files-from", "--exclude-from"], not: ["--exclude"] },
+  tar: TAR_LISTS,
+  gtar: TAR_LISTS,
+  bsdtar: TAR_LISTS,
   find: { single: ["-files0-from"] },
 };
 function listOptions(name: string, args: string[]): string[] {
-  const spec = LIST_OPTIONS[name];
+  // (B8-8: git's are its subcommand's, read after git's own leading options.)
+  const call = name === "git" ? gitCall(args) : undefined;
+  if (typeof call === "string") return [];
+  const spec = call ? (Object.hasOwn(GIT_LIST_OPTIONS, call.sub ?? "") ? GIT_LIST_OPTIONS[call.sub!] : undefined) : Object.hasOwn(LIST_OPTIONS, name) ? LIST_OPTIONS[name] : undefined;
   if (!spec) return [];
   const out: string[] = [];
-  const words = name === "find" ? args : name.endsWith("tar") ? tarWords(args) : args;
+  const words = call ? call.rest : name === "find" ? args : name.endsWith("tar") ? tarWords(args) : args;
+  const prefixOf = (given: string, names: string[] | undefined) => !!names?.some((l) => l === given || (!spec.exact && given.length > 2 && l.startsWith(given) && !spec.not?.includes(given)));
+  // The file an rsync filter rule names, where it names one.
+  const rule = (value: string) => void (RSYNC_RULE.test(value) && out.push(RSYNC_RULE.exec(value)![1]));
   for (let i = 0; i < words.length; i++) {
     const a = words[i];
     if (a === "--" && name !== "find") break;
@@ -5932,14 +7151,38 @@ function listOptions(name: string, args: string[]): string[] {
     else if (a.startsWith("--")) {
       const eq = a.indexOf("=");
       const given = eq < 0 ? a : a.slice(0, eq);
-      const hit = spec.long?.some((l) => l === given || (!spec.exact && given.length > 2 && l.startsWith(given) && !spec.not?.includes(given)));
-      if (hit) out.push(eq < 0 ? (words[++i] ?? "") : a.slice(eq + 1));
+      if (prefixOf(given, spec.long)) out.push(eq < 0 ? (words[++i] ?? "") : a.slice(eq + 1));
+      else if (prefixOf(given, spec.rule?.long)) rule(eq < 0 ? (words[++i] ?? "") : a.slice(eq + 1));
+    } else if (spec.valued !== undefined && a.startsWith("-") && a.length > 1) {
+      // Letter by letter, as getopt reads a cluster: a list letter takes the rest of the word or
+      // the next word; any other letter that takes a value ends the cluster (`date -dfriday`, `git
+      // commit -mt.env`: the rest is its value, no list). The word after such a letter is read
+      // like any other: only wider than the program reads it.
+      for (let k = 1; k < a.length; k++) {
+        const rest = () => (k + 1 < a.length ? a.slice(k + 1) : (words[++i] ?? ""));
+        if (spec.short?.includes(a[k])) out.push(rest());
+        else if (spec.rule?.short.includes(a[k])) rule(rest());
+        else if (!spec.valued.includes(a[k]) && /[a-zA-Z0-9]/.test(a[k])) continue;
+        break;
+      }
     } else if (spec.short && a.startsWith("-") && a.length > 1) {
       const at = [...a].findIndex((ch, k) => k > 0 && spec.short!.includes(ch));
       if (at > 0 && /^-[a-zA-Z0-9]*$/.test(a.slice(0, at))) out.push(at + 1 < a.length ? a.slice(at + 1) : (words[++i] ?? ""));
     }
   }
   return spec.split ? out.flatMap((v) => v.split(spec.split!)) : out;
+}
+// The directories a git command's list file is read from: where its `-C` options lead.
+function listDirs(name: string, args: string[], dirs: string[] | undefined): string[] | undefined {
+  const call = name === "git" ? gitCall(args) : undefined;
+  if (!call || typeof call === "string" || !call.dirs.length) return dirs;
+  if (call.dirs.some((d) => /[$`*?[\]{}]/.test(d) || /^~[^/]/.test(d))) return undefined;
+  const lead = (from: string | undefined) => call.dirs.reduce<string | undefined>((at, d) => (path.isAbsolute(tilde(d)) ? tilde(d) : at === undefined ? undefined : `${at}/${d}`), from);
+  if (dirs === undefined) {
+    const fixed = lead(undefined);
+    return fixed === undefined ? undefined : [fixed];
+  }
+  return dirs.map((d) => lead(d)!);
 }
 // The verdict on one such file, as a read in every directory the command may run in (`dirs`;
 // undefined: not known). As bash hands the word over: a glob or braces are every file they match
@@ -6076,22 +7319,69 @@ const isFile = (p: string) => {
 // file in a directory of the project above it: `npm`, `cargo`, `pytest` and `just` look upward),
 // or a mark of an unlisted write covers a place or lies below it. The reason names the file;
 // the files go to the model.
-function runnerTouched(name: string, places: (string | undefined)[], written: Set<string>, unlisted: string[], ctx: ArgvContext): GuardVerdict | undefined {
+// B8-3: a file the session wrote anywhere in the project counts, wherever the program lives and
+// wherever it runs (a script in `scripts/` sources `../lib/helper.sh`, `cd packages/a && npm test`
+// runs `../b`). A write outside every project root (the temp directory) keeps the reach above:
+// in a place of the program or below it. So does a mark.
+// `note`: what the program is, where it is not simply the tool of its name (B8-1, B8-2).
+// B10-2: `anywhere`: the program is one that git's configuration, a hook or a URL names, which may
+// lie anywhere (found by PATH, at a path the value gives, in the hooks directory, or run from a
+// file it reads): every write of the session's counts for it, one into a temp directory and a
+// mark there included. B8-3's reach stays as it was for every program's own place.
+function runnerTouched(name: string, places: (string | undefined)[], written: Set<string>, unlisted: string[], ctx: ArgvContext, note?: string, anywhere = false): GuardVerdict | undefined {
   if (!written.size && !unlisted.length) return undefined;
-  if (places.some((p) => p === undefined)) return { action: "classify", reason: `runs ${name} in a place the check cannot tell, after this session wrote files` };
+  const what = note ? `${name}, ${note},` : name;
+  if (places.some((p) => p === undefined)) return { action: "classify", reason: `runs ${what} in a place the check cannot tell, after this session wrote files` };
   const dirs = places as string[];
   const above = (w: string) => {
     const d = path.dirname(w);
     return !!ctx.inProject?.(d) && dirs.some((p) => within(p, d));
   };
-  const hits = [...written].filter((w) => dirs.some((p) => within(w, p)) || above(w));
+  const near = (w: string) => anywhere || dirs.some((p) => within(w, p)) || above(w);
+  const all = [...written];
+  const hits = [...all.filter(near), ...all.filter((w) => !near(w) && (ctx.inProject ? ctx.inProject(w) : true))];
   if (hits.length) {
-    const at = ctx.cwdKnown ? ctx.cwd : dirs[0];
+    const at = ctx.cwdKnown ? ctx.cwd : (dirs[0] ?? ctx.cwd);
     const shown = hits.slice(0, 3).map((w) => path.relative(at, w) || path.basename(w));
-    return { action: "classify", reason: `runs ${name} after this session wrote ${shown.join(", ")}${hits.length > 3 ? ` and ${hits.length - 3} more` : ""}`, files: hits.slice(0, 3).filter(isFile) };
+    return { action: "classify", reason: `runs ${what} after this session wrote ${shown.join(", ")}${hits.length > 3 ? ` and ${hits.length - 3} more` : ""}`, files: hits.slice(0, 3).filter(isFile) };
   }
-  const mark = unlisted.find((m) => dirs.some((p) => within(m, p) || within(p, m)));
-  if (mark) return { action: "classify", reason: `runs ${name} where this session wrote files the check cannot list (${mark})` };
+  const mark = unlisted.find((m) => anywhere || dirs.some((p) => within(m, p) || within(p, m)));
+  if (mark) return { action: "classify", reason: `runs ${what} where this session wrote files the check cannot list (${mark})` };
+  return undefined;
+}
+
+// B8-9, the maintainer's decision: a command that unpacks an archive or applies a patch writes the
+// files the archive or the patch names, and those names are inside the file: no check of the
+// command's words sees them (`tar -xf evil.tar` with a member `.git/hooks/pre-commit`). The
+// sandbox keeps such a write out of the protected places; without it the command asks. Read
+// here, asked where the plugin knows the sandbox is off (index.ts).
+// tar when it extracts (`-x`, `--extract`, `--get`, a bundle with `x`), unzip when it writes
+// (not `-l`, `-t`, `-p`, `-c`, `-z`, `-Z`, `-v`, `-h`, and not without an archive), patch (not
+// `--dry-run`, `--help`, `--version`), `git apply` when it applies (not `--stat`, `--numstat`,
+// `--summary`, `--check` alone) and `git am` (not `--abort`, `--quit`, `--show-current-patch`):
+// the ones that are rule allows. (bsdtar and gtar are read as tar. cpio, 7z, unrar, ar, pax, jar
+// and an interpreter's own unpacker are the model's to judge, with or without the sandbox.)
+export function unseenWriter(cmds: Simple[]): string | undefined {
+  const why = (what: string, file: string) => `${what} writes the files the ${file} names: what such a command writes is named inside the file and cannot be seen without the sandbox`;
+  for (const cmd of cmds) for (const at of programs(cmd.argv)) {
+    const name = path.basename(cmd.argv[at]);
+    const args = cmd.argv.slice(at + 1);
+    if (name === "tar" || name === "gtar" || name === "bsdtar") {
+      const first = args[0] ?? "";
+      if (longOption(args, ["--extract", "--get"]) || args.some((a) => /^-[a-zA-Z]*x/.test(a) && !a.startsWith("--")) || /^[a-zA-Z]*x[a-zA-Z]*$/.test(first)) return why(`${name} -x`, "archive");
+    } else if (name === "unzip") {
+      // (B9-1: one reading of unzip's words, unzipWords, here and in writesOf.)
+      if (unzipWords(args).writes) return why("unzip", "archive");
+    } else if (name === "patch") {
+      const got = getopt(args, PATCH_OPTIONS);
+      if (got.unknown || !got.opts.some((o) => ["--dry-run", "--help", "--version"].includes(o.name))) return why("patch", "patch");
+    } else if (name === "git") {
+      const call = gitCall(args);
+      if (typeof call === "string") continue;
+      if (call.sub === "apply" && gitApplies(call.rest)) return why("git apply", "patch");
+      if (call.sub === "am" && !call.rest.some((w) => /^--(abort|quit|show-current-patch(=.*)?)$/.test(w))) return why("git am", "patch");
+    }
+  }
   return undefined;
 }
 
@@ -6150,19 +7440,24 @@ const MARK_UNQUOTED = "\u000e";
 const MARK_QUOTED = "\u000f";
 const MARKS = /[\u000e\u000f]/;
 const unmark = (w: string) => w.replace(/[\u000e\u000f]/g, "");
+// N3c: with `globs`, markExpansions also puts MARK_GLOB before each `*`, `?` and `[` bash would
+// glob: not quoted, not escaped, not inside `${...}` and not the name of `$*` or `$?`.
+const MARK_GLOB = "\u0010";
+const unmarkAll = (w: string) => w.replace(/[\u000e\u000f\u0010]/g, "");
 
 // The command with a mark before each expansion bash performs: MARK_UNQUOTED where it is not
 // quoted, MARK_QUOTED inside double quotes. Single-quoted text, escaped characters, comments and
 // quoted heredoc bodies are copied as they are, and `$HOME` is left alone (the parser puts the
 // home directory in its place). Only marks are inserted, so the rules' parser reads the same
-// structure; the caller checks that it did.
-export function markExpansions(s: string, depth = 0): string {
+// structure; the caller checks that it did. (`globs`: see MARK_GLOB.)
+export function markExpansions(s: string, depth = 0, globs = false): string {
   if (depth > 6) return s;
   let out = "";
   let dq = false;
   let wordStart = true;
+  let braces = 0;
   const heredocs: { delimiter: string; quoted: boolean }[] = [];
-  const sub = (open: number, end: number, mark: string) => mark + s.slice(open, open + 2) + markExpansions(s.slice(open + 2, end), depth + 1) + ")";
+  const sub = (open: number, end: number, mark: string) => mark + s.slice(open, open + 2) + markExpansions(s.slice(open + 2, end), depth + 1, globs) + ")";
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
     const next = s[i + 1];
@@ -6200,13 +7495,15 @@ export function markExpansions(s: string, depth = 0): string {
     if (c === "`") {
       const end = s.indexOf("`", i + 1);
       if (end < 0) return out + s.slice(i);
-      out += (dq ? MARK_QUOTED : MARK_UNQUOTED) + "`" + markExpansions(s.slice(i + 1, end), depth + 1) + "`";
+      out += (dq ? MARK_QUOTED : MARK_UNQUOTED) + "`" + markExpansions(s.slice(i + 1, end), depth + 1, globs) + "`";
       i = end;
       wordStart = false;
       continue;
     }
     if (c === "$" && /[A-Za-z_{@*#?$!0-9-]/.test(next ?? "")) {
       out += (/^\$(\{HOME\}|HOME\b)/.test(s.slice(i)) ? "" : dq ? MARK_QUOTED : MARK_UNQUOTED) + c;
+      if (globs && next === "{") braces++;
+      if (globs && (next === "*" || next === "?")) out += s[++i];
       wordStart = false;
       continue;
     }
@@ -6226,6 +7523,8 @@ export function markExpansions(s: string, depth = 0): string {
         continue;
       }
     }
+    if (globs && braces > 0 && c === "}") braces--;
+    else if (globs && !dq && braces === 0 && "*?[".includes(c)) out += MARK_GLOB;
     out += c;
     if (!dq) wordStart = " \t\n;|&()<>".includes(c);
     if (!dq && c === "\n") {
@@ -6234,7 +7533,7 @@ export function markExpansions(s: string, depth = 0): string {
         const rest = s.slice(i + 1);
         const end = new RegExp(`^\\s*${doc.delimiter.replace(/[.\-]/g, "\\$&")}\\s*$`, "m").exec(rest);
         const body = end ? rest.slice(0, end.index) : rest;
-        out += doc.quoted ? body : markBody(body, depth);
+        out += doc.quoted ? body : markBody(body, depth, globs);
         out += end ? end[0] : "";
         i = end ? i + end.index + end[0].length : s.length;
       }
@@ -6243,7 +7542,7 @@ export function markExpansions(s: string, depth = 0): string {
   return out;
 }
 // An unquoted heredoc body: the parser reads only its substitutions, as commands.
-function markBody(body: string, depth: number): string {
+function markBody(body: string, depth: number, globs = false): string {
   let out = "";
   for (let j = 0; j < body.length; j++) {
     if (body[j] === "\\") {
@@ -6252,12 +7551,12 @@ function markBody(body: string, depth: number): string {
     } else if (body[j] === "$" && body[j + 1] === "(") {
       const end = closeNaive(body, j + 1);
       if (end < 0) return out + body.slice(j);
-      out += "$(" + markExpansions(body.slice(j + 2, end), depth + 1) + ")";
+      out += "$(" + markExpansions(body.slice(j + 2, end), depth + 1, globs) + ")";
       j = end;
     } else if (body[j] === "`") {
       const end = body.indexOf("`", j + 1);
       if (end < 0) return out + body.slice(j);
-      out += "`" + markExpansions(body.slice(j + 1, end), depth + 1) + "`";
+      out += "`" + markExpansions(body.slice(j + 1, end), depth + 1, globs) + "`";
       j = end;
     } else out += body[j];
   }
@@ -6315,7 +7614,7 @@ const GIT_VALUES: Record<string, string[]> = {
 const GIT_CHECKED = ["--output", "--output-directory", "--upload-pack", "--receive-pack", "--exec", "--template", "--open-files-in-pager", "--extcmd"];
 
 // The first word of `args` (marked) that can become an option of the program at run time.
-function riskyWord(spec: Keyed, args: string[]): string | undefined {
+function riskyWord(spec: Keyed, args: string[], safe?: (word: string) => boolean): string | undefined {
   let ended = false;
   let operand = false;
   for (let i = 0; i < args.length; i++) {
@@ -6326,7 +7625,7 @@ function riskyWord(spec: Keyed, args: string[]): string | undefined {
       continue;
     }
     if (ended || (spec.operandEnds && operand)) continue;
-    const at = w.search(MARKS);
+    const at = safe?.(w) ? -1 : w.search(MARKS);
     if (at < 0) {
       // A plain option that takes the next word: that word is its value, unless splitting can
       // make more words of it or the value is itself checked.
@@ -6364,16 +7663,16 @@ function riskyWord(spec: Keyed, args: string[]): string | undefined {
 }
 
 // The commands of a call (as allCommands) side by side with the same commands read from the
-// marked text; undefined when the two readings do not line up.
-function markedCommands(command: string, depth = 0): [Simple, Simple][] | undefined {
+// marked text; undefined when the two readings do not line up. (`globs`: see MARK_GLOB.)
+function markedCommands(command: string, depth = 0, globs = false): [Simple, Simple][] | undefined {
   if (depth > 4) return [];
   const real = parse(command).cmds;
-  const seen = parse(markExpansions(command)).cmds;
-  const same = real.length === seen.length && real.every((c, i) => c.argv.length === seen[i].argv.length && c.argv.every((w, j) => w === unmark(seen[i].argv[j])));
+  const seen = parse(markExpansions(command, 0, globs)).cmds;
+  const same = real.length === seen.length && real.every((c, i) => c.argv.length === seen[i].argv.length && c.argv.every((w, j) => w === (globs ? unmarkAll : unmark)(seen[i].argv[j])));
   if (!same) return undefined;
   const out = real.map((c, i): [Simple, Simple] => [c, seen[i]]);
   for (const body of nestedBodies(real)) {
-    const inner = markedCommands(body, depth + 1);
+    const inner = markedCommands(body, depth + 1, globs);
     if (!inner) return undefined;
     out.push(...inner);
   }

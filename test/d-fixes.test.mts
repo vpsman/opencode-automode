@@ -2231,7 +2231,7 @@ const D5_STRINGS: string[] = [
 // spelled with quotes or a backslash in it; another npx of the call.
 const D5_ELSEWHERE: string[] = [
   "rm -rf node_modules; npx tsc", "ls node_modules/.bin; npx tsc", "ls node_modules && npx tsc", "rm -rf node_modules/.cache && npx tsc", "rm -rf node_modules/.vite && npx vite build", "cat node_modules/typescript/package.json; npx tsc --version",
-  "du -sh node_modules; npx tsc", "test -d node_modules && npx tsc", "[[ -d node_modules ]] && npx tsc", "echo 'cleaning node_modules/.cache' && npx tsc", "grep -rn foo --exclude-dir=node_modules . ; npx tsc", "tar czf ../a.tgz --exclude=node_modules . && npx tsc",
+  "du -sh node_modules; npx tsc", "test -d node_modules && npx tsc", "[[ -d node_modules ]] && npx tsc", "echo 'cleaning node_modules/.cache' && npx tsc", "grep -rn foo --exclude-dir=node_modules . ; npx tsc", "tar czf /tmp/a.tgz --exclude=node_modules . && npx tsc",
   "find . -name '*.ts' -not -path './node_modules/*' | head -3; npx tsc", "timeout 5 node_modules/.bin/tsc; npx tsc", "node_modules/.bin/eslint . ; npx tsc",
   "npx tsc; rm -rf node_modules", "npx tsc && ls node_modules/.cache", "npx tsc | grep -v node_modules", "npx tsc --noEmit 2>&1 | grep -v node_modules", "npx tsc & rm -rf node_modules",
   "for i in 1 2; do npx tsc; rm -rf node_modules; done", "f() { rm -rf node_modules; }; npx tsc; f", "f() { npx tsc; }; rm -rf node_modules; f", "if true; then rm -rf node_modules; fi; npx tsc", "bash -c 'rm -rf node_modules; npx tsc'", "(rm -rf node_modules); npx tsc",
@@ -2247,15 +2247,17 @@ const D5_OTHERWISE: string[] = ["PATH=node_modules/.bin:$PATH npx tsc", "NODE_PA
 const D5_ASKS: string[] = [...D5_STRINGS, ...D5_ELSEWHERE, ...D5_OTHERWISE];
 // The 54 calls the fourth pass newly asked about (the variant check's "new asks", each the model
 // before it): another command that names package.json or .npmrc, hands a glob or `.` to a program,
-// or deletes by name under `.`. None spells node_modules: the model.
+// or deletes by name under `.`. None spells node_modules: the model. (B9-6: an archive tar or
+// zip makes is a write of its own, and one outside the project asks as `cp x ../y` does: the
+// archives of these forms go to /tmp, as the copies beside them do.)
 const D5_NEW_ASKS: string[] = [
   "jq . package.json && npx tsc", "jq .version package.json && npx tsc", "jq -r .name package.json && npx tsc", "sed -n 1,5p package.json && npx tsc", "awk 'NR<3' package.json && npx tsc", "less package.json && npx tsc",
   "bat package.json && npx tsc", "file package.json && npx tsc", "md5sum package.json && npx tsc", "sha256sum package-lock.json package.json && npx tsc", "sort package.json && npx tsc", "uniq package.json && npx tsc",
   "xxd package.json && npx tsc", "od package.json && npx tsc", "strings package.json && npx tsc", "git add package.json && npx tsc", "git add package.json package-lock.json && npx tsc", "git diff package.json && npx tsc",
   "git diff HEAD -- package.json && npx tsc", "git log -p package.json && npx tsc", "git log --oneline -- package.json && npx tsc", "git blame package.json && npx tsc", "git status package.json && npx tsc",
   "git ls-files package.json && npx tsc", "git commit -m x package.json && npx tsc", "git add -f package.json && npx tsc", "prettier --check package.json && npx tsc", "eslint package.json && npx tsc",
-  "cp package.json package.json.bak && npx tsc", "cp package.json /tmp/p.json && npx tsc", "rsync -a package.json /tmp/ && npx tsc", "tar czf ../a.tgz package.json && npx tsc",
-  "zip -r ../a.zip src package.json && npx tsc", "find . -type f -name '*.log' -delete && npx tsc", "find . -name '.DS_Store' -delete && npx tsc", "find . -name '*.orig' -delete && npx tsc",
+  "cp package.json package.json.bak && npx tsc", "cp package.json /tmp/p.json && npx tsc", "rsync -a package.json /tmp/ && npx tsc", "tar czf /tmp/a.tgz package.json && npx tsc",
+  "zip -r /tmp/a.zip src package.json && npx tsc", "find . -type f -name '*.log' -delete && npx tsc", "find . -name '.DS_Store' -delete && npx tsc", "find . -name '*.orig' -delete && npx tsc",
   "find . -empty -type d -delete && npx tsc", "find . -name '*.ts' -exec wc -l {} + && npx tsc", "find . -name '*.ts' -exec chmod 644 {} + && npx tsc", "chmod -R u+w . && npx tsc", "chmod -R g+r . && npx tsc",
   "chmod 644 package.json && npx tsc", "chmod 755 . && npx tsc", "chown -R $USER . && npx tsc", "touch package.json && npx tsc", "touch .npmrc && npx tsc", "touch -c package.json && npx tsc", "code package.json && npx tsc",
   "open package.json && npx tsc", "git add * && npx tsc", "git add ./* && npx tsc", "prettier --check '*' && npx tsc", "eslint './*' && npx tsc",
@@ -2276,7 +2278,7 @@ const D5_ON_PURPOSE: string[] = [
   "rm -rf node_mod*; npx tsc", "rm -rf ./n*; npx tsc", "trap 'rm -rf node_mod*' DEBUG; npx tsc", "echo cm0gLXJmIG5vZGVfbW9kdWxlcw== | base64 -d | sh; npx tsc", "printf 'rm -rf node_\\155odules' | sh; npx tsc",
   // a command that removes or swaps the tool without naming it;
   "F=-fdx; git clean $F; npx tsc", "git stash -a && npx tsc", "git checkout other && npx tsc", "git switch other && npx tsc", "npm uninstall dep && npx tsc", "npm prune && npx tsc", "npm run reset && npx tsc", "make reset && npx tsc", "./reset.sh && npx tsc",
-  "bash reset.sh; npx tsc", "sh < reset.sh; npx tsc", "tar --remove-files -cf ../a.tar . && npx tsc", "cp -r ../tpl/. . && npx tsc", "cp -rT tpl . && npx tsc", "npx rimraf . && npx tsc", "find . -delete; npx tsc", "chmod -R a-x .; npx tsc",
+  "bash reset.sh; npx tsc", "sh < reset.sh; npx tsc", "tar --remove-files -cf /tmp/a.tar . && npx tsc", "cp -r ../tpl/. . && npx tsc", "cp -rT tpl . && npx tsc", "npx rimraf . && npx tsc", "find . -delete; npx tsc", "chmod -R a-x .; npx tsc",
   // a change of what npm reads.
   "npm set script-shell=./x && npx tsc", "npm pkg set bin.tsc=./x.js && npx tsc", "echo x >> .npmrc; npx tsc", "cp other.json package.json && npx tsc", "sed -i 's/fixture/x/' package.json; npx tsc",
 ];
