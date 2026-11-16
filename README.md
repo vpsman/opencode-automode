@@ -13,7 +13,10 @@ For each shell tool call:
    plain spelling that bash and the rules cannot read differently: each word bare or in single
    quotes, braces expanded into the words bash would make of them, comments and
    backslash-newlines gone, backticks written as `$(...)`, every heredoc under a fresh
-   delimiter, and the code handed to a nested `bash -c`, `sh -c`, `dash -c` or `eval` printed
+   delimiter, `"$(cat <<'EOF' ... EOF)"` written as the text it stands for (no `cat` runs
+   for it; where the `cat` that `PATH` finds lies in a directory a call can write, or `PATH`
+   has a relative entry, the call asks instead), and the code handed to a nested `bash -c`,
+   `sh -c`, `dash -c` or `eval` printed
    the same way. Everything below is decided on the printed text, and when the command is
    allowed **the printed text is what runs**, in place of the text the agent wrote. opencode's
    prompt shows the command as the agent issued it; the decision log holds both where they
@@ -310,7 +313,17 @@ For each shell tool call:
      (`~/`, `~user/`, `%(prefix)/`) and as deep as git follows them, the known hook-manager files (`.husky/`, `lefthook.yml` and its variants,
      `.pre-commit-config.yaml`, `.overcommit.yml`) and opencode's project files
      (`opencode.json[c]`, `.opencode/`, `.claude/`, `.agents/`, `AGENTS.md`, `CLAUDE.md`, in
-     the session directory and each writable parent). The plugin creates an empty `.opencode/` in the
+     the session directory and each writable parent), with what the symbolic links inside
+     those directories lead to where a call could write it. Links are followed one level: a
+     link to a directory that itself holds a link, to a directory that is or holds one a call
+     can write, through another link a call could replace, out of a directory a call could
+     replace with a `..`, to a place not there yet, or to a file with a hard link makes every
+     call ask, and so does a file with a hard link in those directories themselves. That
+     includes `.opencode/node_modules` installed by bun or pnpm, which link the files from their
+     store, as the project's own `node_modules` usually does: remove that `node_modules` and
+     install again as copies (`bun install --backend=copyfile`, or pnpm with
+     `--package-import-method=copy`) and the calls stop asking, until something installs there
+     by hard links again. The plugin creates an empty `.opencode/` in the
      session directory (git does not show empty directories) so that it can be made read-only
      rather than appear later with a plugin in it. Every directory between a writable root and
      a protected or hidden path is pinned, so no parent can be renamed and rebuilt. A mount

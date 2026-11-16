@@ -803,7 +803,7 @@ test("r4 21: a call in a linked worktree that also works in its populated submod
 // ---- 8. git's variables, the other way round ----
 
 test("r4 21: a variable that points the plugin's own git at other configuration than the shell's asks either way round", () => {
-  const names = ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM", "GIT_NO_REPLACE_OBJECTS"];
+  const names = ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM", "GIT_NO_REPLACE_OBJECTS", "HOME", "XDG_CONFIG_HOME"];
   const base = { PATH: "/usr/bin", HOME: "/home/x" };
   for (const name of names) {
     // Set for the plugin, absent from the shell (or there with another value).
@@ -816,6 +816,8 @@ test("r4 21: a variable that points the plugin's own git at other configuration 
     assert.equal(gitElsewhere({ ...base, [name]: "/some/value" }, { ...base, [name]: "/some/value" }), undefined, name);
   }
   assert.equal(gitElsewhere({ ...base }, { ...base }), undefined);
+  // (Council round 1: XDG_CONFIG_HOME unset is $HOME/.config, the same directory.)
+  assert.equal(gitElsewhere({ ...base }, { ...base, XDG_CONFIG_HOME: "/home/x/.config" }), undefined);
   // What the plugin's own lookups drop (gitEnv) is the shell's alone, as before.
   assert.equal(gitElsewhere({ ...base }, { ...base, GIT_DIR: "/x/.git" }), undefined);
   assert.equal(gitElsewhere({ ...base, GIT_DIR: "/x/.git" }, { ...base, GIT_DIR: "/x/.git" }), "GIT_DIR");
