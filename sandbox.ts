@@ -219,6 +219,23 @@ let pluginWritable: ((p: string) => boolean) | undefined;
 export function setPluginWritable(writable: (p: string) => boolean): void {
   pluginWritable = writable;
 }
+// (Round 7: the loader's lists too: LD_LIBRARY_PATH, LD_PRELOAD and LD_AUDIT keep only their
+// absolute entries outside the places a call can write; with none left, the variable goes.)
+function pluginLoader(env: NodeJS.ProcessEnv): void {
+  for (const name of ["LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT"]) {
+    const value = env[name];
+    if (value === undefined) continue;
+    const kept = cleanList(value.split(name === "LD_LIBRARY_PATH" ? ":" : /[:\s]/));
+    if (kept.length) env[name] = kept.join(":");
+    else delete env[name];
+  }
+}
+function cleanList(entries: string[]): string[] {
+  const temps = [...new Set(["/tmp", "/var/tmp", "/dev/shm", os.tmpdir()].flatMap((d) => [d, realpath(d)]))];
+  const cwd = process.cwd();
+  const writable = pluginWritable ?? ((p: string) => cwd !== "/" && !within(HOME, cwd) && within(p, cwd));
+  return entries.filter((e) => path.isAbsolute(e) && ![e, realpath(e)].some((p) => writable(p) || temps.some((t) => within(p, t))));
+}
 export function pluginPath(list = process.env.PATH ?? ""): string {
   const temps = [...new Set(["/tmp", "/var/tmp", "/dev/shm", os.tmpdir()].flatMap((d) => [d, realpath(d)]))];
   const cwd = process.cwd();
@@ -237,6 +254,7 @@ export const gitEnv = (): NodeJS.ProcessEnv => {
   // whose `uploadpack` a repository's config names (council project review 1).
   const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0", GIT_ASKPASS: "", SSH_ASKPASS: "", SSH_ASKPASS_REQUIRE: "never", GIT_PAGER: "cat", GIT_NO_LAZY_FETCH: "1", PATH: pluginPath() };
   for (const name of ["GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_EXTERNAL_DIFF", "GIT_EDITOR"]) delete env[name];
+  pluginLoader(env);
   return env;
 };
 export const gitArgs = (args: string[]) => [...GIT_SAFE, ...args];

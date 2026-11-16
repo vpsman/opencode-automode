@@ -253,7 +253,9 @@ For each shell tool call:
      variable that names a program or a file a listed program loads (`GIT_EXTERNAL_DIFF`,
      `GIT_SSH_COMMAND`, `EDITOR`, `PAGER`, `RIPGREP_CONFIG_PATH`, ...) with a path the session
      can write, and a shell given such a value where opencode's own has none asks, as for
-     `PATH`. A git
+     `PATH`; the loader's `LD_LIBRARY_PATH`, `LD_PRELOAD` and `LD_AUDIT` are read as `PATH` is
+     (an empty or relative entry counts), and with such an entry in `PATH` any program counts
+     as running code of the project for the hold-back below. A git
      command is on it only where the repository's own configuration, and every file it
      includes whatever the condition, holds no key that may name a program
      (`core.hooksPath` as husky sets it, `credential.helper`, `alias.*`, a URL whose scheme
@@ -791,7 +793,8 @@ message), which is why pushes and ssh use deterministic rules instead.
   command or a git hook run later outside the sandbox. Hook managers are in this class: the
   known files are read-only (`.husky/`, lefthook, pre-commit, overcommit), but only where they
   already exist, and a hook that calls `npm run lint` or a script in the repository runs
-  whatever that has become. Read the diff before you run or commit. The other side of that
+  whatever that has become. Read the diff before you run or commit. What a hook writes when a
+  git command runs it is the hook's doing and is not in the record of what the session wrote. The other side of that
   protection: a git command that would rewrite one of those files (a `git switch` to a branch
   with another `.husky/pre-commit`) asks, and `git pull` asks in every repository that tracks
   one, or tracks `AGENTS.md`, `CLAUDE.md`, `opencode.json`, `.claude/` or `.agents/`.

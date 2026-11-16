@@ -314,6 +314,7 @@ class Lexer {
   private inner: boolean;
   private tokens: Token[] = [];
   private parts: Part[] | undefined;
+  private bareDollarEnd = -1;
   private pending: { doc: Heredoc; delimiter: string; dash: boolean }[] = [];
   private commandStart = true;
   // 1 after the keyword `time`, 2 after its `-p`.
@@ -402,6 +403,9 @@ class Lexer {
     const parts = this.parts;
     this.parts = undefined;
     if (!parts) return;
+    // bash 5.2 does not split a word that ends in a bare `$` after an unquoted expansion
+    // (`$p$`): printed, the `$` is quoted, and the word would be split.
+    if (this.bareDollarEnd === this.i && parts.some((p) => (p.kind === "var" || p.kind === "param" || p.kind === "sub" || p.kind === "arith") && !p.quoted)) ask("a bare $ at the end of a word after an expansion");
     const word: Word = { type: "word", parts };
     const redir = this.wanting();
     if (redir) {
@@ -688,6 +692,8 @@ class Lexer {
         // A `$` that expands nothing is printed in quotes, which in a regular expression would
         // turn the end-of-line anchor into a literal dollar.
         if (this.regexWord && !quoted) ask("a $ inside a regular expression after =~");
+        // (Council project review 1, round 7: see endWord.)
+        if (!quoted) this.bareDollarEnd = this.i + 1;
         this.lit("$", true);
         this.i++;
       } else {

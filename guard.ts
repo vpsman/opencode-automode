@@ -4819,6 +4819,9 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
     // (Council project review 1, round 3: a bare stash writes HEAD's version of each changed file,
     // and HEAD may have been moved without a write the record saw: `git symbolic-ref`.)
     if (sub === "branch" || sub === "tag") return undefined;
+    // (Council project review 1, round 7: format-patch writes files whose text and suffix the
+    // command chooses, `--format=%B --suffix=.test.js`, unless they go to its output.)
+    if (sub === "format-patch" && !call.rest.includes("--stdout")) return "git format-patch writes files the command shapes";
     // A new branch at HEAD changes no file (round 4, finding 4: the mark it would leave lasts).
     const end = call.rest.indexOf("--");
     const own = end < 0 ? call.rest : call.rest.slice(0, end);
@@ -6939,7 +6942,7 @@ export function bentPath(inProject: (p: string) => boolean, list = process.env.P
 // pager; less's input filter; ripgrep's config). Where one names a path the session can write (a
 // relative one, or one in the project or a temp directory), a safe-list program may run what the
 // session wrote, as with a PATH entry there: after a session write nothing is on the safe list.
-export const PROGRAM_ENV = ["GIT_EXTERNAL_DIFF", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND", "LESS", "LESSKEYIN", "LESSKEY", "LESSKEYIN_SYSTEM", "LESSKEY_SYSTEM", "LESSKEY_CONTENT", "LESSKEY_CONTENT_SYSTEM", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "GIT_PAGER", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "EDITOR", "VISUAL", "PAGER", "MANPAGER", "BROWSER", "RIPGREP_CONFIG_PATH", "LESSOPEN", "LESSCLOSE", "TAR_OPTIONS"];
+export const PROGRAM_ENV = ["LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT", "GIT_EXTERNAL_DIFF", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND", "LESS", "LESSKEYIN", "LESSKEY", "LESSKEYIN_SYSTEM", "LESSKEY_SYSTEM", "LESSKEY_CONTENT", "LESSKEY_CONTENT_SYSTEM", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "GIT_PAGER", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "EDITOR", "VISUAL", "PAGER", "MANPAGER", "BROWSER", "RIPGREP_CONFIG_PATH", "LESSOPEN", "LESSCLOSE", "TAR_OPTIONS"];
 // (Round 3: the ones whose value is a path, not a command: a bare name is a relative path.)
 const FILE_ENV = new Set(["GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "RIPGREP_CONFIG_PATH", "LESSKEYIN", "LESSKEY", "LESSKEYIN_SYSTEM", "LESSKEY_SYSTEM"]);
 export function bentEnv(inProject: (p: string) => boolean, env: Record<string, string | undefined> = process.env): string | undefined {
@@ -6951,6 +6954,15 @@ export function bentEnv(inProject: (p: string) => boolean, env: Record<string, s
     // less's options and lesskey text can name a lesskey file or set LESSOPEN themselves.
     if ((name === "LESS" && /(^|\s)(-[a-zA-Z]*k|--l)/.test(value)) || (/^LESSKEY_CONTENT/.test(name) && /LESS(OPEN|CLOSE)/.test(value))) return `${name}=${value}`;
     if (name === "LESS" || /^LESSKEY_CONTENT/.test(name)) continue;
+    // (Round 7: the loader's lists, which every program reads: an empty or a relative entry is
+    // the working directory, as a PATH entry is.)
+    if (/^LD_/.test(name)) {
+      if (value.split(name === "LD_LIBRARY_PATH" ? ":" : /[:\s]/).some((e) => {
+        const t = e === "~" ? home : e.startsWith("~/") ? path.join(home, e.slice(2)) : e;
+        return !path.isAbsolute(t) || [t, walked(t) ?? t].some((p) => inProject(p) || temp.some((d) => within(p, d)));
+      })) return `${name}=${value}`;
+      continue;
+    }
     const file = FILE_ENV.has(name);
     const words = file ? [value] : value.replace(/^\s*\|\|?-?/, "").trim().split(/\s+/);
     for (const [i, raw] of words.entries()) {
@@ -7096,6 +7108,8 @@ export const gitOnlyReads = (args: string[]): boolean => {
   const call = gitCall(args);
   return typeof call !== "string" && GIT_ONLY_READS.has(call.sub ?? "");
 };
+// (Round 7: whether a command runs any program PATH finds, not one of bash's own words.)
+export const runsAnyProgram = (cmds: Simple[]): boolean => cmds.some((cmd) => programs(cmd.argv).some((at) => !SHELL_OWN.has(path.basename(cmd.argv[at])) || cmd.argv[at].includes("/")));
 export function runsProjectCode(cmds: Simple[]): boolean {
   return cmds.some((cmd) =>
     programs(cmd.argv).some((at) => {
@@ -7424,7 +7438,11 @@ export function runnerPlaces(name: string, args: string[], cwd: string | undefin
     if (word.startsWith("@")) return [];
     return pathPieces(word).flatMap((piece) => {
       const p = resolve(piece);
-      return p !== undefined && fs.existsSync(p) ? [isFile(p) ? path.dirname(p) : p] : [];
+      if (p === undefined) return [];
+      if (fs.existsSync(p)) return [isFile(p) ? path.dirname(p) : p];
+      // (Round 7: `jest -c=/tmp/x.js` after a write of that file in the same call.)
+      // (Not `/` itself: a tail cut from a relative path, `/Cargo.toml` of `../web/Cargo.toml`.)
+      return path.isAbsolute(piece) && path.dirname(p) !== "/" && fs.existsSync(path.dirname(p)) ? [path.dirname(p)] : [];
     });
   };
   const read = RUNNER_SUBS.has(name) ? runnerSub(name, args) : undefined;

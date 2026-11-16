@@ -10,7 +10,8 @@ import path from "node:path";
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_ASK, decideShell, SessionState, takeMoment, type Guard } from "../decide.ts";
-import { gitRun, plan, pluginPath, setPluginWritable } from "../sandbox.ts";
+import { gitEnv, gitRun, plan, pluginPath, setPluginWritable } from "../sandbox.ts";
+import { canonical } from "../canon.ts";
 import http from "node:http";
 SessionState.moment = takeMoment;
 import { compileRules } from "../rules.ts";
@@ -353,4 +354,64 @@ test("a runner whose decision was with the model while a write was recorded asks
   } finally {
     server.close();
   }
+});
+
+// Round 7.
+test("the loader's variables turn the safe list off where they name a place the session can write", async () => {
+  const after = async (vars: Record<string, string | undefined>, command: string) =>
+    withEnv(vars, async () => {
+      const s = new SessionState(repo);
+      assert.equal(await effect("echo x > note.txt", s), "allow");
+      return effect(command, s);
+    });
+  for (const vars of [{ LD_LIBRARY_PATH: "/usr/local/cuda/lib64:" }, { LD_LIBRARY_PATH: `${repo}/lib` }, { LD_LIBRARY_PATH: "lib" }, { LD_PRELOAD: `${repo}/x.so` }, { LD_AUDIT: "./a.so" }]) {
+    assert.notEqual(await after(vars, "ls"), "allow", JSON.stringify(vars));
+  }
+  assert.equal(await after({ LD_LIBRARY_PATH: "/usr/local/cuda/lib64" }, "ls"), "allow");
+});
+
+test("the plugin's own git keeps only the loader entries a call cannot write", () => {
+  setPluginWritable((p) => p === repo || p.startsWith(repo + "/"));
+  const before = { l: process.env.LD_LIBRARY_PATH, p: process.env.LD_PRELOAD };
+  try {
+    process.env.LD_LIBRARY_PATH = `/usr/local/cuda/lib64::${repo}/lib:rel`;
+    process.env.LD_PRELOAD = `${repo}/x.so`;
+    const env = gitEnv();
+    assert.equal(env.LD_LIBRARY_PATH, "/usr/local/cuda/lib64");
+    assert.equal(env.LD_PRELOAD, undefined);
+  } finally {
+    setPluginWritable(() => false);
+    before.l === undefined ? delete process.env.LD_LIBRARY_PATH : (process.env.LD_LIBRARY_PATH = before.l);
+    before.p === undefined ? delete process.env.LD_PRELOAD : (process.env.LD_PRELOAD = before.p);
+  }
+});
+
+test("with a PATH entry the session can write, any program counts as running code of the project", async () => {
+  const d = await withEnv({ PATH: `${repo}/bin:${process.env.PATH}` }, () => decideShell(guard, new SessionState(repo), repo, "cat f"));
+  assert.equal(d.effect, "allow");
+  assert.ok(d.runsCode);
+  assert.ok(!(await decideShell(guard, new SessionState(repo), repo, "cat f")).runsCode);
+});
+
+test("a runner names a file the same call writes, in a spelling with = after a short option", async () => {
+  const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp1-r7-")));
+  try {
+    for (const c of [`printf x > ${d}/c.js && jest -c=${d}/c.js`, `printf x > ${d}/r.js && mocha -r=${d}/r.js`, `printf x > ${d}/g.mod && go test -modfile=${d}/g.mod ./...`]) assert.notEqual(await effect(c), "allow", c);
+  } finally {
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test("git format-patch writes files the record holds", async () => {
+  const s = new SessionState(repo);
+  await effect("git format-patch -1 --suffix=.test.js -o test", s);
+  assert.notEqual(await effect("npm test", s), "allow");
+  const t = new SessionState(repo);
+  await effect("git format-patch -1 --stdout", t);
+  assert.equal(await effect("npm test", t), "allow");
+});
+
+test("a bare $ ending a word after an expansion asks", () => {
+  for (const c of ["printf '%s' $p$", "echo ${p}$", "echo $(id)$"]) assert.ok("ask" in canonical(c), c);
+  for (const c of ["echo x$ $p", "echo $", "echo $p'$'", "grep 'x$' f"]) assert.ok(!("ask" in canonical(c)), c);
 });
