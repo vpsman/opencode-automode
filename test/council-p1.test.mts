@@ -178,3 +178,50 @@ test("the code caches include v8-compile-cache's and Jest's, and NODE_COMPILE_CA
   assert.match(relative.problem ?? "", /NODE_COMPILE_CACHE/);
   fs.rmSync(moved, { recursive: true, force: true });
 });
+
+// Round 3.
+test("more values of opencode's environment that name a place the session can write", async () => {
+  const after = async (vars: Record<string, string | undefined>, command: string) =>
+    withEnv(vars, async () => {
+      const s = new SessionState(repo);
+      assert.equal(await effect("echo x > note.txt", s), "allow");
+      return effect(command, s);
+    });
+  for (const [vars, command] of [
+    [{ RIPGREP_CONFIG_PATH: "rgconfig" }, "rg x f"],
+    [{ GIT_EXTERNAL_DIFF: "sh helper" }, "git diff"],
+    [{ GIT_EDITOR: "sh x.sh" }, "git diff"],
+    [{ LESS: "--lesskey-src=keys" }, "less f"],
+    [{ LESSKEYIN: "keys" }, "less f"],
+    [{ GIT_PROXY_COMMAND: "./proxy" }, "git diff"],
+  ] as [Record<string, string>, string][]) {
+    assert.notEqual(await after(vars, command), "allow", JSON.stringify(vars));
+  }
+  assert.equal(await after({ GIT_EXTERNAL_DIFF: "difft", LESS: "-R", PAGER: "less -FRX" }, "git diff"), "allow");
+});
+
+test("less with a lesskey option is off the safe list after a session write", async () => {
+  for (const c of ["less --lesskey-src=keys f", "less '--lesskey-content=#env;LESSOPEN=|sh t.sh %s' f", "less -k keys f", "less --lessk=keys f"]) {
+    const s = new SessionState(repo);
+    assert.equal(await effect("echo x > note.txt", s), "allow");
+    assert.notEqual(await effect(c, s), "allow", c);
+  }
+});
+
+test("git writes of the work tree the record missed, and uniq's stdin operand", async () => {
+  execFileSync("git", ["-C", repo, "branch", "-f", "incoming"]);
+  for (const writer of ["git stash", "git checkout -bnb incoming", "git checkout -qbnb incoming", "git switch -cabc incoming", "git bisect broken incoming", "printf x | uniq - test.js"]) {
+    const s = new SessionState(repo);
+    await effect(writer, s);
+    assert.notEqual(await effect("npm test", s), "allow", writer);
+  }
+  // A new branch at HEAD writes nothing, as before.
+  const s = new SessionState(repo);
+  assert.equal(await effect("git checkout -b nb", s), "allow");
+  assert.equal(await effect("npm test", s), "allow");
+});
+
+test("NODE_COMPILE_CACHE that is a writable root itself is a problem", async () => {
+  const p = await withEnv({ NODE_COMPILE_CACHE: "/tmp" }, async () => plan({ projectRoots: [repo], allowedPaths: [], cacheDirs: [], gitWritable: false, exposeSsh: false, keepSockets: [], showPaths: [], hidePaths: [], project: repo }));
+  assert.match(p.problem ?? "", /NODE_COMPILE_CACHE/);
+});

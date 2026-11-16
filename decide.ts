@@ -4458,6 +4458,12 @@ function gitProgramsOutside(dir: string, diff: boolean, inside: (p: string) => b
     if (!outsideProgram(value, top, inside)) return false;
     if (scope !== "global" && scope !== "system" && !KNOWN_PROGRAM_LINES.some((l) => l.key.test(key) && l.value.test(value))) return false;
   }
+  // (Round 3: git-lfs runs the programs its own keys name, an extension's clean and smudge or a
+  // custom transfer agent: with one set, no git-lfs line holds.)
+  if (/(^|\s|")git-lfs\s/.test(r.out)) {
+    const lfs = gitRun(["-C", dir, "config", "--null", "--name-only", "--get-regexp", "^lfs\\.(extension\\.|customtransfer\\.|standalonetransferagent)"]);
+    if (lfs.status !== 1) return false;
+  }
   return true;
 }
 

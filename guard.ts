@@ -4814,16 +4814,20 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
     // second pass: read by git's own reading of the options).
     if (sub === "apply" && !gitApplies(call.rest)) return undefined;
     if (sub === "stash" && ["list", "show", "create", "store"].includes(words[0] ?? "")) return undefined;
-    if (sub === "stash" && !words.length) return undefined; // saves and cleans: writes only what was there
+    // (Council project review 1, round 3: a bare stash writes HEAD's version of each changed file,
+    // and HEAD may have been moved without a write the record saw: `git symbolic-ref`.)
     if (sub === "branch" || sub === "tag") return undefined;
     // A new branch at HEAD changes no file (round 4, finding 4: the mark it would leave lasts).
     const end = call.rest.indexOf("--");
     const own = end < 0 ? call.rest : call.rest.slice(0, end);
     const creates = sub === "checkout" ? /^-[a-zA-Z]*[bB]$/ : /^-[a-zA-Z]*[cC]$/;
-    if ((sub === "checkout" || sub === "switch") && end < 0 && own.some((w) => creates.test(w) || (sub === "switch" && /^--(create|force-create)$/.test(w))) && words.length <= 1 && own.every((w) => !w.startsWith("-") || creates.test(w) || /^-(q|-quiet)$/.test(w) || /^--(create|force-create)$/.test(w))) return undefined;
+    // (Round 3: `-bnb` is `-b nb`, the name attached: a word after it is a start point.)
+    const attached = own.some((w) => !w.startsWith("--") && (sub === "checkout" ? /^-[a-zA-Z]*?[bB]./ : /^-[a-zA-Z]*?[cC]./).test(w));
+    if ((sub === "checkout" || sub === "switch") && end < 0 && own.some((w) => creates.test(w) || (sub === "switch" && /^--(create|force-create)$/.test(w))) && words.length <= (attached ? 0 : 1) && own.every((w) => !w.startsWith("-") || creates.test(w) || /^-(q|-quiet)$/.test(w) || /^--(create|force-create)$/.test(w))) return undefined;
     if (["apply", "am", "checkout", "switch", "restore", "reset", "stash", "merge", "pull", "rebase", "cherry-pick", "revert", "mv", "checkout-index", "read-tree", "worktree", "submodule", "sparse-checkout"].includes(sub)) return `git ${sub} writes files of the work tree`;
     // A bisect checks out the commits it steps through (round 4, finding 4, second pass).
-    if (sub === "bisect" && ["start", "reset", "good", "bad", "new", "old", "skip", "next"].includes(words[0] ?? "")) return "git bisect checks out other commits";
+    // (Round 3: any word but those that only print, terms of its own included: `--term-new=broken`.)
+    if (sub === "bisect" && !["log", "terms", "visualize", "view", "help"].includes(words[0] ?? "")) return "git bisect checks out other commits";
   }
   return undefined;
 }
@@ -4933,7 +4937,12 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       }
       else if (name === "tree") valued(args, "o", "--never").forEach((f) => add(f, false));
       else if (name === "less") [...valued(args, "o", "--log-file"), ...valued(args, "O", "--LOG-FILE")].forEach((f) => add(f, false));
-      else if (name === "uniq" || name === "xxd") add(files.length > 1 ? files[1] : undefined, false);
+      // (Round 3: `-` is the input operand, `uniq - out`; the last of two or more operands is the
+      // output, an option's value counted among them, which can only record more.)
+      else if (name === "uniq" || name === "xxd") {
+        const operands = args.filter((a) => a === "-" || !a.startsWith("-"));
+        add(operands.length > 1 ? operands.at(-1) : undefined, false);
+      }
       else if ((name === "yq" || name === "jq") && args.some((a) => /^(-[a-zA-Z]*i|--inplace)$/.test(a))) files.slice(1).forEach((f) => add(f, false));
       // B7-7: a directory or a file an option names for the program to write in: tar's `-C` and
       // unzip's `-d` when they extract, find's `-fprint0` (the rules ask on `-fprint`, `-fprintf`
@@ -6916,16 +6925,27 @@ export function bentPath(inProject: (p: string) => boolean, list = process.env.P
 // pager; less's input filter; ripgrep's config). Where one names a path the session can write (a
 // relative one, or one in the project or a temp directory), a safe-list program may run what the
 // session wrote, as with a PATH entry there: after a session write nothing is on the safe list.
-export const PROGRAM_ENV = ["GIT_EXTERNAL_DIFF", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "GIT_PAGER", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "EDITOR", "VISUAL", "PAGER", "MANPAGER", "BROWSER", "RIPGREP_CONFIG_PATH", "LESSOPEN", "LESSCLOSE", "TAR_OPTIONS"];
+export const PROGRAM_ENV = ["GIT_EXTERNAL_DIFF", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND", "LESS", "LESSKEYIN", "LESSKEY", "LESSKEYIN_SYSTEM", "LESSKEY_SYSTEM", "LESSKEY_CONTENT", "LESSKEY_CONTENT_SYSTEM", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "GIT_PAGER", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "EDITOR", "VISUAL", "PAGER", "MANPAGER", "BROWSER", "RIPGREP_CONFIG_PATH", "LESSOPEN", "LESSCLOSE", "TAR_OPTIONS"];
+// (Round 3: the ones whose value is a path, not a command: a bare name is a relative path.)
+const FILE_ENV = new Set(["GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "RIPGREP_CONFIG_PATH", "LESSKEYIN", "LESSKEY", "LESSKEYIN_SYSTEM", "LESSKEY_SYSTEM"]);
 export function bentEnv(inProject: (p: string) => boolean, env: Record<string, string | undefined> = process.env): string | undefined {
   const temp = tempDirs();
   const home = os.homedir();
   for (const name of PROGRAM_ENV) {
     const value = env[name];
     if (!value) continue;
-    for (const raw of value.replace(/^\s*\|\|?-?/, "").split(/[\s=]+/)) {
-      const w = raw.replace(/^['"]|['"]$/g, "");
-      if (!w.includes("/")) continue;
+    // less's options and lesskey text can name a lesskey file or set LESSOPEN themselves.
+    if ((name === "LESS" && /(^|\s)(-[a-zA-Z]*k|--l)/.test(value)) || (/^LESSKEY_CONTENT/.test(name) && /LESS(OPEN|CLOSE)/.test(value))) return `${name}=${value}`;
+    if (name === "LESS" || /^LESSKEY_CONTENT/.test(name)) continue;
+    const file = FILE_ENV.has(name);
+    const words = file ? [value] : value.replace(/^\s*\|\|?-?/, "").trim().split(/\s+/);
+    for (const [i, raw] of words.entries()) {
+      const word = file ? raw : raw.replace(/^['"]|['"]$/g, "");
+      const option = !file && word.startsWith("-");
+      const w = option ? word.slice(word.indexOf("=") + 1 || word.length) : word;
+      // The program itself, an option's value or a placeholder without a `/` (`vi`, `-R`,
+      // `%s`): PATH finds the program, and PATH is judged on its own (bentPath).
+      if (!file && (w === "" || /^%[A-Za-z]$/.test(w) || ((i === 0 || option) && !w.includes("/")))) continue;
       const t = w === "~" ? home : w.startsWith("~/") ? path.join(home, w.slice(2)) : w;
       if (!path.isAbsolute(t) || [t, walked(t) ?? t].some((p) => inProject(p) || temp.some((d) => within(p, d)))) return `${name}=${value}`;
     }
@@ -7084,7 +7104,9 @@ function safeAfterWrite(name: string, args: string[], cmd: Simple, ctx: ArgvCont
   // and TAR_OPTIONS can hand tar an option that runs one; both are inherited from your
   // environment. less is on the list only where each is unset or names, by its absolute path, a
   // program outside every place a call can write (`| /usr/bin/lesspipe %s`); tar where it is unset.
-  if (name === "less" || name === "more") return ["LESSOPEN", "LESSCLOSE"].every((n) => lessFilterPlain(process.env[n], ctx));
+  // (Round 3: a lesskey file or text given as an option, `--lesskey-src=keys`,
+  // `--lesskey-content=#env ...`, `-k keys`, can set LESSOPEN too; long options abbreviate.)
+  if (name === "less" || name === "more") return !args.some((a) => /^-[a-zA-Z]*k|^--l/.test(a)) && ["LESSOPEN", "LESSCLOSE"].every((n) => lessFilterPlain(process.env[n], ctx));
   if (name === "tar" && process.env.TAR_OPTIONS) return false;
   if (SAFE_AFTER_WRITE.has(name)) return true;
   if (name === "rg") return !args.some((w) => w === "--pre" || w.startsWith("--pre="));

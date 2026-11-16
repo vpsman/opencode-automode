@@ -236,7 +236,8 @@ For each shell tool call:
      finds it: a builtin, or a file on `PATH` outside the project and the temp directories
      (`/bin/cat`, `./cat` and a name the call defines a function under are not). `less` is
      on it only where `LESSOPEN` and `LESSCLOSE` are unset or name, by an absolute path, a
-     program outside every place a call can write (`| /usr/bin/lesspipe %s`), and `tar`
+     program outside every place a call can write (`| /usr/bin/lesspipe %s`), and with no
+     lesskey option (`-k`, `--lesskey-src`, `--lesskey-content`), and `tar`
      only where `TAR_OPTIONS` is unset. Nothing is on it while opencode's environment has a
      variable that names a program or a file a listed program loads (`GIT_EXTERNAL_DIFF`,
      `GIT_SSH_COMMAND`, `EDITOR`, `PAGER`, `RIPGREP_CONFIG_PATH`, ...) with a path the session
@@ -508,7 +509,8 @@ For each shell tool call:
    asks.
 
 The plugin records the project's git layout at session start, nested repositories and pointer
-files included, and checks it before every decision. A git directory is known by the device
+files included, and checks it before every decision and when each call is over; a change a
+call made pauses every session, and a session that starts while one is paused starts paused. A git directory is known by the device
 and inode of a descriptor the plugin holds open on it (one descriptor per git directory for
 the length of the session), so one moved away and replaced is noticed; a restart of opencode
 takes a fresh record of what is there then. Repositories outside the project (in

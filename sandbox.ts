@@ -1661,7 +1661,9 @@ function codeCaches(rwDirs: string[]): { tmpfs: string[]; problems: string[] } {
   if (moved && !path.isAbsolute(moved)) problems.push(`NODE_COMPILE_CACHE (${moved}) is relative: where node keeps code it runs later cannot be covered`);
   else if (moved) {
     const at = path.join(realpath(path.dirname(path.resolve(moved))), path.basename(path.resolve(moved)));
-    if (rwDirs.some((d) => within(at, d) && at !== d)) cover(at, rwDirs);
+    // (Round 3: one that is a writable root itself, `/tmp` say, cannot be covered whole: it asks.)
+    if (rwDirs.includes(at)) problems.push(`NODE_COMPILE_CACHE (${moved}) is a directory every call can write, where node keeps code it runs later: it cannot be covered`);
+    else if (rwDirs.some((d) => within(at, d))) cover(at, rwDirs);
   }
   return { tmpfs: [...new Set(tmpfs)], problems };
 }

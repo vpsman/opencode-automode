@@ -2579,3 +2579,21 @@ describe("council project review 1, round 2: what the record and the shell's env
     assert.match(permission.message, /PATH/);
   });
 });
+
+describe("council project review 1, round 3: a plant one session made pauses the others", () => {
+  test("a git directory a call made pauses every session once the call is over, and a session that starts later", async () => {
+    const host = await start({ useClassifier: false });
+    const dir = path.join(project, "cp1r3");
+    try {
+      const plant = await call(host, "mkdir -p cp1r3/objects cp1r3/refs && echo 'ref: refs/heads/main' > cp1r3/HEAD", { sessionID: "cp1r3-sub" });
+      assert.equal(plant.permission.effect, "allow", plant.permission.message);
+      execFileSync("bash", ["-c", plant.shell.command.startsWith("mkdir") ? plant.shell.command : "mkdir -p cp1r3/objects cp1r3/refs && echo 'ref: refs/heads/main' > cp1r3/HEAD"], { cwd: project });
+      await host.after({ tool: "shell", sessionID: "cp1r3-sub", messageID: "m1", id: plant.id, status: "completed" });
+      const later = await call(host, "ls", { sessionID: "cp1r3-parent" });
+      assert.equal(later.permission.effect, "ask");
+      assert.match(later.permission.message, /paused/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

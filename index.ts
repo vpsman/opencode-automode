@@ -333,6 +333,10 @@ export default Plugin.define({
         // anywhere in the project then: the project is marked whole, as for an approved call
         // the checks could not read.
         if (s.resumed) for (const r of projectRoots(s)) if (!s.unlisted.includes(r)) s.unlisted.push(r);
+        // Round 3: while another session is paused, a new one starts paused: its baseline would
+        // be the tree with what the pause is about in it.
+        const paused = [...sessions.values()].find((o) => o.tampered)?.tampered;
+        if (paused) s.tampered = { ...paused };
         sessions.set(id, s);
       }
       return s;
@@ -387,10 +391,18 @@ export default Plugin.define({
           // the next decision checks again
         }
       }
-      if (!c.expecting) return;
-      c.expecting.done = true;
+      if (c.expecting) c.expecting.done = true;
+      // Council project review 1, round 3: the layout check for every allowed call that is over,
+      // not only an approved one that expected a repository. What a call planted pauses every
+      // session now, and not at its own session's next decision: a subagent's session may make
+      // none, and a session that starts later would take the tree as it then is for its baseline.
+      // (An ask whose approval is not yet known is checked when it is, or at its next decision.)
+      if (!c.expecting && c.decision.effect !== "allow") return;
       try {
-        gitTampered(session(c.sessionID), RESUME_FILE);
+        const s = session(c.sessionID);
+        const before = s.tampered;
+        const found = gitTampered(s, RESUME_FILE);
+        if (found && !before && s.tampered) pauseAll(found, s);
       } catch {
         // the next decision checks again
       }
