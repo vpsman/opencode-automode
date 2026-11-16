@@ -44,7 +44,7 @@ import { compileRules, compilePattern, within } from "./rules.ts";
 import { closeGitSnapshot, decideFile, decideRead, decideShell, EXPECT_MS, expectedRepos, gitDirectories, gitOnly, gitWriteDirectories, gitMaintainDirectories, gitStateTampered, gitTampered, mirrorable, noteGitCall, projectRoots, pushCandidate, pushDestinations, quarantineGitFiles, realish, sandboxBreaks, SessionState, unseenWrites, usesSsh, type Decision, type Expected, type GitCall, type Guard } from "./decide.ts";
 import { envKept, envStringProblem, gitElsewhere, plan, realpath, Scan, shellOwn, type Plan } from "./sandbox.ts";
 import { loadConfig, type Config } from "./config.ts";
-import { bentPath, shellAlsoKeeps, shellCdpath } from "./guard.ts";
+import { bentEnv, bentPath, pathFinds, pathHas, shellAlsoKeeps, shellCdpath } from "./guard.ts";
 import { canonical } from "./canon.ts";
 
 // A command that holds the word `git` as a program's name (broad on purpose: `.git` and
@@ -225,6 +225,9 @@ interface Call {
   // Its shell's PATH holds an entry the session can write (in the project, a temp directory, empty
   // or relative) that opencode's own does not: the safe list was judged by opencode's.
   bentPath?: string;
+  // A variable the checks read from opencode's own environment (PATH for a folded heredoc `cat`,
+  // PROGRAM_ENV for the safe list) that its shell has otherwise, in a way that matters.
+  envDiffers?: string;
   // permission.evaluate was applied, or the tool call is over: it waits for no shell.
   settled?: boolean;
   // Where the command would create repositories, when it asks; and the approval of that.
@@ -324,7 +327,12 @@ export default Plugin.define({
           s.files = first.files;
           s.touched = first.touched;
           s.unlisted = first.unlisted;
+          s.worktree = first.worktree;
         }
+        // Round 2: a session an earlier process saw (opencode restarted) may have written
+        // anywhere in the project then: the project is marked whole, as for an approved call
+        // the checks could not read.
+        if (s.resumed) for (const r of projectRoots(s)) if (!s.unlisted.includes(r)) s.unlisted.push(r);
         sessions.set(id, s);
       }
       return s;
@@ -666,6 +674,26 @@ export default Plugin.define({
           return;
         }
       }
+      // Council project review 1, round 2: what else the checks read from opencode's own
+      // environment. A folded `"$(cat <<EOF ...)"` is the command as written only where the
+      // shell's PATH finds the real cat; and the safe list holds by the variables that name a
+      // program or a file it loads (PROGRAM_ENV), as by PATH above: one the shell has that names
+      // a place the session can write, where opencode's own names none, is not what was judged.
+      if (config.enabled && queue.some((c) => c.decision.effect === "allow")) {
+        const top = realpath(project);
+        const inProject = (p: string) => within(p, top) || within(p, project) || [...config.allowedPaths, ...config.sandboxWritable].some((d) => within(p, d));
+        const catOdd = shellPath !== process.env.PATH && queue.some((c) => c.decision.folded) && (pathFinds("cat", undefined, inProject, () => false, shellPath ?? "") !== undefined || !pathHas("cat", shellPath ?? ""));
+        const shellBent = bentEnv(inProject, event.env);
+        const name = catOdd ? "PATH" : shellBent !== undefined && bentEnv(inProject) === undefined ? shellBent.slice(0, shellBent.indexOf("=")) : undefined;
+        if (name) {
+          for (const c of queue) {
+            c.unsure = true;
+            c.envDiffers = name;
+          }
+          event.env.AUTOMODE_CALL = token;
+          return;
+        }
+      }
       if (!config.sandbox && allAllowed && modelled) {
         // No wrapper to hand the text to: the shell is given the printed text as its command.
         // opencode builds the shell's arguments from the event after this hook.
@@ -789,6 +817,8 @@ export default Plugin.define({
                 ? `${would}, but its shell inherits ${call.gitEnv}, which makes git work in another repository or with another configuration than the one that was judged (the checks read the repository in the command's directory). Unset it where opencode is started, or approve this to run it as it is; naming it in sandboxKeepEnv keeps it for sandboxed shells and does not change this`
               : call.bentPath !== undefined
                 ? `${would}, but its shell's PATH holds ${clip(call.bentPath, 200)}, a directory the session can write, which opencode's own PATH does not: the checks judged the programs it names by opencode's PATH, and this shell may find others under the same names. Start opencode and its sessions with the same PATH, or approve this to run it as it is`
+              : call.envDiffers !== undefined
+                ? `${would}, but its shell's ${call.envDiffers} is not opencode's own, which the checks judged it by (${call.envDiffers === "PATH" ? 'a "$(cat <<EOF ...)" is printed as its text only where PATH finds the real cat, and this one may not' : "it names a place the session can write, through which a program may run or load what the session wrote"}). Start opencode and its sessions with the same ${call.envDiffers}, or approve this to run it as it is`
               : call.cdpath !== undefined
                 ? `${would}, but its shell ${call.cdpath ? `has CDPATH=${clip(call.cdpath, 200)}` : "has no CDPATH"} and opencode's own environment ${shellCdpath() ? `has ${clip(shellCdpath()!, 200)}` : "has none"} (sandboxKeepEnv keeps the shell's): bash looks the directory of a cd up in CDPATH, and the checks followed this command's cd as opencode's own environment says, so it may lead somewhere else in this shell. Start opencode and its sessions with the same CDPATH (or with none), or approve this to run it as it is`
               : call.tooLong

@@ -329,12 +329,12 @@ describe("K1: edit and read only tighten", () => {
       git("fetch", "-q", "origin");
       git("branch", "-q", `--set-upstream-to=origin/${git("branch", "--show-current").trim()}`);
       // (Each in a session of its own: after an ask, the next git command is the model's.)
-      const chained = await call(await start(), "git fetch && git merge --ff-only @{upstream}");
+      const chained = await call(await start(), "git fetch && git merge --ff-only @{upstream}", { sessionID: "r4-12-chained" });
       assert.equal(chained.permission.effect, "ask");
       assert.match(chained.permission.message, /git merge may rewrite .*AGENTS\.md, which the sandbox keeps read-only.*git fetch in the same command/);
-      const alone = await call(await start(), "git merge --ff-only @{upstream}");
+      const alone = await call(await start(), "git merge --ff-only @{upstream}", { sessionID: "r4-12-alone" });
       assert.equal(alone.permission.effect, "allow", alone.permission.message);
-      const pulled = await call(await start(), "git pull");
+      const pulled = await call(await start(), "git pull", { sessionID: "r4-12-pulled" });
       assert.equal(pulled.permission.effect, "ask");
       assert.match(pulled.permission.message, /run `git fetch` first, then `git merge --ff-only @\{upstream\}` or `git rebase @\{upstream\}`, which can be told/);
     } finally {
@@ -2362,13 +2362,16 @@ describe("r4 B8 (hooks)", () => {
       host = await start({ useClassifier: false });
       const again = await call(host, "sh b8s/tidy.sh", { sessionID: "b8-restart" });
       assert.equal(again.permission.effect, "ask");
-      assert.match(again.permission.message ?? "", /changed since this session began/);
-      // What nobody changed since still runs, and a session seen for the first time now is
-      // measured from now.
+      assert.match(again.permission.message ?? "", /changed since this session began|cannot list/);
+      // Council project review 1, round 2: a session an earlier process saw counts as having
+      // written anywhere in the project (what it wrote then is not in this process's record), so
+      // what nobody changed goes to the model too, and so it does for another session (the
+      // record is the project's). A session seen for the first time now has a moment of its own.
       const untouched = await call(host, "sh b8s/old.sh", { sessionID: "b8-restart" });
-      assert.equal(untouched.permission.effect, "allow", untouched.permission.message);
+      assert.equal(untouched.permission.effect, "ask", untouched.permission.message);
+      assert.match(untouched.permission.message ?? "", /cannot list/);
       const other = await call(host, "sh ./b8s/tidy.sh", { sessionID: "b8-restart-other" });
-      assert.equal(other.permission.effect, "allow", other.permission.message);
+      assert.equal(other.permission.effect, "ask", other.permission.message);
       assert.deepEqual(fs.readdirSync(moments).length, 2);
     } finally {
       git("rm", "-q", "-r", "-f", "b8s");
@@ -2504,5 +2507,75 @@ describe("council project review 1: one record of what was written for every ses
     } finally {
       fs.rmSync(pkg, { force: true });
     }
+  });
+});
+
+describe("council project review 1, round 2: what the record and the shell's environment carry", () => {
+  const g = (...args: string[]) => execFileSync("git", ["-C", project, "-c", "user.name=t", "-c", "user.email=t@t", ...args], { stdio: ["ignore", "pipe", "pipe"] });
+  const runShell = (shell: { shell: string; command: string; env: Record<string, string | undefined> }) => spawnSync(shell.shell, ["-c", shell.command], { cwd: project, env: shell.env as NodeJS.ProcessEnv, encoding: "utf8" });
+  test("a git work-tree change one session made reaches the record of every session", async () => {
+    const here = g("rev-parse", "--abbrev-ref", "HEAD").toString().trim();
+    const pkg = path.join(project, "package.json");
+    fs.writeFileSync(pkg, '{"scripts":{"test":"echo one"}}\n');
+    g("add", "package.json");
+    g("commit", "-qm", "cp1 r2 base");
+    g("checkout", "-qb", "cp1-r2-other");
+    fs.writeFileSync(pkg, '{"scripts":{"test":"echo two"}}\n');
+    g("commit", "-qam", "cp1 r2 other");
+    g("checkout", "-q", here);
+    try {
+      const host = await start({ useClassifier: false });
+      assert.equal((await call(host, "npm test", { sessionID: "cp1r2-b" })).permission.effect, "allow");
+      const sw = await call(host, "git switch cp1-r2-other", { sessionID: "cp1r2-a" });
+      assert.equal(sw.permission.effect, "allow", sw.permission.message);
+      assert.equal(runShell(sw.shell).status, 0);
+      await host.after({ tool: "shell", sessionID: "cp1r2-a", messageID: "m1", id: sw.id, status: "completed" });
+      const other = await call(host, "npm test", { sessionID: "cp1r2-b" });
+      assert.equal(other.permission.effect, "ask", "the other session");
+      assert.match(other.permission.message, /package\.json/);
+    } finally {
+      g("checkout", "-q", "-f", here);
+      g("branch", "-q", "-D", "cp1-r2-other");
+      g("rm", "-q", "-f", "package.json");
+      g("commit", "-qm", "cp1 r2 cleanup");
+    }
+  });
+  test("a session an earlier process saw counts as having written in the project", async () => {
+    let host = await start({ useClassifier: false });
+    assert.equal((await call(host, "git status", { sessionID: "cp1r2-restart" })).permission.effect, "allow");
+    await host.stop();
+    hosts.splice(hosts.indexOf(host), 1);
+    host = await start({ useClassifier: false });
+    const again = await call(host, "make", { sessionID: "cp1r2-restart" });
+    assert.equal(again.permission.effect, "ask");
+    assert.match(again.permission.message, /cannot list/);
+    assert.equal((await call(host, "git status", { sessionID: "cp1r2-restart" })).permission.effect, "allow", "the safe list as before");
+    assert.equal((await call(host, "make", { sessionID: "cp1r2-new" })).permission.effect, "ask", "the record is the project's");
+  });
+  test("a shell whose LESSOPEN names a place the session can write is not run as decided", async () => {
+    const host = await start({ useClassifier: false });
+    fs.writeFileSync(path.join(project, "cp1-f"), "x\n");
+    try {
+      const plain = await call(host, "less cp1-f", { sessionID: "cp1r2-less" });
+      assert.equal(plain.permission.effect, "allow", plain.permission.message);
+      for (const env of [{ LESSOPEN: "|./lp %s" }, { GIT_EXTERNAL_DIFF: "./differ" }, { EDITOR: `${project}/e` }]) {
+        const { permission } = await call(host, "less cp1-f", { sessionID: "cp1r2-less", env });
+        assert.equal(permission.effect, "ask", JSON.stringify(env));
+        assert.match(permission.message, /names a place the session can write/);
+      }
+      assert.equal((await call(host, "less cp1-f", { sessionID: "cp1r2-less", env: { EDITOR: "vi", LESSOPEN: "| /usr/bin/lesspipe %s" } })).permission.effect, "allow");
+    } finally {
+      fs.rmSync(path.join(project, "cp1-f"), { force: true });
+    }
+  });
+  test("a folded heredoc cat asks where the shell's PATH finds no cat", async () => {
+    const host = await start({ useClassifier: false });
+    const command = `printf '<%s>\\n' "$(cat <<'EOF'\nhello\nEOF\n)"`;
+    assert.equal((await call(host, command, { sessionID: "cp1r2-cat" })).permission.effect, "allow");
+    const empty = path.join(os.homedir(), "cp1-no-cat");
+    fs.mkdirSync(empty, { recursive: true });
+    const { permission } = await call(host, command, { sessionID: "cp1r2-cat", env: { PATH: empty } });
+    assert.equal(permission.effect, "ask");
+    assert.match(permission.message, /PATH/);
   });
 });

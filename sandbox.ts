@@ -1636,24 +1636,34 @@ function opencodePaths(project: string | undefined, rwDirs: string[]): Protected
 }
 
 // Code caches in the temp directories (council project review 1): Node's compile cache, which
-// tsc and tsserver turn on themselves, and tsx's and jiti's. A later node outside the sandbox
+// tsc and tsserver turn on themselves, tsx's, jiti's, v8-compile-cache's (yarn 1, older eslint)
+// and Jest's. A later node outside the sandbox
 // runs what they hold, checked against its source by little more than its length. Each gets a
 // private, empty tmpfs for the call, and one that is missing is made first, so that a call
 // cannot make it.
-export const TEMP_CODE_CACHES = ["node-compile-cache", `tsx-${process.getuid?.() ?? 0}`, "jiti"];
-function codeCaches(): { tmpfs: string[]; problems: string[] } {
+const UID = process.getuid?.() ?? 0;
+export const TEMP_CODE_CACHES = ["node-compile-cache", `tsx-${UID}`, "jiti", `v8-compile-cache-${UID}`, `jest_${UID.toString(36)}`];
+function codeCaches(rwDirs: string[]): { tmpfs: string[]; problems: string[] } {
   const tmpfs: string[] = [];
   const problems: string[] = [];
+  const cover = (p: string, roots: string[]) => {
+    if (isSymlink(p) || (lexists(p) && !isDir(p))) problems.push(`${p}, where node keeps code it runs later, is not a directory and cannot be covered`);
+    else if (!lexists(p) && !ensureDir(p, roots)) problems.push(`${p}, where node keeps code it runs later, does not exist and could not be made`);
+    else tmpfs.push(p);
+  };
   for (const temp of new Set(["/tmp", "/var/tmp", os.tmpdir()].map(realpath))) {
     if (!isDir(temp)) continue;
-    for (const name of TEMP_CODE_CACHES) {
-      const p = path.join(temp, name);
-      if (isSymlink(p) || (lexists(p) && !isDir(p))) problems.push(`${p}, where node keeps code it runs later, is not a directory and cannot be covered`);
-      else if (!lexists(p) && !ensureDir(p, [temp])) problems.push(`${p}, where node keeps code it runs later, does not exist and could not be made`);
-      else tmpfs.push(p);
-    }
+    for (const name of TEMP_CODE_CACHES) cover(path.join(temp, name), [temp]);
   }
-  return { tmpfs, problems };
+  // (Round 2: NODE_COMPILE_CACHE in opencode's environment moves Node's cache: where it lies in a
+  // writable directory, it is covered the same way. A relative one lies where node runs.)
+  const moved = process.env.NODE_COMPILE_CACHE;
+  if (moved && !path.isAbsolute(moved)) problems.push(`NODE_COMPILE_CACHE (${moved}) is relative: where node keeps code it runs later cannot be covered`);
+  else if (moved) {
+    const at = path.join(realpath(path.dirname(path.resolve(moved))), path.basename(path.resolve(moved)));
+    if (rwDirs.some((d) => within(at, d) && at !== d)) cover(at, rwDirs);
+  }
+  return { tmpfs: [...new Set(tmpfs)], problems };
 }
 
 const secretScope = makeScope("/", []);
@@ -1869,7 +1879,7 @@ export function plan(o: PlanOptions, scan?: Scan): Plan {
   // directories are the session's and its writable parents', temp ones included: round 8.)
   const followed = linkedInto([...(git.linkTops ?? []).filter((t) => own.some((o) => within(t, o))), ...(opencode.linkTops ?? [])], rwDirs);
   const ro = [...new Set([...git.ro, ...opencode.ro, ...followed.ro, ...closed])];
-  const caches = codeCaches();
+  const caches = codeCaches(rwDirs);
   const tmpfs = ["/dev/shm", ...caches.tmpfs];
   const problems = [...found.problems, ...lookupProblems, ...git.problems, ...opencode.problems, ...followed.problems, ...caches.problems];
   // ssh-using commands see known_hosts, config and public keys; private keys stay hidden.

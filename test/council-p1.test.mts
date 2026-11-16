@@ -10,7 +10,7 @@ import path from "node:path";
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_ASK, decideShell, SessionState, takeMoment, type Guard } from "../decide.ts";
-import { gitRun } from "../sandbox.ts";
+import { gitRun, plan } from "../sandbox.ts";
 SessionState.moment = takeMoment;
 import { compileRules } from "../rules.ts";
 import { DEFAULT_CLASSIFIER } from "../kev.ts";
@@ -50,7 +50,7 @@ const withEnv = async <T,>(vars: Record<string, string | undefined>, fn: () => P
 };
 
 test("a value given to one of bash's integer variables asks, however it is given", async () => {
-  for (const name of ["RANDOM", "SRANDOM", "OPTIND", "HISTCMD", "BASH_XTRACEFD", "READLINE_MARK"]) {
+  for (const name of ["RANDOM", "SRANDOM", "OPTIND", "HISTCMD", "SECONDS", "BASHPID", "BASH_XTRACEFD", "READLINE_MARK"]) {
     for (const c of [`${name}='a[$(id)]'`, `x='a[$(id)]'; ${name}=$x`, `${name}=$(cat f)`, `printf -v ${name} %s 'a[$(id)]'`, `for ${name} in 'a[$(id)]'; do :; done`, `git status; ${name}='x[$(id)]'`, `ls && ${name}=1`]) {
       assert.notEqual(await effect(c), "allow", c);
     }
@@ -119,4 +119,62 @@ test("a directory with HEAD and commondir is a git directory to the layout check
     fs.rmSync(path.join(repo, "x"), { recursive: true, force: true });
     fs.rmSync(path.join(repo, "y"), { recursive: true, force: true });
   }
+});
+
+// Round 2.
+test("a variable set through a name built at run time asks", async () => {
+  for (const c of [`x='RANDOM=a[$(id)]'; export "$x"`, `x='OPTIND=a[$(id)]'; declare "$x"`, `x=PATH=.; export "$x"; cat f`, `x=HOME=.; export "$x"; git status`, `f(){ local "$1"; }; f x`, `readonly "$x"`, `typeset "$x"`, "export ${x}", "export $(cat f)", `declare -x "$x"`, `export -- "$x"`]) {
+    assert.notEqual(await effect(c), "allow", c);
+  }
+  assert.equal(await effect(`x=1; echo "$x"`), "allow");
+});
+
+test("after a session write, a variable of opencode's environment that names a place the session can write turns the safe list off", async () => {
+  const after = async (vars: Record<string, string | undefined>, command: string) =>
+    withEnv(vars, async () => {
+      const s = new SessionState(repo);
+      assert.equal(await effect("echo x > note.txt", s), "allow");
+      return effect(command, s);
+    });
+  assert.equal(await after({ GIT_EXTERNAL_DIFF: undefined }, "git diff"), "allow");
+  for (const [name, value] of [["GIT_EXTERNAL_DIFF", "./differ"], ["GIT_SSH_COMMAND", "./s"], ["EDITOR", `${repo}/e`], ["RIPGREP_CONFIG_PATH", "rc/x"], ["PAGER", `${os.tmpdir()}/p`], ["GIT_EXEC_PATH", repo]]) {
+    assert.notEqual(await after({ [name]: value }, "git diff"), "allow", name);
+  }
+  assert.equal(await after({ EDITOR: "vi", PAGER: "/usr/bin/less -R" }, "git diff"), "allow");
+});
+
+test("the plugin's own git status runs no filter a repository's own config names, unless it is a known one", async () => {
+  const r = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp1-filter-")));
+  const marker = path.join(base, "filtered");
+  try {
+    execFileSync("git", ["init", "-q", "-b", "main", r]);
+    fs.writeFileSync(path.join(r, "payload"), `Host h0st\n  ProxyCommand touch ${marker}\n`);
+    execFileSync("git", ["-C", r, "add", "payload"]);
+    execFileSync("git", ["-C", r, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"]);
+    fs.writeFileSync(path.join(r, ".git", "info", "attributes"), "payload filter=x\n");
+    execFileSync("git", ["-C", r, "config", "filter.x.clean", "ssh -F %f h0st"]);
+    // An index without the files' times: status hashes each file through its filter.
+    execFileSync("git", ["-C", r, "read-tree", "HEAD"]);
+    spawnSync("git", ["-C", r, "status", "--porcelain"], { stdio: "ignore" });
+    assert.ok(fs.existsSync(marker), "plain git status runs the filter: the test is real");
+    fs.rmSync(marker);
+    execFileSync("git", ["-C", r, "read-tree", "HEAD"]);
+    for (const c of [`git -C ${r} checkout main`, `git -C ${r} switch main`, `git -C ${r} checkout -- payload`]) {
+      await effect(c);
+      assert.ok(!fs.existsSync(marker), c);
+    }
+  } finally {
+    fs.rmSync(r, { recursive: true, force: true });
+  }
+});
+
+test("the code caches include v8-compile-cache's and Jest's, and NODE_COMPILE_CACHE where it lies in a writable place", async () => {
+  const moved = path.join(repo, "cc");
+  const p = await withEnv({ NODE_COMPILE_CACHE: moved }, async () => plan({ projectRoots: [repo], allowedPaths: [], cacheDirs: [], gitWritable: false, exposeSsh: false, keepSockets: [], showPaths: [], hidePaths: [], project: repo }));
+  const uid = process.getuid!();
+  for (const name of [`v8-compile-cache-${uid}`, `jest_${uid.toString(36)}`]) assert.ok(p.tmpfs.includes(path.join(fs.realpathSync(os.tmpdir()), name)), name);
+  assert.ok(p.tmpfs.includes(moved), "NODE_COMPILE_CACHE");
+  const relative = await withEnv({ NODE_COMPILE_CACHE: "cc" }, async () => plan({ projectRoots: [repo], allowedPaths: [], cacheDirs: [], gitWritable: false, exposeSsh: false, keepSockets: [], showPaths: [], hidePaths: [], project: repo }));
+  assert.match(relative.problem ?? "", /NODE_COMPILE_CACHE/);
+  fs.rmSync(moved, { recursive: true, force: true });
 });

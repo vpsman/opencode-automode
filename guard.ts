@@ -1941,10 +1941,10 @@ export function alsoByName(m: Matcher): Matcher {
 // EXECIGNORE (which files a PATH search passes over, so which program a word runs) and
 // BASH_LOADABLES_PATH (where `enable -f` finds a builtin to load) are bash's own variables that
 // change what a word runs or a pattern matches, held as IFS and CDPATH are.
-// RANDOM, SRANDOM, OPTIND, HISTCMD, BASH_XTRACEFD and READLINE_MARK/_POINT: bash evaluates a value
-// given to them as arithmetic, where `a[$(...)]` runs a command (council project review 1).
+// RANDOM, SRANDOM, OPTIND, HISTCMD, SECONDS, BASHPID, BASH_XTRACEFD and READLINE_MARK/_POINT: bash
+// evaluates a value given to them as arithmetic (in some of the ways it can be given), where `a[$(...)]` runs a command (council project review 1).
 const ENV_DANGEROUS =
-  /^(RANDOM|SRANDOM|OPTIND|HISTCMD|BASH_XTRACEFD|READLINE_(?:MARK|POINT)|PATH|HOME|IFS|CDPATH|GLOBIGNORE|GLOBSORT|EXECIGNORE|BASH_LOADABLES_PATH|SHELL|ENV|BASH_ENV|BASH_FUNC.*|BASHOPTS|SHELLOPTS|POSIXLY_CORRECT|BASH_COMPAT|BASH_ALIASES|BASH_CMDS|histchars|PROMPT_COMMAND|PS[0-4]|EDITOR|VISUAL|PAGER|BROWSER|TMPDIR|GIT_.*|SSH_.*|LD_.*|DYLD_.*|XDG_.*|PYTHON(PATH|STARTUP|HOME|USERBASE|WARNINGS|BREAKPOINT)|NODE_(OPTIONS|PATH)|PERL5(LIB|OPT|DB)|PERLLIB|RUBY(OPT|LIB)|GEM_(HOME|PATH)|GO(FLAGS|PATH|ROOT|BIN|PROXY|NOSUMDB|INSECURE|PRIVATE|TOOLCHAIN|ENV)|RUSTC.*|RUSTUP_.*|RUSTFLAGS|RUSTDOCFLAGS|CARGO_(HOME|BUILD_.*|TARGET_.*_(RUNNER|LINKER|RUSTFLAGS)|REGISTR.*|ENCODED_RUSTFLAGS)|CC|CXX|LD|AR|MAKEFLAGS|GNUMAKEFLAGS|MAKEFILES|npm_config_.*|NPM_CONFIG_.*|PIP_.*|UV_.*|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JAVA_HOME|MAVEN_OPTS|GRADLE_.*|OPENCODE.*|AUTOMODE_.*|TAR_OPTIONS|RIPGREP_CONFIG_PATH|GREP_OPTIONS|LESSOPEN|LESSCLOSE|MANOPT|MANPAGER|MANROFFOPT|MAN_DISABLE_SECCOMP|MANPATH|GROFF_.*|FZF_DEFAULT_(COMMAND|OPTS)|RSYNC_(RSH|CONNECT_PROG)|CURL_HOME|WGETRC|DOCKER_(HOST|CONFIG|CONTEXT|CERT_PATH)|KUBECONFIG|AWS_.*|GOOGLE_APPLICATION_CREDENTIALS|CLOUDSDK_.*|PWD|OLDPWD|VIRTUAL_ENV|LUA_.*|GCONV_PATH|SUDO_(EDITOR|ASKPASS)|SYSTEMD_(PAGER|EDITOR)|BAT_.*|GH_.*|BUNDLE_.*|POETRY_.*|PIPENV_.*|PDM_.*|HATCH_.*|YARN_.*|COREPACK_.*)$/;
+  /^(RANDOM|SRANDOM|OPTIND|HISTCMD|SECONDS|BASHPID|BASH_XTRACEFD|READLINE_(?:MARK|POINT)|PATH|HOME|IFS|CDPATH|GLOBIGNORE|GLOBSORT|EXECIGNORE|BASH_LOADABLES_PATH|SHELL|ENV|BASH_ENV|BASH_FUNC.*|BASHOPTS|SHELLOPTS|POSIXLY_CORRECT|BASH_COMPAT|BASH_ALIASES|BASH_CMDS|histchars|PROMPT_COMMAND|PS[0-4]|EDITOR|VISUAL|PAGER|BROWSER|TMPDIR|GIT_.*|SSH_.*|LD_.*|DYLD_.*|XDG_.*|PYTHON(PATH|STARTUP|HOME|USERBASE|WARNINGS|BREAKPOINT)|NODE_(OPTIONS|PATH)|PERL5(LIB|OPT|DB)|PERLLIB|RUBY(OPT|LIB)|GEM_(HOME|PATH)|GO(FLAGS|PATH|ROOT|BIN|PROXY|NOSUMDB|INSECURE|PRIVATE|TOOLCHAIN|ENV)|RUSTC.*|RUSTUP_.*|RUSTFLAGS|RUSTDOCFLAGS|CARGO_(HOME|BUILD_.*|TARGET_.*_(RUNNER|LINKER|RUSTFLAGS)|REGISTR.*|ENCODED_RUSTFLAGS)|CC|CXX|LD|AR|MAKEFLAGS|GNUMAKEFLAGS|MAKEFILES|npm_config_.*|NPM_CONFIG_.*|PIP_.*|UV_.*|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JAVA_HOME|MAVEN_OPTS|GRADLE_.*|OPENCODE.*|AUTOMODE_.*|TAR_OPTIONS|RIPGREP_CONFIG_PATH|GREP_OPTIONS|LESSOPEN|LESSCLOSE|MANOPT|MANPAGER|MANROFFOPT|MAN_DISABLE_SECCOMP|MANPATH|GROFF_.*|FZF_DEFAULT_(COMMAND|OPTS)|RSYNC_(RSH|CONNECT_PROG)|CURL_HOME|WGETRC|DOCKER_(HOST|CONFIG|CONTEXT|CERT_PATH)|KUBECONFIG|AWS_.*|GOOGLE_APPLICATION_CREDENTIALS|CLOUDSDK_.*|PWD|OLDPWD|VIRTUAL_ENV|LUA_.*|GCONV_PATH|SUDO_(EDITOR|ASKPASS)|SYSTEMD_(PAGER|EDITOR)|BAT_.*|GH_.*|BUNDLE_.*|POETRY_.*|PIPENV_.*|PDM_.*|HATCH_.*|YARN_.*|COREPACK_.*)$/;
 // Values of a dangerous variable that change nothing that runs (round 3, finding 28, signed
 // off): NODE_OPTIONS made only of options that load no code, `PAGER=cat`, `GIT_PAGER=cat`, a
 // bare compiler name for CC and CXX, and a PYTHONPATH whose every entry lies in the project.
@@ -2000,7 +2000,7 @@ const ENV_HARMLESS =
   /^(NODE_ENV|CI|DEBUG|VERBOSE|FORCE_COLOR|NO_COLOR|CLICOLOR(_FORCE)?|TERM|COLORTERM|COLUMNS|LINES|LANG|LANGUAGE|LC_[A-Z]+|TZ|RUST_BACKTRACE|RUST_LOG|CARGO_TERM_[A-Z_]+|CARGO_INCREMENTAL|PYTHONUNBUFFERED|PYTHONDONTWRITEBYTECODE|PYTHONHASHSEED|PYTEST_ADDOPTS|LOG_LEVEL|PORT|HOST|TEST_[A-Z0-9_]+|GOMAXPROCS|JOBS|NINJA_STATUS)$/;
 const ASSIGN = /^([A-Za-z_]\w*)\+?=/;
 const DECLARERS = new Set(["export", "declare", "typeset", "readonly", "local"]);
-const ARITHMETIC_VARIABLE = /^(RANDOM|SRANDOM|OPTIND|HISTCMD|BASH_XTRACEFD|READLINE_(?:MARK|POINT))$/;
+const ARITHMETIC_VARIABLE = /^(RANDOM|SRANDOM|OPTIND|HISTCMD|SECONDS|BASHPID|BASH_XTRACEFD|READLINE_(?:MARK|POINT))$/;
 const dangerous = (variable: string) => (ARITHMETIC_VARIABLE.test(variable) ? `sets ${variable}, whose value bash evaluates as arithmetic` : `sets ${variable}, which changes what programs run or load`);
 // Whether a variable of this name changes what programs run or load (for the callers outside).
 export const dangerousName = (name: string) => ENV_DANGEROUS.test(name);
@@ -4426,6 +4426,9 @@ function sinkProblem(name: string, args: string[]): string | undefined {
     if (at >= 0 && (subscript(args[at + 1]) || /[$`]/.test(args[at + 1]))) return `${name} -v with a subscript or a variable, which bash evaluates as arithmetic`;
   }
   if (name === "read" && args.some((a) => /[$`]/.test(a) && !a.startsWith("-"))) return "read into a name taken from a variable";
+  // Council project review 1, round 2: `export "$x"` with `x=PATH=.` (or `RANDOM=a[$(...)]`) sets
+  // a variable no check reads: a name built at run time asks, as for read.
+  if (DECLARERS.has(name) && args.some((a) => !a.startsWith("-") && /[$`*?[]/.test(a.includes("=") ? a.slice(0, a.indexOf("=")) : a))) return `${name} with a name built at run time`;
   return undefined;
 }
 
@@ -6807,6 +6810,7 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
   // program goes to the model, naming the entry. Bash's own words find nothing on PATH. (B10-1:
   // wherever in PATH the entry stands, bentPath.)
   const bent = bentPath((p) => !!ctx.inProject?.(p) || !!ctx.canWrite?.(p));
+  const bentVariable = bentEnv((p) => !!ctx.inProject?.(p) || !!ctx.canWrite?.(p));
   if (!ctx.pattern?.(cmd)) for (const at of npx?.program !== undefined ? [...programs(cmd.argv), npx.program] : programs(cmd.argv)) {
     const word = cmd.argv[at];
     const name = path.basename(word);
@@ -6819,6 +6823,10 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
     if (!wrote.size && !marks.length) continue;
     if (bent !== undefined && !(!word.includes("/") && SHELL_OWN.has(name) && asBashFinds(name, cmd, ctx, wrote, marks) === undefined)) {
       add({ action: "classify", reason: `runs ${name} after this session wrote files, and PATH holds ${bent}, a directory the session can write: a program found there, or one a program runs by PATH, may be the session's` });
+      continue;
+    }
+    if (bentVariable !== undefined && !(!word.includes("/") && SHELL_OWN.has(name))) {
+      add({ action: "classify", reason: `runs ${name} after this session wrote files, and opencode's environment has ${bentVariable}, which names a place the session can write: a program run or a file loaded through it may be the session's` });
       continue;
     }
     const places = runnerPlaces(name, args, ctx.cwdOf?.(cmd), (w) => ctx.resolve(w, cmd)) ?? [];
@@ -6903,6 +6911,27 @@ export function bentPath(inProject: (p: string) => boolean, list = process.env.P
   }
   return undefined;
 }
+// Council project review 1, round 2: variables of opencode's environment that name a program or
+// a file a safe-list program loads (git's diff program, ssh command, editor and config; the
+// pager; less's input filter; ripgrep's config). Where one names a path the session can write (a
+// relative one, or one in the project or a temp directory), a safe-list program may run what the
+// session wrote, as with a PATH entry there: after a session write nothing is on the safe list.
+export const PROGRAM_ENV = ["GIT_EXTERNAL_DIFF", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "GIT_PAGER", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "EDITOR", "VISUAL", "PAGER", "MANPAGER", "BROWSER", "RIPGREP_CONFIG_PATH", "LESSOPEN", "LESSCLOSE", "TAR_OPTIONS"];
+export function bentEnv(inProject: (p: string) => boolean, env: Record<string, string | undefined> = process.env): string | undefined {
+  const temp = tempDirs();
+  const home = os.homedir();
+  for (const name of PROGRAM_ENV) {
+    const value = env[name];
+    if (!value) continue;
+    for (const raw of value.replace(/^\s*\|\|?-?/, "").split(/[\s=]+/)) {
+      const w = raw.replace(/^['"]|['"]$/g, "");
+      if (!w.includes("/")) continue;
+      const t = w === "~" ? home : w.startsWith("~/") ? path.join(home, w.slice(2)) : w;
+      if (!path.isAbsolute(t) || [t, walked(t) ?? t].some((p) => inProject(p) || temp.some((d) => within(p, d)))) return `${name}=${value}`;
+    }
+  }
+  return undefined;
+}
 export const tempDirs = () => [...new Set(["/tmp", "/var/tmp", "/dev/shm", os.tmpdir()].flatMap((d) => [d, walked(d) ?? d]))];
 export function asBashFinds(name: string, cmd: Simple, ctx: ArgvContext, wrote: Set<string>, marks: string[]): { why: string; place?: string | undefined } | undefined {
   if (ctx.functions?.has(name)) return { why: "a function this call defines" };
@@ -6917,10 +6946,9 @@ export function asBashFinds(name: string, cmd: Simple, ctx: ArgvContext, wrote: 
 // The walk of PATH for `name`, from the directories `dirs` (undefined: not known). `inProject`:
 // whether a path lies in the project; `wrote(dir, file)`: whether the session or the call wrote
 // `file`, or files the checks cannot list in `dir`, above it or below it.
-export function pathFinds(name: string, dirs: string[] | undefined, inProject: (p: string) => boolean, wrote: (dir: string, file: string) => boolean): { why: string; place?: string | undefined } | undefined {
+export function pathFinds(name: string, dirs: string[] | undefined, inProject: (p: string) => boolean, wrote: (dir: string, file: string) => boolean, list = process.env.PATH): { why: string; place?: string | undefined } | undefined {
   const temp = tempDirs();
   const writable = (p: string) => inProject(p) || temp.some((t) => within(p, t));
-  const list = process.env.PATH;
   if (list === undefined) return { why: "found by a PATH the environment does not set", place: undefined };
   for (const entry of list.split(":")) {
     const fixed = path.isAbsolute(entry);
@@ -6958,8 +6986,8 @@ const lexists = (p: string) => {
 };
 // Whether an absolute entry of PATH holds a program `name` at all (pathFinds' undefined is also
 // its answer for a name PATH does not find; council project review 1).
-export function pathHas(name: string): boolean {
-  return (process.env.PATH ?? "").split(":").some((entry) => {
+export function pathHas(name: string, list = process.env.PATH): boolean {
+  return (list ?? "").split(":").some((entry) => {
     if (!path.isAbsolute(entry)) return false;
     const file = path.join(entry, name);
     try {

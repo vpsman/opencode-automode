@@ -173,8 +173,9 @@ For each shell tool call:
      `NAME=value` arguments of make on the environment's terms; `fd -x`; `rg --pre`;
      `man -P`, `-H` and `-C`); builtins that evaluate a value as arithmetic (`let`,
      `declare -i`, `test -v` with a subscript), and a value given in any of those ways to
-     one of bash's integer variables (`RANDOM`, `SRANDOM`, `OPTIND`, `HISTCMD`,
-     `BASH_XTRACEFD`, `READLINE_MARK`, `READLINE_POINT`); a glob, or an unquoted expansion whose
+     one of bash's integer variables (`RANDOM`, `SRANDOM`, `OPTIND`, `HISTCMD`, `SECONDS`,
+     `BASHPID`, `BASH_XTRACEFD`, `READLINE_MARK`, `READLINE_POINT`), and `export`, `declare`,
+     `typeset`, `readonly` or `local` of a name built at run time (`export "$x"`); a glob, or an unquoted expansion whose
      value the call does not set to plain text first (`ls $x`, `ls $(cmd)`), that matches a
      file whose name starts with `-` (`ls *` beside a file called `-rf`; a file named `-`
      alone does not count); a path with a part named like an option that is not there yet,
@@ -223,7 +224,8 @@ For each shell tool call:
      session in the state directory's `moments/`, removed thirty days after its last use.
      As a second line the plugin keeps what the session wrote, for the whole session,
      approved commands and approved edits included, in one record for every session of the
-     project (a subagent works in a session of its own): once the session has written a file
+     project (a subagent works in a session of its own); a session an earlier opencode process
+     saw counts as having written anywhere in the project: once the session has written a file
      anywhere in the project, every program goes to the model unless it is on a short safe
      list (shell syntax and builtins, text, file and archive tools, `curl` and `wget`, and
      git's commands that read, add, commit, switch or fetch, but not `pull`, `merge`
@@ -235,7 +237,11 @@ For each shell tool call:
      (`/bin/cat`, `./cat` and a name the call defines a function under are not). `less` is
      on it only where `LESSOPEN` and `LESSCLOSE` are unset or name, by an absolute path, a
      program outside every place a call can write (`| /usr/bin/lesspipe %s`), and `tar`
-     only where `TAR_OPTIONS` is unset. A git
+     only where `TAR_OPTIONS` is unset. Nothing is on it while opencode's environment has a
+     variable that names a program or a file a listed program loads (`GIT_EXTERNAL_DIFF`,
+     `GIT_SSH_COMMAND`, `EDITOR`, `PAGER`, `RIPGREP_CONFIG_PATH`, ...) with a path the session
+     can write, and a shell given such a value where opencode's own has none asks, as for
+     `PATH`. A git
      command is on it only where the repository's own configuration, and every file it
      includes whatever the condition, holds no key that may name a program
      (`core.hooksPath` as husky sets it, `credential.helper`, `alias.*`, a URL whose scheme
@@ -300,8 +306,10 @@ For each shell tool call:
    - **Writes** only beneath the project's checkouts, `allowedPaths`, temp dirs,
      `sandboxWritable`, `/dev/null`, `/dev/zero`, `/dev/full` and a private `/dev/shm`.
      The code caches in the temp directories (`node-compile-cache`, which tsc turns on
-     itself, `tsx-<uid>` and `jiti`) are private and empty for each call, so nothing a call
-     writes there runs in a later node outside the sandbox.
+     itself, `tsx-<uid>`, `jiti`, `v8-compile-cache-<uid>` and Jest's `jest_<uid>`, and a
+     `NODE_COMPILE_CACHE` in a writable place) are private and empty for each call, so nothing
+     a call writes there runs in a later node outside the sandbox. Other tools' caches in the
+     temp directories are not covered (see Known gaps).
      Everything else is mounted read-only as well, so `chmod`, `touch -d` and `setxattr` fail
      there too. Terminals (`/dev/tty`, `/dev/ptmx`, `/dev/pts`) are not writable and no device
      opened inside the sandbox accepts an ioctl. **No build cache is writable by default**:
@@ -873,7 +881,8 @@ message), which is why pushes and ssh use deterministic rules instead.
   `systemctl cat` print a unit's configuration, environment settings included.
 - **`/tmp` is shared.** It stays writable and shared with other processes, because agents and
   opencode's own tools pass files through it, and it is walked before every allowed command
-  (see the scan budget above). A repository there, or in a `sandboxWritable` directory, has
+  (see the scan budget above). A tool that keeps code it runs later in a temp directory under a
+  name the sandbox does not cover (see "Writes" above) runs what a sandboxed call left there. A repository there, or in a `sandboxWritable` directory, has
   its existing hooks and config made read-only; what cannot be protected in it (a missing
   include, a symbolic or hard link) is left, where the same thing in the project or an
   `allowedPaths` directory would make the command ask. Your global hooks directory is

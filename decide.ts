@@ -138,6 +138,8 @@ export interface Decision {
   printed?: string;
   // The printed text relies on bash (braces expanded, `[[ ]]`, `<<<`, ...): under dash it asks.
   bashOnly?: boolean;
+  // A `"$(cat <<EOF ...)"` was printed as the text it stands for, judged by opencode's own PATH.
+  folded?: boolean;
   // On an ask: records what the call writes, as an allow does (its named writes, the marks of the
   // writes the checks cannot list, and the git work-tree changes it will make), for when the user
   // approves it (round 4, finding 4, second pass). The plugin calls it from its approval hook.
@@ -417,6 +419,9 @@ export class SessionState {
   // Compare only filesystem timestamps. Failure to take a baseline grants no trust.
   readonly began: bigint;
   readonly project: string;
+  // Council project review 1, round 2: the session was seen by an earlier process (its moment
+  // was kept): what it wrote then is not in this process's record.
+  readonly resumed: boolean;
   files: SessionFiles = new Map();
   // Files a command of this session wrote, appended to or edited in place. The rules' own list
   // (`files`) leaves an appended file's origin alone and does not follow `sed -i`.
@@ -452,6 +457,7 @@ export class SessionState {
   constructor(project: string, id?: string) {
     this.project = realpath(project);
     const own = SessionState.moment();
+    this.resumed = id !== undefined && fs.existsSync(momentFile(id));
     this.moment = id === undefined ? own : sessionMoment(id, own);
     this.began = this.moment.at;
   }
@@ -3482,7 +3488,7 @@ function heldRewritten(c: { sub: string; rest: string[]; dir: string }, held: ()
   // program of the project (a clean filter), as below.
   if (writes === "all" && now && gitProgramsOutside(tree, false, (p) => within(realish(p), realish(tree)))) {
     const others = gitRun(["-C", tree, "ls-files", "--others", "-z", ...(stashFlag("a", "--all") ? [] : ["--exclude-standard"])]);
-    const unchanged = (cached: string[]) => gitRun(["-C", tree, "diff", "--quiet", "--no-ext-diff", "--no-textconv", ...cached, "HEAD", "--"]).status === 0;
+    const unchanged = (cached: string[]) => gitRun(["-C", tree, "diff", "--quiet", "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty", ...cached, "HEAD", "--"]).status === 0;
     if (others.status === 0 && others.out === "" && unchanged([]) && unchanged(["--cached"])) return undefined;
   }
   if (writes === "cannot tell" || writes === "clean" || writes === "all" || after !== undefined) return unsure();
@@ -4432,16 +4438,27 @@ export function outsideProgram(value: string, top: string, inside: (p: string) =
   if ([file, real].some((f) => inside(f) || within(f, temp))) return false;
   return rest.every((w) => /^%[A-Za-z]$/.test(w) || w.replace(/^-+/, "").split("=").every((part) => !/[\/.]/.test(part) && (part === "" || !lexists(path.join(top, part)))));
 }
+// Council project review 1, round 2: a program the repository's own configuration names (the
+// scopes `local` and `worktree`, which a call may have written: a repository it built in a temp
+// directory) passes only as one of KNOWN_PROGRAM_LINES; your own and the system's as before.
 function gitProgramsOutside(dir: string, diff: boolean, inside: (p: string) => boolean): boolean {
   const keys = diff ? "^(filter\\..*\\.(clean|smudge|process)|diff\\.external|diff\\..*\\.(command|textconv))$" : "^filter\\..*\\.(clean|smudge|process)$";
-  const r = gitRun(["-C", dir, "config", "--null", "--get-regexp", keys]);
+  const r = gitRun(["-C", dir, "config", "--show-scope", "--null", "--get-regexp", keys]);
   if (r.status === 1) return true;
   if (r.status !== 0) return false;
   const top = safeGit(["-C", dir, "rev-parse", "--show-toplevel"])?.trim() || dir;
-  return r.out.split("\0").filter(Boolean).every((entry) => {
+  const fields = r.out.split("\0");
+  if (fields.at(-1) === "") fields.pop();
+  if (fields.length % 2) return false;
+  for (let i = 0; i < fields.length; i += 2) {
+    const [scope, entry] = [fields[i], fields[i + 1]];
     const at = entry.indexOf("\n");
-    return at >= 0 && outsideProgram(entry.slice(at + 1), top, inside);
-  });
+    if (at < 0) return false;
+    const [key, value] = [entry.slice(0, at), entry.slice(at + 1)];
+    if (!outsideProgram(value, top, inside)) return false;
+    if (scope !== "global" && scope !== "system" && !KNOWN_PROGRAM_LINES.some((l) => l.key.test(key) && l.value.test(value))) return false;
+  }
+  return true;
 }
 
 // B8-2: what in the configuration of the repository git works in at `dir` may name a program, or
@@ -4941,7 +4958,9 @@ function worktreeStatus(top: string): Map<string, string> | undefined {
   // runs before the sandbox: give up rather than execute a configured project program (one
   // outside the work tree, git-lfs's, is the user's own and runs for every status of theirs).
   if (!gitProgramsOutside(top, false, (p) => within(realish(p), realish(top)))) return undefined;
-  const r = gitRun(["-C", top, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching", "--ignore-submodules=none"], 10_000);
+  // (`dirty`: a submodule's commit is compared, and nothing runs in it: its own filters are not
+  // read here. Council project review 1, round 2.)
+  const r = gitRun(["-C", top, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching", "--ignore-submodules=dirty"], 10_000);
   if (r.status !== 0) return undefined;
   const out = new Map<string, string>();
   const fields = r.out.split("\0");
@@ -5015,7 +5034,8 @@ function worktreeChanged(e: WorkTreeChange): { files: string[]; dirs: string[] }
 // At each decision: the git calls that are over get their changed files marked. (The
 // repositories of those that may still run count as marked: see decidePrinted.)
 function settleWorktree(session: SessionState): void {
-  session.worktree = session.worktree.filter((e) => {
+  // (In place: every session of the project holds the same list. Council project review 1.)
+  const kept = session.worktree.filter((e) => {
     if (!e.done) return true;
     const changed = worktreeChanged(e);
     if (!changed) {
@@ -5026,6 +5046,7 @@ function settleWorktree(session: SessionState): void {
     for (const d of changed.dirs) if (!session.unlisted.includes(realish(d))) session.unlisted.push(realish(d));
     return false;
   });
+  session.worktree.splice(0, session.worktree.length, ...kept);
 }
 
 // The rules' deny for a command as it was issued, if they have one (see decideShell). A text
@@ -5070,7 +5091,7 @@ export async function decideShell(guard: Guard, session: SessionState, cwd: stri
     if (odd) return withApproval(session, askBy(`the command's "$(cat <<EOF ...)" is printed as the text it stands for, and the cat it would run is not plainly the real one (${odd.why})`));
   }
   const decision = await decidePrinted(guard, session, cwd, printed, signal, scan);
-  return { ...withApproval(session, decision), printed: printed.text, ...(printed.bashOnly ? { bashOnly: true } : {}) };
+  return { ...withApproval(session, decision), printed: printed.text, ...(printed.bashOnly ? { bashOnly: true } : {}), ...(printed.folded ? { folded: true } : {}) };
   } catch (e) {
     if (e instanceof PathWalkError) return withApproval(session, askBy(e.message));
     throw e;
