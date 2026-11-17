@@ -563,3 +563,9 @@ test("round 17: fd 0 in any spelling before a tee; npm pack passes only a regist
   for (const c of ["npm pack foo@git+https://example.com/r", "npm pack git@github.com:u/r", "npm pack GIT+https://example.com/r", "npm pack GITHUB:u/r", "npm pack x@u/r", "npm pack a@b.c:d", "pnpm pack git@github.com:u/r"]) assert.equal(await effect(c), "ask", c);
   for (const c of ["npm pack lodash", "npm pack lodash@4.17.21", "npm pack @scope/pkg@^1.0.0", "npm pack ./dir", "npm pack", "npm test 2>&1 | tee test.log"]) assert.equal(await effect(c), "allow", c);
 });
+
+test("round 18: npm view and info of a non-registry spec ask", async () => {
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+  for (const c of [`npm view github:u/r#${sha}`, `npm info u/r#${sha} name`, `npm view git+ssh://git@github.com/u/r.git#${sha}`, `pnpm view gitlab:u/r#${sha}`]) assert.equal(await effect(c), "ask", c);
+  for (const c of ["npm view lodash", "npm info lodash version", "npm view @scope/pkg dist.tarball"]) assert.equal(await effect(c), "allow", c);
+});
