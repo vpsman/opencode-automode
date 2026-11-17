@@ -4159,7 +4159,8 @@ function managerProblem(name: string, args: string[]): string | undefined {
     // word after the first that names one of these is read: a registry name, a local path or a
     // field word (`versions[0]`, `dist.tarball`) passes; a git spec or URL holds `:`, `/`, `#` or
     // an `@` after its start, and asks.)
-    const field = /^[\w.$[\]*-]+$/;
+    // (Round 21, Opus: no glob characters, which bash could expand to a spec; `[0]` subscripts only.)
+    const field = /^[\w.$-]+(\[\d+\])*[\w.$-]*$/;
     const specs = packAt < 0 ? [] : args.slice(packAt + 1).filter((a) => !a.startsWith("-"));
     if (specs.some((a) => !registry.test(a) && !local.test(a) && !field.test(a))) return `${name} ${args[packAt]} of a git repository, a URL or another non-registry spec runs that package's prepare script`;
     const run = args.findIndex((a) => ["run", "run-script", "rum", "urn"].includes(a));
@@ -4198,8 +4199,15 @@ function buildToolProblem(name: string, args: string[]): string | undefined {
   const own = args.slice(0, args.includes("--") ? args.indexOf("--") : args.length);
   const operands = own.filter((a) => !a.startsWith("-"));
   if (COMPILER.test(name)) {
-    // (Round 20, Mythos: `-fcompare-debug=<options>` compiles again with those options.)
-    const again = args.find((a) => a.startsWith("-fcompare-debug=") && buildToolProblem(name, a.slice("-fcompare-debug=".length).split(/\s+/).filter(Boolean)));
+    // (Round 20, Mythos: `-fcompare-debug=<options>` compiles again with those options. Round 21,
+    // Opus and Mythos: gcc reads them as spec text, where `%Y`, `\`, `%{...}` and `%:include()`
+    // build any option, so only a list of plain option words passes.)
+    const plainOption = /^-(O[\w]*|g[\w]*|f[a-z0-9][a-z0-9-]*|W[a-z0-9][a-z0-9-]*|m[a-z0-9][\w-]*(=[\w.-]+)?)$/;
+    const again = args.find((a) => {
+      if (!a.startsWith("-fcompare-debug=")) return false;
+      const words = a.slice("-fcompare-debug=".length).split(/\s+/).filter(Boolean);
+      return words.some((w) => !plainOption.test(w)) || !!buildToolProblem(name, words);
+    });
     if (again) return `${name} -fcompare-debug= with an option that runs a program or loads a plugin`;
     const word = args.find((a, i) => /^(-wrapper|-load|-B.*|--prefix(=.*)?|-fmodule-mapper(=.*)?|-fplugin(=.*|-arg.*)?|-fpass-plugin=.*|--?specs(=.*)?|--ld-path(=.*)?|-Xclang|-ccc-.*|--gcc-toolchain(=.*)?|--gcc-install-dir(=.*)?)$/.test(a) || (/^-fuse-ld=/.test(a) && a.includes("/")) || (/^(-Wl,|-Wp,|--for-linker=)/.test(a) && /plugin/.test(a)) || ((a === "-Xlinker" || a === "--for-linker") && /plugin/.test(args[i + 1] ?? "")));
     if (word) return `${name} ${word.split("=")[0]} runs a program or loads a plugin the call names`;

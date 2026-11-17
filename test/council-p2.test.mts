@@ -601,3 +601,14 @@ test("round 20: an option's value before npm's subcommand or package; gcc -fcomp
   assert.notEqual(await effect("gcc -fcompare-debug=-O2 -c t.c -o t.o"), "ask");
   assert.ok("ask" in canonical('echo "$\\\n$(echo "c")"'), "a $ before a line continuation still asks, as $$(");
 });
+
+// ---- round 21 ----
+
+test("round 21: -fcompare-debug= passes only plain option words; npm field words hold no glob", async () => {
+  for (const c of ["gcc '-fcompare-debug=%{!nosuch:-wrapper} /bin/sh,-c,echo${IFS}hi' -c t.c -o t.o", "gcc '-fcompare-debug=%:include(x.specs)' -c t.c -o t.o", "gcc '-fcompare-debug=-wrap\\per /tmp/d/w.sh' -c t.c -o t.o", "gcc '-fcompare-debug=\\-B/tmp/d/b/' -c t.c -o t.o", "gcc -fcompare-debug=-fplug%Yin=./x.so -c t.c", "ccache gcc -fcompare-debug=-fplug%Yin=./x.so -c t.c", "g++ -fcompare-debug=-fplug%Zin=./x.so -c t.cc", "cmake -DCMAKE_C_FLAGS=-fcompare-debug=-fplug%Yin=./x.so ."]) {
+    assert.equal(await effect(c), "ask", c);
+  }
+  for (const c of ["gcc -fcompare-debug=-O2 -c t.c -o t.o", "gcc '-fcompare-debug=-gtoggle -O1' -c t.c -o t.o", "gcc -fcompare-debug -c t.c -o t.o"]) assert.notEqual(await effect(c), "ask", c);
+  for (const c of ["npm pack '*'", "npm view x '?'", "npm view lodash 'v[a-z]'"]) assert.equal(await effect(c), "ask", c);
+  assert.equal(await effect("npm view lodash 'versions[0]'"), "allow");
+});
