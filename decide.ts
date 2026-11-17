@@ -5150,6 +5150,39 @@ function holdsLink(dir: string, budget = { left: 4000 }): boolean {
   }
   return false;
 }
+// Whether unzip's words set overwrite-all (`-o`) or never-overwrite (`-n`) for good, as unzip reads
+// them (council project review 2, round 29): only the option words before the archive (after it,
+// and after `-x`, words are member names); `-d`, `-P`, `-O` and `-I` take the rest of the word or
+// the next one; a `-` inside a word, or a word starting `--`, negates the letters after it.
+function unzipNeverPrompts(args: string[]): boolean {
+  let o = false;
+  let n = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (!a.startsWith("-") || a === "-") break;
+    let negate = false;
+    let stop = false;
+    for (let j = 1; j < a.length; j++) {
+      const c = a[j];
+      if (c === "-") {
+        negate = !negate;
+        continue;
+      }
+      if ("dPOI".includes(c)) {
+        if (j === a.length - 1) i++;
+        break;
+      }
+      if (c === "x") {
+        stop = true;
+        break;
+      }
+      if (c === "o") o = !negate;
+      if (c === "n") n = !negate;
+    }
+    if (stop) break;
+  }
+  return o || n;
+}
 // Commands that make or copy a link: a write later in the same call may land where the link
 // leads, which the record does not walk (council project review 2, rounds 12 and 13). `ln`,
 // `link`, and `cp` with an option that makes a link or copies one as a link (`-s`, `-l`, `-d`,
@@ -5426,14 +5459,11 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   // (Round 13, all four: `cp -s`, `-P`, `-a` and every other program that makes, copies or moves
   // a link.)
   // (Round 28, Mythos: unzip without -o or -n asks at a file that is there, and reads a new name
-  // from its standard input, which a pipe, a redirect or a heredoc can feed: the name may lead
-  // anywhere.)
+  // from its standard input, whatever feeds it: the name may lead anywhere, so such an unzip marks
+  // every writable root. Round 29, all four: the overwrite mode as unzip reads it.)
   for (const u of found.unlisted) {
     const unzip = u.cmd.argv.findIndex((a) => path.basename(a) === "unzip");
-    if (unzip < 0) continue;
-    const opts = u.cmd.argv.slice(unzip + 1).filter((a) => a.startsWith("-"));
-    if (opts.some((a) => /^-[^-]*[on]/.test(a))) continue;
-    if (where.pipes.get(u.cmd) !== undefined || u.cmd.in?.length || u.cmd.heredoc) project(u.cmd);
+    if (unzip >= 0 && !unzipNeverPrompts(u.cmd.argv.slice(unzip + 1))) project(u.cmd);
   }
   if (cmds.some((c) => makesLink(c.argv))) for (const w of [...found.writes, ...found.unlisted]) project(w.cmd);
   // (Round 23, Mythos: a writer the check cannot list, an extraction, may put a link in place

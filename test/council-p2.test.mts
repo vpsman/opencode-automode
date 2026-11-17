@@ -751,3 +751,23 @@ test("round 28: a descriptor walk takes .. after a link, tar -M and -L, unzip fe
   }
   for (const c of ["tar -xf a.tar", "tar czf b.tgz src", "unzip -o a.zip -d sub"]) assert.equal(await effect(c), "allow", c);
 });
+
+// ---- round 29 ----
+
+test("round 29: unzip's overwrite mode read as unzip reads it", async () => {
+  const b = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-r29-")));
+  try {
+    for (const u of [`unzip -qo-o ${b}/a.zip -d ${b}/out`, `unzip -qn-n ${b}/a.zip -d ${b}/out`, `unzip -q ${b}/a.zip -d ${b}/out -x -o`, `unzip -q ${b}/a.zip f -o -d ${b}/out`, `unzip -q -Ppassword ${b}/a.zip -d ${b}/out`, `unzip -q -d${b}/out ${b}/a.zip`, `unzip -q -o --o ${b}/a.zip -d ${b}/out`, `unzip -d../out ../a.zip`]) {
+      const s = new SessionState(repo);
+      const wrote = await effect(`printf 'r\\n/x.test.js\\n' | ${u}`, s);
+      assert.ok(wrote !== "allow" || (await effect("npm test", s)) !== "allow", u);
+    }
+    for (const u of [`unzip -o -q ${b}/a.zip -d ${b}/out`, `unzip -qn ${b}/a.zip -d ${b}/out`]) {
+      const s = new SessionState(repo);
+      await effect(u, s);
+      assert.equal(await effect("npm test", s), "allow", u);
+    }
+  } finally {
+    fs.rmSync(b, { recursive: true, force: true });
+  }
+});
