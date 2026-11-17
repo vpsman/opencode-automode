@@ -4154,9 +4154,14 @@ function managerProblem(name: string, args: string[]): string | undefined {
     // `GITHUB:u/r`. A registry name, scoped or not, with a version or tag, and a local path pass.)
     const registry = /^(@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*(@[\w.^~<>=*| -]+)?$/i;
     const local = /^(\.{1,2}(\/|$)|\/|~\/)/;
-    // (Round 19, Sol: `view`, `info`, `show` read one package; the words after it name fields.)
-    const specs = packAt < 0 ? [] : args.slice(packAt + 1).filter((a) => !a.startsWith("-")).slice(0, args[packAt] === "pack" ? undefined : 1);
-    if (specs.some((a) => !registry.test(a) && !local.test(a))) return `${name} ${args[packAt]} of a git repository, a URL or another non-registry spec runs that package's prepare script`;
+    // (Round 20, all four: an option's value may stand where the subcommand or the package is
+    // looked for, `npm --loglevel info pack <spec>`, `npm view --loglevel silent <spec>`. So every
+    // word after the first that names one of these is read: a registry name, a local path or a
+    // field word (`versions[0]`, `dist.tarball`) passes; a git spec or URL holds `:`, `/`, `#` or
+    // an `@` after its start, and asks.)
+    const field = /^[\w.$[\]*-]+$/;
+    const specs = packAt < 0 ? [] : args.slice(packAt + 1).filter((a) => !a.startsWith("-"));
+    if (specs.some((a) => !registry.test(a) && !local.test(a) && !field.test(a))) return `${name} ${args[packAt]} of a git repository, a URL or another non-registry spec runs that package's prepare script`;
     const run = args.findIndex((a) => ["run", "run-script", "rum", "urn"].includes(a));
     if (run >= 0 && args.slice(run + 1).includes("env")) return `${name} run env prints the environment, or runs the words after it as a command`;
   }
@@ -4193,7 +4198,10 @@ function buildToolProblem(name: string, args: string[]): string | undefined {
   const own = args.slice(0, args.includes("--") ? args.indexOf("--") : args.length);
   const operands = own.filter((a) => !a.startsWith("-"));
   if (COMPILER.test(name)) {
-    const word = args.find((a, i) => /^(-wrapper|-B.*|--prefix(=.*)?|-fmodule-mapper(=.*)?|-fplugin(=.*|-arg.*)?|-fpass-plugin=.*|--?specs(=.*)?|--ld-path(=.*)?|-Xclang|-ccc-.*|--gcc-toolchain(=.*)?|--gcc-install-dir(=.*)?)$/.test(a) || (/^-fuse-ld=/.test(a) && a.includes("/")) || (/^(-Wl,|-Wp,|--for-linker=)/.test(a) && /plugin/.test(a)) || ((a === "-Xlinker" || a === "--for-linker") && /plugin/.test(args[i + 1] ?? "")));
+    // (Round 20, Mythos: `-fcompare-debug=<options>` compiles again with those options.)
+    const again = args.find((a) => a.startsWith("-fcompare-debug=") && buildToolProblem(name, a.slice("-fcompare-debug=".length).split(/\s+/).filter(Boolean)));
+    if (again) return `${name} -fcompare-debug= with an option that runs a program or loads a plugin`;
+    const word = args.find((a, i) => /^(-wrapper|-load|-B.*|--prefix(=.*)?|-fmodule-mapper(=.*)?|-fplugin(=.*|-arg.*)?|-fpass-plugin=.*|--?specs(=.*)?|--ld-path(=.*)?|-Xclang|-ccc-.*|--gcc-toolchain(=.*)?|--gcc-install-dir(=.*)?)$/.test(a) || (/^-fuse-ld=/.test(a) && a.includes("/")) || (/^(-Wl,|-Wp,|--for-linker=)/.test(a) && /plugin/.test(a)) || ((a === "-Xlinker" || a === "--for-linker") && /plugin/.test(args[i + 1] ?? "")));
     if (word) return `${name} ${word.split("=")[0]} runs a program or loads a plugin the call names`;
   }
   if (name === "rustc") {

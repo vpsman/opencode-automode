@@ -588,3 +588,16 @@ test("round 19: an escaped \\ before a line end keeps a later \$( escaped; npm s
   for (const c of ["npm show github:u/r", "npm v u/r"]) assert.equal(await effect(c), "ask", c);
   for (const c of ["npm view lodash 'versions[0]'", "npm pack .", "npm pack ..", "npm view ."]) assert.equal(await effect(c), "allow", c);
 });
+
+// ---- round 20 ----
+
+test("round 20: an option's value before npm's subcommand or package; gcc -fcompare-debug=-fplugin", async () => {
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+  for (const c of ["npm --loglevel info pack git+file:///tmp/x/pkg", "npm --prefix info pack github:u/r", "npm -w v pack github:u/r", "npm --prefix view pack github:u/r", "pnpm --filter v pack github:u/r", "yarn --cwd v pack github:u/r", `npm view --loglevel silent github:u/r#${sha}`, "npm view -w a github:u/r", "npm view --tag latest github:u/r", "npm info --color false github:u/r", `npm --loglevel info view github:u/r#${sha}`]) {
+    assert.equal(await effect(c), "ask", c);
+  }
+  for (const c of ["npm view lodash 'versions[0]'", "npm view --json lodash dist.tarball", "npm view left-pad versions"]) assert.equal(await effect(c), "allow", c);
+  for (const c of ["gcc -fcompare-debug=-fplugin=./x.so -c t.c", "ccache gcc -fcompare-debug=-fplugin=./x.so -c t.c", "clang -cc1 -load ./x.so t.c"]) assert.equal(await effect(c), "ask", c);
+  assert.notEqual(await effect("gcc -fcompare-debug=-O2 -c t.c -o t.o"), "ask");
+  assert.ok("ask" in canonical('echo "$\\\n$(echo "c")"'), "a $ before a line continuation still asks, as $$(");
+});
