@@ -130,9 +130,10 @@ For each shell tool call:
      `switch -f`, `--discard-changes` and `-C`, `checkout -B`, a `checkout` operand that
      names an existing path, looked up where git runs, `-C` included
      (`git checkout HEAD ./`), `branch -f`, `-M` and `-C`, `gc --prune=<date>`,
-     `reset --merge`, `--abort` and `--skip` of `merge`, `rebase`, `am`, `cherry-pick` and
-     `revert` (they reset the work tree, conflicts resolved so far with it), `clean` but a
-     dry run (`-n`; `-i`, and a plain `clean` under `clean.requireForce=false`, delete too), a
+     `reset --merge`, `clean` but a
+     dry run (`-n`, read as git reads it: the last of `-n` and `--no-dry-run` decides, and
+     `-en` is `-e n`; `-i`, and a plain `clean` under `clean.requireForce=false`, delete
+     too), a
      `checkout` operand with a backslash (a pathspec), and a
      `fetch` or `pull` that can move a local branch or tag backwards or delete one: a `+`
      refspec, `--force` (the last of `--force` and `--no-force` decides), `--refmap`,
@@ -182,12 +183,14 @@ For each shell tool call:
      `man -P`, `-H` and `-C`; a compiler's `-wrapper`, `-B`, `-fplugin`, `-specs`, `-Xclang`,
      `-fuse-ld=<path>`, `--prefix` and a linker plugin; `rustc -C linker=`,
      `link-arg` (or `link_arg`) and `-Z`; `ccache` with a program other than a compiler, or
-     `-o`; `cmake -E`, `-P`, `-C`, `--toolchain` and `-D CMAKE_<...>_COMPILER`, `_LAUNCHER`,
-     `_LINKER`, `CMAKE_TOOLCHAIN_FILE`, `CMAKE_MAKE_PROGRAM`, the project includes and rule
-     overrides, or `CMAKE_<...>FLAGS` with one of the compiler options above; `ctest -S`, `--build-and-test` and `--test-command`; `just --command`/`-c` and
+     `-o`; `cmake -E`, `-P`, `-C`, `--toolchain`, `-D` of a `CMAKE_` variable outside a short
+     list of harmless ones (`CMAKE_BUILD_TYPE`, `CMAKE_INSTALL_PREFIX`, the standards, ...),
+     `CMAKE_<...>FLAGS` with one of the compiler options above, and `cmake --build -- <words>`
+     held to make's checks; `make NAME=value` whose value is one of the compiler options above;
+     `cargo clippy`, `rustc` and `rustdoc` with rustc's options after `--`; `ctest -S`, `--build-and-test` and `--test-command`; `just --command`/`-c` and
      `--shell` and `--chooser`; `tox exec` and `-x`/`--override`; `meson devenv` and
-     `--wrapper`; `mypy --python-executable` and `--install-types`; `go` with `-extld`
-     anywhere, and `-gccgoflags`; `npm run env`, wherever `env` stands after `run`; an option of any of these held in a variable goes to the model); builtins that evaluate a value as arithmetic (`let`,
+     `--wrapper`; `mypy --python-executable` and `--install-types`; `go` with `-extld` or
+     `-extar` anywhere, and `-gccgoflags`; `npm run env`, wherever `env` stands after `run`; an option of any of these held in a variable goes to the model); builtins that evaluate a value as arithmetic (`let`,
      `declare -i`, `test -v` with a subscript), and a value given in any of those ways to
      one of bash's integer variables (`RANDOM`, `SRANDOM`, `OPTIND`, `HISTCMD`, `SECONDS`,
      `BASHPID`, `BASH_XTRACEFD`, `READLINE_MARK`, `READLINE_POINT`); a locale (`LANG`,
@@ -295,7 +298,9 @@ For each shell tool call:
      expands itself (`npm test -- '/tmp/d*/x.test.js'`) counts from the last `/` before its
      first `*`, `?`, `[`, `{`, `(` or `\`, and a word with a `%xx` escape or a `data:` URL is a
      place the check cannot tell; one in the first part of an absolute path could be anywhere. A write the check cannot place (an archive
-     extraction, `patch`, `git apply`, a recursive copy) marks the directory it ran in; after a git command that writes the work tree
+     extraction, `patch`, `git apply`, a recursive copy, a compiler's own output name such as
+     `a.out`, rustc's outputs, a linker output named through `-Wl,`) marks the directory it ran
+     in, or the project where the place cannot be read; after a git command that writes the work tree
      (`pull`, `merge`, `checkout`, `rebase`, `stash pop`, `reset`) only the files git
      changed count, once the call is over. In a session that has written nothing in the
      project, `make`, `npm test` and `cargo build` are allows and run the project's code
@@ -516,8 +521,8 @@ For each shell tool call:
    rebase under `merge.autoStash` or `rebase.autoStash`, `git apply` of a patch, a sparse
    checkout, a merge on a branch whose `branch.<name>.mergeOptions` holds `--autostash`,
    `git bisect reset <commit>` (a switch to a commit with the same version of the file,
-   `--continue` or `--quit` of a merge, rebase, cherry-pick, revert or `git am` with nothing
-   in progress (`--abort` and `--skip` ask in any case, see Rules), `git bisect reset` with no bisect, and `git apply
+   `--abort`, `--continue`, `--skip` or `--quit` of a merge, rebase, cherry-pick, revert or
+   `git am` with nothing in progress, `git bisect reset` with no bisect, and `git apply
    --check` run); `git stash -u` or `-a` when there is something to stash, in any
    repository, because it would also remove the empty `.opencode/` the plugin makes
    (unless git ignores it);

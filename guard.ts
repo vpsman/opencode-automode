@@ -1707,6 +1707,41 @@ const GIT_VALUE_OPTIONS: Record<string, RegExp> = {
   switch: /^(-[a-zA-Z]*[cC]|--create|--force-create|--orphan|--conflict)$/,
   branch: /^(-[a-zA-Z]*u|--set-upstream-to|--contains|--no-contains|--merged|--no-merged|--points-at|--sort|--format|--color|--column)$/,
 };
+// `git clean`'s words as git reads them (council project review 2, round 4): `-e`/`--exclude`
+// take a value (the rest of a cluster, or the next word), the last of `-n`/`--dry-run` and
+// `--no-dry-run` decides, long options by any unique prefix. `unknown`: a word it cannot read.
+const CLEAN_LONG = ["--dry-run", "--no-dry-run", "--interactive", "--no-interactive", "--force", "--no-force", "--quiet", "--no-quiet", "--exclude", "--no-exclude"];
+export function cleanReading(rest: string[]): { dry: boolean; interactive: boolean; unknown: boolean } {
+  const out = { dry: false, interactive: false, unknown: false };
+  for (let i = 0; i < rest.length; i++) {
+    const w = rest[i];
+    if (w === "--") break;
+    if (w.startsWith("--")) {
+      const name = w.split("=")[0];
+      const matches = CLEAN_LONG.filter((l) => l.startsWith(name));
+      const full = matches.includes(name) ? name : matches.length === 1 ? matches[0] : undefined;
+      if (full === undefined) out.unknown = true;
+      else if (full === "--dry-run") out.dry = true;
+      else if (full === "--no-dry-run") out.dry = false;
+      else if (full === "--interactive") out.interactive = true;
+      else if (full === "--no-interactive") out.interactive = false;
+      else if (full === "--exclude" && !w.includes("=")) i++;
+      continue;
+    }
+    if (!w.startsWith("-") || w === "-") continue;
+    for (let j = 1; j < w.length; j++) {
+      const c = w[j];
+      if (c === "e") {
+        if (j + 1 === w.length) i++;
+        break;
+      }
+      if (c === "n") out.dry = true;
+      else if (c === "i") out.interactive = true;
+      else if (!"dfqxX".includes(c)) out.unknown = true;
+    }
+  }
+  return out;
+}
 function gitDestroys(sub: string, rest: string[], exists?: (word: string) => boolean): string | undefined {
   const end = rest.indexOf("--");
   const own = end < 0 ? rest : rest.slice(0, end);
@@ -1741,14 +1776,17 @@ function gitDestroys(sub: string, rest: string[], exists?: (word: string) => boo
   if (sub === "tag" && (has(["--delete"], "d") || (has(["--force"], "f") && operands.length > 0))) return discards;
   if (sub === "gc" && own.some((w) => /^--prune=/.test(w))) return "git gc --prune=<date> deletes objects nothing refers to, which git otherwise keeps for a while";
   // Council project review 2 (Opus): `reset --merge` drops staged changes as `--hard` does where
-  // the index and the work tree agree, and an operation's `--abort` or `--skip` resets the work
-  // tree, the conflicts resolved so far with it (`merge --abort` is `reset --merge`).
+  // the index and the work tree agree. (An operation's `--abort` and `--skip` stay as they were:
+  // giving up a stopped merge is an everyday allow, test/allow-corpus.txt, r4 21.)
   if (sub === "reset" && long("--merge")) return "git reset --merge discards staged changes, as --hard does";
   // (Round 3, Mythos: under clean.requireForce=false a plain `git clean` deletes too; without it,
-  // it only fails. Only a dry run is left alone.)
+  // it only fails. Only a dry run is left alone. Round 4, all four: read as git reads it.)
   // (`-f` is the rules' own ask; a word bash computes goes to the model, as before.)
-  if (sub === "clean" && !has(["--dry-run"], "n") && !has(["--force"], "f") && !own.some((w) => /[$`]/.test(w))) return "git clean deletes untracked files (with -f, -i, or clean.requireForce=false)";
-  if (["merge", "rebase", "am", "cherry-pick", "revert"].includes(sub) && long("--abort", "--skip")) return `git ${sub} --abort or --skip resets the work tree, discarding the conflicts resolved so far`;
+  if (sub === "clean" && !own.some((w) => /[$`]/.test(w))) {
+    const clean = cleanReading(rest);
+    if (clean.interactive) return "git clean -i deletes the untracked files its input picks, without -f";
+    if ((!clean.dry || clean.unknown) && !has(["--force"], "f")) return "git clean deletes untracked files (with -f, -i, or clean.requireForce=false)";
+  }
   if (sub === "fetch" || sub === "pull") return fetchMoves(sub, rest);
   return undefined;
 }
@@ -4070,7 +4108,8 @@ function makeProblem(args: string[], cwd: string | undefined, inProject: ((p: st
     if (/\$[({]/.test(value)) return ask(`make ${name}=: the value calls a make function or names a variable, which make expands`);
     if (ENV_DANGEROUS.test(name) || MAKE_DANGEROUS.test(name)) {
       if (op || !envValueOk(name, value, cwd, inProject)) return ask(`make ${name}= picks a program make runs or how it reads makefiles`);
-    } else if (!/^[\w.,:+@%-]*$/.test(value) || SHELLS.has(value) || INTERPRETERS.has(value) || /^(python[\d.]*|env|xargs|eval|exec|sudo|doas|npx|bunx|uvx|pipx)$/.test(value)) verdict ??= { action: "classify", reason: `make ${name}=${value}: a value make may run in a recipe` };
+    } else if (buildToolProblem("gcc", [value]) || /(^|,)-wrapper(,|$)/.test(value)) return ask(`make ${name}=${value}: a compiler option that runs a program the call names`);
+    else if (!/^[\w.,:+@%-]*$/.test(value) || SHELLS.has(value) || INTERPRETERS.has(value) || /^(python[\d.]*|env|xargs|eval|exec|sudo|doas|npx|bunx|uvx|pipx)$/.test(value)) verdict ??= { action: "classify", reason: `make ${name}=${value}: a value make may run in a recipe` };
   }
   return verdict;
 }
@@ -4096,6 +4135,12 @@ function managerProblem(name: string, args: string[]): string | undefined {
   if (name === "cargo") {
     const option = own.find((a) => abbreviates(a, ["--config"]) || /^-[a-zA-Z]*Z/.test(a));
     if (option) return `cargo ${option.split("=")[0]} sets cargo config, which can name a program to run (build.rustc-wrapper)`;
+    // (Council project review 2, round 4, Mythos: these hand the words after `--` to rustc.)
+    const sub = own.find((a) => !a.startsWith("-") && !a.startsWith("+"));
+    if (end >= 0 && ["clippy", "rustc", "rustdoc"].includes(sub ?? "")) {
+      const rustc = buildToolProblem("rustc", args.slice(end + 1));
+      if (rustc) return `cargo ${sub} -- hands rustc its words: ${rustc}`;
+    }
   }
   if (name === "go") {
     const option = own.find((a) => /^--?(toolexec|exec|vettool)(=|$)/.test(a));
@@ -4103,7 +4148,7 @@ function managerProblem(name: string, args: string[]): string | undefined {
     // (Council project review 2, round 2: `-ldflags=-extld=<prog>` names the external linker.)
     // (Round 3: in any `-ldflags`, the last of several decides, and `go tool link -extld`; and
     // `-gccgoflags`, a compiler's options, `-wrapper` among them.)
-    if (own.some((a) => /extld/.test(a))) return "go with -extld runs the linker the call names";
+    if (own.some((a) => /ext(ld|ar)/.test(a))) return "go with -extld or -extar runs the linker or archiver the call names";
     const gccgo = own.find((a) => /^--?gccgoflags(=|$)/.test(a));
     if (gccgo) return "go -gccgoflags hands gccgo options, which can name a program it runs";
   }
@@ -4113,6 +4158,7 @@ function managerProblem(name: string, args: string[]): string | undefined {
 // Council project review 2 (Mythos): what a compiler or build tool the rules allow by name runs
 // beyond the project's own build, read from its words. Python tools (argparse) take any unique
 // prefix of a long option.
+const CMAKE_SAFE = /^CMAKE_(BUILD_TYPE|INSTALL_PREFIX|EXPORT_COMPILE_COMMANDS|(C|CXX|CUDA|OBJC|OBJCXX|HIP)_(STANDARD|STANDARD_REQUIRED|EXTENSIONS)|POSITION_INDEPENDENT_CODE|VERBOSE_MAKEFILE|COLOR_DIAGNOSTICS|COLOR_MAKEFILE|INTERPROCEDURAL_OPTIMIZATION|UNITY_BUILD|MESSAGE_LOG_LEVEL|FIND_DEBUG_MODE|SKIP_RPATH|SKIP_INSTALL_RPATH|BUILD_WITH_INSTALL_RPATH|OSX_ARCHITECTURES|OSX_DEPLOYMENT_TARGET|(RUNTIME|LIBRARY|ARCHIVE)_OUTPUT_DIRECTORY|EXPORT_PACKAGE_REGISTRY|FIND_PACKAGE_PREFER_CONFIG|DISABLE_PRECOMPILE_HEADERS|SUPPRESS_REGENERATION|WARN_DEPRECATED|ERROR_DEPRECATED|INSTALL_MESSAGE|BUILD_PARALLEL_LEVEL)$/;
 function buildToolProblem(name: string, args: string[]): string | undefined {
   const own = args.slice(0, args.includes("--") ? args.indexOf("--") : args.length);
   const operands = own.filter((a) => !a.startsWith("-"));
@@ -4140,11 +4186,21 @@ function buildToolProblem(name: string, args: string[]): string | undefined {
     // (Round 2, Opus: a compiler, launcher or toolchain file named on the command line is run.)
     // (Round 3: the make program, the files cmake includes into the project, and compiler flags
     // that name a program.)
+    // (Round 4: cmake's own variables are read from an allowlist; many others name a program the
+    // build runs, `CMAKE_C_LINK_EXECUTABLE`, `CMAKE_AR`, `CMAKE_C_CLANG_TIDY`.)
     const set = own.find((a, i) => {
-      const def = /^-D/.test(a) ? (a === "-D" ? (own[i + 1] ?? "") : a) : "";
-      return /CMAKE_\w*(COMPILER|LAUNCHER|LINKER|TOOLCHAIN_FILE|MAKE_PROGRAM|INCLUDE|INCLUDES|OVERRIDE)\w*(:\w+)?=/.test(def) || (/CMAKE_\w*FLAGS\w*(:\w+)?=/.test(def) && /-wrapper|-B|--prefix|plugin|-specs|-Xclang|-fuse-ld|extld/.test(def));
+      const def = /^-D/.test(a) ? (a === "-D" ? (own[i + 1] ?? "") : a.slice(2)) : "";
+      const m = /^(CMAKE_\w+?)(:\w+)?=(.*)$/s.exec(def);
+      if (!m) return false;
+      if (/FLAGS\w*$|_STANDARD_LIBRARIES$/.test(m[1])) return /-wrapper|-B|--prefix|plugin|-specs|-Xclang|-fuse-ld|ext(ld|ar)/.test(m[3]);
+      return !CMAKE_SAFE.test(m[1]);
     });
-    if (set) return "cmake -D names a program, a script or compiler options that run one, which cmake runs";
+    if (set) return "cmake -D sets a CMake variable outside a short list of harmless ones: many name a program, a script or compiler options the build runs";
+    // `cmake --build <dir> -- <words>` hands the words to the build tool, make or ninja.
+    if (own.includes("--build") && args.includes("--")) {
+      const made = makeProblem(args.slice(args.indexOf("--") + 1), undefined, undefined);
+      if (made) return `cmake --build -- hands its words to the build tool: ${made.reason}`;
+    }
   }
   if (name === "ctest") {
     const word = own.find((a) => /^(-S.*|--script|--script-new-process|--build-and-test|--test-command)(=.*)?$/.test(a));
@@ -4918,6 +4974,16 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
   // (Council project review 1, round 9: a compiler's dependency and aux files, `-MF test.js -MT
   // '<text>'`, are written with text the command chooses, where no check reads them.)
   if (/^(gcc|cc|clang|g\+\+|c\+\+|clang\+\+)(-\d+(\.\d+)*)?$/.test(name) && args.some((a) => /^-(MF|MJ|MD|MMD|aux-info|save-temps|dumpdir|Wp,)/.test(a))) return `${name} writes dependency or auxiliary files the check does not place`;
+  // Council project review 2, round 4 (Mythos): a linker's output named through `-Wl,`, `-Xlinker`
+  // or `--for-linker`, and the output a compiler names itself (`a.out`, `x.o`) where no `-o`
+  // names one; rustc's outputs in every spelling. `ccache` writes what its compiler writes.
+  if (COMPILER.test(name)) {
+    if (args.some((a) => /^(-Wl,|-Xlinker$|--for-linker)/.test(a))) return `${name} hands the linker options, which can name the file it writes`;
+    const informational = args.some((a) => /^(-E|-fsyntax-only|-M|-MM|--version|-v|--help|-###|-dump\w*|-print-.*|--print-.*)$/.test(a));
+    if (!informational && !args.some((a) => /^(-o|--output)/.test(a)) && args.some((a) => !a.startsWith("-") || a === "-")) return `${name} writes its output (a.out or an object file) under a name it chooses`;
+  }
+  if (name === "rustc" && !args.some((a) => /^(-V|-vV|--version|--print|--explain|-h|--help)/.test(a))) return "rustc writes its outputs, whose names the check does not place";
+  if (name === "ccache" && args.length && COMPILER.test(args[0])) return unnamedWrite(args[0], args.slice(1), filesOnly) ?? (args.some((a) => /^(-o|--output)/.test(a)) ? "ccache's compiler writes its output" : undefined);
   if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|unlz4)$/.test(name) || (/^(gzip|xz|zstd|bzip2|lzop|lz4|lzip|brotli)$/.test(name) && args.some((a) => /^(-[a-zA-Z]*d[a-zA-Z]*|--decompress|--uncompress)$/.test(a)))) return `${name} -d writes files next to its input`;
   if (name === "patch") {
     const got = getopt(args, PATCH_OPTIONS);
@@ -4997,6 +5063,11 @@ function unnamedWriteDirs(name: string, args: string[]): (string | undefined)[] 
   if (name === "cpio") return [undefined];
   if (name === "7z") return args.some((a) => /^-o/.test(a)) ? place(args.filter((a) => /^-o/.test(a)).map((a) => a.slice(2))) : [];
   if (name === "git") return [undefined];
+  // (Council project review 2, round 4: a compiler's own output is where it runs; one a linker
+  // option or rustc's `-o`, `--out-dir`, `--emit` names is not placed.)
+  if (name === "ccache" && args.length && COMPILER.test(args[0])) return unnamedWriteDirs(args[0], args.slice(1));
+  if (COMPILER.test(name)) return args.some((a) => /^(-Wl,|-Xlinker$|--for-linker)/.test(a)) ? [undefined] : [];
+  if (name === "rustc") return args.some((a) => /^(-o|--out-dir|--emit|-C|--codegen)/.test(a)) ? [undefined] : [];
   if (name === "curl" || name === "wget") return place(fetcherWrites(name, args).chosen.map((c) => c.dir || "."));
   // (Round 4: an option that puts the output elsewhere, zstd's `--output-dir-flat=.`, lzop's
   // `-p`, a `-o`: the place is not read, and the project is marked.)
@@ -7330,7 +7401,10 @@ function safeAfterWrite(name: string, args: string[], cmd: Simple, ctx: ArgvCont
   if (sub === "cat-file") return config(!call.rest.every((w) => !w.startsWith("-") || CAT_FILE_PLAIN.test(w)));
   if (sub === "bisect" && ["start", "reset", "good", "bad", "new", "old", "skip", "terms", "log"].includes(call.rest[0] ?? "")) return config(false);
   // `git clean -n` lists what a clean would remove, and removes nothing.
-  if (sub === "clean") return call.rest.some((w) => /^(-[a-zA-Z]*n[a-zA-Z]*|--dry-run)$/.test(w)) && config(false);
+  if (sub === "clean") {
+    const clean = cleanReading(call.rest);
+    return clean.dry && !clean.interactive && !clean.unknown && config(false);
+  }
   if (sub === "config") return !configWrite(call.rest, false) && config(false);
   if (sub === "worktree") return call.rest[0] === "list" && config(false);
   return false;

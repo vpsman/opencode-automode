@@ -1,5 +1,5 @@
 // Council project review 2: code that xargs -I or find -exec fills in is not printed; `git reset
-// --merge` and an operation's `--abort`/`--skip` discard work; a saved "Always allow" for `git rm`
+// --merge` discards staged work; a saved "Always allow" for `git rm`
 // is not mirrored; compilers and build tools that run a program the call names ask; a pattern a
 // runner expands itself counts as a place a session write may lie.
 // Run: node test/run.mjs test/council-p2.test.mts.
@@ -69,8 +69,8 @@ test("what runs for an input with a ; in it is what was written", () => {
   assert.equal(spawnSync("bash", ["-c", printed.text!], { encoding: "utf8" }).stdout, "<safe; echo EXTRA>\n");
 });
 
-test("git reset --merge and an operation's --abort or --skip ask", async () => {
-  for (const c of ["git reset --merge", "git reset --mer", "git reset --merge HEAD", "git merge --abort", "git merge --abo", "git rebase --abort", "git rebase --skip", "git am --abort", "git am --skip", "git cherry-pick --abort", "git cherry-pick --skip", "git revert --abort", "git revert --skip"]) {
+test("git reset --merge asks", async () => {
+  for (const c of ["git reset --merge", "git reset --mer", "git reset --merge HEAD"]) {
     assert.equal(await effect(c), "ask", c);
   }
   for (const c of ["git reset", "git reset --soft HEAD", "git status"]) assert.equal(await effect(c), "allow", c);
@@ -227,4 +227,47 @@ test("round 3: a runner's word with a %xx escape or a data: URL is a place the c
   } finally {
     fs.rmSync(d, { recursive: true, force: true });
   }
+});
+
+// ---- round 4 ----
+
+test("round 4: git clean is read as git reads it; -i asks whatever else is there", async () => {
+  for (const c of ["git clean -e -n", "git clean --exclude -n", "git clean -en", "git clean -xen", "git clean -dq -en", "git clean -n --no-dry-run", "git clean --dry-run --no-dry-run", "git clean -i -n", "git clean -en -i", "git clean -n --no-d -i", "git clean -n --frobnicate"]) {
+    assert.equal(await effect(c), "ask", c);
+  }
+  for (const c of ["git clean -n", "git clean -dxn", "git clean -e x -n", "git clean --exclude=x --dry-run", "git clean --no-dry-run -n", "git clean --dry"]) assert.equal(await effect(c), "allow", c);
+});
+
+test("round 4: what a compiler writes under a name it or a linker option chooses marks where it ran", async () => {
+  for (const writer of [
+    "printf 'fn main(){}' | rustc - -o node_modules/.bin/node",
+    "rustc --emit=link=node_modules/.bin/node x.rs",
+    "rustc --out-dir node_modules/.bin x.rs",
+    "rustc x.rs",
+    "printf 'int main(){}' | gcc -xc - -Wl,-o,node_modules/.bin/node",
+    "gcc -xc - -Wl,--output=node_modules/.bin/node",
+    "gcc -xc - -Xlinker -o -Xlinker node_modules/.bin/node",
+    "gcc t.c",
+    "ccache gcc -xc - -o node_modules/.bin/node",
+  ]) {
+    const s = new SessionState(repo);
+    // Either the writer asks (what is approved runs outside the sandbox), or what it wrote is
+    // marked and npm goes to the model after it.
+    const wrote = await effect(writer, s);
+    assert.ok(wrote !== "allow" || (await effect("npm test", s)) !== "allow", writer);
+  }
+  const s = new SessionState(repo);
+  assert.equal(await effect("rustc --version", s), "allow");
+  assert.equal(await effect("npm test", s), "allow");
+});
+
+test("round 4: cargo hands rustc its words after --; make's values and cmake's variables are read", async () => {
+  for (const c of [
+    "cargo clippy -- --emit=link -Clink-arg=-wrapper -Clink-arg=sh,-c,true,--", "cargo clippy -- -Clinker=/bin/false", "cargo rustc -- -C linker=sh", "cargo rustdoc -- -Z x",
+    "make x.o CFLAGS=-wrapper CPPFLAGS=sh,-c,id", "make CFLAGS=-B/tmp/x", "make LDFLAGS=-Wl,-plugin,x.so",
+    "cmake -DCMAKE_C_LINK_EXECUTABLE=sh .", "cmake -DCMAKE_AR=/tmp/ar .", "cmake -DCMAKE_C_CLANG_TIDY=sh .", "cmake -DCMAKE_CROSSCOMPILING_EMULATOR=sh .", "cmake '-DCMAKE_C_STANDARD_LIBRARIES=-wrapper sh,-c,x' .",
+    "cmake --build build -- SHELL=/tmp/sh", "cmake --build build -- --eval=x",
+    "go build -ldflags=-extar=/tmp/x .", "go tool link -extar /tmp/x x",
+  ]) assert.equal(await effect(c), "ask", c);
+  for (const c of ["cargo clippy -- -D warnings", "cargo test -- --nocapture", "make CFLAGS=-O2", "cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON .", "cmake --build build -- -j4"]) assert.notEqual(await effect(c), "ask", c);
 });
