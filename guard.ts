@@ -7694,7 +7694,11 @@ export function runnerPlaces(name: string, args: string[], cwd: string | undefin
       if (fs.existsSync(p)) return [isFile(p) ? path.dirname(p) : p];
       // (Round 7: `jest -c=/tmp/x.js` after a write of that file in the same call.)
       // (Not `/` itself: a tail cut from a relative path, `/Cargo.toml` of `../web/Cargo.toml`.)
-      return path.isAbsolute(piece) && path.dirname(p) !== "/" && fs.existsSync(path.dirname(p)) ? [path.dirname(p)] : [];
+      // (Council project review 2, round 11, Mythos: a path the call is about to make, in a
+      // directory it makes too or by a relative path, counts from its nearest existing ancestor.)
+      let d = path.dirname(p);
+      while (d !== "/" && !fs.existsSync(d)) d = path.dirname(d);
+      return d === "/" ? [] : [d];
     });
   };
   const read = RUNNER_SUBS.has(name) ? runnerSub(name, args) : undefined;

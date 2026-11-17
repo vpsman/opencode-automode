@@ -5289,7 +5289,9 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
     marks.push(...dirs);
     marksBy.set(cmd, [...(marksBy.get(cmd) ?? []), ...dirs]);
   };
-  const project = (cmd: Simple) => note(cmd, roots.map(realish));
+  // (Council project review 2, round 11, Opus: and the temp directories, where such a writer may
+  // have written too, `gcc -MF /tmp/d/x.test.js`, `git format-patch -o /tmp/d`.)
+  const project = (cmd: Simple) => note(cmd, [...new Set([...roots, ...tempDirs()].map(realish))]);
   const mark = (dir: string | undefined, cmd: Simple) => {
     const at = cwdOf(cmd);
     if (dir === undefined || (!path.isAbsolute(tilde(dir)) && at === undefined)) project(cmd);

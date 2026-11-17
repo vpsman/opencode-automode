@@ -396,3 +396,28 @@ test("round 10: a runner word bash computes is a place the check cannot tell; mo
   for (const c of ["echo nop | x86_64-linux-gnu-as -V", "octave-cli -V", "bsd-csh -V", "gview -V", "rgvim -V", "eview -V", "gvimdiff -V"]) assert.notEqual(await effect(c), "allow", c);
   assert.equal(await effect("npm test -- $X"), "allow", "with nothing written, as before");
 });
+
+// ---- round 11 ----
+
+test("round 11: a file the call makes and hands a runner counts from its nearest existing directory; an unplaced write marks the temp directories", async () => {
+  const base11 = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-r11-")));
+  const scratch = path.join(base11, "scratch");
+  try {
+    for (const c of [`mkdir -p ${base11}/new && printf x > ${base11}/new/a.test.js && npm test -- ${base11}/new/a.test.js`, `printf x > ${base11}/q.test.js; npm test -- ${path.relative(repo, base11)}/q.test.js`, `mkdir -p ${base11}/n2 && printf x > ${base11}/n2/a.test.js && pnpm test ${base11}/n2/a.test.js`]) {
+      assert.notEqual(await effect(c), "allow", c);
+    }
+    // A scratch project in a temp directory the session did not write.
+    fs.mkdirSync(scratch);
+    fs.writeFileSync(path.join(scratch, "package.json"), JSON.stringify({ scripts: { test: "node --test" } }));
+    fs.writeFileSync(path.join(repo, "t.c"), "int x;\n");
+    for (const c of [`gcc -M -MT x -MF ${scratch}/x.test.js t.c && cd ${scratch} && npm test`, `git format-patch -1 -o ${scratch} --suffix=.test.js && cd ${scratch} && npm test`]) {
+      assert.notEqual(await effect(c), "allow", c);
+    }
+    const s = new SessionState(repo);
+    await effect(`gcc -M -MT x -MF ${scratch}/y.test.js t.c`, s);
+    assert.notEqual((await decideShell(guard, s, scratch, "npm test")).effect, "allow");
+  } finally {
+    fs.rmSync(base11, { recursive: true, force: true });
+    fs.rmSync(path.join(repo, "t.c"), { force: true });
+  }
+});
