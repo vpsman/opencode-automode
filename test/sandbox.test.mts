@@ -94,7 +94,8 @@ after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
 describe("normal work inside the project", () => {
   test("r4 24: a timed-out global hooks lookup is a problem", () => {
-    const bin = fs.mkdtempSync(path.join(tmp, "timeout-bin-"));
+    // (In the home: the plugin's own git leaves temp directories out of its PATH.)
+    const bin = fs.mkdtempSync(path.join(home, "timeout-bin-"));
     const gitExe = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
     fs.writeFileSync(path.join(bin, "git"), `#!/bin/sh\ncase " $* " in *" --git-dir "*) ;; *" core.hooksPath "*) exec sleep 5;; esac\nexec '${gitExe}' "$@"\n`, { mode: 0o755 });
     const before = process.env.PATH;
@@ -183,7 +184,7 @@ describe("normal work inside the project", () => {
   // receives a push reads it (`-C <dir> --git-dir .`).
   const lookups = { "your own": '*" --git-dir "*) ;; *" core.hooksPath "*) exit 128;;', "the repository's": '*" --git-dir . "*) ;; *" --git-dir "*" core.hooksPath "*) exit 128;;', "the receiving": '*" --git-dir . "*" core.hooksPath "*) exit 128;;' };
   for (const [scope, pattern] of Object.entries(lookups)) test(`r4 24: failed ${scope} hooks lookup is a problem`, () => {
-    const bin = fs.mkdtempSync(path.join(tmp, "lookup-bin-"));
+    const bin = fs.mkdtempSync(path.join(home, "lookup-bin-"));
     const gitExe = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
     fs.writeFileSync(path.join(bin, "git"), `#!/bin/sh\ncase " $* " in ${pattern} esac\nexec '${gitExe}' "$@"\n`, { mode: 0o755 });
     const before = process.env.PATH;
@@ -1050,5 +1051,32 @@ describe("r3 34: lockwrite refuses a terminal and root", () => {
     const r = spawnSync("unshare", ["-U", "--map-current-user", "--keep-caps", WRAPPER, "-c", "grep -E '^Cap(Eff|Prm|Amb)' /proc/self/status"], { cwd: repo, env: envFor(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
     assert.equal(r.status, 0, r.stderr);
     assert.deepEqual(r.stdout.trim().split("\n").map((l) => l.split(/\s+/)[1]), ["0000000000000000", "0000000000000000", "0000000000000000"], r.stdout);
+  });
+});
+
+// Council project review 1: a later node outside the sandbox runs what these caches hold.
+describe("council project review 1: the code caches in the temp directories", () => {
+  const caches = () => [...new Set(["/tmp", os.tmpdir()].map((d) => fs.realpathSync(d)))].flatMap((d) => sandbox.TEMP_CODE_CACHES.map((n) => path.join(d, n)));
+  test("a call writes into private, empty copies of them, and nothing it writes stays", () => {
+    const r = attempt(caches().map((c) => `mkdir -p ${c}/x && echo planted > ${c}/x/entry`).join(" && "));
+    for (const c of caches()) {
+      assert.ok(r.plan.tmpfs.includes(c), c);
+      assert.ok(fs.statSync(c).isDirectory(), c);
+      assert.ok(!fs.existsSync(path.join(c, "x")), c);
+    }
+  });
+  test("node runs in the sandbox with its compile cache on", () => {
+    const r = attempt(`node -e 'console.log(require("node:module").enableCompileCache().status)'`);
+    assert.match(r.stdout, /^\d+\nran\n$/);
+  });
+  test("one that is a symbolic link is a problem", () => {
+    const link = path.join(fs.realpathSync(os.tmpdir()), "jiti");
+    fs.rmSync(link, { recursive: true, force: true });
+    fs.symlinkSync(repo, link);
+    try {
+      assert.match(planFor("ls").problem ?? "", /jiti.*not a directory/);
+    } finally {
+      fs.rmSync(link);
+    }
   });
 });

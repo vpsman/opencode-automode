@@ -704,7 +704,8 @@ describe("G: feature-branch push", () => {
   withKey("some.unknownKey", "x");
 
   test("G1: a config that cannot be read asks", async () => {
-    const bin = fs.mkdtempSync(path.join(tmp, "bin-"));
+    // (In the home: the plugin's own git leaves temp directories out of its PATH.)
+    const bin = fs.mkdtempSync(path.join(os.homedir(), "bin-"));
     const real = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
     fs.writeFileSync(path.join(bin, "git"), `#!/bin/sh\ncase " $* " in *" config "*"--show-scope"*) exit 3;; esac\nexec ${real} "$@"\n`, { mode: 0o755 });
     const before = process.env.PATH;
@@ -7470,7 +7471,8 @@ describe("r4 B8", () => {
     test("r4 B8-2: the user's own configuration is not the project's: only its filters and diff programs are read, as before", async () => {
       const f = b8Fixture();
       const was = process.env.GIT_CONFIG_GLOBAL;
-      const own = path.join(tmp, `b8-global-${path.basename(f.dir)}`);
+      // (In the home, not a temp directory: a GIT_CONFIG_GLOBAL a call can write turns the safe list off.)
+      const own = path.join(os.homedir(), `b8-global-${path.basename(f.dir)}`);
       const base = was ? fs.readFileSync(was, "utf8") : "";
       try {
         process.env.GIT_CONFIG_GLOBAL = own;
@@ -8413,7 +8415,8 @@ describe("r4 B9", () => {
       const f = b9Fixture();
       const dir = fs.mkdtempSync(path.join(tmp, "b9-hooks-"));
       hook(f, "pre-commit", 0o755, dir);
-      const global = path.join(dir, "gitconfig");
+      // (The file in the home: a GIT_CONFIG_GLOBAL a call can write turns the safe list off.)
+      const global = path.join(os.homedir(), `b9-gitconfig-${path.basename(dir)}`);
       fs.writeFileSync(global, `${fs.readFileSync(process.env.GIT_CONFIG_GLOBAL!, "utf8")}\n[core]\n\thooksPath = ${dir}\n`);
       const was = process.env.GIT_CONFIG_GLOBAL;
       try {

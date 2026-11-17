@@ -210,10 +210,52 @@ export interface GitResult {
   out: string;
 }
 
+// Council project review 1, round 4: the plugin's own git (its lookups, and the dry-run push
+// and ls-remote with their ssh) finds git and what git runs by PATH: an entry a call can write (in
+// the project or a writable path, a temp directory, a relative one) could hold a planted `git` or
+// `ssh` that would run in this process, outside the sandbox. Those entries are left out of its
+// PATH. `setPluginWritable` tells the places (index.ts); the working directory counts until then.
+let pluginWritable: ((p: string) => boolean) | undefined;
+export function setPluginWritable(writable: (p: string) => boolean): void {
+  pluginWritable = writable;
+}
+// (Round 7: the loader's lists too: LD_LIBRARY_PATH, LD_PRELOAD and LD_AUDIT keep only their
+// absolute entries outside the places a call can write; with none left, the variable goes.)
+function pluginLoader(env: NodeJS.ProcessEnv): void {
+  // (Round 8: and GIT_EXEC_PATH, where git looks for what it runs before PATH: a filter's `cat`.)
+  for (const name of ["LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT", "GIT_EXEC_PATH"]) {
+    const value = env[name];
+    if (value === undefined) continue;
+    const kept = cleanList(name === "GIT_EXEC_PATH" ? [value] : value.split(name === "LD_LIBRARY_PATH" ? ":" : /[:\s]/));
+    if (kept.length) env[name] = kept.join(":");
+    else delete env[name];
+  }
+}
+function cleanList(entries: string[]): string[] {
+  const temps = [...new Set(["/tmp", "/var/tmp", "/dev/shm", os.tmpdir()].flatMap((d) => [d, realpath(d)]))];
+  const cwd = process.cwd();
+  const writable = pluginWritable ?? ((p: string) => cwd !== "/" && !within(HOME, cwd) && within(p, cwd));
+  return entries.filter((e) => path.isAbsolute(e) && ![e, realpath(e)].some((p) => writable(p) || temps.some((t) => within(p, t))));
+}
+export function pluginPath(list = process.env.PATH ?? ""): string {
+  const temps = [...new Set(["/tmp", "/var/tmp", "/dev/shm", os.tmpdir()].flatMap((d) => [d, realpath(d)]))];
+  const cwd = process.cwd();
+  const writable = pluginWritable ?? ((p: string) => cwd !== "/" && !within(HOME, cwd) && within(p, cwd));
+  const kept = list
+    .split(":")
+    .filter((e) => path.isAbsolute(e) && ![e, realpath(e)].some((p) => writable(p) || temps.some((t) => within(p, t))))
+    .join(":");
+  // (Round 6: an empty PATH is searched as the working directory: with no entry left, git is not
+  // found at all, and the lookups that need it ask.)
+  return kept || "/nonexistent/automode-no-path";
+}
 const GIT_SAFE = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.untrackedCache=false", "-c", "core.askPass=", "-c", "core.pager=cat"];
 export const gitEnv = (): NodeJS.ProcessEnv => {
-  const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0", GIT_ASKPASS: "", SSH_ASKPASS: "", SSH_ASKPASS_REQUIRE: "never", GIT_PAGER: "cat" };
+  // GIT_NO_LAZY_FETCH: a partial clone's missing object is not fetched from its promisor remote,
+  // whose `uploadpack` a repository's config names (council project review 1).
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0", GIT_ASKPASS: "", SSH_ASKPASS: "", SSH_ASKPASS_REQUIRE: "never", GIT_PAGER: "cat", GIT_NO_LAZY_FETCH: "1", PATH: pluginPath() };
   for (const name of ["GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_EXTERNAL_DIFF", "GIT_EDITOR"]) delete env[name];
+  pluginLoader(env);
   return env;
 };
 export const gitArgs = (args: string[]) => [...GIT_SAFE, ...args];
@@ -225,9 +267,13 @@ export const gitArgs = (args: string[]) => [...GIT_SAFE, ...args];
 export const inGitDir = (gitDir: string) => ["--git-dir", gitDir, "--work-tree", gitDir];
 
 // git, with nothing from the repository able to run code in this process. A caller that grants
-// trust on the answer must look at `status`: no answer is not the same as an empty one.
+// trust on the answer must look at `status`: no answer is not the same as an empty one. These
+// are lookups: no transport may start (council project review 1: a lazy fetch ran a planted
+// `remote.<name>.uploadpack`), which `ls-remote --get-url` does not need. An empty
+// GIT_ALLOW_PROTOCOL allows none, and unlike `-c protocol.allow=never` it is not in the
+// configuration the checks list.
 export function gitRun(args: string[], timeout = 3000): GitResult {
-  const r = spawnSync("git", gitArgs(args), { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout, maxBuffer: 16 << 20, env: gitEnv() });
+  const r = spawnSync("git", gitArgs(args), { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout, maxBuffer: 16 << 20, env: { ...gitEnv(), GIT_ALLOW_PROTOCOL: "" } });
   if (r.error || r.status === null) return { status: undefined, out: "" };
   return { status: r.status, out: r.stdout ?? "" };
 }
@@ -375,7 +421,9 @@ function scanRoot(root: string, skip: Set<string>, secrets: boolean): Found {
     // own top, or the git directory of a work tree elsewhere, which is not: `core.bare` tells
     // them apart, once the walk is over (`standalone`). None of it depends on which of a
     // directory and its pointer file the walk reaches first.
-    const gitDirHere = names.has("HEAD") && names.has("objects") && names.has("refs") && !names.has(".git");
+    // (Council project review 1: `HEAD` and `commondir` are a git directory too, its objects and
+    // refs in the directory `commondir` names, as git reads it.)
+    const gitDirHere = names.has("HEAD") && ((names.has("objects") && names.has("refs")) || names.has("commondir")) && !names.has(".git");
     if (gitDirHere) {
       addGitDir(here);
       if (!inGit) standalone.add(here);
@@ -1627,6 +1675,39 @@ function opencodePaths(project: string | undefined, rwDirs: string[]): Protected
   return { ro, pin: [], problems, linkTops: held };
 }
 
+// Code caches in the temp directories (council project review 1): Node's compile cache, which
+// tsc and tsserver turn on themselves, tsx's, jiti's, v8-compile-cache's (yarn 1, older eslint)
+// and Jest's. A later node outside the sandbox
+// runs what they hold, checked against its source by little more than its length. Each gets a
+// private, empty tmpfs for the call, and one that is missing is made first, so that a call
+// cannot make it.
+const UID = process.getuid?.() ?? 0;
+export const TEMP_CODE_CACHES = ["node-compile-cache", `tsx-${UID}`, "jiti", `v8-compile-cache-${UID}`, `jest_${UID.toString(36)}`];
+function codeCaches(rwDirs: string[]): { tmpfs: string[]; problems: string[] } {
+  const tmpfs: string[] = [];
+  const problems: string[] = [];
+  const cover = (p: string, roots: string[]) => {
+    if (isSymlink(p) || (lexists(p) && !isDir(p))) problems.push(`${p}, where node keeps code it runs later, is not a directory and cannot be covered`);
+    else if (!lexists(p) && !ensureDir(p, roots)) problems.push(`${p}, where node keeps code it runs later, does not exist and could not be made`);
+    else tmpfs.push(p);
+  };
+  for (const temp of new Set(["/tmp", "/var/tmp", os.tmpdir()].map(realpath))) {
+    if (!isDir(temp)) continue;
+    for (const name of TEMP_CODE_CACHES) cover(path.join(temp, name), [temp]);
+  }
+  // (Round 2: NODE_COMPILE_CACHE in opencode's environment moves Node's cache: where it lies in a
+  // writable directory, it is covered the same way. A relative one lies where node runs.)
+  const moved = process.env.NODE_COMPILE_CACHE;
+  if (moved && !path.isAbsolute(moved)) problems.push(`NODE_COMPILE_CACHE (${moved}) is relative: where node keeps code it runs later cannot be covered`);
+  else if (moved) {
+    const at = path.join(realpath(path.dirname(path.resolve(moved))), path.basename(path.resolve(moved)));
+    // (Round 3: one that is a writable root itself, `/tmp` say, cannot be covered whole: it asks.)
+    if (rwDirs.includes(at)) problems.push(`NODE_COMPILE_CACHE (${moved}) is a directory every call can write, where node keeps code it runs later: it cannot be covered`);
+    else if (rwDirs.some((d) => within(at, d))) cover(at, rwDirs);
+  }
+  return { tmpfs: [...new Set(tmpfs)], problems };
+}
+
 const secretScope = makeScope("/", []);
 // The rules' own test for a credential file or directory.
 export const isSecretPath = (p: string) => readVerdict("read", p, secretScope) !== undefined;
@@ -1840,7 +1921,9 @@ export function plan(o: PlanOptions, scan?: Scan): Plan {
   // directories are the session's and its writable parents', temp ones included: round 8.)
   const followed = linkedInto([...(git.linkTops ?? []).filter((t) => own.some((o) => within(t, o))), ...(opencode.linkTops ?? [])], rwDirs);
   const ro = [...new Set([...git.ro, ...opencode.ro, ...followed.ro, ...closed])];
-  const problems = [...found.problems, ...lookupProblems, ...git.problems, ...opencode.problems, ...followed.problems];
+  const caches = codeCaches(rwDirs);
+  const tmpfs = ["/dev/shm", ...caches.tmpfs];
+  const problems = [...found.problems, ...lookupProblems, ...git.problems, ...opencode.problems, ...followed.problems, ...caches.problems];
   // ssh-using commands see known_hosts, config and public keys; private keys stay hidden.
   // Credential files in the project and the allowed paths, at any depth.
   const inProject = [...found.secrets];
@@ -1853,7 +1936,7 @@ export function plan(o: PlanOptions, scan?: Scan): Plan {
   // A directory that holds a protected path could be renamed and rebuilt without it: every
   // directory between a writable root and such a path is pinned.
   const pin = new Set<string>();
-  for (const p of [...ro, ...git.pin, ...hide]) {
+  for (const p of [...ro, ...git.pin, ...hide, ...caches.tmpfs]) {
     const roots = rwDirs.filter((d) => within(p, d) && p !== d);
     for (const root of roots) for (let dir = path.dirname(p); dir !== root && within(dir, root); dir = path.dirname(dir)) pin.add(dir);
   }
@@ -1878,9 +1961,9 @@ export function plan(o: PlanOptions, scan?: Scan): Plan {
   // project's nor an allowed path's: the temp directories and `sandboxWritable` (the cache
   // directories). An allowed path counts as the project: a git directory there is walked.
   problems.push(...linksOut([...(git.whole ?? []).map((dir) => ({ dir })), ...[...shutIn].map(([dir, only]) => ({ dir, only }))], found.gitDirs, own, rwDirs.filter((d) => !own.some((o) => within(d, o))), new Set(git.judged)));
-  const unexpressible = [...rwDirs, ...ro, ...reopen, ...pins, ...hide].filter((p) => !usable(p));
+  const unexpressible = [...rwDirs, ...ro, ...reopen, ...pins, ...hide, ...tmpfs].filter((p) => !usable(p));
   if (unexpressible.length) problems.push(`cannot protect a path containing a newline (${JSON.stringify(unexpressible[0])})`);
-  for (const [name, paths] of [["RW", rwDirs], ["RO", ro], ["REOPEN", reopen], ["PIN", pins], ["HIDE", hide], ["TMPFS", ["/dev/shm"]]] as const) {
+  for (const [name, paths] of [["RW", rwDirs], ["RO", ro], ["REOPEN", reopen], ["PIN", pins], ["HIDE", hide], ["TMPFS", tmpfs]] as const) {
     const tooLong = envStringProblem(`AUTOMODE_${name}`, paths.join("\n"));
     if (tooLong) problems.push(tooLong);
   }
@@ -1893,7 +1976,7 @@ export function plan(o: PlanOptions, scan?: Scan): Plan {
     reopen: reopen.filter(usable),
     pin: pins.filter(usable),
     hide: hide.filter(usable),
-    tmpfs: ["/dev/shm"],
+    tmpfs: tmpfs.filter(usable),
     ...(problems.length ? { problem: problems[0] } : {}),
   };
 }

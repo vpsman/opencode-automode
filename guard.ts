@@ -1941,8 +1941,10 @@ export function alsoByName(m: Matcher): Matcher {
 // EXECIGNORE (which files a PATH search passes over, so which program a word runs) and
 // BASH_LOADABLES_PATH (where `enable -f` finds a builtin to load) are bash's own variables that
 // change what a word runs or a pattern matches, held as IFS and CDPATH are.
+// RANDOM, SRANDOM, OPTIND, HISTCMD, SECONDS, BASHPID, BASH_XTRACEFD and READLINE_MARK/_POINT: bash
+// evaluates a value given to them as arithmetic (in some of the ways it can be given), where `a[$(...)]` runs a command (council project review 1).
 const ENV_DANGEROUS =
-  /^(PATH|HOME|IFS|CDPATH|GLOBIGNORE|GLOBSORT|EXECIGNORE|BASH_LOADABLES_PATH|SHELL|ENV|BASH_ENV|BASH_FUNC.*|BASHOPTS|SHELLOPTS|POSIXLY_CORRECT|BASH_COMPAT|BASH_ALIASES|BASH_CMDS|histchars|PROMPT_COMMAND|PS[0-4]|EDITOR|VISUAL|PAGER|BROWSER|TMPDIR|GIT_.*|SSH_.*|LD_.*|DYLD_.*|XDG_.*|PYTHON(PATH|STARTUP|HOME|USERBASE|WARNINGS|BREAKPOINT)|NODE_(OPTIONS|PATH)|PERL5(LIB|OPT|DB)|PERLLIB|RUBY(OPT|LIB)|GEM_(HOME|PATH)|GO(FLAGS|PATH|ROOT|BIN|PROXY|NOSUMDB|INSECURE|PRIVATE|TOOLCHAIN|ENV)|RUSTC.*|RUSTUP_.*|RUSTFLAGS|RUSTDOCFLAGS|CARGO_(HOME|BUILD_.*|TARGET_.*_(RUNNER|LINKER|RUSTFLAGS)|REGISTR.*|ENCODED_RUSTFLAGS)|CC|CXX|LD|AR|MAKEFLAGS|GNUMAKEFLAGS|MAKEFILES|npm_config_.*|NPM_CONFIG_.*|PIP_.*|UV_.*|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JAVA_HOME|MAVEN_OPTS|GRADLE_.*|OPENCODE.*|AUTOMODE_.*|TAR_OPTIONS|RIPGREP_CONFIG_PATH|GREP_OPTIONS|LESSOPEN|LESSCLOSE|MANOPT|MANPAGER|MANROFFOPT|MAN_DISABLE_SECCOMP|MANPATH|GROFF_.*|FZF_DEFAULT_(COMMAND|OPTS)|RSYNC_(RSH|CONNECT_PROG)|CURL_HOME|WGETRC|DOCKER_(HOST|CONFIG|CONTEXT|CERT_PATH)|KUBECONFIG|AWS_.*|GOOGLE_APPLICATION_CREDENTIALS|CLOUDSDK_.*|PWD|OLDPWD|VIRTUAL_ENV|LUA_.*|GCONV_PATH|SUDO_(EDITOR|ASKPASS)|SYSTEMD_(PAGER|EDITOR)|BAT_.*|GH_.*|BUNDLE_.*|POETRY_.*|PIPENV_.*|PDM_.*|HATCH_.*|YARN_.*|COREPACK_.*)$/;
+  /^(LANG|LC_[A-Z]+|RANDOM|SRANDOM|OPTIND|HISTCMD|SECONDS|BASHPID|BASH_XTRACEFD|READLINE_(?:MARK|POINT)|PATH|HOME|IFS|CDPATH|GLOBIGNORE|GLOBSORT|EXECIGNORE|BASH_LOADABLES_PATH|SHELL|ENV|BASH_ENV|BASH_FUNC.*|BASHOPTS|SHELLOPTS|POSIXLY_CORRECT|BASH_COMPAT|BASH_ALIASES|BASH_CMDS|histchars|PROMPT_COMMAND|PS[0-4]|EDITOR|VISUAL|PAGER|BROWSER|TMPDIR|GIT_.*|SSH_.*|LD_.*|DYLD_.*|XDG_.*|PYTHON(PATH|STARTUP|HOME|USERBASE|WARNINGS|BREAKPOINT)|NODE_(OPTIONS|PATH)|PERL5(LIB|OPT|DB)|PERLLIB|RUBY(OPT|LIB)|GEM_(HOME|PATH)|GO(FLAGS|PATH|ROOT|BIN|PROXY|NOSUMDB|INSECURE|PRIVATE|TOOLCHAIN|ENV)|RUSTC.*|RUSTUP_.*|RUSTFLAGS|RUSTDOCFLAGS|CARGO_(HOME|BUILD_.*|TARGET_.*_(RUNNER|LINKER|RUSTFLAGS)|REGISTR.*|ENCODED_RUSTFLAGS)|CC|CXX|LD|AR|MAKEFLAGS|GNUMAKEFLAGS|MAKEFILES|npm_config_.*|NPM_CONFIG_.*|PIP_.*|UV_.*|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JAVA_HOME|MAVEN_OPTS|GRADLE_.*|OPENCODE.*|AUTOMODE_.*|TAR_OPTIONS|RIPGREP_CONFIG_PATH|GREP_OPTIONS|LESSOPEN|LESSCLOSE|MANOPT|MANPAGER|MANROFFOPT|MAN_DISABLE_SECCOMP|MANPATH|GROFF_.*|FZF_DEFAULT_(COMMAND|OPTS)|RSYNC_(RSH|CONNECT_PROG)|CURL_HOME|WGETRC|DOCKER_(HOST|CONFIG|CONTEXT|CERT_PATH)|KUBECONFIG|AWS_.*|GOOGLE_APPLICATION_CREDENTIALS|CLOUDSDK_.*|PWD|OLDPWD|VIRTUAL_ENV|LUA_.*|GCONV_PATH|SUDO_(EDITOR|ASKPASS)|SYSTEMD_(PAGER|EDITOR)|BAT_.*|GH_.*|BUNDLE_.*|POETRY_.*|PIPENV_.*|PDM_.*|HATCH_.*|YARN_.*|COREPACK_.*)$/;
 // Values of a dangerous variable that change nothing that runs (round 3, finding 28, signed
 // off): NODE_OPTIONS made only of options that load no code, `PAGER=cat`, `GIT_PAGER=cat`, a
 // bare compiler name for CC and CXX, and a PYTHONPATH whose every entry lies in the project.
@@ -1982,6 +1984,9 @@ export function envValueOk(name: string, value: string, cwd: string | undefined,
     return options.every((o) => NODE_OPTIONS_OK.some((re) => re.test(o)));
   }
   if (name === "PAGER" || name === "GIT_PAGER") return value === "cat";
+  // (Council project review 1, round 10: a locale is safe where its charset reads no ASCII byte as
+  // part of a character: C, POSIX and UTF-8.)
+  if (/^(LANG|LC_[A-Z]+)$/.test(name)) return localeOk(value);
 
   if (name === "CC" || name === "CXX") return COMPILER.test(value);
   if (name === "PYTHONPATH") {
@@ -1994,11 +1999,13 @@ export function envValueOk(name: string, value: string, cwd: string | undefined,
   return false;
 }
 // Variables that only change output or verbosity.
+export const localeOk = (value: string) => /^(|C|POSIX|C\.(UTF-?8|utf-?8)|[A-Za-z]{2,3}(_[A-Za-z]{2,3})?\.(UTF-?8|utf-?8)(@[A-Za-z]+)?)$/.test(value);
 const ENV_HARMLESS =
-  /^(NODE_ENV|CI|DEBUG|VERBOSE|FORCE_COLOR|NO_COLOR|CLICOLOR(_FORCE)?|TERM|COLORTERM|COLUMNS|LINES|LANG|LANGUAGE|LC_[A-Z]+|TZ|RUST_BACKTRACE|RUST_LOG|CARGO_TERM_[A-Z_]+|CARGO_INCREMENTAL|PYTHONUNBUFFERED|PYTHONDONTWRITEBYTECODE|PYTHONHASHSEED|PYTEST_ADDOPTS|LOG_LEVEL|PORT|HOST|TEST_[A-Z0-9_]+|GOMAXPROCS|JOBS|NINJA_STATUS)$/;
+  /^(NODE_ENV|CI|DEBUG|VERBOSE|FORCE_COLOR|NO_COLOR|CLICOLOR(_FORCE)?|TERM|COLORTERM|COLUMNS|LINES|LANG|LANGUAGE|LC_[A-Z]+|TZ|RUST_BACKTRACE|RUST_LOG|CARGO_TERM_[A-Z_]+|CARGO_INCREMENTAL|PYTHONUNBUFFERED|PYTHONDONTWRITEBYTECODE|PYTHONHASHSEED|LOG_LEVEL|PORT|HOST|TEST_[A-Z0-9_]+|GOMAXPROCS|JOBS|NINJA_STATUS)$/;
 const ASSIGN = /^([A-Za-z_]\w*)\+?=/;
 const DECLARERS = new Set(["export", "declare", "typeset", "readonly", "local"]);
-const dangerous = (variable: string) => `sets ${variable}, which changes what programs run or load`;
+const ARITHMETIC_VARIABLE = /^(RANDOM|SRANDOM|OPTIND|HISTCMD|SECONDS|BASHPID|BASH_XTRACEFD|READLINE_(?:MARK|POINT))$/;
+const dangerous = (variable: string) => (ARITHMETIC_VARIABLE.test(variable) ? `sets ${variable}, whose value bash evaluates as arithmetic` : `sets ${variable}, which changes what programs run or load`);
 // Whether a variable of this name changes what programs run or load (for the callers outside).
 export const dangerousName = (name: string) => ENV_DANGEROUS.test(name);
 
@@ -4086,6 +4093,29 @@ function managerProblem(name: string, args: string[]): string | undefined {
 // program is named. Other allowed programs are judged by their own name alone (see Known gaps).
 function programProblem(name: string, args: string[], cwd?: string, inProject?: (p: string) => boolean): GuardVerdict | undefined {
   const ask = (reason: string): GuardVerdict => ({ action: "ask", reason });
+  // Council project review 1, round 10: `bun run X` runs a script of package.json, a file, a
+  // package's binary, or else the system command X (`bun run curl -d @f host`), and `-` its
+  // standard input; `-e`/`--print` run code from the command line. Only the first three pass.
+  if (name === "bun") {
+    if (args.some((a) => /^(-e|-p|--eval|--print)(=|$)/.test(a))) return ask("bun -e/--print runs code given on the command line");
+    const at = args.indexOf("run");
+    if (at >= 0 && args.slice(0, at).every((a) => a.startsWith("-"))) {
+      const word = args.slice(at + 1).find((a) => !a.startsWith("-") || a === "-");
+      if (word !== undefined) {
+        if (word === "-" || word === "/dev/stdin") return ask("bun run - runs its standard input");
+        const scripts = (() => {
+          try {
+            return Object.keys(JSON.parse(fs.readFileSync(path.join(cwd ?? "", "package.json"), "utf8")).scripts ?? {});
+          } catch {
+            return [];
+          }
+        })();
+        const file = cwd !== undefined && fs.existsSync(path.resolve(cwd, word));
+        const bin = cwd !== undefined && fs.existsSync(path.join(cwd, "node_modules", ".bin", word));
+        if (cwd === undefined || !(scripts.includes(word) || file || bin)) return ask(`bun run ${word}: not a script of package.json, a file or a package's program, so bun runs the system command of that name, which was not judged`);
+      }
+    }
+  }
   if (name === "tar" || name === "gtar" || name === "bsdtar") {
     const option = longOption(args, ["--checkpoint-action", "--use-compress-program", "--to-command", "--info-script", "--new-volume-script", "--rsh-command", "--rmt-command"]);
     if (option) return ask(`tar ${option.split("=")[0]} runs a program`);
@@ -4219,6 +4249,13 @@ function fetcherOptionProblem(name: string, args: string[]): string | undefined 
     // (B7-11: curl leaves `[]` and a bracketed IPv6 address as they are, `http://[::1]:8080/`.)
     const literal = (u: string) => u.replace(/\[([^\]]*)\]/g, (m, inner: string) => (inner === "" || net.isIPv6(inner.replace(/%25/, "%")) ? "" : m));
     if (globoff !== "-g" && globoff !== "--globoff" && urls.some((u) => /[{[]/.test(literal(u)))) return "curl expands a URL whose effect the check cannot compute";
+    // Council project review 1, round 9: only http and https (and `file:`, read as a file
+    // elsewhere): telnet sends standard input to the host, and other schemes send or store. A URL
+    // without a scheme whose host curl reads as one (`ftp.`, `dict.`, ...) counts as that scheme.
+    for (const u of urls) {
+      const scheme = /^\s*([A-Za-z][A-Za-z0-9+.-]*):\/\//.exec(u)?.[1]?.toLowerCase();
+      if (scheme !== undefined ? !["http", "https", "file"].includes(scheme) : /^\s*(?:[^@/]*@)?(ftp|dict|ldap|imap|smtp|pop3|telnet|gopher|mqtt|rtsp|smb|tftp|scp|sftp)\./i.test(u)) return `curl ${u}: only http and https URLs are fetched without a prompt; another scheme may send data or store it`;
+    }
   }
   // B7-6: wget globs an ftp URL against the server's listing (`*`, `?`, `[`) and writes every
   // name the server lists: names no check has read.
@@ -4423,6 +4460,9 @@ function sinkProblem(name: string, args: string[]): string | undefined {
     if (at >= 0 && (subscript(args[at + 1]) || /[$`]/.test(args[at + 1]))) return `${name} -v with a subscript or a variable, which bash evaluates as arithmetic`;
   }
   if (name === "read" && args.some((a) => /[$`]/.test(a) && !a.startsWith("-"))) return "read into a name taken from a variable";
+  // Council project review 1, round 2: `export "$x"` with `x=PATH=.` (or `RANDOM=a[$(...)]`) sets
+  // a variable no check reads: a name built at run time asks, as for read.
+  if (DECLARERS.has(name) && args.some((a) => !a.startsWith("-") && /[$`*?[]/.test(a.includes("=") ? a.slice(0, a.indexOf("=")) : a))) return `${name} with a name built at run time`;
   return undefined;
 }
 
@@ -4784,7 +4824,12 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
     if (longOption(args, ["--extract", "--get"]) || args.some((a) => /^-[a-zA-Z]*x/.test(a) && !a.startsWith("--")) || /^[a-zA-Z]*x/.test(first)) return `${name} -x writes the files the archive names`;
   }
   if ((name === "unzip" && unzipWords(args).writes) || name === "7z" || name === "cpio" || name === "rar" || name === "unrar") return `${name} writes the files the archive names`;
-  if (/^(gunzip|unxz|unzstd|bunzip2|uncompress)$/.test(name) || (/^(gzip|xz|zstd|bzip2)$/.test(name) && args.some((a) => /^(-[a-zA-Z]*d|--decompress|--uncompress)$/.test(a)))) return `${name} -d writes files next to its input`;
+  // (Council project review 1, round 4: `-d` anywhere in a cluster, `gzip -dk`; and the other
+  // compressors the write checks know.)
+  // (Council project review 1, round 9: a compiler's dependency and aux files, `-MF test.js -MT
+  // '<text>'`, are written with text the command chooses, where no check reads them.)
+  if (/^(gcc|cc|clang|g\+\+|c\+\+|clang\+\+)(-\d+(\.\d+)*)?$/.test(name) && args.some((a) => /^-(MF|MJ|MD|MMD|aux-info|save-temps|dumpdir|Wp,)/.test(a))) return `${name} writes dependency or auxiliary files the check does not place`;
+  if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|unlz4)$/.test(name) || (/^(gzip|xz|zstd|bzip2|lzop|lz4|lzip|brotli)$/.test(name) && args.some((a) => /^(-[a-zA-Z]*d[a-zA-Z]*|--decompress|--uncompress)$/.test(a)))) return `${name} -d writes files next to its input`;
   if (name === "patch") {
     const got = getopt(args, PATCH_OPTIONS);
     if (got.unknown || !got.opts.some((o) => ["--dry-run", "-o", "--output"].includes(o.name))) return "patch writes the files the diff names";
@@ -4808,16 +4853,23 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
     // second pass: read by git's own reading of the options).
     if (sub === "apply" && !gitApplies(call.rest)) return undefined;
     if (sub === "stash" && ["list", "show", "create", "store"].includes(words[0] ?? "")) return undefined;
-    if (sub === "stash" && !words.length) return undefined; // saves and cleans: writes only what was there
+    // (Council project review 1, round 3: a bare stash writes HEAD's version of each changed file,
+    // and HEAD may have been moved without a write the record saw: `git symbolic-ref`.)
     if (sub === "branch" || sub === "tag") return undefined;
+    // (Council project review 1, round 7: format-patch writes files whose text and suffix the
+    // command chooses, `--format=%B --suffix=.test.js`, unless they go to its output.)
+    if (sub === "format-patch" && !call.rest.includes("--stdout")) return "git format-patch writes files the command shapes";
     // A new branch at HEAD changes no file (round 4, finding 4: the mark it would leave lasts).
     const end = call.rest.indexOf("--");
     const own = end < 0 ? call.rest : call.rest.slice(0, end);
     const creates = sub === "checkout" ? /^-[a-zA-Z]*[bB]$/ : /^-[a-zA-Z]*[cC]$/;
-    if ((sub === "checkout" || sub === "switch") && end < 0 && own.some((w) => creates.test(w) || (sub === "switch" && /^--(create|force-create)$/.test(w))) && words.length <= 1 && own.every((w) => !w.startsWith("-") || creates.test(w) || /^-(q|-quiet)$/.test(w) || /^--(create|force-create)$/.test(w))) return undefined;
+    // (Round 3: `-bnb` is `-b nb`, the name attached: a word after it is a start point.)
+    const attached = own.some((w) => !w.startsWith("--") && (sub === "checkout" ? /^-[a-zA-Z]*?[bB]./ : /^-[a-zA-Z]*?[cC]./).test(w));
+    if ((sub === "checkout" || sub === "switch") && end < 0 && own.some((w) => creates.test(w) || (sub === "switch" && /^--(create|force-create)$/.test(w))) && words.length <= (attached ? 0 : 1) && own.every((w) => !w.startsWith("-") || creates.test(w) || /^-(q|-quiet)$/.test(w) || /^--(create|force-create)$/.test(w))) return undefined;
     if (["apply", "am", "checkout", "switch", "restore", "reset", "stash", "merge", "pull", "rebase", "cherry-pick", "revert", "mv", "checkout-index", "read-tree", "worktree", "submodule", "sparse-checkout"].includes(sub)) return `git ${sub} writes files of the work tree`;
     // A bisect checks out the commits it steps through (round 4, finding 4, second pass).
-    if (sub === "bisect" && ["start", "reset", "good", "bad", "new", "old", "skip", "next"].includes(words[0] ?? "")) return "git bisect checks out other commits";
+    // (Round 3: any word but those that only print, terms of its own included: `--term-new=broken`.)
+    if (sub === "bisect" && !["log", "terms", "visualize", "view", "help"].includes(words[0] ?? "")) return "git bisect checks out other commits";
   }
   return undefined;
 }
@@ -4857,7 +4909,12 @@ function unnamedWriteDirs(name: string, args: string[]): (string | undefined)[] 
   if (name === "7z") return args.some((a) => /^-o/.test(a)) ? place(args.filter((a) => /^-o/.test(a)).map((a) => a.slice(2))) : [];
   if (name === "git") return [undefined];
   if (name === "curl" || name === "wget") return place(fetcherWrites(name, args).chosen.map((c) => c.dir || "."));
-  if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|gzip|xz|zstd|bzip2)$/.test(name)) return place(args.filter((a) => !a.startsWith("-")).map((f) => path.dirname(f)));
+  // (Round 4: an option that puts the output elsewhere, zstd's `--output-dir-flat=.`, lzop's
+  // `-p`, a `-o`: the place is not read, and the project is marked.)
+  if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|unlz4|gzip|xz|zstd|bzip2|lzop|lz4|lzip|brotli)$/.test(name)) {
+    if (args.some((a) => /^--(output|path)|^-[a-zA-Z]*[op]/.test(a))) return [undefined];
+    return place(args.filter((a) => !a.startsWith("-")).map((f) => path.dirname(f)));
+  }
   if (["cp", "mv", "install", "rsync"].includes(name)) {
     const words = copyWords(name, args);
     if (words.unknown) return [undefined];
@@ -4927,7 +4984,18 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       }
       else if (name === "tree") valued(args, "o", "--never").forEach((f) => add(f, false));
       else if (name === "less") [...valued(args, "o", "--log-file"), ...valued(args, "O", "--LOG-FILE")].forEach((f) => add(f, false));
-      else if (name === "uniq" || name === "xxd") add(files.length > 1 ? files[1] : undefined, false);
+      // (Round 3: `-` is the input operand, `uniq - out`; the last of two or more operands is the
+      // output, an option's value counted among them, which can only record more.)
+      // (Council project review 1, round 6: `python3 -m json.tool IN OUT` writes OUT.)
+      else if (/^python[0-9.]*$/.test(name) && args.some((a, k) => (a === "-m" && args[k + 1] === "json.tool") || a === "-mjson.tool")) {
+        const at = args.findIndex((a, k) => (a === "-m" && args[k + 1] === "json.tool") || a === "-mjson.tool");
+        const operands = args.slice(at + (args[at] === "-m" ? 2 : 1)).filter((a) => a === "-" || !a.startsWith("-"));
+        if (operands.length > 1) add(operands[1], true);
+      }
+      else if (name === "uniq" || name === "xxd") {
+        const operands = args.filter((a) => a === "-" || !a.startsWith("-"));
+        add(operands.length > 1 ? operands.at(-1) : undefined, false);
+      }
       else if ((name === "yq" || name === "jq") && args.some((a) => /^(-[a-zA-Z]*i|--inplace)$/.test(a))) files.slice(1).forEach((f) => add(f, false));
       // B7-7: a directory or a file an option names for the program to write in: tar's `-C` and
       // unzip's `-d` when they extract, find's `-fprint0` (the rules ask on `-fprint`, `-fprintf`
@@ -6733,7 +6801,8 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
     if (word.includes("/")) runs(word);
     // (B7-2: a test runner's or a builder's file operand is code it runs, `pytest x_test.py`,
     // `go run x.go`: judged by its change time too, where it names a file.)
-    if (SHELLS.has(name) || INTERPRETERS.has(name) || FILE_RUNNERS.has(name) || /^python3?(\.\d+)?$/.test(name)) for (const f of files) runs(f, FILE_RUNNERS.has(name) ? "file" : false);
+    // (Round 6: `pytest tests/test_a.py::test_one` names the file before the `::`.)
+    if (SHELLS.has(name) || INTERPRETERS.has(name) || FILE_RUNNERS.has(name) || /^python3?(\.\d+)?$/.test(name)) for (const f of files) runs(f.includes("::") ? f.replace(/::.*$/, "") : f, FILE_RUNNERS.has(name) || f.includes("::") ? "file" : false);
     if (INTERPRETERS.has(name) || /^python3?(\.\d+)?$/.test(name)) {
       // -m/-c/-e execute a module or inline code, not their next operand as a script path.
       if (!args.some((a) => /^(-m|-c|-e|--eval|--print)$/.test(a))) {
@@ -6804,6 +6873,7 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
   // program goes to the model, naming the entry. Bash's own words find nothing on PATH. (B10-1:
   // wherever in PATH the entry stands, bentPath.)
   const bent = bentPath((p) => !!ctx.inProject?.(p) || !!ctx.canWrite?.(p));
+  const bentVariable = bentEnv((p) => !!ctx.inProject?.(p) || !!ctx.canWrite?.(p));
   if (!ctx.pattern?.(cmd)) for (const at of npx?.program !== undefined ? [...programs(cmd.argv), npx.program] : programs(cmd.argv)) {
     const word = cmd.argv[at];
     const name = path.basename(word);
@@ -6816,6 +6886,10 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
     if (!wrote.size && !marks.length) continue;
     if (bent !== undefined && !(!word.includes("/") && SHELL_OWN.has(name) && asBashFinds(name, cmd, ctx, wrote, marks) === undefined)) {
       add({ action: "classify", reason: `runs ${name} after this session wrote files, and PATH holds ${bent}, a directory the session can write: a program found there, or one a program runs by PATH, may be the session's` });
+      continue;
+    }
+    if (bentVariable !== undefined && !(!word.includes("/") && SHELL_OWN.has(name))) {
+      add({ action: "classify", reason: `runs ${name} after this session wrote files, and opencode's environment has ${bentVariable}, which names a place the session can write: a program run or a file loaded through it may be the session's` });
       continue;
     }
     const places = runnerPlaces(name, args, ctx.cwdOf?.(cmd), (w) => ctx.resolve(w, cmd)) ?? [];
@@ -6900,6 +6974,47 @@ export function bentPath(inProject: (p: string) => boolean, list = process.env.P
   }
   return undefined;
 }
+// Council project review 1, round 2: variables of opencode's environment that name a program or
+// a file a safe-list program loads (git's diff program, ssh command, editor and config; the
+// pager; less's input filter; ripgrep's config). Where one names a path the session can write (a
+// relative one, or one in the project or a temp directory), a safe-list program may run what the
+// session wrote, as with a PATH entry there: after a session write nothing is on the safe list.
+export const PROGRAM_ENV = ["LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT", "GIT_EXTERNAL_DIFF", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND", "LESS", "LESSKEYIN", "LESSKEY", "LESSKEYIN_SYSTEM", "LESSKEY_SYSTEM", "LESSKEY_CONTENT", "LESSKEY_CONTENT_SYSTEM", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "GIT_PAGER", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "EDITOR", "VISUAL", "PAGER", "MANPAGER", "BROWSER", "RIPGREP_CONFIG_PATH", "LESSOPEN", "LESSCLOSE", "TAR_OPTIONS"];
+// (Round 3: the ones whose value is a path, not a command: a bare name is a relative path.)
+const FILE_ENV = new Set(["GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "RIPGREP_CONFIG_PATH", "LESSKEYIN", "LESSKEY", "LESSKEYIN_SYSTEM", "LESSKEY_SYSTEM"]);
+export function bentEnv(inProject: (p: string) => boolean, env: Record<string, string | undefined> = process.env): string | undefined {
+  const temp = tempDirs();
+  const home = os.homedir();
+  for (const name of PROGRAM_ENV) {
+    const value = env[name];
+    if (!value) continue;
+    // less's options and lesskey text can name a lesskey file or set LESSOPEN themselves.
+    if ((name === "LESS" && /(^|\s)(-[a-zA-Z]*k|--l)/.test(value)) || (/^LESSKEY_CONTENT/.test(name) && /LESS(OPEN|CLOSE)/.test(value))) return `${name}=${value}`;
+    if (name === "LESS" || /^LESSKEY_CONTENT/.test(name)) continue;
+    // (Round 7: the loader's lists, which every program reads: an empty or a relative entry is
+    // the working directory, as a PATH entry is.)
+    if (/^LD_/.test(name)) {
+      if (value.split(name === "LD_LIBRARY_PATH" ? ":" : /[:\s]/).some((e) => {
+        const t = e === "~" ? home : e.startsWith("~/") ? path.join(home, e.slice(2)) : e;
+        return !path.isAbsolute(t) || [t, walked(t) ?? t].some((p) => inProject(p) || temp.some((d) => within(p, d)));
+      })) return `${name}=${value}`;
+      continue;
+    }
+    const file = FILE_ENV.has(name);
+    const words = file ? [value] : value.replace(/^\s*\|\|?-?/, "").trim().split(/\s+/);
+    for (const [i, raw] of words.entries()) {
+      const word = file ? raw : raw.replace(/^['"]|['"]$/g, "");
+      const option = !file && word.startsWith("-");
+      const w = option ? word.slice(word.indexOf("=") + 1 || word.length) : word;
+      // The program itself, an option's value or a placeholder without a `/` (`vi`, `-R`,
+      // `%s`): PATH finds the program, and PATH is judged on its own (bentPath).
+      if (!file && (w === "" || /^%[A-Za-z]$/.test(w) || ((i === 0 || option) && !w.includes("/")))) continue;
+      const t = w === "~" ? home : w.startsWith("~/") ? path.join(home, w.slice(2)) : w;
+      if (!path.isAbsolute(t) || [t, walked(t) ?? t].some((p) => inProject(p) || temp.some((d) => within(p, d)))) return `${name}=${value}`;
+    }
+  }
+  return undefined;
+}
 export const tempDirs = () => [...new Set(["/tmp", "/var/tmp", "/dev/shm", os.tmpdir()].flatMap((d) => [d, walked(d) ?? d]))];
 export function asBashFinds(name: string, cmd: Simple, ctx: ArgvContext, wrote: Set<string>, marks: string[]): { why: string; place?: string | undefined } | undefined {
   if (ctx.functions?.has(name)) return { why: "a function this call defines" };
@@ -6914,10 +7029,9 @@ export function asBashFinds(name: string, cmd: Simple, ctx: ArgvContext, wrote: 
 // The walk of PATH for `name`, from the directories `dirs` (undefined: not known). `inProject`:
 // whether a path lies in the project; `wrote(dir, file)`: whether the session or the call wrote
 // `file`, or files the checks cannot list in `dir`, above it or below it.
-export function pathFinds(name: string, dirs: string[] | undefined, inProject: (p: string) => boolean, wrote: (dir: string, file: string) => boolean): { why: string; place?: string | undefined } | undefined {
+export function pathFinds(name: string, dirs: string[] | undefined, inProject: (p: string) => boolean, wrote: (dir: string, file: string) => boolean, list = process.env.PATH): { why: string; place?: string | undefined } | undefined {
   const temp = tempDirs();
   const writable = (p: string) => inProject(p) || temp.some((t) => within(p, t));
-  const list = process.env.PATH;
   if (list === undefined) return { why: "found by a PATH the environment does not set", place: undefined };
   for (const entry of list.split(":")) {
     const fixed = path.isAbsolute(entry);
@@ -6953,6 +7067,20 @@ const lexists = (p: string) => {
     return false;
   }
 };
+// Whether an absolute entry of PATH holds a program `name` at all (pathFinds' undefined is also
+// its answer for a name PATH does not find; council project review 1).
+export function pathHas(name: string, list = process.env.PATH): boolean {
+  return (list ?? "").split(":").some((entry) => {
+    if (!path.isAbsolute(entry)) return false;
+    const file = path.join(entry, name);
+    try {
+      fs.accessSync(file, fs.constants.X_OK);
+      return fs.statSync(file).isFile();
+    } catch {
+      return false;
+    }
+  });
+}
 // The names a call defines a function under, read off its text (`name ( ) { ... }`, `function
 // name`), wider than bash reads them: quoted text that looks like a definition counts.
 export function functionNames(text: string): Set<string> {
@@ -7002,6 +7130,46 @@ const SAFE_AFTER_WRITE = new Set([
   // their only allowed options are the ones on fetcherWords' lists.
   ...listed("curl wget"),
 ]);
+// Council project review 1, round 4: whether a command runs a program that may run code the
+// session can write (index.ts holds a write back while one may still be running): a file by its
+// path, a shell given a script, or a name off the safe list. git and the readers whose program-
+// running options are judged on their own (their programs are program positions of their own,
+// or ask) are not.
+// (Round 5: sed, awk, jq and zip with a program read from a file, or an option that runs one, by
+// the safe list's own tests.)
+const RUN_READERS = new Set(["find"]);
+// (Round 5: git runs the repository's hooks, and every ref it updates runs reference-transaction:
+// a runner, but for the subcommands that only read and run no hook.)
+const GIT_ONLY_READS = new Set(listed("status diff log show blame ls-files ls-tree rev-parse rev-list cat-file show-ref for-each-ref merge-base count-objects describe shortlog whatchanged grep"));
+export const gitOnlyReads = (args: string[]): boolean => {
+  const call = gitCall(args);
+  return typeof call !== "string" && GIT_ONLY_READS.has(call.sub ?? "");
+};
+// (Round 7: whether a command runs any program PATH finds, not one of bash's own words.)
+export const runsAnyProgram = (cmds: Simple[]): boolean => cmds.some((cmd) => programs(cmd.argv).some((at) => !SHELL_OWN.has(path.basename(cmd.argv[at])) || cmd.argv[at].includes("/")));
+export function runsProjectCode(cmds: Simple[]): boolean {
+  return cmds.some((cmd) =>
+    programs(cmd.argv).some((at) => {
+      const word = cmd.argv[at];
+      const name = path.basename(word);
+      const args = cmd.argv.slice(at + 1);
+      if (word.includes("/")) return true;
+      if (SHELLS.has(name)) return name === "source" || name === "." || shellScript(name, args) !== undefined;
+      if (name === "rg") return args.some((w) => w === "--pre" || w.startsWith("--pre="));
+      if (name === "less" || name === "more" || name === "tar") return pagerRuns(name, args);
+      if (name === "sed") return sedProblem(args) !== undefined;
+      if (AWKS.has(name)) return awkProblem(args) !== undefined;
+      if (name === "jq") return args.some((w) => /^(-[a-zA-Z]*[fL]|--from-file|--library-path)/.test(w) || /\b(import|include)\b/.test(w));
+      if (name === "zip") return args.some((w) => /^-[a-zA-Z0-9]*T/.test(w) || /^--(test|unzip-command)/.test(w));
+      if (name === "git") {
+        const call = gitCall(args);
+        return typeof call === "string" || !GIT_ONLY_READS.has(call.sub ?? "");
+      }
+      return !SAFE_AFTER_WRITE.has(name) && !RUN_READERS.has(name);
+    }),
+  );
+}
+const pagerRuns = (name: string, args: string[]) => (name === "tar" ? !!process.env.TAR_OPTIONS : args.some((a) => /^-[a-zA-Z]*k|^--l/.test(a)) || !!process.env.LESSOPEN || !!process.env.LESSCLOSE);
 // git's subcommands that read objects, refs or the index, or write refs: no filter, driver or
 // alias runs for them, and their hooks and config are read-only in the sandbox. (`push` among
 // them, as `fetch` is: it sends objects, and whether it may run at all is the push check's.)
@@ -7022,12 +7190,27 @@ const DIFF_GIT = new Set(listed("diff log show blame describe shortlog whatchang
 const CAT_FILE_PLAIN = /^-[tsep]$|^--(batch|batch-check|batch-command|batch-all-objects|buffer|unordered|follow-symlinks|allow-unknown-type)(=.*)?$/;
 // bun's subcommands (bun 1.x `bun --help`): the word after `bun` is one of these, or a file.
 const BUN_SUBCOMMANDS = new Set(listed("run test x repl exec install add remove update audit outdated link unlink publish patch pm info build init create upgrade why"));
+function lessFilterPlain(value: string | undefined, ctx: ArgvContext): boolean {
+  if (!value) return true;
+  const m = /^\s*(?:\|\|?-?)?\s*(\/[\w./+-]+)(\s+%s){1,2}\s*$/.exec(value);
+  if (!m || !ctx.inProject) return false;
+  const real = walked(m[1]);
+  return real !== undefined && ![m[1], real].some((p) => !!ctx.inProject?.(p) || !!ctx.canWrite?.(p) || tempDirs().some((t) => within(p, t)));
+}
 // The answer: true (on the list), false, or for a git command whose repository's configuration
 // may name a program, what in it does (B8-2).
 function safeAfterWrite(name: string, args: string[], cmd: Simple, ctx: ArgvContext): boolean | string {
   // A shell is safe for the code it is handed (`bash -c`, whose commands are judged one by one);
   // with a script it is that script (`bash x.sh`, `source x`, `. x`), a program like any other.
   if (SHELLS.has(name)) return name !== "source" && name !== "." && shellScript(name, args) === undefined;
+  // Council project review 1: less runs the program LESSOPEN and LESSCLOSE name on what it shows,
+  // and TAR_OPTIONS can hand tar an option that runs one; both are inherited from your
+  // environment. less is on the list only where each is unset or names, by its absolute path, a
+  // program outside every place a call can write (`| /usr/bin/lesspipe %s`); tar where it is unset.
+  // (Round 3: a lesskey file or text given as an option, `--lesskey-src=keys`,
+  // `--lesskey-content=#env ...`, `-k keys`, can set LESSOPEN too; long options abbreviate.)
+  if (name === "less" || name === "more") return !args.some((a) => /^-[a-zA-Z]*k|^--l/.test(a)) && ["LESSOPEN", "LESSCLOSE"].every((n) => lessFilterPlain(process.env[n], ctx));
+  if (name === "tar" && process.env.TAR_OPTIONS) return false;
   if (SAFE_AFTER_WRITE.has(name)) return true;
   if (name === "rg") return !args.some((w) => w === "--pre" || w.startsWith("--pre="));
   // sed and awk with a program in their words that only edits or prints (sedProblem, awkProblem:
@@ -7271,8 +7454,34 @@ const RUNNER_PLACE_OPTIONS = /^(-C|-d|-f|-S|-B|-P|-c|--directory|--dir|--cwd|--p
 // package directory, a build directory).
 // A spelling the reading cannot place counts as a runner when any of its words could be the
 // runner subcommand, with a place the check cannot tell (fail closed).
+// Council project review 1, round 6: every path a runner's word may hold, whatever the option
+// (`--start-directory=/tmp/d`, `-s/tmp/d`, `-include/tmp/x`, `-C linker=/tmp/x`, `-wrapper
+// /bin/sh,/tmp/x.sh`, `t.py::test_a`, `/tmp/d/...`, a path in quoted JSON): each part after a
+// `=`, `,` or `:`, each tail from a `/`, a short option's attached value, cut at a quote or a
+// brace. Those that exist count as places, read fail-closed.
+function pathPieces(w: string): string[] {
+  const pieces = new Set<string>(w.startsWith("-") ? [] : [w]);
+  for (let k = 0; k < w.length; k++) if ("=,:".includes(w[k])) pieces.add(w.slice(k + 1));
+  for (let k = w.indexOf("/"); k > 0; k = w.indexOf("/", k + 1)) if (w[k - 1] !== "/" && w[k - 1] !== ".") pieces.add(w.slice(k));
+  if (/^-[A-Za-z]./.test(w) && !w.startsWith("--")) pieces.add(w.slice(2));
+  return [...pieces]
+    .flatMap((v) => v.split(/[,="'{}\s]/))
+    .map((v) => v.replace(/::.*$/, "").replace(/\/\.\.\.$/, ""))
+    .filter((v) => v !== "" && !v.startsWith(":") && !/[$`]/.test(v));
+}
 export function runnerPlaces(name: string, args: string[], cwd: string | undefined, resolve: (word: string) => string | undefined): (string | undefined)[] | undefined {
   const words = args.filter((a) => a !== "--");
+  const existing = (word: string): string[] => {
+    if (word.startsWith("@")) return [];
+    return pathPieces(word).flatMap((piece) => {
+      const p = resolve(piece);
+      if (p === undefined) return [];
+      if (fs.existsSync(p)) return [isFile(p) ? path.dirname(p) : p];
+      // (Round 7: `jest -c=/tmp/x.js` after a write of that file in the same call.)
+      // (Not `/` itself: a tail cut from a relative path, `/Cargo.toml` of `../web/Cargo.toml`.)
+      return path.isAbsolute(piece) && path.dirname(p) !== "/" && fs.existsSync(path.dirname(p)) ? [path.dirname(p)] : [];
+    });
+  };
   const read = RUNNER_SUBS.has(name) ? runnerSub(name, args) : undefined;
   // Trust is granted by safeAfterWrite, never by completing a list of dev tools.
   // make reads its words as codeFiles does: the `-C` chain, in every spelling.
@@ -7285,6 +7494,8 @@ export function runnerPlaces(name: string, args: string[], cwd: string | undefin
       const target = tilde(word);
       places.push(expands(word) || (!path.isAbsolute(target) && base === undefined) ? undefined : physical(path.isAbsolute(target) ? target : `${base}/${target}`));
     }
+    // (Round 6: make's other words too, read as every runner's are.)
+    for (const w of words) places.push(...(w.startsWith("@") ? [undefined] : existing(w)));
     return [...new Set(places)];
   }
   const places: (string | undefined)[] = [cwd];
@@ -7311,12 +7522,17 @@ export function runnerPlaces(name: string, args: string[], cwd: string | undefin
       if (value === undefined) continue;
       const p = resolve(value);
       place(value, !!p && isFile(p));
+      places.push(...existing(value));
       continue;
     }
-    if (w.startsWith("-")) continue;
-    // An operand that names something on disk is part of what runs (`pytest tests/test_x.py`).
-    const p = /[$`]/.test(w) ? undefined : resolve(w);
-    if (p !== undefined && fs.existsSync(p)) places.push(isFile(p) ? path.dirname(p) : p);
+    // Council project review 1, round 6: every path a word may hold counts, whatever the option
+    // (`--start-directory=/tmp/d`, `-s/tmp/d`, `-wrapper /bin/sh,/tmp/x.sh`, `t.py::test_a`,
+    // `/tmp/d/...`); a file of more words (`@args`) is not read, and leaves the place unknown.
+    if (w.startsWith("@")) {
+      places.push(undefined);
+      continue;
+    }
+    places.push(...existing(w));
   }
   return places;
 }

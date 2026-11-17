@@ -329,12 +329,12 @@ describe("K1: edit and read only tighten", () => {
       git("fetch", "-q", "origin");
       git("branch", "-q", `--set-upstream-to=origin/${git("branch", "--show-current").trim()}`);
       // (Each in a session of its own: after an ask, the next git command is the model's.)
-      const chained = await call(await start(), "git fetch && git merge --ff-only @{upstream}");
+      const chained = await call(await start(), "git fetch && git merge --ff-only @{upstream}", { sessionID: "r4-12-chained" });
       assert.equal(chained.permission.effect, "ask");
       assert.match(chained.permission.message, /git merge may rewrite .*AGENTS\.md, which the sandbox keeps read-only.*git fetch in the same command/);
-      const alone = await call(await start(), "git merge --ff-only @{upstream}");
+      const alone = await call(await start(), "git merge --ff-only @{upstream}", { sessionID: "r4-12-alone" });
       assert.equal(alone.permission.effect, "allow", alone.permission.message);
-      const pulled = await call(await start(), "git pull");
+      const pulled = await call(await start(), "git pull", { sessionID: "r4-12-pulled" });
       assert.equal(pulled.permission.effect, "ask");
       assert.match(pulled.permission.message, /run `git fetch` first, then `git merge --ff-only @\{upstream\}` or `git rebase @\{upstream\}`, which can be told/);
     } finally {
@@ -1253,8 +1253,9 @@ describe("r3 18/36: calls that run at the same time", () => {
       assert.equal(after.permission.effect, "ask", after.permission.message);
       assert.match(after.permission.message, /leave this to the model/);
       assert.match(after.permission.message, /b10\.sh/);
+      // Council project review 1: another session of the project shares the record.
       const other = await whole(host, "./b10-window-run.sh", { sessionID: "b10w-other" });
-      assert.equal(other.permission.effect, "allow", other.permission.message);
+      assert.equal(other.permission.effect, "ask", other.permission.message);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
       g("rm", "-q", "b10-window-run.sh");
@@ -2313,22 +2314,26 @@ describe("r4 B8 (hooks)", () => {
   const READS = ["tar -tf b8.tar", "tar -cf b8-new.tar b8-f", "unzip -l b8.zip", "patch --dry-run -p1 -i b8.diff", "git apply --stat b8.diff", "git apply --check b8.diff", "ls", "cat b8.diff"];
   test("r4 B8-9: with the sandbox off, a command that unpacks an archive or applies a patch asks", async () => {
     files();
-    const host = await start({ sandbox: false, useClassifier: false });
+    // (Council project review 1: one plugin per command, since the sessions of one share the
+    // record of what was written.)
     for (const c of WRITES) {
+      const host = await start({ sandbox: false, useClassifier: false });
       const { permission } = await call(host, c, { sessionID: `b8-9-${ids}` });
       assert.equal(permission.effect, "ask", c);
       assert.match(permission.message ?? "", /named inside the file and cannot be seen without the sandbox/, c);
     }
     for (const c of READS) {
+      const host = await start({ sandbox: false, useClassifier: false });
       const { permission } = await call(host, c, { sessionID: `b8-9-${ids}` });
       assert.equal(permission.effect, "allow", `${c}: ${permission.message}`);
     }
   });
   test("r4 B8-9: with the sandbox on nothing changes: the same commands are allowed, in the sandbox", async () => {
     files();
-    const host = await start({ useClassifier: false });
-    // (`git am` writes inside .git, and asks for that with the sandbox on, as before.)
+    // (`git am` writes inside .git, and asks for that with the sandbox on, as before. One plugin
+    // per command, as with the sandbox off.)
     for (const c of [...WRITES.filter((w) => !w.startsWith("git am")), ...READS]) {
+      const host = await start({ useClassifier: false });
       const { permission, shell } = await call(host, c, { sessionID: `b8-9on-${ids}` });
       assert.equal(permission.effect, "allow", `${c}: ${permission.message}`);
       assert.ok(wrapped(shell), c);
@@ -2357,13 +2362,16 @@ describe("r4 B8 (hooks)", () => {
       host = await start({ useClassifier: false });
       const again = await call(host, "sh b8s/tidy.sh", { sessionID: "b8-restart" });
       assert.equal(again.permission.effect, "ask");
-      assert.match(again.permission.message ?? "", /changed since this session began/);
-      // What nobody changed since still runs, and a session seen for the first time now is
-      // measured from now.
+      assert.match(again.permission.message ?? "", /changed since this session began|cannot list/);
+      // Council project review 1, round 2: a session an earlier process saw counts as having
+      // written anywhere in the project (what it wrote then is not in this process's record), so
+      // what nobody changed goes to the model too, and so it does for another session (the
+      // record is the project's). A session seen for the first time now has a moment of its own.
       const untouched = await call(host, "sh b8s/old.sh", { sessionID: "b8-restart" });
-      assert.equal(untouched.permission.effect, "allow", untouched.permission.message);
+      assert.equal(untouched.permission.effect, "ask", untouched.permission.message);
+      assert.match(untouched.permission.message ?? "", /cannot list/);
       const other = await call(host, "sh ./b8s/tidy.sh", { sessionID: "b8-restart-other" });
-      assert.equal(other.permission.effect, "allow", other.permission.message);
+      assert.equal(other.permission.effect, "ask", other.permission.message);
       assert.deepEqual(fs.readdirSync(moments).length, 2);
     } finally {
       git("rm", "-q", "-r", "-f", "b8s");
@@ -2442,8 +2450,8 @@ describe("r4 B10 (hooks)", () => {
     assert.equal(permission.effect, "ask", permission.message);
     assert.match(permission.message ?? "", /leave this to the model/);
     assert.match(permission.message ?? "", /b10\.sh/);
-    // Another session wrote nothing.
-    assert.equal((await call(host, "./b10-run.sh", { sessionID: `${sessionID}-other` })).permission.effect, "allow");
+    // Council project review 1: another session of the project (a subagent's) shares the record.
+    assert.equal((await call(host, "./b10-run.sh", { sessionID: `${sessionID}-other` })).permission.effect, "ask");
   });
   test("r4 B10-9: an edit the user rejects is no session write", async () => {
     const target = b10Script();
@@ -2477,5 +2485,230 @@ describe("r4 B10 checks: the shell's PATH", () => {
       const { permission } = await call(host, "ls", { env: { PATH: plain }, sessionID: `r4-b10c-plain-${n}` });
       assert.equal(permission.effect, "allow", `${plain}: ${permission.message}`);
     }
+  });
+});
+
+// Council project review 1: a subagent works in a session of its own, on the same project.
+describe("council project review 1: one record of what was written for every session", () => {
+  test("a session runs what another session wrote: it goes to the model", async () => {
+    const host = await start({ useClassifier: false });
+    const pkg = path.join(project, "package.json");
+    fs.writeFileSync(pkg, '{"name":"x","version":"1.0.0","scripts":{"test":"echo ok"}}\n');
+    try {
+      const before = await call(host, "npm test", { sessionID: "cp1-before" });
+      assert.equal(before.permission.effect, "allow", before.permission.message);
+      // (Over before the write: a write waits for no call that runs code of the project, round 4.)
+      await host.after({ tool: "shell", sessionID: "cp1-before", messageID: "m1", id: before.id, status: "completed" });
+      const wrote = await call(host, "sed -i 's/echo ok/echo changed/' package.json", { sessionID: "cp1-parent" });
+      assert.equal(wrote.permission.effect, "allow", wrote.permission.message);
+      for (const id of ["cp1-child", "cp1-before"]) {
+        const { permission } = await call(host, "npm test", { sessionID: id });
+        assert.equal(permission.effect, "ask", id);
+        assert.match(permission.message, /package\.json/);
+      }
+    } finally {
+      fs.rmSync(pkg, { force: true });
+    }
+  });
+});
+
+describe("council project review 1, round 2: what the record and the shell's environment carry", () => {
+  const g = (...args: string[]) => execFileSync("git", ["-C", project, "-c", "user.name=t", "-c", "user.email=t@t", ...args], { stdio: ["ignore", "pipe", "pipe"] });
+  const runShell = (shell: { shell: string; command: string; env: Record<string, string | undefined> }) => spawnSync(shell.shell, ["-c", shell.command], { cwd: project, env: shell.env as NodeJS.ProcessEnv, encoding: "utf8" });
+  test("a git work-tree change one session made reaches the record of every session", async () => {
+    const here = g("rev-parse", "--abbrev-ref", "HEAD").toString().trim();
+    const pkg = path.join(project, "package.json");
+    fs.writeFileSync(pkg, '{"scripts":{"test":"echo one"}}\n');
+    g("add", "package.json");
+    g("commit", "-qm", "cp1 r2 base");
+    g("checkout", "-qb", "cp1-r2-other");
+    fs.writeFileSync(pkg, '{"scripts":{"test":"echo two"}}\n');
+    g("commit", "-qam", "cp1 r2 other");
+    g("checkout", "-q", here);
+    try {
+      const host = await start({ useClassifier: false });
+      const first = await call(host, "npm test", { sessionID: "cp1r2-b" });
+      assert.equal(first.permission.effect, "allow");
+      await host.after({ tool: "shell", sessionID: "cp1r2-b", messageID: "m1", id: first.id, status: "completed" });
+      const sw = await call(host, "git switch cp1-r2-other", { sessionID: "cp1r2-a" });
+      assert.equal(sw.permission.effect, "allow", sw.permission.message);
+      assert.equal(runShell(sw.shell).status, 0);
+      await host.after({ tool: "shell", sessionID: "cp1r2-a", messageID: "m1", id: sw.id, status: "completed" });
+      const other = await call(host, "npm test", { sessionID: "cp1r2-b" });
+      assert.equal(other.permission.effect, "ask", "the other session");
+      assert.match(other.permission.message, /package\.json/);
+    } finally {
+      g("checkout", "-q", "-f", here);
+      g("branch", "-q", "-D", "cp1-r2-other");
+      g("rm", "-q", "-f", "package.json");
+      g("commit", "-qm", "cp1 r2 cleanup");
+    }
+  });
+  test("a session an earlier process saw counts as having written in the project", async () => {
+    let host = await start({ useClassifier: false });
+    assert.equal((await call(host, "git status", { sessionID: "cp1r2-restart" })).permission.effect, "allow");
+    await host.stop();
+    hosts.splice(hosts.indexOf(host), 1);
+    host = await start({ useClassifier: false });
+    const again = await call(host, "make", { sessionID: "cp1r2-restart" });
+    assert.equal(again.permission.effect, "ask");
+    assert.match(again.permission.message, /cannot list/);
+    assert.equal((await call(host, "git status", { sessionID: "cp1r2-restart" })).permission.effect, "allow", "the safe list as before");
+    assert.equal((await call(host, "make", { sessionID: "cp1r2-new" })).permission.effect, "ask", "the record is the project's");
+  });
+  test("a shell whose LESSOPEN names a place the session can write is not run as decided", async () => {
+    const host = await start({ useClassifier: false });
+    fs.writeFileSync(path.join(project, "cp1-f"), "x\n");
+    try {
+      const plain = await call(host, "less cp1-f", { sessionID: "cp1r2-less" });
+      assert.equal(plain.permission.effect, "allow", plain.permission.message);
+      for (const env of [{ LESSOPEN: "|./lp %s" }, { GIT_EXTERNAL_DIFF: "./differ" }, { EDITOR: `${project}/e` }]) {
+        const { permission } = await call(host, "less cp1-f", { sessionID: "cp1r2-less", env });
+        assert.equal(permission.effect, "ask", JSON.stringify(env));
+        assert.match(permission.message, /names a place the session can write/);
+      }
+      assert.equal((await call(host, "less cp1-f", { sessionID: "cp1r2-less", env: { EDITOR: "vi", LESSOPEN: "| /usr/bin/lesspipe %s" } })).permission.effect, "allow");
+    } finally {
+      fs.rmSync(path.join(project, "cp1-f"), { force: true });
+    }
+  });
+  test("a folded heredoc cat asks where the shell's PATH finds no cat", async () => {
+    const host = await start({ useClassifier: false });
+    const command = `printf '<%s>\\n' "$(cat <<'EOF'\nhello\nEOF\n)"`;
+    assert.equal((await call(host, command, { sessionID: "cp1r2-cat" })).permission.effect, "allow");
+    const empty = path.join(os.homedir(), "cp1-no-cat");
+    fs.mkdirSync(empty, { recursive: true });
+    const { permission } = await call(host, command, { sessionID: "cp1r2-cat", env: { PATH: empty } });
+    assert.equal(permission.effect, "ask");
+    assert.match(permission.message, /PATH/);
+  });
+});
+
+describe("council project review 1, round 3: a plant one session made pauses the others", () => {
+  test("a git directory a call made pauses every session once the call is over, and a session that starts later", async () => {
+    const host = await start({ useClassifier: false });
+    const dir = path.join(project, "cp1r3");
+    try {
+      const plant = await call(host, "mkdir -p cp1r3/objects cp1r3/refs && echo 'ref: refs/heads/main' > cp1r3/HEAD", { sessionID: "cp1r3-sub" });
+      assert.equal(plant.permission.effect, "allow", plant.permission.message);
+      execFileSync("bash", ["-c", plant.shell.command.startsWith("mkdir") ? plant.shell.command : "mkdir -p cp1r3/objects cp1r3/refs && echo 'ref: refs/heads/main' > cp1r3/HEAD"], { cwd: project });
+      await host.after({ tool: "shell", sessionID: "cp1r3-sub", messageID: "m1", id: plant.id, status: "completed" });
+      const later = await call(host, "ls", { sessionID: "cp1r3-parent" });
+      assert.equal(later.permission.effect, "ask");
+      assert.match(later.permission.message, /paused/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("council project review 1, round 4: a write waits for no call that runs code of the project", () => {
+  test("a write asks while an allowed call that runs programs of the project may still be running", async () => {
+    const host = await start({ useClassifier: false });
+    const runner = decidedCall(host, "sleep 1; make", "cp1r4");
+    await runner.decision;
+    const w = await call(host, "printf 'all:\\n' > cp1r4.mk", { sessionID: "cp1r4" });
+    assert.equal(w.permission.effect, "ask");
+    assert.match(w.permission.message, /may still be running/);
+  });
+  test("a call that only reads holds no write back", async () => {
+    const host = await start({ useClassifier: false });
+    const reader = decidedCall(host, "sleep 1; ls", "cp1r4-ls");
+    await reader.decision;
+    const ok = await call(host, "printf x > cp1r4.txt", { sessionID: "cp1r4-ls" });
+    assert.equal(ok.permission.effect, "allow", ok.permission.message);
+  });
+});
+function decidedCall(host: Host, command: string, sessionID: string) {
+  const id = `dc-${++ids}`;
+  const decision = host.tool({ tool: "shell", sessionID, messageID: "m1", id, input: { command } });
+  return { id, decision };
+}
+
+describe("council project review 1, round 5: edits and hooked git calls", () => {
+  test("an edit asks while an allowed call that runs programs of the project may still be running", async () => {
+    const host = await start({ useClassifier: false });
+    const runner = decidedCall(host, "sleep 1; make", "cp1r5");
+    await runner.decision;
+    const permission: any = { sessionID: "cp1r5", action: "edit", resources: [path.join(project, "Makefile")], effect: "allow" };
+    await host.permission(permission);
+    assert.equal(permission.effect, "ask");
+    assert.match(permission.message, /may still be running/);
+  });
+  test("a write asks while an allowed git call that runs hooks may still be running", async () => {
+    const host = await start({ useClassifier: false });
+    const commit = decidedCall(host, "git commit --allow-empty -m cp1r5", "cp1r5-git");
+    await commit.decision;
+    const w = await call(host, "printf x > cp1r5.txt", { sessionID: "cp1r5-git" });
+    assert.equal(w.permission.effect, "ask");
+    assert.match(w.permission.message, /may still be running/);
+  });
+});
+
+describe("council project review 1, round 6: a runner waits for no write that may not have run yet", () => {
+  test("a runner asks while an allowed write decided before it may still be running", async () => {
+    const host = await start({ useClassifier: false });
+    // (A write into a temp directory: it does not reach make's places, so the record alone does
+    // not send make to the model.)
+    const writer = decidedCall(host, `printf x > ${path.join(tmp, "cp1r6.txt")}`, "cp1r6");
+    await writer.decision;
+    const r = await call(host, "make", { sessionID: "cp1r6" });
+    assert.equal(r.permission.effect, "ask");
+    assert.match(r.permission.message, /writes may still be running/);
+  });
+});
+
+describe("council project review 1, round 8: a shell that comes after its call's window", () => {
+  test("an identical call whose shell came after the window asks; the one wrapped in it does not", async () => {
+    const host = await start({ useClassifier: false });
+    const mk = (id: string) => ({ tool: "shell", sessionID: "cp1r8", messageID: "m8", id, input: { command: "ls" } });
+    const shellEvent = () => ({ command: "ls", cwd: project, timeout: 120000, shell: "/bin/bash", env: baseEnv() as Record<string, string | undefined> });
+    const perm = (id: string) => ({ sessionID: "cp1r8", action: "shell", resources: ["ls"], source: { type: "tool", messageID: "m8", id }, effect: "allow" }) as any;
+    await host.tool(mk("r8a"));
+    await host.tool(mk("r8b"));
+    const s1 = shellEvent();
+    await host.shell(s1);
+    assert.ok(wrapped(s1));
+    const real = Date.now;
+    Date.now = () => real() + 16_000;
+    try {
+      const s2 = shellEvent();
+      await host.shell(s2);
+      assert.ok(!wrapped(s2), "left as it is");
+      const pa = perm("r8a");
+      await host.permission(pa);
+      const pb = perm("r8b");
+      await host.permission(pb);
+      assert.equal(pb.effect, "ask", "the call whose shell may be the second");
+      assert.equal(pa.effect, "ask", "either may be");
+    } finally {
+      Date.now = real;
+    }
+  });
+});
+
+describe("council project review 1, round 9: an edit while a runner's hook has not finished", () => {
+  test("a runner asks where an edit was recorded before it was marked decided", async () => {
+    const host = await start({ useClassifier: false });
+    const id = `r9-${++ids}`;
+    const decision = host.tool({ tool: "shell", sessionID: "cp1r9", messageID: "m9", id, input: { command: "make" } });
+    const edit: any = { sessionID: "cp1r9", action: "edit", resources: [path.join(project, "cp1r9.mk")], effect: "allow" };
+    await host.permission(edit);
+    await decision;
+    const shell = { command: "make", cwd: project, timeout: 120000, shell: "/bin/bash", env: baseEnv() as Record<string, string | undefined> };
+    await host.shell(shell);
+    const permission: any = { sessionID: "cp1r9", action: "shell", resources: ["make"], source: { type: "tool", messageID: "m9", id }, effect: "allow" };
+    await host.permission(permission);
+    assert.ok(edit.effect === "ask" || permission.effect === "ask", `edit ${edit.effect}, make ${permission.effect}`);
+  });
+});
+
+describe("council project review 1, round 10: the shell's locale", () => {
+  test("a shell handed a locale whose charset can read a backslash as part of a character asks", async () => {
+    const host = await start({ useClassifier: false });
+    const odd = await call(host, "ls", { sessionID: "cp1r10", env: { LC_ALL: "zh_CN.GBK" } });
+    assert.equal(odd.permission.effect, "ask");
+    assert.match(odd.permission.message, /LC_ALL/);
+    assert.equal((await call(host, "ls", { sessionID: "cp1r10", env: { LC_ALL: "C.UTF-8" } })).permission.effect, "allow");
   });
 });

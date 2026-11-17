@@ -1002,13 +1002,15 @@ describe("r4 B7 (guard level)", () => {
   });
   test("r4 B7-2: the change time of a runner's file operand, and of nothing that is no file", () => {
     const old = fs.statSync(`${dir}/f`, { bigint: true }).ctimeNs;
-    const ctx = (began: bigint | ((file: string, dev: bigint) => bigint)) => ({ began, written: () => new Set<string>() });
+    const ctx = (began: bigint | ((file: string, dev: bigint) => bigint)) => ({ began, written: () => new Set<string>(), cwdOf: () => dir });
     for (const c of ["pytest f", "go run f", "jest f", "bun test f", "bun run f", "bun build f"]) {
       assert.match(verdictOf(c, ctx(old))?.reason ?? "", /runs f, changed since this session began/, c);
       assert.equal(verdictOf(c, ctx(old + 1n)), undefined, c);
     }
     // No file of that name, or a directory: nothing to judge (and `bun test` reads no file `test`).
-    for (const c of ["pytest -k name", "pytest nosuch", "go test ./...", "pytest src", "bun test", "bun run build"]) assert.equal(verdictOf(c, ctx(0n)), undefined, c);
+    // (Council project review 1, round 10: `bun run build` with no script nor file of that name
+    // runs the system command `build`, and asks.)
+    for (const c of ["pytest -k name", "pytest nosuch", "go test ./...", "pytest src", "bun test"]) assert.equal(verdictOf(c, ctx(0n)), undefined, c);
     // The clock is asked for the file's own file system.
     const seen: [string, bigint][] = [];
     verdictOf("pytest f", ctx((file, dev) => (seen.push([file, dev]), old + 1n)));

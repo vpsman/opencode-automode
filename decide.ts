@@ -35,9 +35,10 @@ import {
   type Verdict,
 } from "./rules.ts";
 import { scoreCommand, type ClassifierConfig } from "./kev.ts";
-import { findGitEntries, gitArgs, Scan, gitEnv, gitReadsElsewhere, gitRun, inGitDir, located as followed, madeByPlan, pushHooksMissing, HOOK_MANAGER_FILES, OPENCODE_CONFIG_NAMES, OPENCODE_PROJECT_FILES, opencodeDirs, protectedPaths, realpath, safeGit, workTreeSubmodules } from "./sandbox.ts";
+import { TEMP_CODE_CACHES, findGitEntries, gitArgs, Scan, gitEnv, gitReadsElsewhere, gitRun, inGitDir, located as followed, madeByPlan, pushHooksMissing, HOOK_MANAGER_FILES, OPENCODE_CONFIG_NAMES, OPENCODE_PROJECT_FILES, opencodeDirs, protectedPaths, realpath, safeGit, workTreeSubmodules } from "./sandbox.ts";
 import { canonical, type Printed } from "./canon.ts";
-import { PathWalkError, PWD_LEAD, fetchDestination, functionNames, pathFinds, procRelative, runsItsWords, tempDirs, unseenWriter } from "./guard.ts";
+import { PathWalkError, PWD_LEAD, fetchDestination, functionNames, pathFinds, pathHas, procRelative, runsItsWords, tempDirs, unseenWriter } from "./guard.ts";
+import { bentEnv, bentPath, gitOnlyReads, runsAnyProgram, runsProjectCode } from "./guard.ts";
 import { abbreviates, allCommands, arithmeticAssignments, braceWords, expandNames, expandWord, gitMessageWords, EDITOR_ASSIGNMENT, editorCommand, programs, withoutGlobals, alsoByName, argvGuards, dangerousName, envAssignmentsOk, expansionProblem, gitCall, gitProblem, inputReads, landing, linkedReads, literalTargets, located, physical, placedReads, present, cdTo, type Place, type Places, observer, protectedNameIn, runtimeReads, single, stricter, strict, strictCommands, textGuards, tilde, tildeMismatch, unmodelled, writesOf, writtenBy, type Single, type StrictCommand, getopt, GIT_OPTIONS, lastOf, type Getopt, unreadableGlob, withoutExpansions } from "./guard.ts";
 
 export type Effect = "allow" | "ask" | "deny";
@@ -138,6 +139,14 @@ export interface Decision {
   printed?: string;
   // The printed text relies on bash (braces expanded, `[[ ]]`, `<<<`, ...): under dash it asks.
   bashOnly?: boolean;
+  // A `"$(cat <<EOF ...)"` was printed as the text it stands for, judged by opencode's own PATH.
+  folded?: boolean;
+  // Council project review 1, round 4: an allow that records writes, and one that runs programs
+  // of the project (index.ts: a write waits for no such call that may still be running).
+  writes?: boolean;
+  runsCode?: boolean;
+  // The record's count when this allow was judged, its own write counted (round 9).
+  recordAt?: number;
   // On an ask: records what the call writes, as an allow does (its named writes, the marks of the
   // writes the checks cannot list, and the git work-tree changes it will make), for when the user
   // approves it (round 4, finding 4, second pass). The plugin calls it from its approval hook.
@@ -417,6 +426,9 @@ export class SessionState {
   // Compare only filesystem timestamps. Failure to take a baseline grants no trust.
   readonly began: bigint;
   readonly project: string;
+  // Council project review 1, round 2: the session was seen by an earlier process (its moment
+  // was kept): what it wrote then is not in this process's record.
+  readonly resumed: boolean;
   files: SessionFiles = new Map();
   // Files a command of this session wrote, appended to or edited in place. The rules' own list
   // (`files`) leaves an appended file's origin alone and does not follow `sed -i`.
@@ -449,9 +461,13 @@ export class SessionState {
   // it: once the call is over, the files git changed are marked (added to `touched`); until then,
   // its repository counts as marked.
   worktree: WorkTreeChange[] = [];
+  // Council project review 1, round 6: how many times the record grew, shared like it: a call
+  // that runs programs of the project and was being decided while it grew asks.
+  record = { writes: 0 };
   constructor(project: string, id?: string) {
     this.project = realpath(project);
     const own = SessionState.moment();
+    this.resumed = id !== undefined && fs.existsSync(momentFile(id));
     this.moment = id === undefined ? own : sessionMoment(id, own);
     this.began = this.moment.at;
   }
@@ -3482,7 +3498,7 @@ function heldRewritten(c: { sub: string; rest: string[]; dir: string }, held: ()
   // program of the project (a clean filter), as below.
   if (writes === "all" && now && gitProgramsOutside(tree, false, (p) => within(realish(p), realish(tree)))) {
     const others = gitRun(["-C", tree, "ls-files", "--others", "-z", ...(stashFlag("a", "--all") ? [] : ["--exclude-standard"])]);
-    const unchanged = (cached: string[]) => gitRun(["-C", tree, "diff", "--quiet", "--no-ext-diff", "--no-textconv", ...cached, "HEAD", "--"]).status === 0;
+    const unchanged = (cached: string[]) => gitRun(["-C", tree, "diff", "--quiet", "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty", ...cached, "HEAD", "--"]).status === 0;
     if (others.status === 0 && others.out === "" && unchanged([]) && unchanged(["--cached"])) return undefined;
   }
   if (writes === "cannot tell" || writes === "clean" || writes === "all" || after !== undefined) return unsure();
@@ -4432,16 +4448,33 @@ export function outsideProgram(value: string, top: string, inside: (p: string) =
   if ([file, real].some((f) => inside(f) || within(f, temp))) return false;
   return rest.every((w) => /^%[A-Za-z]$/.test(w) || w.replace(/^-+/, "").split("=").every((part) => !/[\/.]/.test(part) && (part === "" || !lexists(path.join(top, part)))));
 }
+// Council project review 1, round 2: a program the repository's own configuration names (the
+// scopes `local` and `worktree`, which a call may have written: a repository it built in a temp
+// directory) passes only as one of KNOWN_PROGRAM_LINES; your own and the system's as before.
 function gitProgramsOutside(dir: string, diff: boolean, inside: (p: string) => boolean): boolean {
   const keys = diff ? "^(filter\\..*\\.(clean|smudge|process)|diff\\.external|diff\\..*\\.(command|textconv))$" : "^filter\\..*\\.(clean|smudge|process)$";
-  const r = gitRun(["-C", dir, "config", "--null", "--get-regexp", keys]);
+  const r = gitRun(["-C", dir, "config", "--show-scope", "--null", "--get-regexp", keys]);
   if (r.status === 1) return true;
   if (r.status !== 0) return false;
   const top = safeGit(["-C", dir, "rev-parse", "--show-toplevel"])?.trim() || dir;
-  return r.out.split("\0").filter(Boolean).every((entry) => {
+  const fields = r.out.split("\0");
+  if (fields.at(-1) === "") fields.pop();
+  if (fields.length % 2) return false;
+  for (let i = 0; i < fields.length; i += 2) {
+    const [scope, entry] = [fields[i], fields[i + 1]];
     const at = entry.indexOf("\n");
-    return at >= 0 && outsideProgram(entry.slice(at + 1), top, inside);
-  });
+    if (at < 0) return false;
+    const [key, value] = [entry.slice(0, at), entry.slice(at + 1)];
+    if (!outsideProgram(value, top, inside)) return false;
+    if (scope !== "global" && scope !== "system" && !KNOWN_PROGRAM_LINES.some((l) => l.key.test(key) && l.value.test(value))) return false;
+  }
+  // (Round 3: git-lfs runs the programs its own keys name, an extension's clean and smudge or a
+  // custom transfer agent: with one set, no git-lfs line holds.)
+  if (/(^|\s|")git-lfs\s/.test(r.out)) {
+    const lfs = gitRun(["-C", dir, "config", "--null", "--name-only", "--get-regexp", "^lfs\\.(extension\\.|customtransfer\\.|standalonetransferagent)"]);
+    if (lfs.status !== 1) return false;
+  }
+  return true;
 }
 
 // B8-2: what in the configuration of the repository git works in at `dir` may name a program, or
@@ -4941,7 +4974,9 @@ function worktreeStatus(top: string): Map<string, string> | undefined {
   // runs before the sandbox: give up rather than execute a configured project program (one
   // outside the work tree, git-lfs's, is the user's own and runs for every status of theirs).
   if (!gitProgramsOutside(top, false, (p) => within(realish(p), realish(top)))) return undefined;
-  const r = gitRun(["-C", top, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching", "--ignore-submodules=none"], 10_000);
+  // (`dirty`: a submodule's commit is compared, and nothing runs in it: its own filters are not
+  // read here. Council project review 1, round 2.)
+  const r = gitRun(["-C", top, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching", "--ignore-submodules=dirty"], 10_000);
   if (r.status !== 0) return undefined;
   const out = new Map<string, string>();
   const fields = r.out.split("\0");
@@ -4968,10 +5003,16 @@ function worktreeStatus(top: string): Map<string, string> | undefined {
 }
 // The work-tree change a git call will make where it runs, or undefined where the check cannot
 // tell (the directory unknown, not a repository, HEAD unborn, git failing).
-function worktreeBefore(dir: string | undefined): WorkTreeChange | undefined {
+// Council project review 1, round 5: only in a repository of the project, whose configuration
+// every sandboxed call has read-only. One elsewhere (a temp directory) may be one a call still
+// running made after its plan, whose configuration it can rewrite between the filter check and
+// the status, and the status would run what it names here: its work tree is marked whole
+// (`outside`) and not read.
+function worktreeBefore(dir: string | undefined, roots: string[]): WorkTreeChange | { outside: string } | undefined {
   if (dir === undefined) return undefined;
   const top = safeGit(["-C", dir, "rev-parse", "--show-toplevel"])?.trim();
   if (!top) return undefined;
+  if (!roots.some((r) => within(realish(top), r))) return { outside: realish(top) };
   const head = safeGit(["-C", top, "rev-parse", "--verify", "-q", "HEAD"])?.trim();
   if (!head) return undefined;
   const status = worktreeStatus(top);
@@ -5015,7 +5056,8 @@ function worktreeChanged(e: WorkTreeChange): { files: string[]; dirs: string[] }
 // At each decision: the git calls that are over get their changed files marked. (The
 // repositories of those that may still run count as marked: see decidePrinted.)
 function settleWorktree(session: SessionState): void {
-  session.worktree = session.worktree.filter((e) => {
+  // (In place: every session of the project holds the same list. Council project review 1.)
+  const kept = session.worktree.filter((e) => {
     if (!e.done) return true;
     const changed = worktreeChanged(e);
     if (!changed) {
@@ -5026,6 +5068,8 @@ function settleWorktree(session: SessionState): void {
     for (const d of changed.dirs) if (!session.unlisted.includes(realish(d))) session.unlisted.push(realish(d));
     return false;
   });
+  if (kept.length !== session.worktree.length) session.record.writes++;
+  session.worktree.splice(0, session.worktree.length, ...kept);
 }
 
 // The rules' deny for a command as it was issued, if they have one (see decideShell). A text
@@ -5065,11 +5109,12 @@ export async function decideShell(guard: Guard, session: SessionState, cwd: stri
     const roots = projectRoots(session).map(realish);
     const writable = (p: string) => [...roots, ...guard.allowedPaths, ...(guard.writable ?? [])].some((d) => within(realish(p), realish(d)));
     // (A relative PATH entry is not placed: a `cd` in the call may come before the substitution.)
-    const odd = pathFinds("cat", undefined, writable, () => false);
+    // (Council project review 1: and a PATH that finds no `cat` at all runs none.)
+    const odd = pathFinds("cat", undefined, writable, () => false) ?? (pathHas("cat") ? undefined : { why: "PATH finds no cat" });
     if (odd) return withApproval(session, askBy(`the command's "$(cat <<EOF ...)" is printed as the text it stands for, and the cat it would run is not plainly the real one (${odd.why})`));
   }
   const decision = await decidePrinted(guard, session, cwd, printed, signal, scan);
-  return { ...withApproval(session, decision), printed: printed.text, ...(printed.bashOnly ? { bashOnly: true } : {}) };
+  return { ...withApproval(session, decision), printed: printed.text, ...(printed.bashOnly ? { bashOnly: true } : {}), ...(printed.folded ? { folded: true } : {}) };
   } catch (e) {
     if (e instanceof PathWalkError) return withApproval(session, askBy(e.message));
     throw e;
@@ -5084,6 +5129,7 @@ function withApproval(session: SessionState, d: Decision): Decision {
     ...d,
     approve: () => {
       for (const r of projectRoots(session).map(realish)) if (!session.unlisted.includes(r)) session.unlisted.push(r);
+      session.record.writes++;
     },
   };
 }
@@ -5091,6 +5137,8 @@ function withApproval(session: SessionState, d: Decision): Decision {
 // `printed.text` is what runs: the scanner and the checks that grant trust read it. The rules
 // and the guards read `printed.judged` (see canon.ts for the few places where the two differ).
 async function decidePrinted(guard: Guard, session: SessionState, cwd: string, printed: Printed, signal: AbortSignal | undefined, scan: Scan): Promise<Decision> {
+  // (Round 6: the record as it is when the decision begins; see `allowed`.)
+  const recordAt = session.record.writes;
   const run = printed.text;
   const text = printed.judged;
   // What the layout check could not see (a walk that stopped, a directory that cannot be listed)
@@ -5255,7 +5303,11 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
       const at = cwdOf(u.cmd);
       let dir: string | undefined = at;
       for (const d of u.git) dir = /[$`*?[\]]/.test(d) || /^~[^/]/.test(d) ? undefined : path.isAbsolute(tilde(d)) ? tilde(d) : dir === undefined ? undefined : `${dir}/${d}`;
-      const before = worktreeBefore(dir);
+      const before = worktreeBefore(dir, projectRoots(session).map(realish));
+      if (before && "outside" in before) {
+        mark(before.outside, u.cmd);
+        continue;
+      }
       if (before) {
         if (!worktree.some((w) => w.top === before.top)) worktree.push(before);
         marksBy.set(u.cmd, [...(marksBy.get(u.cmd) ?? []), before.top]);
@@ -5367,6 +5419,7 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
     if (committed) return;
     committed = true;
     commitWrites(scope);
+    session.record.writes++;
     for (const p of writes) session.touched.add(p);
     for (const d of marks) if (!session.unlisted.includes(d)) session.unlisted.push(d);
     session.worktree.push(...worktree);
@@ -5381,7 +5434,22 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
     for (const r of roots.map(realish)) if (!session.unlisted.includes(r)) session.unlisted.push(r);
   };
   const asked = (d: Decision): Decision => (d.effect === "ask" ? { ...d, approve: d.rule === "classify" ? () => (commit(), unread()) : commit, ...(worktree.length ? { worktree } : {}) } : d);
-  const allowed = (d: Decision): Decision => (commit(), worktree.length ? { ...d, worktree } : d);
+  const d0 = { unread: false };
+  // (Round 5: a git that only reads runs what the repository's configuration names, as the
+  // safe list reads it: a filter, a textconv, fsmonitor.)
+  // (Round 6: and the hooks it runs, `post-index-change` for a status: gitAfterWrite.)
+  const gitReadRuns = () => cmds.some((cmd) => programs(cmd.argv).some((at) => path.basename(cmd.argv[at]) === "git" && gitOnlyReads(cmd.argv.slice(at + 1)) && gitAfterWrite(cmd, cmd.argv.slice(at + 1), true) !== undefined));
+  // (Round 7: with a PATH entry the session can write, any program PATH finds may be the session's.)
+  // (Round 8: and with a variable of opencode's environment that names one, LD_PRELOAD say.)
+  const bentRuns = () => (bentPath((p) => !!inProject(p) || canWrite(p)) !== undefined || bentEnv((p) => !!inProject(p) || canWrite(p)) !== undefined) && runsAnyProgram(cmds);
+  const flags = () => ({ ...(writes.length || marks.length || worktree.length || scope.pending.size || d0.unread ? { writes: true } : {}), ...(runsProjectCode(cmds) || gitReadRuns() || bentRuns() ? { runsCode: true } : {}) });
+  const allowed = (d: Decision): Decision => {
+    const f = flags();
+    // (Round 6: judged on the record as it was when this decision began.)
+    if (f.runsCode && session.record.writes !== recordAt) return asked(askBy("a write was recorded while this call was being decided, and it runs programs of the project, which may now be other than the ones judged"));
+    commit();
+    return { ...d, ...f, recordAt: session.record.writes, ...(worktree.length ? { worktree } : {}) };
+  };
   if (gitIssue) return asked(askBy(gitIssue));
   if (writeIssue) return asked(askBy(writeIssue));
   if (verdict.action === "ask") return asked(fromRules(verdict));
@@ -5398,6 +5466,10 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   if (typeof guard.classifier.askAbove !== "number" || !(score < guard.classifier.askAbove)) {
     return asked({ effect: "ask", by: "model", rule: "classify", reason: `model risk ${score.toFixed(2)} (asks at ${guard.classifier.askAbove} and above)`, score, ms });
   }
+  // Council project review 1, round 4: what a call the model allows writes is code the checks do
+  // not read, as for one the user approves: the project is marked whole.
+  unread();
+  d0.unread = true;
   return allowed({ effect: "allow", by: "model", rule: "classify", reason: `model risk ${score.toFixed(2)}`, score, ms });
 }
 
@@ -5461,6 +5533,13 @@ function protectedFile(guard: Guard, session: SessionState, target: string, scan
 
 // edit/write/patch: only ever tightens. Undefined means "leave opencode's own verdict alone".
 export function decideFile(guard: Guard, session: SessionState, cwd: string, target: string): Decision | undefined {
+  // Council project review 1, round 9: a temp directory's code cache (node's compile cache, tsx,
+  // jiti, ...), which a later node outside the sandbox runs: sandboxed calls get a private copy,
+  // and an edit there asks.
+  const at = realish(path.resolve(cwd, target));
+  const caches = [...new Set(["/tmp", "/var/tmp", os.tmpdir()].map(realish))].flatMap((t) => TEMP_CODE_CACHES.map((n) => path.join(t, n)));
+  const moved = process.env.NODE_COMPILE_CACHE;
+  if ([...caches, ...(moved && path.isAbsolute(moved) ? [realish(moved)] : [])].some((c) => within(at, c))) return withApproval(session, askBy(`edit inside ${at}, a cache of code that node runs later outside the sandbox`));
   // One walk of each root for this edit (round 3, finding 40).
   const scan = new Scan(guard.allowedPaths);
   projectRoots(session, scan);
@@ -5478,11 +5557,13 @@ export function decideFile(guard: Guard, session: SessionState, cwd: string, tar
   const approve = () => {
     commitWrites(scope);
     if (![file, realish(file)].some((p) => scope.files.has(p))) scope.files.set(file, "other");
+    session.record.writes++;
   };
   if (verdict.action === "allow") {
     const reason = protectedFile(guard, session, path.resolve(cwd, target), scan);
     if (reason) return { effect: "ask", by: "rules", rule: "ask", reason: `edit ${reason}`, approve };
     commitWrites(scope);
+    session.record.writes++;
     return undefined;
   }
   const decision = fromRules(verdict);

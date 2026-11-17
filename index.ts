@@ -42,9 +42,9 @@ import { fileURLToPath } from "node:url";
 import { Plugin } from "@opencode/plugin";
 import { compileRules, compilePattern, within } from "./rules.ts";
 import { closeGitSnapshot, decideFile, decideRead, decideShell, EXPECT_MS, expectedRepos, gitDirectories, gitOnly, gitWriteDirectories, gitMaintainDirectories, gitStateTampered, gitTampered, mirrorable, noteGitCall, projectRoots, pushCandidate, pushDestinations, quarantineGitFiles, realish, sandboxBreaks, SessionState, unseenWrites, usesSsh, type Decision, type Expected, type GitCall, type Guard } from "./decide.ts";
-import { envKept, envStringProblem, gitElsewhere, plan, realpath, Scan, shellOwn, type Plan } from "./sandbox.ts";
+import { envKept, envStringProblem, gitElsewhere, plan, realpath, Scan, setPluginWritable, shellOwn, type Plan } from "./sandbox.ts";
 import { loadConfig, type Config } from "./config.ts";
-import { bentPath, shellAlsoKeeps, shellCdpath } from "./guard.ts";
+import { bentEnv, bentPath, localeOk, pathFinds, pathHas, shellAlsoKeeps, shellCdpath } from "./guard.ts";
 import { canonical } from "./canon.ts";
 
 // A command that holds the word `git` as a program's name (broad on purpose: `.git` and
@@ -225,6 +225,9 @@ interface Call {
   // Its shell's PATH holds an entry the session can write (in the project, a temp directory, empty
   // or relative) that opencode's own does not: the safe list was judged by opencode's.
   bentPath?: string;
+  // A variable the checks read from opencode's own environment (PATH for a folded heredoc `cat`,
+  // PROGRAM_ENV for the safe list) that its shell has otherwise, in a way that matters.
+  envDiffers?: string;
   // permission.evaluate was applied, or the tool call is over: it waits for no shell.
   settled?: boolean;
   // Where the command would create repositories, when it asks; and the approval of that.
@@ -310,12 +313,39 @@ export default Plugin.define({
       return decision;
     };
     let guard = makeGuard();
+    // Council project review 1, round 4: the places a call can write, which the plugin's own git
+    // leaves out of its PATH (sandbox.ts, pluginPath).
+    setPluginWritable((p) => {
+      const top = realpath(project);
+      return within(p, top) || within(p, project) || [...config.allowedPaths, ...config.sandboxWritable].some((d) => within(p, d));
+    });
 
     const sessions = new Map<string, SessionState>();
     const session = (id: string) => {
       let s = sessions.get(id);
       // (B8-5: with its id, so that the moment it is measured from outlives a restart.)
-      if (!s) sessions.set(id, (s = new SessionState(project, id)));
+      if (!s) {
+        s = new SessionState(project, id);
+        // Council project review 1: one record of what was written for every session of the
+        // project. A subagent's session, or a second one, runs what another session wrote.
+        const first = sessions.values().next().value;
+        if (first) {
+          s.files = first.files;
+          s.touched = first.touched;
+          s.unlisted = first.unlisted;
+          s.worktree = first.worktree;
+          s.record = first.record;
+        }
+        // Round 2: a session an earlier process saw (opencode restarted) may have written
+        // anywhere in the project then: the project is marked whole, as for an approved call
+        // the checks could not read.
+        if (s.resumed) for (const r of projectRoots(s)) if (!s.unlisted.includes(r)) s.unlisted.push(r);
+        // Round 3: while another session is paused, a new one starts paused: its baseline would
+        // be the tree with what the pause is about in it.
+        const paused = [...sessions.values()].find((o) => o.tampered)?.tampered;
+        if (paused) s.tampered = { ...paused };
+        sessions.set(id, s);
+      }
       return s;
     };
 
@@ -368,10 +398,18 @@ export default Plugin.define({
           // the next decision checks again
         }
       }
-      if (!c.expecting) return;
-      c.expecting.done = true;
+      if (c.expecting) c.expecting.done = true;
+      // Council project review 1, round 3: the layout check for every allowed call that is over,
+      // not only an approved one that expected a repository. What a call planted pauses every
+      // session now, and not at its own session's next decision: a subagent's session may make
+      // none, and a session that starts later would take the tree as it then is for its baseline.
+      // (An ask whose approval is not yet known is checked when it is, or at its next decision.)
+      if (!c.expecting && c.decision.effect !== "allow") return;
       try {
-        gitTampered(session(c.sessionID), RESUME_FILE);
+        const s = session(c.sessionID);
+        const before = s.tampered;
+        const found = gitTampered(s, RESUME_FILE);
+        if (found && !before && s.tampered) pauseAll(found, s);
       } catch {
         // the next decision checks again
       }
@@ -415,6 +453,19 @@ export default Plugin.define({
         const push = others.find((c) => c.push && (!c.decided || c.decision.effect === "allow"));
         if (push) return `a checked push may still be running (${clip(push.command, 80)}), and this call gets a writable .git, with which it could move HEAD or a branch under it`;
       }
+      // Council project review 1, round 4: a call allowed earlier (in the same message, in the
+      // background, in another session) is judged by the record as it was then. A write now could
+      // change what it runs once it gets there: the write asks while one may still be running.
+      if (call.decision.writes) {
+        const runner = others.find((c) => c.decided && c.decision.effect === "allow" && c.decision.runsCode);
+        if (runner) return `another allowed call that runs programs of the project may still be running (${clip(runner.command, 80)}), and what this call writes could change what that runs after it was judged`;
+      }
+      // (Round 6, the other way round: an allowed write decided before this call may not have run
+      // yet, and this call was judged on the files as they are now.)
+      if (call.decision.runsCode) {
+        const writer = others.find((c) => c.decided && c.decision.effect === "allow" && c.decision.writes);
+        if (writer) return `another allowed call that writes may still be running (${clip(writer.command, 80)}), and this call, which runs programs of the project, was judged on the files as they were before that write`;
+      }
       const open = windows().find((e) => reaches(call, e.dirs));
       if (open) return `an approved command may still be creating a repository in ${open.dirs[0]}, and this call could write there`;
       return undefined;
@@ -450,6 +501,11 @@ export default Plugin.define({
         decision = await decide(s, cwd, command, scan);
       } catch (e) {
         decision = { effect: "ask", by: "rules", rule: "ask", reason: `automode failed, asking instead: ${(e as Error).message}` };
+      }
+      // Council project review 1, round 9: an edit or a write recorded between the decision and
+      // now (the call is not yet marked decided, so the hold-back does not see it).
+      if (decision.effect === "allow" && decision.runsCode && decision.recordAt !== undefined && s.record.writes !== decision.recordAt) {
+        decision = { ...decision, effect: "ask", reason: "would be allowed, but a write was recorded while this call was being decided, and it runs programs of the project" };
       }
       call.decision = decision;
       call.at = Date.now();
@@ -585,6 +641,10 @@ export default Plugin.define({
       // Calls whose shell never came (the tool failed first, or opencode denied it) drop out,
       // so they cannot take the place of a later identical command.
       const queue = waiting(key);
+      // Council project review 1, round 8: a call of this command and directory that is no longer
+      // waiting (decided more than the window ago) and not settled may be this shell's: it is left
+      // as it is, and that call's allow asks.
+      for (const c of calls.values()) if (!c.settled && !queue.includes(c) && wrapKey(c.command, c.cwd) === key) c.unsure = true;
       if (!queue.length) return void toWrap.delete(key);
       toWrap.set(key, queue);
       // Marks the processes of this shell, whichever of the waiting calls it belongs to.
@@ -650,6 +710,28 @@ export default Plugin.define({
           for (const c of queue) {
             c.unsure = true;
             c.bentPath = bent;
+          }
+          event.env.AUTOMODE_CALL = token;
+          return;
+        }
+      }
+      // Council project review 1, round 2: what else the checks read from opencode's own
+      // environment. A folded `"$(cat <<EOF ...)"` is the command as written only where the
+      // shell's PATH finds the real cat; and the safe list holds by the variables that name a
+      // program or a file it loads (PROGRAM_ENV), as by PATH above: one the shell has that names
+      // a place the session can write, where opencode's own names none, is not what was judged.
+      if (config.enabled && queue.some((c) => c.decision.effect === "allow")) {
+        const top = realpath(project);
+        const inProject = (p: string) => within(p, top) || within(p, project) || [...config.allowedPaths, ...config.sandboxWritable].some((d) => within(p, d));
+        const catOdd = shellPath !== process.env.PATH && queue.some((c) => c.decision.folded) && (pathFinds("cat", undefined, inProject, () => false, shellPath ?? "") !== undefined || !pathHas("cat", shellPath ?? ""));
+        const shellBent = bentEnv(inProject, event.env);
+        // (Round 10: and a locale whose charset can read a `\` as part of a character.)
+        const locale = ["LC_ALL", "LC_CTYPE", "LANG"].find((n) => event.env[n] !== undefined && !localeOk(event.env[n]!));
+        const name = catOdd ? "PATH" : shellBent !== undefined && bentEnv(inProject) === undefined ? shellBent.slice(0, shellBent.indexOf("=")) : locale;
+        if (name) {
+          for (const c of queue) {
+            c.unsure = true;
+            c.envDiffers = name;
           }
           event.env.AUTOMODE_CALL = token;
           return;
@@ -778,6 +860,8 @@ export default Plugin.define({
                 ? `${would}, but its shell inherits ${call.gitEnv}, which makes git work in another repository or with another configuration than the one that was judged (the checks read the repository in the command's directory). Unset it where opencode is started, or approve this to run it as it is; naming it in sandboxKeepEnv keeps it for sandboxed shells and does not change this`
               : call.bentPath !== undefined
                 ? `${would}, but its shell's PATH holds ${clip(call.bentPath, 200)}, a directory the session can write, which opencode's own PATH does not: the checks judged the programs it names by opencode's PATH, and this shell may find others under the same names. Start opencode and its sessions with the same PATH, or approve this to run it as it is`
+              : call.envDiffers !== undefined
+                ? `${would}, but its shell's ${call.envDiffers} is not opencode's own, which the checks judged it by (${call.envDiffers === "PATH" ? 'a "$(cat <<EOF ...)" is printed as its text only where PATH finds the real cat, and this one may not' : /^(LANG|LC_)/.test(call.envDiffers) ? "a charset other than UTF-8 can read a backslash as part of a character" : "it names a place the session can write, through which a program may run or load what the session wrote"}). Start opencode and its sessions with the same ${call.envDiffers}, or approve this to run it as it is`
               : call.cdpath !== undefined
                 ? `${would}, but its shell ${call.cdpath ? `has CDPATH=${clip(call.cdpath, 200)}` : "has no CDPATH"} and opencode's own environment ${shellCdpath() ? `has ${clip(shellCdpath()!, 200)}` : "has none"} (sandboxKeepEnv keeps the shell's): bash looks the directory of a cd up in CDPATH, and the checks followed this command's cd as opencode's own environment says, so it may lead somewhere else in this shell. Start opencode and its sessions with the same CDPATH (or with none), or approve this to run it as it is`
               : call.tooLong
@@ -835,6 +919,15 @@ export default Plugin.define({
               editAsked(0);
               return;
             }
+          }
+          // Council project review 1, round 5: as for a shell call that writes (besides).
+          const runner = [...live].find((c) => c.decided && c.decision.effect === "allow" && c.decision.runsCode);
+          if (runner) {
+            const decision: Decision = { effect: "ask", by: "rules", rule: "ask", reason: `another allowed call that runs programs of the project may still be running (${clip(runner.command, 80)}), and this edit could change what that runs after it was judged` };
+            apply(event, decision);
+            log(config, { ...base, ...decision });
+            editAsked(0);
+            return;
           }
         }
         if (event.action === "edit" || event.action === "read") {
