@@ -794,3 +794,29 @@ test("round 30: unzip's dashes carry, go mod edit writes go.mod", async () => {
   await effect("go mod edit -json", t);
   assert.equal(await effect("npm test", t), "allow", "go mod edit -json writes nothing");
 });
+
+// ---- round 31 ----
+
+test("round 31: unzip reads options past a bare - and an x, npm version writes package.json, go -C mod edit", async () => {
+  const b = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-r31-")));
+  try {
+    for (const o of ["-o - --o", "-o -x --o", "-n -x --n", "-ox --o", "-o -qx --o", "-o -x -- -o"]) {
+      const s = new SessionState(repo);
+      const wrote = await effect(`printf 'r\\n/x.test.js\\n' | unzip ${o} ${b}/a.zip -d ${b}/out`, s);
+      assert.ok(wrote !== "allow" || (await effect("npm test", s)) !== "allow", o);
+    }
+    const ok = new SessionState(repo);
+    await effect(`unzip -o -x ${b}/a.zip -d ${b}/out`, ok);
+    assert.equal(await effect("npm test", ok), "allow", "-o -x alone never prompts");
+  } finally {
+    fs.rmSync(b, { recursive: true, force: true });
+  }
+  for (const writer of ["npm version 1.2.3 --no-git-tag-version", "npm pkg set scripts.test=x", "go -C . mod edit -require=example.com/x@v1.0.0"]) {
+    const s = new SessionState(repo);
+    const wrote = await effect(writer, s);
+    assert.ok(wrote !== "allow" || (await effect("npm test", s)) !== "allow", writer);
+  }
+  const v = new SessionState(repo);
+  await effect("npm version", v);
+  assert.equal(await effect("npm test", v), "allow", "npm version alone prints versions");
+});

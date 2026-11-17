@@ -5159,12 +5159,13 @@ function unzipNeverPrompts(args: string[]): boolean {
   let n = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (!a.startsWith("-") || a === "-") break;
+    // (Round 31, Astra: a bare `-` is an option word to unzip, a dash that carries.)
+    if (a === "-") return false;
+    if (!a.startsWith("-")) break;
     // (Round 30, all four: unzip counts each `-` and carries the count into the next word until an
     // option letter uses it, `-o--o`, `-q- -o`, `---o`: any such word may leave it prompting.)
     if (a.slice(1).includes("-")) return false;
     let negate = false;
-    let stop = false;
     for (let j = 1; j < a.length; j++) {
       const c = a[j];
       if (c === "-") {
@@ -5175,14 +5176,11 @@ function unzipNeverPrompts(args: string[]): boolean {
         if (j === a.length - 1) i++;
         break;
       }
-      if (c === "x") {
-        stop = true;
-        break;
-      }
+      // (Round 31, Mythos and Opus: an `x` before the archive changes nothing, and the options
+      // go on; the member list starts after the archive.)
       if (c === "o") o = !negate;
       if (c === "n") n = !negate;
     }
-    if (stop) break;
   }
   return o || n;
 }

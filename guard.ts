@@ -5081,7 +5081,18 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
   if (COMPILER.test(name) && !compilerQuery(args)) return `${name} writes files under names it or its options choose`;
   if (name === "rustc" && !rustcQuery(args)) return "rustc writes its outputs, whose names the check does not place";
   // (Council project review 2, round 30, Mythos: `go mod edit` rewrites go.mod where it runs.)
-  if (name === "go" && args[0] === "mod" && args[1] === "edit" && !args.slice(2).every((a) => /^--?(json|print|fmt)$/.test(a) || !a.startsWith("-"))) return "go mod edit writes go.mod";
+  if (name === "go") {
+    // (Round 31: past `-C <dir>`, as the subcommand is read elsewhere.)
+    let k = 0;
+    while (k < args.length && args[k].startsWith("-")) k += /^--?C$/.test(args[k]) ? 2 : 1;
+    if (args[k] === "mod" && args[k + 1] === "edit" && !args.slice(k + 2).every((a) => /^--?(json|print|fmt)$/.test(a) || !a.startsWith("-"))) return "go mod edit writes go.mod";
+  }
+  // (Council project review 2, round 31, Sol: `npm version <v>` and `npm pkg set|delete|fix`
+  // rewrite package.json where they run.)
+  if (["npm", "pnpm", "yarn"].includes(name)) {
+    const words = args.filter((a) => !a.startsWith("-"));
+    if ((words[0] === "version" && words.length > 1) || (words[0] === "pkg" && ["set", "delete", "fix"].includes(words[1] ?? ""))) return `${name} ${words[0]} rewrites package.json`;
+  }
   if (name === "ccache" && args.length && COMPILER.test(args[0])) return unnamedWrite(args[0], args.slice(1), filesOnly);
   if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|unlz4)$/.test(name) || (/^(gzip|xz|zstd|bzip2|lzop|lz4|lzip|brotli)$/.test(name) && args.some((a) => /^-[a-zA-Z0-9]*d[a-zA-Z0-9]*$/.test(a) || (a.length > 2 && ("--decompress".startsWith(a) || "--uncompress".startsWith(a))))) || (name === "lzop" && args.some((a) => /^-[a-zA-Z0-9]*x/.test(a)))) return `${name} -d writes files next to its input`;
   if (name === "patch") {
@@ -5174,6 +5185,10 @@ function unnamedWriteDirs(name: string, args: string[]): (string | undefined)[] 
   // (Round 6: a precompiled header lands beside its input, wherever that is: the project.)
   if (COMPILER.test(name)) return [undefined];
   if (name === "rustc") return [undefined];
+  if (name === "go") {
+    const c = args.findIndex((a) => /^--?C$/.test(a));
+    return c >= 0 && args[c + 1] !== undefined ? place([args[c + 1]]) : [];
+  }
   if (name === "curl" || name === "wget") return place(fetcherWrites(name, args).chosen.map((c) => c.dir || "."));
   // (Round 4: an option that puts the output elsewhere, zstd's `--output-dir-flat=.`, lzop's
   // `-p`, a `-o`: the place is not read, and the project is marked.)
