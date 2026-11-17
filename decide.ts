@@ -3950,7 +3950,9 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       if (/[$`*?[\]{}]/.test(target) || /^~[^/]/.test(t) || /^&/.test(target) || roots === undefined) continue;
       for (const dir of path.isAbsolute(t) ? ["/"] : (dirsOf?.(cmd) ?? [])) {
         const full = path.isAbsolute(t) ? t : `${dir}/${t}`;
-        if (/^\/dev\//.test(full) || procRelative(full)) continue;
+        // (Council project review 2, round 24, Mythos: a device by its normalised path, not a
+        // `/dev/` prefix of the words, `/dev/../tmp/o/l/hooks/pre-commit`.)
+        if (DEVICE.test(path.resolve(full)) || procRelative(full)) continue;
         const landed = physical(full);
         const root = roots.find((r) => within(landed, r));
         const below = root === undefined ? landed : path.relative(root, landed);
@@ -5085,6 +5087,8 @@ function deniedAsIssued(guard: Guard, session: SessionState, cwd: string, comman
   }
 }
 
+// The devices a write to which writes no file (round 24: by the normalised path).
+const DEVICE = /^\/dev\/(null|zero|stdout|stderr|tty|fd\/\d+)$/;
 // Whether a directory holds a symbolic link at any depth (council project review 2, round 22), or
 // is too large to tell within a small budget; a link to a place inside the directory counts too.
 function holdsLink(dir: string, budget = { left: 4000 }): boolean {
@@ -5379,8 +5383,12 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   // that a second write of the same call follows, `tar -xf a.tar -C o && tar -xf b.tar -C o`. A
   // lone such writer keeps its narrow mark.)
   else {
-    const extractors = found.unlisted.filter((u) => u.cmd.argv.some((a) => /^(tar|gtar|bsdtar|unzip|7z|cpio|rsync)$/.test(path.basename(a))));
-    const others = [...found.writes.filter((w) => !/^\/dev\//.test(w.word)), ...found.unlisted].filter((w) => !extractors.some((e) => e.cmd === w.cmd));
+    // (Round 24, Opus and Mythos: every writer the check cannot list may put a link in place,
+    // a git switch or a moved directory as an extraction does; and a device is told by the
+    // normalised path, `/dev/../tmp/...` is no device.)
+    const extractors = found.unlisted;
+    const device = (w: { word: string; cmd: Simple }) => DEVICE.test(path.resolve(cwdOf(w.cmd) ?? "/", tilde(w.word)));
+    const others = [...found.writes.filter((w) => !device(w)), ...found.unlisted].filter((w) => !extractors.some((e) => e.cmd === w.cmd));
     if (extractors.length > 1 || (extractors.length === 1 && others.length > 0)) for (const w of [...found.writes, ...found.unlisted]) project(w.cmd);
   }
   const unplaced = unplacedAll[0];

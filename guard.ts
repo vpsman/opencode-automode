@@ -4195,7 +4195,10 @@ function managerProblem(name: string, args: string[]): string | undefined {
     while (at < args.length && args[at].startsWith("-")) at += args[at] === "-C" ? 2 : 1;
     const tool = args[at] === "tool" ? at : -1;
     if (tool >= 0) {
-      const which = args.slice(tool + 1).find((a) => !a.startsWith("-"));
+      // (Round 24, Mythos: `-C <dir>` after `tool` too.)
+      let w = tool + 1;
+      while (w < args.length && args[w].startsWith("-")) w += /^--?C$/.test(args[w]) ? 2 : 1;
+      const which = args[w];
       const after = which === undefined ? [] : args.slice(args.indexOf(which, tool + 1) + 1);
       if (which === "test2json" && after.some((a) => !a.startsWith("-"))) return "go tool test2json runs the command after its options";
       if (which === "cgo" && after.includes("--")) {

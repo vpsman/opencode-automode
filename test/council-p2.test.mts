@@ -650,3 +650,23 @@ test("round 23: unzip clusters with :, go -C tool, an extraction and a second wr
   }
   for (const c of ["go -C tool tool test2json /bin/sh -c id", "go -C tool tool cgo -- -wrapper /bin/sh,-c,id x.go", "go -C tool tool pprof -tools=/tmp/x: bin prof"]) assert.notEqual(await effect(c), "allow", c);
 });
+
+// ---- round 24 ----
+
+test("round 24: devices by their normalised path; git and mv beside a second write; go tool -C", async () => {
+  const b = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-r24-")));
+  try {
+    for (const writer of [`tar -xf ${b}/a.tar -C ${b}/o2 && printf x > /dev/..${b}/o2/l/x.test.js && rm ${b}/o2/l`, `git -C ${b}/r switch -q withlink && printf x > ${b}/r/l/x.test.js && git -C ${b}/r switch -q main`, `mv ${b}/o ${b}/k && printf x > ${b}/k/l/x.test.js && rm ${b}/k/l`]) {
+      const s = new SessionState(repo);
+      const wrote = await effect(writer, s);
+      assert.ok(wrote !== "allow" || (await effect("npm test", s)) !== "allow", writer);
+    }
+    fs.mkdirSync(path.join(b, "lo"));
+    fs.symlinkSync(path.join(repo, ".git"), path.join(b, "lo", "l"));
+    assert.equal(await effect(`printf x > /dev/..${b}/lo/l/hooks/pre-commit`), "ask", "a .git hook through /dev/..");
+  } finally {
+    fs.rmSync(b, { recursive: true, force: true });
+  }
+  for (const c of ["go tool -C . test2json /bin/sh -c id", "go tool --C . test2json sh", "go tool -C . cgo -- -wrapper /bin/sh,-c,id x.go"]) assert.notEqual(await effect(c), "allow", c);
+  assert.equal(await effect("npm test > /dev/null"), "allow");
+});
