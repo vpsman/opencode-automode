@@ -4145,6 +4145,10 @@ function managerProblem(name: string, args: string[]): string | undefined {
     // package.json has none, which prints the environment or runs the words after it.)
     // (Round 3, all four: npm takes options with values and `--` anywhere, `npm --prefix . run --
     // env`: any `env` after a word that names `run` counts.)
+    // (Council project review 2, round 16, Mythos: `npm pack <git spec>` fetches the repository
+    // and runs its `prepare` script, as an install does.)
+    const packAt = args.indexOf("pack");
+    if (packAt >= 0 && args.slice(packAt + 1).some((a) => !a.startsWith("-") && /^(github:|gitlab:|bitbucket:|gist:|git\+|git:\/\/|https?:\/\/|ssh:\/\/)|^[\w.-]+\/[\w.-]+(#.*)?$|\.git(#.*)?$/.test(a))) return `${name} pack of a git repository or a URL runs that package's prepare script`;
     const run = args.findIndex((a) => ["run", "run-script", "rum", "urn"].includes(a));
     if (run >= 0 && args.slice(run + 1).includes("env")) return `${name} run env prints the environment, or runs the words after it as a command`;
   }

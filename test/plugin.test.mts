@@ -1119,7 +1119,9 @@ describe("r3 18/36: calls that run at the same time", () => {
       // it lies goes to the model for it (B7-2), which nothing but the record makes it do.
       const beside = await whole(host, "cd r4-old && ./old.sh");
       assert.equal(beside.permission.effect, "ask");
-      assert.match(beside.permission.message, /runs old\.sh after this session wrote \S*r4-approved\.sh/);
+      // (Council project review 2, round 16: an approved ask marks every writable root as well, and
+      // that mark may be the reason given.)
+      assert.match(beside.permission.message, /runs old\.sh after this session wrote \S*r4-approved\.sh|runs \.\/old\.sh, in a place where this session wrote files the guard cannot list/);
     } finally {
       fs.rmSync(script, { force: true });
       g("rm", "-q", "-r", "-f", "r4-old");
@@ -1252,7 +1254,8 @@ describe("r3 18/36: calls that run at the same time", () => {
       const after = await whole(host, "./b10-window-run.sh", { sessionID: "b10w" });
       assert.equal(after.permission.effect, "ask", after.permission.message);
       assert.match(after.permission.message, /leave this to the model/);
-      assert.match(after.permission.message, /b10\.sh/);
+      // (Round 16: or the mark every approved ask now leaves.)
+      assert.match(after.permission.message, /b10\.sh|in a place where this session wrote files the guard cannot list/);
       // Council project review 1: another session of the project shares the record.
       const other = await whole(host, "./b10-window-run.sh", { sessionID: "b10w-other" });
       assert.equal(other.permission.effect, "ask", other.permission.message);

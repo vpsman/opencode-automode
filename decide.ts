@@ -5382,9 +5382,12 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
         if (/^(head|tail)$/.test(name)) return args.every((a, i) => /^-[nc]?\d+$/.test(a) || (/^-[nc]$/.test(a) && /^\d+$/.test(args[i + 1] ?? "")) || (/^\d+$/.test(a) && /^-[nc]$/.test(args[i - 1] ?? "")));
         return name === "cat" && args.length === 0;
       };
+      // (Round 16, Mythos: a descriptor copied into standard input, `tee x <&3` with `3>&0` on a
+      // group, does not read the pipe; the call has no fed tee then.)
+      const dupIn = /<&|\d>&0(?!\d)/.test(run);
       const fed = (c: Simple) => {
         const [from, to] = [cmds.indexOf(cmd), cmds.indexOf(c)];
-        if (pipe === undefined || where.pipes.get(c) !== pipe || to <= from || c.argv[0] !== "tee" || !stdinOnly(c)) return false;
+        if (dupIn || pipe === undefined || where.pipes.get(c) !== pipe || to <= from || c.argv[0] !== "tee" || !stdinOnly(c)) return false;
         return cmds.slice(from + 1, to).every((m) => where.pipes.get(m) === pipe && stdinOnly(m) && passes(m));
       };
       const rest = cmds.filter((c) => c !== cmd && !fed(c));
@@ -5467,13 +5470,16 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   // B7-2: a call that was the model's to judge (code the checks do not read: `python3 -c`, a
   // script, a place they cannot tell) may have written, moved or renamed anything in the project
   // once the user approves it: the project is marked whole then, as for an ask the checks never
-  // got to read (withApproval). An ask the rules make of a command they read (`git push`) records
-  // what it writes, as before; so does a call the model allows.
+  // got to read (withApproval). Since round 16 every approved ask is marked so (asked), and a call
+  // the model allows too.
   const unread = () => {
     for (const r of roots.map(realish)) if (!session.unlisted.includes(r)) session.unlisted.push(r);
     markEverywhere(session, extraOf(guard));
   };
-  const asked = (d: Decision): Decision => (d.effect === "ask" ? { ...d, approve: d.rule === "classify" ? () => (commit(), unread()) : commit, ...(worktree.length ? { worktree } : {}) } : d);
+  // (Council project review 2, round 16, Opus: any ask, once approved, runs outside the sandbox,
+  // and a rule ask may sit beside code the checks do not read, `python3 gen.py && git push`: the
+  // project and every other writable place are marked, whatever made the call ask.)
+  const asked = (d: Decision): Decision => (d.effect === "ask" ? { ...d, approve: () => (commit(), unread()), ...(worktree.length ? { worktree } : {}) } : d);
   const d0 = { unread: false };
   // (Round 5: a git that only reads runs what the repository's configuration names, as the
   // safe list reads it: a filter, a textconv, fsmonitor.)

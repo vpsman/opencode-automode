@@ -533,3 +533,23 @@ test("round 15: an approved call the model judges marks every writable root; the
     fs.rmSync(b, { recursive: true, force: true });
   }
 });
+
+// ---- round 16 ----
+
+test("round 16: an approved rule ask beside code the checks do not read marks every writable root", async () => {
+  for (const c of [`git push origin main; python3 -c "open('t.test.js','w').write('x')"`, "python3 gen_tests.py && git push", "sudo true; python3 -c \"open('t.test.js','w')\"", "git push origin main; bash ./gen.sh"]) {
+    const s = new SessionState(repo);
+    const d = await decideShell(guard, s, repo, c);
+    assert.equal(d.effect, "ask", c);
+    d.approve?.();
+    assert.notEqual(await effect("npm test", s), "allow", c);
+  }
+});
+
+test("round 16: a tee fed from a copied descriptor, npm pack of a git spec", async () => {
+  for (const c of [`{ npm test -s | tee x.test.js <&3 ; } <<< 'code' 3>&0`, `printf code | { npm test -s | tee x.test.js <&3; } 3>&0`, `{ npm test | cat <&3 | tee x.test.js; } <<< code 3>&0`]) {
+    assert.notEqual(await effect(c), "allow", c);
+  }
+  for (const c of ["npm pack github:u/r", "npm pack git+https://example.com/r.git", "npm pack u/r", "npm pack git://example.com/r", "npm pack https://example.com/r.tgz"]) assert.equal(await effect(c), "ask", c);
+  for (const c of ["npm pack", "npm pack --dry-run", "npm test 2>&1 | tee test.log"]) assert.equal(await effect(c), "allow", c);
+});
