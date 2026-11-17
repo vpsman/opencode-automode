@@ -731,3 +731,23 @@ test("round 27: a long chain of links to a descriptor asks", async () => {
     fs.rmSync(b, { recursive: true, force: true });
   }
 });
+
+// ---- round 28 ----
+
+test("round 28: a descriptor walk takes .. after a link, tar -M and -L, unzip fed a new name", async () => {
+  const b = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-r28-")));
+  try {
+    fs.symlinkSync("/dev/shm", path.join(b, "hop"));
+    fs.symlinkSync("hop/../stdin", path.join(b, "out"));
+    for (const c of [`echo hi < package.json > ${b}/out`, `{ printf x > ${b}/hop/../stdout; } < package.json >&0`]) assert.notEqual(await effect(c), "allow", c);
+    const s = new SessionState(repo);
+    await effect(`printf 'r\\n/test/x.test.js\\n' | unzip -q ${b}/a.zip -d ${b}/out2`, s);
+    assert.notEqual(await effect("npm test", s), "allow", "unzip fed a new name");
+  } finally {
+    fs.rmSync(b, { recursive: true, force: true });
+  }
+  for (const c of ["printf x | tar -c -M -L 10 -f v.tar big", "tar -cML 10 -f v.tar big", "tar cMLf 10 v.tar big", "tar --multi-volume --tape-length=10 -cf v.tar big", "tar -x -M -f v.tar", "tar -c -L 10 -f v.tar big"]) {
+    assert.equal(await effect(c), "ask", c);
+  }
+  for (const c of ["tar -xf a.tar", "tar czf b.tgz src", "unzip -o a.zip -d sub"]) assert.equal(await effect(c), "allow", c);
+});

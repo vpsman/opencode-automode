@@ -4330,11 +4330,13 @@ function programProblem(name: string, args: string[], cwd?: string, inProject?: 
     }
   }
   if (name === "tar" || name === "gtar" || name === "bsdtar") {
-    const option = longOption(args, ["--checkpoint-action", "--use-compress-program", "--to-command", "--info-script", "--new-volume-script", "--rsh-command", "--rmt-command"]);
-    if (option) return ask(`tar ${option.split("=")[0]} runs a program`);
-    // Bundled short options, with or without the dash (`tar cIf`): -I and -F name a program.
+    const option = longOption(args, ["--checkpoint-action", "--use-compress-program", "--to-command", "--info-script", "--new-volume-script", "--rsh-command", "--rmt-command", "--multi-volume", "--tape-length"]);
+    if (option) return ask(`tar ${option.split("=")[0]} runs a program, or prompts for the next volume, where \`!\` runs a shell on standard input`);
+    // Bundled short options, with or without the dash (`tar cIf`): -I and -F name a program; -M
+    // and -L make tar prompt for the next volume, where `!` runs a shell on standard input
+    // (council project review 2, round 28, Mythos).
     const bundles = args.filter((a, i) => (/^-[a-zA-Z]+/.test(a) && !a.startsWith("--")) || (i === 0 && /^[a-zA-Z]+$/.test(a)));
-    if (bundles.some((a) => /[IF]/.test(a))) return ask("tar -I or -F runs a program");
+    if (bundles.some((a) => /[IFML]/.test(a))) return ask("tar -I or -F runs a program, and -M or -L prompts for the next volume, where ! runs a shell on standard input");
     if (args.some((a) => !a.startsWith("-") && /^[\w.@-]+:/.test(a)) && !args.includes("--force-local")) return ask("tar with an archive on a remote host runs a remote shell");
   }
   if (name === "sort" && longOption(args, ["--compress-program"])) return ask("sort --compress-program runs a program");

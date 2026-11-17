@@ -372,7 +372,9 @@ For each shell tool call:
      cache works against it read-only (`cargo build` and `cargo test` do, with a crate from
      `~/.cargo/registry`); a build that must fetch or write a shared cache fails with
      "Read-only file system". List the directory in `sandboxWritable` if you accept that, or
-     run the fetch step yourself.
+     run the fetch step yourself. A store file that is hard-linked into the project (pnpm and
+     bun link `node_modules` files from their stores) is the same file under both names, and a
+     write through the project's name reaches it (see Known gaps).
    - **Git directories** found under the project, `allowedPaths` and temp dirs (main, linked
      worktrees, submodules, bare repos; at any depth, `node_modules` included) are read-only
      all the way down, mounts beneath them included, as are `.git` pointer files, every
@@ -939,6 +941,10 @@ message), which is why pushes and ssh use deterministic rules instead.
   remote command are lexical: they read the words, not the remote machine, so a remote
   symbolic link to `/proc/<pid>/environ` is not seen, and `systemctl show` and
   `systemctl cat` print a unit's configuration, environment settings included.
+- **Hard links out of the writable directories.** A file the sandbox may write under one name
+  is written under every name it has: a pnpm or bun store file hard-linked into
+  `node_modules` changes in the store when the call writes `node_modules/<pkg>/index.js`.
+  Landlock grants by the path walked, and a hard link's other names cannot be told from it.
 - **`/tmp` is shared.** It stays writable and shared with other processes, because agents and
   opencode's own tools pass files through it, and it is walked before every allowed command
   (see the scan budget above). A tool that keeps code it runs later in a temp directory under a

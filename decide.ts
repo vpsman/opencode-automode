@@ -5097,32 +5097,42 @@ const DESCRIPTOR = /^\/(dev\/(stdin|stdout|stderr|fd\/\d+)|proc\/(self|thread-se
 // The descriptor paths a write target reaches through its links, walked with readlink one link at
 // a time (round 26, Sol and Opus): never through `realpath`, which would follow the plugin's own
 // descriptors. Each step's directory is taken physically, as the kernel walks it.
-function descriptorsReached(p: string): string[] {
-  const out: string[] = [];
-  // (Round 27, all four: the kernel's 40 links, and a walk that runs out counts as reaching fd 0,
-  // so it asks, as the other walkers fail to a problem.)
-  for (let hop = 0; hop <= 40; hop++) {
-    if (DESCRIPTOR.test(p)) {
-      out.push(p);
-      return out;
+function descriptorsReached(raw: string): string[] {
+  // (Round 28, Astra, Opus and Mythos: part by part as the kernel walks, a link followed before
+  // the `..` after it, in the words and in a link's target. `/proc/self`, `/proc/thread-self`
+  // and `/dev/fd` lead into the plugin's own process, so they are kept as written; a descriptor
+  // path is judged before what it leads to. Past 40 links the walk counts as reaching fd 0.)
+  const todo = raw.split("/").filter((c) => c !== "" && c !== ".");
+  let cur = "/";
+  let links = 0;
+  while (todo.length) {
+    const c = todo.shift()!;
+    if (c === ".") continue;
+    if (c === "..") {
+      cur = path.dirname(cur);
+      continue;
     }
-    let next: string;
+    const next = cur === "/" ? `/${c}` : `${cur}/${c}`;
+    if (DESCRIPTOR.test(next)) return [next];
+    if (/^\/(proc\/(self|thread-self)|dev\/fd)$/.test(next)) {
+      cur = next;
+      continue;
+    }
+    let link: string | undefined;
     try {
-      const dir = path.dirname(p);
-      const at = path.join(DESCRIPTOR.test(dir) ? dir : physical(dir), path.basename(p));
-      if (DESCRIPTOR.test(at)) {
-        out.push(at);
-        return out;
-      }
-      if (!fs.lstatSync(at).isSymbolicLink()) return out;
-      next = path.resolve(path.dirname(at), fs.readlinkSync(at));
+      if (fs.lstatSync(next).isSymbolicLink()) link = fs.readlinkSync(next);
     } catch {
-      return out;
+      link = undefined;
     }
-    p = next;
+    if (link === undefined) {
+      cur = next;
+      continue;
+    }
+    if (++links > 40) return ["/dev/stdin"];
+    if (link.startsWith("/")) cur = "/";
+    todo.unshift(...link.split("/").filter((p) => p !== "" && p !== "."));
   }
-  out.push("/dev/stdin");
-  return out;
+  return DESCRIPTOR.test(cur) ? [cur] : [];
 }
 // Whether a directory holds a symbolic link at any depth (council project review 2, round 22), or
 // is too large to tell within a small budget; a link to a place inside the directory counts too.
@@ -5415,6 +5425,16 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   // unplaced.)
   // (Round 13, all four: `cp -s`, `-P`, `-a` and every other program that makes, copies or moves
   // a link.)
+  // (Round 28, Mythos: unzip without -o or -n asks at a file that is there, and reads a new name
+  // from its standard input, which a pipe, a redirect or a heredoc can feed: the name may lead
+  // anywhere.)
+  for (const u of found.unlisted) {
+    const unzip = u.cmd.argv.findIndex((a) => path.basename(a) === "unzip");
+    if (unzip < 0) continue;
+    const opts = u.cmd.argv.slice(unzip + 1).filter((a) => a.startsWith("-"));
+    if (opts.some((a) => /^-[^-]*[on]/.test(a))) continue;
+    if (where.pipes.get(u.cmd) !== undefined || u.cmd.in?.length || u.cmd.heredoc) project(u.cmd);
+  }
   if (cmds.some((c) => makesLink(c.argv))) for (const w of [...found.writes, ...found.unlisted]) project(w.cmd);
   // (Round 23, Mythos: a writer the check cannot list, an extraction, may put a link in place
   // that a second write of the same call follows, `tar -xf a.tar -C o && tar -xf b.tar -C o`. A
@@ -5579,7 +5599,8 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   // (Round 26: every write, by its normalised path and through its links.)
   const reopens = /(^|[^<])<(?![<(&])|[<>]&\s*\d|\bexec\b/.test(run);
   for (const w of found.writes) {
-    const reached = descriptorsReached(path.resolve(cwdOf(w.cmd) ?? "/", tilde(w.word)));
+    const target = tilde(w.word);
+    const reached = descriptorsReached(target.startsWith("/") ? target : `${cwdOf(w.cmd) ?? "/"}/${target}`);
     if (reached.some((d) => /\/dev\/stdin$|\/fd\/0$/.test(d)) || (reached.length > 0 && reopens)) return asked(askBy(`writes ${w.word}, which leads to a descriptor (${reached[0]}) that may hold a file this call opened, which the write then replaces`));
   }
   if (gitIssue) return asked(askBy(gitIssue));
