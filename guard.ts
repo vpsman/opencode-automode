@@ -5080,6 +5080,8 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
   // can name the place (compilerNamesPlace). `ccache` writes what its compiler writes.
   if (COMPILER.test(name) && !compilerQuery(args)) return `${name} writes files under names it or its options choose`;
   if (name === "rustc" && !rustcQuery(args)) return "rustc writes its outputs, whose names the check does not place";
+  // (Council project review 2, round 30, Mythos: `go mod edit` rewrites go.mod where it runs.)
+  if (name === "go" && args[0] === "mod" && args[1] === "edit" && !args.slice(2).every((a) => /^--?(json|print|fmt)$/.test(a) || !a.startsWith("-"))) return "go mod edit writes go.mod";
   if (name === "ccache" && args.length && COMPILER.test(args[0])) return unnamedWrite(args[0], args.slice(1), filesOnly);
   if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|unlz4)$/.test(name) || (/^(gzip|xz|zstd|bzip2|lzop|lz4|lzip|brotli)$/.test(name) && args.some((a) => /^-[a-zA-Z0-9]*d[a-zA-Z0-9]*$/.test(a) || (a.length > 2 && ("--decompress".startsWith(a) || "--uncompress".startsWith(a))))) || (name === "lzop" && args.some((a) => /^-[a-zA-Z0-9]*x/.test(a)))) return `${name} -d writes files next to its input`;
   if (name === "patch") {

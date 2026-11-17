@@ -5160,6 +5160,9 @@ function unzipNeverPrompts(args: string[]): boolean {
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (!a.startsWith("-") || a === "-") break;
+    // (Round 30, all four: unzip counts each `-` and carries the count into the next word until an
+    // option letter uses it, `-o--o`, `-q- -o`, `---o`: any such word may leave it prompting.)
+    if (a.slice(1).includes("-")) return false;
     let negate = false;
     let stop = false;
     for (let j = 1; j < a.length; j++) {

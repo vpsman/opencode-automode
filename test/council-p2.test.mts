@@ -771,3 +771,26 @@ test("round 29: unzip's overwrite mode read as unzip reads it", async () => {
     fs.rmSync(b, { recursive: true, force: true });
   }
 });
+
+// ---- round 30 ----
+
+test("round 30: unzip's dashes carry, go mod edit writes go.mod", async () => {
+  const b = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-r30-")));
+  try {
+    for (const o of ["-o--o", "---o", "-q--o", "-n--n", "-- -o", "-q- -o", "-n- -n", "-o -q- -o", "-o- -o"]) {
+      const s = new SessionState(repo);
+      const wrote = await effect(`printf 'r\\n/x.test.js\\n' | unzip ${o} ${b}/a.zip -d ${b}/out`, s);
+      assert.ok(wrote !== "allow" || (await effect("npm test", s)) !== "allow", o);
+    }
+  } finally {
+    fs.rmSync(b, { recursive: true, force: true });
+  }
+  for (const writer of ["go mod edit -replace example.com/a=example.com/evil@v1.0.0", "go mod edit -require=example.com/x@v1.0.0"]) {
+    const s = new SessionState(repo);
+    const wrote = await effect(writer, s);
+    assert.ok(wrote !== "allow" || (await effect("npm test", s)) !== "allow", writer);
+  }
+  const t = new SessionState(repo);
+  await effect("go mod edit -json", t);
+  assert.equal(await effect("npm test", t), "allow", "go mod edit -json writes nothing");
+});
