@@ -1403,6 +1403,9 @@ class Printer {
         if (cut >= 0) break;
       }
       if (!pure || !/^~(?:[A-Za-z_][A-Za-z0-9._-]*)?$/.test(prefix)) this.bashOnly = true;
+      // (Council project review 1, round 10: bash 5.2 expands `~:` in an argument and leaves what
+      // follows in the word unexpanded, `~:$(echo hi)` and `~:$10` as text: printed, they expand.)
+      if (prefix.startsWith("~") && prefix.includes(":") && parts.some((p) => p.kind !== "lit")) ask("a ~ word with a : before an expansion, which bash leaves unexpanded");
     }
     // Empty quotes inside a word that is literal text all through, and not empty without them,
     // change nothing (`g''it` is `git`), unless the word is one of the kinds above.

@@ -176,7 +176,11 @@ For each shell tool call:
      `man -P`, `-H` and `-C`); builtins that evaluate a value as arithmetic (`let`,
      `declare -i`, `test -v` with a subscript), and a value given in any of those ways to
      one of bash's integer variables (`RANDOM`, `SRANDOM`, `OPTIND`, `HISTCMD`, `SECONDS`,
-     `BASHPID`, `BASH_XTRACEFD`, `READLINE_MARK`, `READLINE_POINT`), and `export`, `declare`,
+     `BASHPID`, `BASH_XTRACEFD`, `READLINE_MARK`, `READLINE_POINT`); a locale (`LANG`,
+     `LC_*`) other than C, POSIX or UTF-8, whose charset can read a backslash as part of a
+     character (GBK, Big5, SJIS), set by the command or handed to its shell; `bun run` of
+     anything but a script of `package.json`, a file or a package's program, `bun run -` and
+     `bun -e`; and `export`, `declare`,
      `typeset`, `readonly` or `local` of a name built at run time (`export "$x"`); a glob, or an unquoted expansion whose
      value the call does not set to plain text first (`ls $x`, `ls $(cmd)`), that matches a
      file whose name starts with `-` (`ls *` beside a file called `-rf`; a file named `-`

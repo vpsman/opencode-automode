@@ -44,7 +44,7 @@ import { compileRules, compilePattern, within } from "./rules.ts";
 import { closeGitSnapshot, decideFile, decideRead, decideShell, EXPECT_MS, expectedRepos, gitDirectories, gitOnly, gitWriteDirectories, gitMaintainDirectories, gitStateTampered, gitTampered, mirrorable, noteGitCall, projectRoots, pushCandidate, pushDestinations, quarantineGitFiles, realish, sandboxBreaks, SessionState, unseenWrites, usesSsh, type Decision, type Expected, type GitCall, type Guard } from "./decide.ts";
 import { envKept, envStringProblem, gitElsewhere, plan, realpath, Scan, setPluginWritable, shellOwn, type Plan } from "./sandbox.ts";
 import { loadConfig, type Config } from "./config.ts";
-import { bentEnv, bentPath, pathFinds, pathHas, shellAlsoKeeps, shellCdpath } from "./guard.ts";
+import { bentEnv, bentPath, localeOk, pathFinds, pathHas, shellAlsoKeeps, shellCdpath } from "./guard.ts";
 import { canonical } from "./canon.ts";
 
 // A command that holds the word `git` as a program's name (broad on purpose: `.git` and
@@ -725,7 +725,9 @@ export default Plugin.define({
         const inProject = (p: string) => within(p, top) || within(p, project) || [...config.allowedPaths, ...config.sandboxWritable].some((d) => within(p, d));
         const catOdd = shellPath !== process.env.PATH && queue.some((c) => c.decision.folded) && (pathFinds("cat", undefined, inProject, () => false, shellPath ?? "") !== undefined || !pathHas("cat", shellPath ?? ""));
         const shellBent = bentEnv(inProject, event.env);
-        const name = catOdd ? "PATH" : shellBent !== undefined && bentEnv(inProject) === undefined ? shellBent.slice(0, shellBent.indexOf("=")) : undefined;
+        // (Round 10: and a locale whose charset can read a `\` as part of a character.)
+        const locale = ["LC_ALL", "LC_CTYPE", "LANG"].find((n) => event.env[n] !== undefined && !localeOk(event.env[n]!));
+        const name = catOdd ? "PATH" : shellBent !== undefined && bentEnv(inProject) === undefined ? shellBent.slice(0, shellBent.indexOf("=")) : locale;
         if (name) {
           for (const c of queue) {
             c.unsure = true;
@@ -859,7 +861,7 @@ export default Plugin.define({
               : call.bentPath !== undefined
                 ? `${would}, but its shell's PATH holds ${clip(call.bentPath, 200)}, a directory the session can write, which opencode's own PATH does not: the checks judged the programs it names by opencode's PATH, and this shell may find others under the same names. Start opencode and its sessions with the same PATH, or approve this to run it as it is`
               : call.envDiffers !== undefined
-                ? `${would}, but its shell's ${call.envDiffers} is not opencode's own, which the checks judged it by (${call.envDiffers === "PATH" ? 'a "$(cat <<EOF ...)" is printed as its text only where PATH finds the real cat, and this one may not' : "it names a place the session can write, through which a program may run or load what the session wrote"}). Start opencode and its sessions with the same ${call.envDiffers}, or approve this to run it as it is`
+                ? `${would}, but its shell's ${call.envDiffers} is not opencode's own, which the checks judged it by (${call.envDiffers === "PATH" ? 'a "$(cat <<EOF ...)" is printed as its text only where PATH finds the real cat, and this one may not' : /^(LANG|LC_)/.test(call.envDiffers) ? "a charset other than UTF-8 can read a backslash as part of a character" : "it names a place the session can write, through which a program may run or load what the session wrote"}). Start opencode and its sessions with the same ${call.envDiffers}, or approve this to run it as it is`
               : call.cdpath !== undefined
                 ? `${would}, but its shell ${call.cdpath ? `has CDPATH=${clip(call.cdpath, 200)}` : "has no CDPATH"} and opencode's own environment ${shellCdpath() ? `has ${clip(shellCdpath()!, 200)}` : "has none"} (sandboxKeepEnv keeps the shell's): bash looks the directory of a cd up in CDPATH, and the checks followed this command's cd as opencode's own environment says, so it may lead somewhere else in this shell. Start opencode and its sessions with the same CDPATH (or with none), or approve this to run it as it is`
               : call.tooLong

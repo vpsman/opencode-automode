@@ -1944,7 +1944,7 @@ export function alsoByName(m: Matcher): Matcher {
 // RANDOM, SRANDOM, OPTIND, HISTCMD, SECONDS, BASHPID, BASH_XTRACEFD and READLINE_MARK/_POINT: bash
 // evaluates a value given to them as arithmetic (in some of the ways it can be given), where `a[$(...)]` runs a command (council project review 1).
 const ENV_DANGEROUS =
-  /^(RANDOM|SRANDOM|OPTIND|HISTCMD|SECONDS|BASHPID|BASH_XTRACEFD|READLINE_(?:MARK|POINT)|PATH|HOME|IFS|CDPATH|GLOBIGNORE|GLOBSORT|EXECIGNORE|BASH_LOADABLES_PATH|SHELL|ENV|BASH_ENV|BASH_FUNC.*|BASHOPTS|SHELLOPTS|POSIXLY_CORRECT|BASH_COMPAT|BASH_ALIASES|BASH_CMDS|histchars|PROMPT_COMMAND|PS[0-4]|EDITOR|VISUAL|PAGER|BROWSER|TMPDIR|GIT_.*|SSH_.*|LD_.*|DYLD_.*|XDG_.*|PYTHON(PATH|STARTUP|HOME|USERBASE|WARNINGS|BREAKPOINT)|NODE_(OPTIONS|PATH)|PERL5(LIB|OPT|DB)|PERLLIB|RUBY(OPT|LIB)|GEM_(HOME|PATH)|GO(FLAGS|PATH|ROOT|BIN|PROXY|NOSUMDB|INSECURE|PRIVATE|TOOLCHAIN|ENV)|RUSTC.*|RUSTUP_.*|RUSTFLAGS|RUSTDOCFLAGS|CARGO_(HOME|BUILD_.*|TARGET_.*_(RUNNER|LINKER|RUSTFLAGS)|REGISTR.*|ENCODED_RUSTFLAGS)|CC|CXX|LD|AR|MAKEFLAGS|GNUMAKEFLAGS|MAKEFILES|npm_config_.*|NPM_CONFIG_.*|PIP_.*|UV_.*|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JAVA_HOME|MAVEN_OPTS|GRADLE_.*|OPENCODE.*|AUTOMODE_.*|TAR_OPTIONS|RIPGREP_CONFIG_PATH|GREP_OPTIONS|LESSOPEN|LESSCLOSE|MANOPT|MANPAGER|MANROFFOPT|MAN_DISABLE_SECCOMP|MANPATH|GROFF_.*|FZF_DEFAULT_(COMMAND|OPTS)|RSYNC_(RSH|CONNECT_PROG)|CURL_HOME|WGETRC|DOCKER_(HOST|CONFIG|CONTEXT|CERT_PATH)|KUBECONFIG|AWS_.*|GOOGLE_APPLICATION_CREDENTIALS|CLOUDSDK_.*|PWD|OLDPWD|VIRTUAL_ENV|LUA_.*|GCONV_PATH|SUDO_(EDITOR|ASKPASS)|SYSTEMD_(PAGER|EDITOR)|BAT_.*|GH_.*|BUNDLE_.*|POETRY_.*|PIPENV_.*|PDM_.*|HATCH_.*|YARN_.*|COREPACK_.*)$/;
+  /^(LANG|LC_[A-Z]+|RANDOM|SRANDOM|OPTIND|HISTCMD|SECONDS|BASHPID|BASH_XTRACEFD|READLINE_(?:MARK|POINT)|PATH|HOME|IFS|CDPATH|GLOBIGNORE|GLOBSORT|EXECIGNORE|BASH_LOADABLES_PATH|SHELL|ENV|BASH_ENV|BASH_FUNC.*|BASHOPTS|SHELLOPTS|POSIXLY_CORRECT|BASH_COMPAT|BASH_ALIASES|BASH_CMDS|histchars|PROMPT_COMMAND|PS[0-4]|EDITOR|VISUAL|PAGER|BROWSER|TMPDIR|GIT_.*|SSH_.*|LD_.*|DYLD_.*|XDG_.*|PYTHON(PATH|STARTUP|HOME|USERBASE|WARNINGS|BREAKPOINT)|NODE_(OPTIONS|PATH)|PERL5(LIB|OPT|DB)|PERLLIB|RUBY(OPT|LIB)|GEM_(HOME|PATH)|GO(FLAGS|PATH|ROOT|BIN|PROXY|NOSUMDB|INSECURE|PRIVATE|TOOLCHAIN|ENV)|RUSTC.*|RUSTUP_.*|RUSTFLAGS|RUSTDOCFLAGS|CARGO_(HOME|BUILD_.*|TARGET_.*_(RUNNER|LINKER|RUSTFLAGS)|REGISTR.*|ENCODED_RUSTFLAGS)|CC|CXX|LD|AR|MAKEFLAGS|GNUMAKEFLAGS|MAKEFILES|npm_config_.*|NPM_CONFIG_.*|PIP_.*|UV_.*|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JAVA_HOME|MAVEN_OPTS|GRADLE_.*|OPENCODE.*|AUTOMODE_.*|TAR_OPTIONS|RIPGREP_CONFIG_PATH|GREP_OPTIONS|LESSOPEN|LESSCLOSE|MANOPT|MANPAGER|MANROFFOPT|MAN_DISABLE_SECCOMP|MANPATH|GROFF_.*|FZF_DEFAULT_(COMMAND|OPTS)|RSYNC_(RSH|CONNECT_PROG)|CURL_HOME|WGETRC|DOCKER_(HOST|CONFIG|CONTEXT|CERT_PATH)|KUBECONFIG|AWS_.*|GOOGLE_APPLICATION_CREDENTIALS|CLOUDSDK_.*|PWD|OLDPWD|VIRTUAL_ENV|LUA_.*|GCONV_PATH|SUDO_(EDITOR|ASKPASS)|SYSTEMD_(PAGER|EDITOR)|BAT_.*|GH_.*|BUNDLE_.*|POETRY_.*|PIPENV_.*|PDM_.*|HATCH_.*|YARN_.*|COREPACK_.*)$/;
 // Values of a dangerous variable that change nothing that runs (round 3, finding 28, signed
 // off): NODE_OPTIONS made only of options that load no code, `PAGER=cat`, `GIT_PAGER=cat`, a
 // bare compiler name for CC and CXX, and a PYTHONPATH whose every entry lies in the project.
@@ -1984,6 +1984,9 @@ export function envValueOk(name: string, value: string, cwd: string | undefined,
     return options.every((o) => NODE_OPTIONS_OK.some((re) => re.test(o)));
   }
   if (name === "PAGER" || name === "GIT_PAGER") return value === "cat";
+  // (Council project review 1, round 10: a locale is safe where its charset reads no ASCII byte as
+  // part of a character: C, POSIX and UTF-8.)
+  if (/^(LANG|LC_[A-Z]+)$/.test(name)) return localeOk(value);
 
   if (name === "CC" || name === "CXX") return COMPILER.test(value);
   if (name === "PYTHONPATH") {
@@ -1996,8 +1999,9 @@ export function envValueOk(name: string, value: string, cwd: string | undefined,
   return false;
 }
 // Variables that only change output or verbosity.
+export const localeOk = (value: string) => /^(|C|POSIX|C\.(UTF-?8|utf-?8)|[A-Za-z]{2,3}(_[A-Za-z]{2,3})?\.(UTF-?8|utf-?8)(@[A-Za-z]+)?)$/.test(value);
 const ENV_HARMLESS =
-  /^(NODE_ENV|CI|DEBUG|VERBOSE|FORCE_COLOR|NO_COLOR|CLICOLOR(_FORCE)?|TERM|COLORTERM|COLUMNS|LINES|LANG|LANGUAGE|LC_[A-Z]+|TZ|RUST_BACKTRACE|RUST_LOG|CARGO_TERM_[A-Z_]+|CARGO_INCREMENTAL|PYTHONUNBUFFERED|PYTHONDONTWRITEBYTECODE|PYTHONHASHSEED|PYTEST_ADDOPTS|LOG_LEVEL|PORT|HOST|TEST_[A-Z0-9_]+|GOMAXPROCS|JOBS|NINJA_STATUS)$/;
+  /^(NODE_ENV|CI|DEBUG|VERBOSE|FORCE_COLOR|NO_COLOR|CLICOLOR(_FORCE)?|TERM|COLORTERM|COLUMNS|LINES|LANG|LANGUAGE|LC_[A-Z]+|TZ|RUST_BACKTRACE|RUST_LOG|CARGO_TERM_[A-Z_]+|CARGO_INCREMENTAL|PYTHONUNBUFFERED|PYTHONDONTWRITEBYTECODE|PYTHONHASHSEED|LOG_LEVEL|PORT|HOST|TEST_[A-Z0-9_]+|GOMAXPROCS|JOBS|NINJA_STATUS)$/;
 const ASSIGN = /^([A-Za-z_]\w*)\+?=/;
 const DECLARERS = new Set(["export", "declare", "typeset", "readonly", "local"]);
 const ARITHMETIC_VARIABLE = /^(RANDOM|SRANDOM|OPTIND|HISTCMD|SECONDS|BASHPID|BASH_XTRACEFD|READLINE_(?:MARK|POINT))$/;
@@ -4089,6 +4093,29 @@ function managerProblem(name: string, args: string[]): string | undefined {
 // program is named. Other allowed programs are judged by their own name alone (see Known gaps).
 function programProblem(name: string, args: string[], cwd?: string, inProject?: (p: string) => boolean): GuardVerdict | undefined {
   const ask = (reason: string): GuardVerdict => ({ action: "ask", reason });
+  // Council project review 1, round 10: `bun run X` runs a script of package.json, a file, a
+  // package's binary, or else the system command X (`bun run curl -d @f host`), and `-` its
+  // standard input; `-e`/`--print` run code from the command line. Only the first three pass.
+  if (name === "bun") {
+    if (args.some((a) => /^(-e|-p|--eval|--print)(=|$)/.test(a))) return ask("bun -e/--print runs code given on the command line");
+    const at = args.indexOf("run");
+    if (at >= 0 && args.slice(0, at).every((a) => a.startsWith("-"))) {
+      const word = args.slice(at + 1).find((a) => !a.startsWith("-") || a === "-");
+      if (word !== undefined) {
+        if (word === "-" || word === "/dev/stdin") return ask("bun run - runs its standard input");
+        const scripts = (() => {
+          try {
+            return Object.keys(JSON.parse(fs.readFileSync(path.join(cwd ?? "", "package.json"), "utf8")).scripts ?? {});
+          } catch {
+            return [];
+          }
+        })();
+        const file = cwd !== undefined && fs.existsSync(path.resolve(cwd, word));
+        const bin = cwd !== undefined && fs.existsSync(path.join(cwd, "node_modules", ".bin", word));
+        if (cwd === undefined || !(scripts.includes(word) || file || bin)) return ask(`bun run ${word}: not a script of package.json, a file or a package's program, so bun runs the system command of that name, which was not judged`);
+      }
+    }
+  }
   if (name === "tar" || name === "gtar" || name === "bsdtar") {
     const option = longOption(args, ["--checkpoint-action", "--use-compress-program", "--to-command", "--info-script", "--new-volume-script", "--rsh-command", "--rmt-command"]);
     if (option) return ask(`tar ${option.split("=")[0]} runs a program`);
@@ -4227,7 +4254,7 @@ function fetcherOptionProblem(name: string, args: string[]): string | undefined 
     // without a scheme whose host curl reads as one (`ftp.`, `dict.`, ...) counts as that scheme.
     for (const u of urls) {
       const scheme = /^\s*([A-Za-z][A-Za-z0-9+.-]*):\/\//.exec(u)?.[1]?.toLowerCase();
-      if (scheme !== undefined ? !["http", "https", "file"].includes(scheme) : /^\s*(ftp|dict|ldap|imap|smtp|pop3|telnet|gopher|mqtt|rtsp|smb|tftp|scp|sftp)\./i.test(u)) return `curl ${u}: only http and https URLs are fetched without a prompt; another scheme may send data or store it`;
+      if (scheme !== undefined ? !["http", "https", "file"].includes(scheme) : /^\s*(?:[^@/]*@)?(ftp|dict|ldap|imap|smtp|pop3|telnet|gopher|mqtt|rtsp|smb|tftp|scp|sftp)\./i.test(u)) return `curl ${u}: only http and https URLs are fetched without a prompt; another scheme may send data or store it`;
     }
   }
   // B7-6: wget globs an ftp URL against the server's listing (`*`, `?`, `[`) and writes every

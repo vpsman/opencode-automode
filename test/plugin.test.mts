@@ -2702,3 +2702,13 @@ describe("council project review 1, round 9: an edit while a runner's hook has n
     assert.ok(edit.effect === "ask" || permission.effect === "ask", `edit ${edit.effect}, make ${permission.effect}`);
   });
 });
+
+describe("council project review 1, round 10: the shell's locale", () => {
+  test("a shell handed a locale whose charset can read a backslash as part of a character asks", async () => {
+    const host = await start({ useClassifier: false });
+    const odd = await call(host, "ls", { sessionID: "cp1r10", env: { LC_ALL: "zh_CN.GBK" } });
+    assert.equal(odd.permission.effect, "ask");
+    assert.match(odd.permission.message, /LC_ALL/);
+    assert.equal((await call(host, "ls", { sessionID: "cp1r10", env: { LC_ALL: "C.UTF-8" } })).permission.effect, "allow");
+  });
+});
