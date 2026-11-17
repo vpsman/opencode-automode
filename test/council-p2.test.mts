@@ -369,3 +369,12 @@ test("round 8: make's assignments after --, and a lone -h or -V that is an optio
   }
   for (const c of ["make -- all", "make -j2 -- X=1", "rbash --version", "vim --version", "zsh --help"]) assert.equal(await effect(c), "allow", c);
 });
+
+// ---- round 9 ----
+
+test("round 9: a lone -h or -V asks for every name of the vim family and of the other shells", async () => {
+  for (const c of ["vim.basic -V <<'EOF'\n:!git push origin HEAD\n:qa!\nEOF", "vim.tiny -V < f", "/usr/bin/vim.basic -V < f", "timeout 20 vim.tiny -V < f", "vim.nox -V", "vim.gtk3 -V", "vimx -V", "editor -V", "ash -V", "lksh -h", "rksh -h", "rzsh -h", "zsh-5.9 -h", "bash-static -h", "tclsh -h", "octave -V", "echo nop | as -V"]) {
+    assert.notEqual(await effect(c), "allow", c);
+  }
+  for (const c of ["vim.basic --version", "zsh --version", "git -h", "ls -h"]) assert.equal(await effect(c), "allow", c);
+});

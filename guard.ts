@@ -444,7 +444,9 @@ function wordsAreData(argv: string[]): number {
   return main;
 }
 
-const STDIN_RUNNERS = new Set(["rbash", "zsh", "ksh", "ksh93", "mksh", "pdksh", "oksh", "yash", "posh", "fish", "tcsh", "csh", "busybox", "ex", "vi", "vim", "view", "nvim", "rvim", "rview", "gvim", "evim", "vimdiff", "ed", "red"]);
+// (Round 9: by family, as Debian installs vim as `vim.basic` and `vim.tiny`, shells as `zsh-5.9`.)
+const STDIN_RUNNER = /^(?:(?:vim|vi|ex|view|rvim|rview|gvim|evim|vimdiff|nvim|vimx)(?:\.\w+)?|editor|sensible-editor|ed|red|rbash|bash-static|posh|busybox|tclsh[\d.]*|wish[\d.]*|octave[\d.-]*|as)$/;
+const STDIN_RUNNERS = { has: (name: string) => STDIN_RUNNER.test(name) || OTHER_SHELL.test(name) };
 // The first option among the leading words of `set` or of a shell that is not known to leave
 // the reading of code alone; "-O" for a shopt option wherever it stands in a cluster.
 function optionsProblem(words: string[], shell: boolean): string | undefined {
