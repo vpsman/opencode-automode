@@ -421,3 +421,43 @@ test("round 11: a file the call makes and hands a runner counts from its nearest
     fs.rmSync(path.join(repo, "t.c"), { force: true });
   }
 });
+
+// ---- round 12 ----
+
+test("round 12: unplaced writes mark allowedPaths; runners look upward; tee only straight after; zstd -dT0; links made in the call; cp --parents", async () => {
+  const b = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-r12-")));
+  const extra = fs.realpathSync(fs.mkdtempSync(path.join(os.homedir(), "cp2-extra-")));
+  try {
+    fs.writeFileSync(path.join(repo, "t.c"), "int x;\n");
+    fs.writeFileSync(path.join(extra, "package.json"), JSON.stringify({ scripts: { test: "node --test" } }));
+    const g2: Guard = { ...guard, allowedPaths: [extra] };
+    const s = new SessionState(repo);
+    await decideShell(g2, s, repo, `gcc -M -MT x -MF ${extra}/r12.test.js t.c`);
+    assert.notEqual((await decideShell(g2, s, extra, "npm test")).effect, "allow", "allowedPaths");
+    // npm looks upward from a temp subdirectory.
+    fs.mkdirSync(path.join(b, "p", "sub"), { recursive: true });
+    const up = new SessionState(repo);
+    assert.equal(await effect(`printf '{}' > ${b}/p/package.json`, up), "allow");
+    fs.writeFileSync(path.join(b, "p", "package.json"), "{}");
+    assert.notEqual(await effect(`cd ${b}/p/sub && npm test`, up), "allow", "upward");
+    for (const c of [`npm test -s | printf 'x' | tee x.test.js`, `npm test | printf '{}' | tee package.json`, "npm test | tee x.test.js <<< 'code'", "make | printf x | tee Makefile"]) assert.notEqual(await effect(c), "allow", c);
+    assert.equal(await effect("npm test 2>&1 | tee test.log"), "allow", "a tee of the command's own output, as before");
+    for (const writer of [`zstd -dT0 ${b}/x.test.js.zst --output-dir-flat .`, `zstd -d1 ${b}/x.zst --output-dir-flat=.`, `lzop -x ${b}/a.lzo`]) {
+      const t = new SessionState(repo);
+      const wrote = await effect(writer, t);
+      assert.ok(wrote !== "allow" || (await effect("npm test", t)) !== "allow", writer);
+    }
+    fs.mkdirSync(path.join(b, "e", "sub"), { recursive: true });
+    const l = new SessionState(repo);
+    await effect(`ln -s ${b}/e/sub ${b}/l && printf x > ${b}/l/x.test.js`, l);
+    assert.notEqual(await effect(`npm test -- ${b}/e/sub/x.test.js`, l), "allow", "a link made in the call");
+    fs.mkdirSync(path.join(b, "d", "s"), { recursive: true });
+    const c = new SessionState(repo);
+    await effect(`cp --parents f ${b}/d`, c);
+    assert.notEqual(await effect(`npm test -- ${b}/d/f`, c), "allow", "cp --parents");
+  } finally {
+    fs.rmSync(b, { recursive: true, force: true });
+    fs.rmSync(extra, { recursive: true, force: true });
+    fs.rmSync(path.join(repo, "t.c"), { force: true });
+  }
+});

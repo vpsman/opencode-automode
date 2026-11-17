@@ -5291,7 +5291,8 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   };
   // (Council project review 2, round 11, Opus: and the temp directories, where such a writer may
   // have written too, `gcc -MF /tmp/d/x.test.js`, `git format-patch -o /tmp/d`.)
-  const project = (cmd: Simple) => note(cmd, [...new Set([...roots, ...tempDirs()].map(realish))]);
+  // (Round 12, Sol and Astra: and every other directory a call may write, `allowedPaths`.)
+  const project = (cmd: Simple) => note(cmd, [...new Set([...roots, ...tempDirs(), ...guard.allowedPaths, ...(guard.writable ?? [])].map(realish))]);
   const mark = (dir: string | undefined, cmd: Simple) => {
     const at = cwdOf(cmd);
     if (dir === undefined || (!path.isAbsolute(tilde(dir)) && at === undefined)) project(cmd);
@@ -5333,6 +5334,10 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   // A write the check cannot place (after `mkdir x && cd x`, through a variable) is a file it
   // cannot name either: what runs by its path afterwards may be that file.
   const unplacedAll = found.writes.filter((w) => /[$`]/.test(pwdPlaced(w.word, w.cmd)) || (!path.isAbsolute(tilde(w.word)) && cwdOf(w.cmd) === undefined));
+  // (Council project review 2, round 12, Mythos: a write through a link the same call makes or
+  // re-points lands where the new link leads, which the record does not walk: such writes are
+  // unplaced.)
+  if (cmds.some((c) => c.argv.some((a) => path.basename(a) === "ln"))) for (const w of found.writes) project(w.cmd);
   const unplaced = unplacedAll[0];
   for (const w of unplacedAll) project(w.cmd);
   const unknownWrite = found.unknown ?? (unplaced ? `writes ${unplaced.word} where the check cannot place it` : undefined);
@@ -5350,7 +5355,21 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
       // (A `tee` further down the command's own pipeline writes the command's own output, as a
       // redirect of it does: `npm test 2>&1 | tee test.log`.)
       const pipe = where.pipes.get(cmd);
-      const fed = (c: Simple) => pipe !== undefined && where.pipes.get(c) === pipe && cmds.indexOf(c) > cmds.indexOf(cmd) && c.argv[0] === "tee" && !c.out.length;
+      // (Round 12, Mythos: a tee that reads the pipe, after nothing but filters that pass on what
+      // they read, `grep -v warning`, `head -n 50`, a bare `cat`; not after `printf`.)
+      const stdinOnly = (c: Simple) => !c.out.length && !c.in?.length && !c.heredoc;
+      const passes = (c: Simple) => {
+        const [name, ...args] = c.argv;
+        const operands = args.filter((a) => !a.startsWith("-"));
+        if (/^(grep|egrep|fgrep)$/.test(name)) return operands.length <= 1 && !args.some((a) => /^-[a-zA-Z]*[ef]$/.test(a) || /^--(regexp|file)/.test(a));
+        if (/^(head|tail)$/.test(name)) return operands.every((a) => /^\d+$/.test(a));
+        return name === "cat" && args.length === 0;
+      };
+      const fed = (c: Simple) => {
+        const [from, to] = [cmds.indexOf(cmd), cmds.indexOf(c)];
+        if (pipe === undefined || where.pipes.get(c) !== pipe || to <= from || c.argv[0] !== "tee" || !stdinOnly(c)) return false;
+        return cmds.slice(from + 1, to).every((m) => where.pipes.get(m) === pipe && stdinOnly(m) && passes(m));
+      };
       const rest = cmds.filter((c) => c !== cmd && !fed(c));
       const theirs = writtenBy(rest, resolve, expand, () => {});
       known = { written: new Set([...session.files.keys(), ...session.touched, ...theirs]), unlisted: [...new Set([...session.unlisted, ...session.worktree.map((w) => w.top), ...rest.flatMap((c) => marksBy.get(c) ?? [])])] };

@@ -308,7 +308,10 @@ For each shell tool call:
      extraction, `patch`, `git apply`, a recursive copy, and every gcc-family or rustc call that
      is not a pure query (`--version`, `--help`, `-print-*`, `-dumpmachine`; `-E` and
      `-fsyntax-only` count as compiles, as an option's value can hide or undo them), since a compiler and its options choose many names) marks the directory it ran
-     in, or the project where the place cannot be read (every compile); after a git command that writes the work tree
+     in, or, where the place cannot be read (every compile, a write in a call that also makes
+     a link, `cp --parents`), the project, the temp directories and `allowedPaths`; a runner
+     outside every project counts a write in a writable directory above where it runs, as npm
+     and cargo look upward; after a git command that writes the work tree
      (`pull`, `merge`, `checkout`, `rebase`, `stash pop`, `reset`) only the files git
      changed count, once the call is over. In a session that has written nothing in the
      project, `make`, `npm test` and `cargo build` are allows and run the project's code

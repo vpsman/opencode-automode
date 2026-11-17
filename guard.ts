@@ -5030,7 +5030,7 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
   if (COMPILER.test(name) && !compilerQuery(args)) return `${name} writes files under names it or its options choose`;
   if (name === "rustc" && !rustcQuery(args)) return "rustc writes its outputs, whose names the check does not place";
   if (name === "ccache" && args.length && COMPILER.test(args[0])) return unnamedWrite(args[0], args.slice(1), filesOnly);
-  if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|unlz4)$/.test(name) || (/^(gzip|xz|zstd|bzip2|lzop|lz4|lzip|brotli)$/.test(name) && args.some((a) => /^(-[a-zA-Z]*d[a-zA-Z]*|--decompress|--uncompress)$/.test(a)))) return `${name} -d writes files next to its input`;
+  if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|unlz4)$/.test(name) || (/^(gzip|xz|zstd|bzip2|lzop|lz4|lzip|brotli)$/.test(name) && args.some((a) => /^(-[a-zA-Z0-9]*d[a-zA-Z0-9]*|--decompress|--uncompress)$/.test(a))) || (name === "lzop" && args.some((a) => /^-[a-zA-Z0-9]*x/.test(a)))) return `${name} -d writes files next to its input`;
   if (name === "patch") {
     const got = getopt(args, PATCH_OPTIONS);
     if (got.unknown || !got.opts.some((o) => ["--dry-run", "-o", "--output"].includes(o.name))) return "patch writes the files the diff names";
@@ -5044,6 +5044,8 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
     // write unless every source is known to be a file.
     const sources = words.target !== undefined ? words.operands : words.operands.slice(0, -1);
     if (words.recursive || (name === "mv" && !(sources.length > 0 && filesOnly?.(sources)))) return `${name} writes the files of directories it copies or moves`;
+    // (Round 12, Mythos: `--parents` puts each file at the destination plus its whole path.)
+    if (name === "cp" && args.some((a) => a.length > 3 && "--parents".startsWith(a))) return "cp --parents writes each file under its whole path below the destination";
   }
   if (name === "git") {
     const call = gitCall(args);
@@ -7799,9 +7801,14 @@ function runnerTouched(name: string, places: (string | undefined)[], written: Se
   const what = note ? `${name}, ${note},` : name;
   if (places.some((p) => p === undefined)) return { action: "classify", reason: `runs ${what} in a place the check cannot tell, after this session wrote files` };
   const dirs = places as string[];
+  // (Council project review 2, round 12, Opus and Mythos: npm, cargo, pytest and just look upward
+  // from a temp directory too: for a runner outside every project, a write in a writable
+  // directory above its place counts.)
+  const writableDir = (d: string) => !!ctx.inProject?.(d) || !!ctx.canWrite?.(d) || tempDirs().some((t) => within(d, t));
+  // (A project's own runner keeps D3: a write above the project does not count for it.)
   const above = (w: string) => {
     const d = path.dirname(w);
-    return !!ctx.inProject?.(d) && dirs.some((p) => within(p, d));
+    return d !== "/" && dirs.some((p) => within(p, d) && (!!ctx.inProject?.(d) || (!ctx.inProject?.(p) && writableDir(d))));
   };
   const near = (w: string) => anywhere || dirs.some((p) => within(w, p)) || above(w);
   const all = [...written];
