@@ -5085,6 +5085,13 @@ function deniedAsIssued(guard: Guard, session: SessionState, cwd: string, comman
   }
 }
 
+// Commands that make or copy a link: a write later in the same call may land where the link
+// leads, which the record does not walk (council project review 2, rounds 12 and 13). `ln`,
+// `link`, and `cp` with an option that makes a link or copies one as a link (`-s`, `-l`, `-d`,
+// `-P`, `-r`/`-R` and `-a`, which copy links as links).
+const makesLink = (argv: string[]) =>
+  argv.some((a) => /^(ln|link)$/.test(path.basename(a))) ||
+  (argv.some((a) => path.basename(a) === "cp") && argv.some((a) => (/^-[a-zA-Z]+$/.test(a) && /[sldPrRa]/.test(a)) || /^--(sy|li|no-d|ar|pr|re)/.test(a)));
 export async function decideShell(guard: Guard, session: SessionState, cwd: string, command: string, signal?: AbortSignal, scan: Scan = new Scan(guard.allowedPaths)): Promise<Decision> {
   try {
   projectRoots(session, scan); // takes the git snapshot first (all git calls here run with fsmonitor and hooks off)
@@ -5337,7 +5344,9 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   // (Council project review 2, round 12, Mythos: a write through a link the same call makes or
   // re-points lands where the new link leads, which the record does not walk: such writes are
   // unplaced.)
-  if (cmds.some((c) => c.argv.some((a) => path.basename(a) === "ln"))) for (const w of found.writes) project(w.cmd);
+  // (Round 13, all four: `cp -s`, `-P`, `-a` and every other program that makes, copies or moves
+  // a link.)
+  if (cmds.some((c) => makesLink(c.argv))) for (const w of found.writes) project(w.cmd);
   const unplaced = unplacedAll[0];
   for (const w of unplacedAll) project(w.cmd);
   const unknownWrite = found.unknown ?? (unplaced ? `writes ${unplaced.word} where the check cannot place it` : undefined);
@@ -5358,11 +5367,12 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
       // (Round 12, Mythos: a tee that reads the pipe, after nothing but filters that pass on what
       // they read, `grep -v warning`, `head -n 50`, a bare `cat`; not after `printf`.)
       const stdinOnly = (c: Simple) => !c.out.length && !c.in?.length && !c.heredoc;
+      // (Round 13: only the plain forms, where no word can be a file: `grep` with flags that take
+      // no value and one pattern; `head`/`tail` with a count.)
       const passes = (c: Simple) => {
         const [name, ...args] = c.argv;
-        const operands = args.filter((a) => !a.startsWith("-"));
-        if (/^(grep|egrep|fgrep)$/.test(name)) return operands.length <= 1 && !args.some((a) => /^-[a-zA-Z]*[ef]$/.test(a) || /^--(regexp|file)/.test(a));
-        if (/^(head|tail)$/.test(name)) return operands.every((a) => /^\d+$/.test(a));
+        if (/^(grep|egrep|fgrep)$/.test(name)) return args.filter((a) => !/^-[vicnwxFEGPsqhHUzbo]+$/.test(a)).length === 1 && !args.at(-1)!.startsWith("-") && args.filter((a) => !a.startsWith("-")).length === 1;
+        if (/^(head|tail)$/.test(name)) return args.every((a, i) => /^-[nc]?\d+$/.test(a) || (/^-[nc]$/.test(a) && /^\d+$/.test(args[i + 1] ?? "")) || (/^\d+$/.test(a) && /^-[nc]$/.test(args[i - 1] ?? "")));
         return name === "cat" && args.length === 0;
       };
       const fed = (c: Simple) => {

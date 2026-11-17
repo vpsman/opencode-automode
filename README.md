@@ -308,8 +308,8 @@ For each shell tool call:
      extraction, `patch`, `git apply`, a recursive copy, and every gcc-family or rustc call that
      is not a pure query (`--version`, `--help`, `-print-*`, `-dumpmachine`; `-E` and
      `-fsyntax-only` count as compiles, as an option's value can hide or undo them), since a compiler and its options choose many names) marks the directory it ran
-     in, or, where the place cannot be read (every compile, a write in a call that also makes
-     a link, `cp --parents`), the project, the temp directories and `allowedPaths`; a runner
+     in, or, where the place cannot be read (every compile, a write in a call that also makes or
+     copies a link: `ln`, or `cp` with `-s`, `-l`, `-d`, `-P`, `-r` or `-a`; `cp --parents`), the project, the temp directories and `allowedPaths`; a runner
      outside every project counts a write in a writable directory above where it runs, as npm
      and cargo look upward; after a git command that writes the work tree
      (`pull`, `merge`, `checkout`, `rebase`, `stash pop`, `reset`) only the files git

@@ -461,3 +461,27 @@ test("round 12: unplaced writes mark allowedPaths; runners look upward; tee only
     fs.rmSync(path.join(repo, "t.c"), { force: true });
   }
 });
+
+// ---- round 13 ----
+
+test("round 13: a link made by cp in the call; only plain filters before a tee; gzip --decomp", async () => {
+  const b = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-r13-")));
+  try {
+    fs.mkdirSync(path.join(b, "B"));
+    fs.mkdirSync(path.join(b, "A"));
+    fs.writeFileSync(path.join(b, "B", "x.test.js"), "");
+    const s = new SessionState(repo);
+    await effect(`cp -s ${b}/B/x.test.js ${b}/A/l.js && printf x > ${b}/A/l.js`, s);
+    assert.notEqual(await effect(`npm test -- ${b}/B/x.test.js`, s), "allow", "cp -s");
+    assert.notEqual(await effect(`cp -s ${repo}/package.json ${b}/p && printf '{}' > ${b}/p && npm test`), "allow", "cp -s in one call");
+    for (const c of ["npm test | grep -e. payload | tee x.test.js", "npm test | grep -hex payload | tee x.test.js", "npm test | grep --reg=. payload | tee x.test.js", "npm test | grep -fpats payload | tee x.test.js", "npm test | grep -v -- -zzz payload | tee x.test.js", "npm test | head 123 | tee x.test.js", "npm test | tail 1 | tee x.test.js", "npm test | grep -r x . | tee x.test.js"]) {
+      assert.notEqual(await effect(c), "allow", c);
+    }
+    for (const c of ["npm test 2>&1 | grep -v warning | tee -a test.log", "npm test | head -n 50 | tee test.log", "npm test | tail -20 | tee test.log", "npm test | cat | tee test.log"]) assert.equal(await effect(c), "allow", c);
+    const t = new SessionState(repo);
+    const wrote = await effect(`gzip --decomp ${b}/x.test.js.gz`, t);
+    assert.ok(wrote !== "allow" || (await effect(`npm test -- ${b}/x.test.js`, t)) !== "allow");
+  } finally {
+    fs.rmSync(b, { recursive: true, force: true });
+  }
+});
