@@ -5030,7 +5030,7 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
   if (COMPILER.test(name) && !compilerQuery(args)) return `${name} writes files under names it or its options choose`;
   if (name === "rustc" && !rustcQuery(args)) return "rustc writes its outputs, whose names the check does not place";
   if (name === "ccache" && args.length && COMPILER.test(args[0])) return unnamedWrite(args[0], args.slice(1), filesOnly);
-  if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|unlz4)$/.test(name) || (/^(gzip|xz|zstd|bzip2|lzop|lz4|lzip|brotli)$/.test(name) && args.some((a) => /^(-[a-zA-Z0-9]*d[a-zA-Z0-9]*|--dec\w*|--unc\w*)$/.test(a))) || (name === "lzop" && args.some((a) => /^-[a-zA-Z0-9]*x/.test(a)))) return `${name} -d writes files next to its input`;
+  if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|unlz4)$/.test(name) || (/^(gzip|xz|zstd|bzip2|lzop|lz4|lzip|brotli)$/.test(name) && args.some((a) => /^-[a-zA-Z0-9]*d[a-zA-Z0-9]*$/.test(a) || (a.length > 2 && ("--decompress".startsWith(a) || "--uncompress".startsWith(a))))) || (name === "lzop" && args.some((a) => /^-[a-zA-Z0-9]*x/.test(a)))) return `${name} -d writes files next to its input`;
   if (name === "patch") {
     const got = getopt(args, PATCH_OPTIONS);
     if (got.unknown || !got.opts.some((o) => ["--dry-run", "-o", "--output"].includes(o.name))) return "patch writes the files the diff names";
@@ -5121,7 +5121,8 @@ function unnamedWriteDirs(name: string, args: string[]): (string | undefined)[] 
   // (Round 4: an option that puts the output elsewhere, zstd's `--output-dir-flat=.`, lzop's
   // `-p`, a `-o`: the place is not read, and the project is marked.)
   if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|unlz4|gzip|xz|zstd|bzip2|lzop|lz4|lzip|brotli)$/.test(name)) {
-    if (args.some((a) => /^--(output|path)|^-[a-zA-Z]*[op]/.test(a))) return [undefined];
+    // (Round 14, Opus: a list of inputs read from a file or stdin, `--files`, `--filelist`.)
+    if (args.some((a) => /^--(output|path|files|filelist)|^-[a-zA-Z]*[op]/.test(a))) return [undefined];
     return place(args.filter((a) => !a.startsWith("-")).map((f) => path.dirname(f)));
   }
   if (["cp", "mv", "install", "rsync"].includes(name)) {

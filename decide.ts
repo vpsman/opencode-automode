@@ -5090,7 +5090,8 @@ function deniedAsIssued(guard: Guard, session: SessionState, cwd: string, comman
 // `link`, and `cp` with an option that makes a link or copies one as a link (`-s`, `-l`, `-d`,
 // `-P`, `-r`/`-R` and `-a`, which copy links as links).
 const makesLink = (argv: string[]) =>
-  argv.some((a) => /^(ln|link)$/.test(path.basename(a))) ||
+  // (Round 14, Mythos: `patch` makes a link from a git diff's `new file mode 120000`.)
+  argv.some((a) => /^(ln|link|patch)$/.test(path.basename(a))) ||
   (argv.some((a) => path.basename(a) === "cp") && argv.some((a) => (/^-[a-zA-Z]+$/.test(a) && /[sldPrRa]/.test(a)) || /^--(sy|li|no-d|ar|pr|re)/.test(a)));
 export async function decideShell(guard: Guard, session: SessionState, cwd: string, command: string, signal?: AbortSignal, scan: Scan = new Scan(guard.allowedPaths)): Promise<Decision> {
   try {

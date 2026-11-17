@@ -485,3 +485,30 @@ test("round 13: a link made by cp in the call; only plain filters before a tee; 
     fs.rmSync(b, { recursive: true, force: true });
   }
 });
+
+// ---- round 14 ----
+
+test("round 14: gzip's short prefixes, xz --files, a link patch makes, $$( in double quotes", async () => {
+  const b = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-r14-")));
+  try {
+    for (const writer of [`gzip --de ${b}/x.test.js.gz`, `gzip --d ${b}/x.test.js.gz`, `gzip --un ${b}/x.test.js.gz`, `xz --u ${b}/x.test.js.xz`]) {
+      const s = new SessionState(repo);
+      const wrote = await effect(writer, s);
+      assert.ok(wrote !== "allow" || (await effect(`npm test -- ${b}/x.test.js`, s)) !== "allow", writer);
+    }
+    fs.mkdirSync(path.join(b, "p"));
+    fs.writeFileSync(path.join(b, "p", "package.json"), "{}");
+    const f = new SessionState(repo);
+    await effect(`xz -d --files=${b}/list`, f);
+    assert.notEqual((await decideShell(guard, f, path.join(b, "p"), "npm test")).effect, "allow", "xz --files");
+    fs.mkdirSync(path.join(b, "e", "sub"), { recursive: true });
+    fs.mkdirSync(path.join(b, "k", "deep"), { recursive: true });
+    const l = new SessionState(repo);
+    await effect(`patch -d ${b}/k/deep -p1 -i ${b}/p.diff && printf x > ${b}/k/deep/l/x.test.js`, l);
+    assert.notEqual(await effect(`npm test -- ${b}/e/sub/x.test.js`, l), "allow", "patch");
+  } finally {
+    fs.rmSync(b, { recursive: true, force: true });
+  }
+  for (const c of [`echo "$$(echo "c")"`, `echo "$\${x"y z"}"`, `echo "$$(echo "; echo INJECTED; ")"`, `echo "$\\\n$(echo "c")"`]) assert.ok("ask" in canonical(c), c);
+  for (const c of [`echo "$$"`, `echo "$$ x"`, `echo "$x(y)"`]) assert.ok(!("ask" in canonical(c)), c);
+});
