@@ -1728,7 +1728,7 @@ function gitDestroys(sub: string, rest: string[], exists?: (word: string) => boo
     const pathsAfter = end >= 0 && rest.length > end + 1;
     if (pathsAfter || (end >= 0 && operands.length !== 1) || operands.length > (creating ? 1 : 1)) return `git checkout ${operands.slice(1).join(" ") || "-- ..."} names paths, whose local changes it overwrites`;
     const only = operands[0];
-    if (!creating && end < 0 && only !== undefined && only !== "-" && (only === "." || /^\.{1,2}(\/|$)/.test(only) || only.startsWith(":") || /[*?[]/.test(only) || exists?.(only))) return `git checkout ${only} names a path, whose local changes it overwrites`;
+    if (!creating && end < 0 && only !== undefined && only !== "-" && (only === "." || /^\.{1,2}(\/|$)/.test(only) || only.startsWith(":") || /[*?[\\]/.test(only) || exists?.(only))) return `git checkout ${only} names a path, whose local changes it overwrites`;
   }
   if (sub === "switch" && has(["--force", "--discard-changes", "--force-create"], "fC")) return discards;
   if (sub === "branch") {
@@ -1744,6 +1744,7 @@ function gitDestroys(sub: string, rest: string[], exists?: (word: string) => boo
   // the index and the work tree agree, and an operation's `--abort` or `--skip` resets the work
   // tree, the conflicts resolved so far with it (`merge --abort` is `reset --merge`).
   if (sub === "reset" && long("--merge")) return "git reset --merge discards staged changes, as --hard does";
+  if (sub === "clean" && has(["--interactive"], "i")) return "git clean -i deletes the untracked files its input picks, without -f";
   if (["merge", "rebase", "am", "cherry-pick", "revert"].includes(sub) && long("--abort", "--skip")) return `git ${sub} --abort or --skip resets the work tree, discarding the conflicts resolved so far`;
   if (sub === "fetch" || sub === "pull") return fetchMoves(sub, rest);
   return undefined;
@@ -4082,6 +4083,10 @@ function managerProblem(name: string, args: string[]): string | undefined {
   if (["npm", "pnpm", "yarn", "bun"].includes(name)) {
     const option = own.find((a) => abbreviates(a, PM_PROGRAM_OPTIONS) || /^--(script|node|init)_/.test(a) || /^--config\./.test(a));
     if (option) return `${name} ${option.split("=")[0]} picks the program scripts run with, or a config that does`;
+    // (Council project review 2, round 2, Mythos: npm supplies an `env` script of its own where
+    // package.json has none, which prints the environment or runs the words after it.)
+    const words = own.filter((a) => !a.startsWith("-"));
+    if (["run", "run-script", "rum", "urn"].includes(words[0] ?? "") && words[1] === "env") return `${name} run env prints the environment, or runs the words after it as a command`;
   }
   if (name === "cargo") {
     const option = own.find((a) => abbreviates(a, ["--config"]) || /^-[a-zA-Z]*Z/.test(a));
@@ -4090,6 +4095,9 @@ function managerProblem(name: string, args: string[]): string | undefined {
   if (name === "go") {
     const option = own.find((a) => /^--?(toolexec|exec|vettool)(=|$)/.test(a));
     if (option) return `go ${option.split("=")[0]} runs a program of the caller's choosing`;
+    // (Council project review 2, round 2: `-ldflags=-extld=<prog>` names the external linker.)
+    const ld = own.findIndex((a) => /^--?ldflags(=|$)/.test(a));
+    if (ld >= 0 && /extld/.test(own[ld].includes("=") ? own[ld] : (own[ld + 1] ?? ""))) return "go -ldflags with -extld runs the linker the call names";
   }
   return undefined;
 }
@@ -4101,11 +4109,13 @@ function buildToolProblem(name: string, args: string[]): string | undefined {
   const own = args.slice(0, args.includes("--") ? args.indexOf("--") : args.length);
   const operands = own.filter((a) => !a.startsWith("-"));
   if (COMPILER.test(name)) {
-    const word = args.find((a, i) => /^(-wrapper|-B.*|-fplugin(=.*|-arg.*)?|-fpass-plugin=.*|--?specs(=.*)?|--ld-path(=.*)?|-Xclang|-ccc-.*|--gcc-toolchain(=.*)?|--gcc-install-dir(=.*)?)$/.test(a) || (/^-fuse-ld=/.test(a) && a.includes("/")) || (/^-Wl,/.test(a) && /plugin/.test(a)) || (a === "-Xlinker" && /plugin/.test(args[i + 1] ?? "")));
+    const word = args.find((a, i) => /^(-wrapper|-B.*|--prefix(=.*)?|-fplugin(=.*|-arg.*)?|-fpass-plugin=.*|--?specs(=.*)?|--ld-path(=.*)?|-Xclang|-ccc-.*|--gcc-toolchain(=.*)?|--gcc-install-dir(=.*)?)$/.test(a) || (/^-fuse-ld=/.test(a) && a.includes("/")) || (/^(-Wl,|-Wp,|--for-linker=)/.test(a) && /plugin/.test(a)) || ((a === "-Xlinker" || a === "--for-linker") && /plugin/.test(args[i + 1] ?? "")));
     if (word) return `${name} ${word.split("=")[0]} runs a program or loads a plugin the call names`;
   }
   if (name === "rustc") {
-    const word = args.find((a, i) => /^-Z/.test(a) || /^(-C|--codegen)=?(linker|link-arg|link-args)=/.test(a) || ((a === "-C" || a === "--codegen") && /^(linker|link-arg|link-args)=/.test(args[i + 1] ?? "")) || /^-C(linker|link-arg|link-args)=/.test(a));
+    // rustc reads `_` and `-` alike in a `-C` key (round 2, Mythos: `link_arg`).
+    const key = /^(linker|link[-_]args?)=/;
+    const word = args.find((a, i) => /^-Z/.test(a) || ((a === "-C" || a === "--codegen") && key.test(args[i + 1] ?? "")) || (/^(-C|--codegen=)/.test(a) && key.test(a.replace(/^(-C|--codegen=)/, ""))));
     if (word) return `rustc ${word.split("=")[0]} runs a linker or passes it options the call names`;
   }
   if (name === "ccache") {
@@ -4117,15 +4127,18 @@ function buildToolProblem(name: string, args: string[]): string | undefined {
     if (args.some((a) => /^(-[a-zA-Z]*o|--set-config)/.test(a))) return "ccache -o sets ccache's config, which can name a program to run (compiler, prefix_command)";
   }
   if (name === "cmake") {
-    const word = own.find((a) => /^-[EP]/.test(a));
+    const word = own.find((a) => /^-[EPC]/.test(a) || /^--toolchain(=|$)/.test(a));
     if (word) return `cmake ${word.slice(0, 2)} runs a command or a script the call names`;
+    // (Round 2, Opus: a compiler, launcher or toolchain file named on the command line is run.)
+    const set = own.find((a, i) => /^-D/.test(a) && /CMAKE_\w*(COMPILER|LAUNCHER|LINKER|TOOLCHAIN_FILE)\w*(:\w+)?=/.test(a === "-D" ? (own[i + 1] ?? "") : a));
+    if (set) return "cmake -D CMAKE_..._COMPILER, _LAUNCHER, _LINKER or CMAKE_TOOLCHAIN_FILE names a program or a script cmake runs";
   }
   if (name === "ctest") {
     const word = own.find((a) => /^(-S.*|--script|--script-new-process|--build-and-test|--test-command)(=.*)?$/.test(a));
     if (word) return `ctest ${word} runs a script or a command the call names`;
   }
   if (name === "just") {
-    const word = own.find((a) => /^--(command|shell|shell-command|shell-arg)(=|$)/.test(a) || (/^-[a-zA-Z]*c/.test(a) && !a.startsWith("--")));
+    const word = own.find((a) => /^--(command|shell|shell-command|shell-arg|chooser)(=|$)/.test(a) || (/^-[a-zA-Z]*c/.test(a) && !a.startsWith("--")));
     if (word) return `just ${word.split("=")[0]} runs a command or a shell the call names`;
   }
   if (name === "tox") {
@@ -4139,8 +4152,8 @@ function buildToolProblem(name: string, args: string[]): string | undefined {
     if (word) return `meson ${word.split("=")[0]} runs a program the call names`;
   }
   if (name === "mypy") {
-    const word = own.find((a) => abbreviates(a, ["--python-executable"]));
-    if (word) return "mypy --python-executable runs the python the call names";
+    const word = own.find((a) => abbreviates(a, ["--python-executable", "--install-types"]));
+    if (word) return `mypy ${word.split("=")[0]} runs the python the call names, or installs packages`;
   }
   return undefined;
 }
@@ -7561,7 +7574,7 @@ export function runnerPlaces(name: string, args: string[], cwd: string | undefin
   }
   const places: (string | undefined)[] = [cwd];
   const place = (word: string, file: boolean) => {
-    if (/[$`*?[\]{}]/.test(word) || /^~[^/]/.test(word)) return void places.push(undefined);
+    if (/[$`*?[\]{}()\\]/.test(word) || /^~[^/]/.test(word)) return void places.push(undefined);
     const p = resolve(word);
     if (p === undefined) return void places.push(undefined);
     places.push(file ? path.dirname(p) : p);
@@ -7571,7 +7584,7 @@ export function runnerPlaces(name: string, args: string[], cwd: string | undefin
   if (read?.unread) places.push(undefined);
   for (const dir of read?.dirs ?? []) place(dir, false);
   for (const selected of read?.places ?? []) {
-    const p = selected === undefined || /[$`*?[\]{}]/.test(selected) ? undefined : resolve(selected);
+    const p = selected === undefined || /[$`*?[\]{}()\\]/.test(selected) ? undefined : resolve(selected);
     places.push(p !== undefined && fs.existsSync(p) && !isFile(p) ? p : undefined);
   }
   for (let i = 0; i < words.length; i++) {
@@ -7599,7 +7612,8 @@ export function runnerPlaces(name: string, args: string[], cwd: string | undefin
     // `/` before its first pattern character; one in the first part of an absolute path, or of a
     // value after `=`, `,` or `:`, could be anywhere.
     for (const head of [w, ...[...w].flatMap((c, k) => ("=,:".includes(c) ? [w.slice(k + 1)] : [])), ...(/^-[A-Za-z]./.test(w) && !w.startsWith("--") ? [w.slice(2)] : [])]) {
-      const at = head.search(/[*?[{]/);
+      // (Round 2: node's extglob `@(x)`, `!(x)`, `+(x)` and a backslash escape too.)
+      const at = head.search(/[*?[{(\\]/);
       if (at < 0 || head.startsWith("-") || /[$`]/.test(head.slice(0, at))) continue;
       const fixed = head.slice(0, head.lastIndexOf("/", at) + 1);
       if (fixed === "") continue;
@@ -7879,7 +7893,7 @@ const FIND_VALUES = [
   ..."-name -iname -path -ipath -wholename -iwholename -regex -iregex -lname -ilname -type -xtype -maxdepth -mindepth -mtime -mmin -ctime -cmin -atime -amin -used -newer -anewer -cnewer -size -user -group -uid -gid -perm -links -inum -samefile -fstype -context -printf -regextype".split(" "),
   ...[..."aBcm"].flatMap((x) => [..."aBcmt"].map((y) => `-newer${x}${y}`)),
 ];
-const PM: Keyed = { values: ["-w", "--workspace", "--filter", "-F", "-p", "--package", "--bin", "--test", "--example", "--bench", "--features", "--target", "-j", "--jobs", "--profile", "-run", "-bench", "-count", "-timeout", "-tags", "-skip", "-parallel", "-cpu", "-benchtime"], checked: ["--prefix", "--cwd", "--manifest-path", "--config", "--target-dir", ...PM_PROGRAM_OPTIONS, "-toolexec", "-exec", "-vettool", "-o", "-C", "-modfile", "-overlay", "-pkgdir", "--toolexec", "--exec", "--vettool"], letters: "CZ" };
+const PM: Keyed = { values: ["-w", "--workspace", "--filter", "-F", "-p", "--package", "--bin", "--test", "--example", "--bench", "--features", "--target", "-j", "--jobs", "--profile", "-run", "-bench", "-count", "-timeout", "-tags", "-skip", "-parallel", "-cpu", "-benchtime"], checked: ["--prefix", "--cwd", "--manifest-path", "--config", "--target-dir", ...PM_PROGRAM_OPTIONS, "-toolexec", "-exec", "-vettool", "-ldflags", "--ldflags", "-o", "-C", "-modfile", "-overlay", "-pkgdir", "--toolexec", "--exec", "--vettool"], letters: "CZ" };
 const KEYED: Record<string, Keyed> = {
   find: { values: FIND_VALUES, checked: ["-fprint", "-fprintf", "-fls"], dashDash: false },
   make: { values: ["-j", "-l", "-o", "-W", "--jobs", "--load-average", "--old-file", "--what-if", "--assume-old", "--assume-new", "--new-file"], checked: ["--file", "--makefile", "--include-dir", "--directory", "--eval"], letters: "fCIE", dashDash: false },
@@ -7895,13 +7909,24 @@ const KEYED: Record<string, Keyed> = {
   npm: PM,
   cargo: PM,
   go: PM,
+  // Council project review 2, round 2 (Mythos): the compilers and build tools whose options
+  // buildToolProblem reads by name.
+  gcc: { checked: ["-wrapper", "--prefix", "-specs", "--specs", "-Xclang", "-Xlinker", "--for-linker", "--ld-path", "--gcc-toolchain", "--gcc-install-dir"], letters: "B", dashDash: false },
+  rustc: { checked: ["-C", "--codegen", "-Z"], letters: "CZ" },
+  ccache: { checked: ["--set-config"], letters: "o", dashDash: false },
+  cmake: { checked: ["-E", "-P", "-C", "-D", "--toolchain"], letters: "EPCD" },
+  ctest: { checked: ["-S", "--script", "--script-new-process", "--build-and-test", "--test-command"], letters: "S" },
+  just: { checked: ["--command", "--shell", "--shell-command", "--shell-arg", "--chooser"], letters: "c" },
+  tox: { checked: ["--override", "-x"], letters: "x" },
+  meson: { checked: ["--wrapper", "--gdb-path"] },
+  mypy: { checked: ["--python-executable"] },
   gh: { values: ["-R", "--repo", "-q", "--jq", "-t", "--template"], checked: ["-X", "--method", "-f", "-F", "--field", "--raw-field", "--input", "-H", "--header"], letters: "XfFH" },
   sysctl: {},
   llamastash: {},
   docker: {},
   systemctl: {},
 };
-for (const [alias, name] of [["gmake", "make"], ["gtar", "tar"], ["bsdtar", "tar"], ["fdfind", "fd"], ["gawk", "awk"], ["mawk", "awk"], ["nawk", "awk"], ["pnpm", "npm"], ["yarn", "npm"], ["bun", "npm"], ["pip", "npm"], ["pip3", "npm"], ["gem", "npm"], ["uv", "npm"], ["poetry", "npm"], ["pipenv", "npm"], ["pdm", "npm"], ["hatch", "npm"], ["bundle", "npm"]]) KEYED[alias] = KEYED[name];
+for (const [alias, name] of [["cc", "gcc"], ["g++", "gcc"], ["c++", "gcc"], ["clang", "gcc"], ["clang++", "gcc"], ["gmake", "make"], ["gtar", "tar"], ["bsdtar", "tar"], ["fdfind", "fd"], ["gawk", "awk"], ["mawk", "awk"], ["nawk", "awk"], ["pnpm", "npm"], ["yarn", "npm"], ["bun", "npm"], ["pip", "npm"], ["pip3", "npm"], ["gem", "npm"], ["uv", "npm"], ["poetry", "npm"], ["pipenv", "npm"], ["pdm", "npm"], ["hatch", "npm"], ["bundle", "npm"]]) KEYED[alias] = KEYED[name];
 const GIT_VALUES: Record<string, string[]> = {
   commit: ["-m", "-F", "-C", "-c", "-t", "--message", "--file", "--author", "--date", "--template", "--reuse-message", "--reedit-message", "--fixup", "--squash", "--trailer", "--cleanup"],
   tag: ["-m", "-F", "--message", "--file"],

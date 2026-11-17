@@ -208,7 +208,9 @@ interface Source {
 // The strings `xargs -I`/`-i`/`--replace` and `find -exec` replace with their input in the words
 // of the program at `at` (chain: the programs the walk runs, guard.ts chainOf). Every word between
 // xargs and the program is read as if it could be the `-I` option, so the real one is among them.
-function placeholders(argv: string[], chain: number[], at: number): string[] {
+// Undefined where the replacement string is one bash computes (`-I "$m"`, `-I fo*`): any could be
+// the one.
+function placeholders(argv: string[], values: (string | undefined)[], chain: number[], at: number): string[] | undefined {
   const out: string[] = [];
   for (const c of chain) {
     if (c >= at) continue;
@@ -225,6 +227,7 @@ function placeholders(argv: string[], chain: number[], at: number): string[] {
       }
       if (!/^-./.test(w)) continue;
       for (let j = 1; j < w.length; j++) {
+        if (w[j] === "I" && j + 1 === w.length && i + 1 < at && values[i + 1] === undefined) return undefined;
         if (w[j] === "I") out.push(j + 1 < w.length ? w.slice(j + 1) : (argv[i + 1] ?? ""));
         else if (w[j] === "i") out.push(j + 1 < w.length ? w.slice(j + 1) : "{}");
         else if (!"aLnPsdEle".includes(w[j])) continue;
@@ -1739,15 +1742,20 @@ class Printer {
       // words in place of `XX` or `{}`, the code among them, after the printer has printed it. A
       // printed `"XX"` loses its quotes, and input with a `;` in it then runs as commands of its
       // own. Where the code (or a word before it) holds such a placeholder, it asks.
-      const marks = placeholders(argv, chainOf(argv), at);
-      const filled = (upTo: number) => marks.length > 0 && values.slice(at, upTo + 1).some((v) => v !== undefined && marks.some((m) => v.includes(m)));
-      const fills = `code for ${name} that xargs -I or find -exec fills in with its input (${marks.join(", ")}), which printing would leave unquoted`;
+      // Round 2 (all four): printing can make one where the code as written has none (`X"X"`
+      // printed `XX`, `\{\}` printed `'{}'`), so the printed code is held to it too.
+      const marks = placeholders(argv, values, chainOf(argv), at);
+      const holds = (text: string) => marks === undefined || marks.some((m) => text.includes(m));
+      const filled = (upTo: number) => (marks === undefined || marks.length > 0) && values.slice(at, upTo + 1).some((v) => v !== undefined && holds(v));
+      const fills = `code for ${name} that xargs -I or find -exec fills in with its input (${marks?.join(", ") ?? "a replacement string bash computes"}), which printing could change`;
+      const printedFilled = (text: string) => (marks === undefined || marks.length > 0) && holds(text);
       if (name === "eval") {
         const rest = values.slice(at + 1);
         if (!rest.length) continue;
         if (filled(values.length - 1)) ask(fills);
         if (rest.some((v) => v === undefined)) ask("code for eval built from a variable, a substitution or a glob");
         const inner = print(rest.join(" "), this.depth + 1, "in the code eval runs");
+        if (printedFilled(inner.text)) ask(fills);
         // What eval defines stays defined for the rest of the command, which was read as a
         // command that defines nothing.
         if (inner.defines) ask("code for eval that defines a function, which changes what a later word of the command runs");
@@ -1774,6 +1782,7 @@ class Printer {
       // The scanner asks about an option between -c and the code; such a word is left as it is.
       if (/^[-+]/.test(code!)) continue;
       const inner = print(code!, this.depth + 1, "in a command a nested shell runs");
+      if (printedFilled(inner.text)) ask(fills);
       // `bash -c ' -x' 'cmd'` runs a command called `-x`; printed without its blank, `-x` would
       // be an option and `cmd` the code.
       if (/^[-+]/.test(inner.text)) ask("code for a nested shell that starts with - or + once printed, which the shell reads as an option");

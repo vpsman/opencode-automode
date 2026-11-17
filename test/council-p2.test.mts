@@ -142,3 +142,60 @@ test("a pattern a runner expands itself counts as a place a session write may li
     fs.rmSync(d, { recursive: true, force: true });
   }
 });
+
+// ---- round 2 ----
+
+test("round 2: a placeholder that only the printed code holds, or one bash computes, asks", () => {
+  for (const c of [
+    `printf '%s\\n' 'safe; echo EXTRA' | xargs -IXX bash -c 'echo X"X"'`,
+    `xargs -I XX bash -c 'echo "X"X'`,
+    `find . -maxdepth 0 -exec bash -c 'echo "{""}"' \;`,
+    `find . -type f -exec bash -c 'echo \\{\\}' \;`,
+    `printf 'x; echo INJECTED; echo \\\\n' | xargs -I"'" bash -c 'echo "a b"'`,
+    `M=foo; xargs -I "$M" bash -c 'echo "foo"'`,
+    `xargs -I "$(echo foo)" bash -c 'echo "foo"'`,
+    `xargs -I fo* bash -c 'echo "foo"'`,
+  ]) assert.ok("ask" in canonical(c), c);
+  // What prints keeps doing what was written.
+  for (const c of [`printf '%s\\n' 'a; echo EXTRA' | xargs -I{} bash -c 'printf "<%s>\\n" "$1"' _ {}`, `printf '%s\\n' 'a; echo EXTRA' | xargs -IXX bash -c 'printf "<%s>\\n" "$1"' _ XX`]) {
+    const printed = canonical(c);
+    assert.ok("text" in printed, c);
+    const run = (t: string) => spawnSync("bash", ["-c", t], { encoding: "utf8" }).stdout;
+    assert.equal(run(printed.text!), run(c), c);
+  }
+});
+
+test("round 2: a build tool's option held in a variable goes to the model; rustc's _ spelling, cmake's compilers, go's -extld ask", async () => {
+  for (const c of ["W=-wrapper; gcc $W sh,-c,true -c t.c", `W=-wrapper; gcc "$W" sh,-c,true -c t.c`, "gcc $CFLAGS -c t.c", "A=-Clinker=sh; rustc $A x.rs", "E=-E; cmake $E env sh", "J=--command; just $J sh", "clang ${W} x -c t.c"]) {
+    assert.notEqual(await effect(c), "allow", c);
+  }
+  for (const c of [
+    "rustc -C link_arg=-wrapper x.rs", "rustc -Clink_arg=x x.rs", "rustc -C link_args=x x.rs", "rustc --codegen link_arg=x x.rs", "rustc --codegen=link_arg=x x.rs",
+    "gcc --prefix=/tmp/x -c t.c", "gcc --prefix /tmp/x -c t.c", "gcc -Wp,-fplugin=x.so -c t.c", "gcc --for-linker=-plugin --for-linker=x.so t.c",
+    "cmake -C x.cmake .", "cmake -DCMAKE_C_COMPILER=/tmp/prog .", "cmake -D CMAKE_C_COMPILER_LAUNCHER=sh .", "cmake -DCMAKE_TOOLCHAIN_FILE:FILEPATH=x.cmake .", "cmake --toolchain x.cmake .",
+    "go build -ldflags=-extld=sh .", "go build -ldflags '-linkmode=external -extld /tmp/prog' .",
+    "just --chooser 'sh -c x' --choose", "mypy --install-types .",
+    "npm run env -- sh -c true", "npm run env", "npm run-script env", "pnpm run env -- sh -c true", "yarn run env",
+  ]) assert.equal(await effect(c), "ask", c);
+  for (const c of ["cmake -DCMAKE_BUILD_TYPE=Release -S . -B build", "go build -ldflags=-s .", "npm run build", "rustc -C opt-level=2 x.rs"]) assert.notEqual(await effect(c), "ask", c);
+});
+
+test("round 2: git clean -i and a checkout operand with a backslash ask", async () => {
+  for (const c of ["git clean -i", "git clean --interactive", "git clean -di", "git checkout '\\f'", "git checkout '\\x'"]) assert.equal(await effect(c), "ask", c);
+});
+
+test("round 2: node's extglob and a backslash in a runner's pattern count as places", async () => {
+  const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-ext-")));
+  const name = path.basename(d);
+  const tmp = path.dirname(d);
+  try {
+    const s = new SessionState(repo);
+    assert.equal(await effect(`printf x > ${d}/x.test.js`, s), "allow");
+    fs.writeFileSync(path.join(d, "x.test.js"), "x");
+    for (const c of [`npm test -- '${tmp}/!(zzz)/x.test.js'`, `npm test -- '${tmp}/@(${name})/x.test.js'`, `npm test -- '${tmp}/+(${name})/x.test.js'`, `npm test -- '/\\${tmp.slice(1)}/${name}/x.test.js'`, `npm test -- '${tmp}/${name}\\/x.test.js'`, `npm test -- '/@(${tmp.split("/")[1]})${tmp.slice(tmp.indexOf("/", 1) < 0 ? tmp.length : tmp.indexOf("/", 1))}/${name}/x.test.js'`]) {
+      assert.notEqual(await effect(c, s), "allow", c);
+    }
+  } finally {
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+});

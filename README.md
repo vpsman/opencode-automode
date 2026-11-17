@@ -131,7 +131,8 @@ For each shell tool call:
      names an existing path, looked up where git runs, `-C` included
      (`git checkout HEAD ./`), `branch -f`, `-M` and `-C`, `gc --prune=<date>`,
      `reset --merge`, `--abort` and `--skip` of `merge`, `rebase`, `am`, `cherry-pick` and
-     `revert` (they reset the work tree, conflicts resolved so far with it), and a
+     `revert` (they reset the work tree, conflicts resolved so far with it), `clean -i`, a
+     `checkout` operand with a backslash (a pathspec), and a
      `fetch` or `pull` that can move a local branch or tag backwards or delete one: a `+`
      refspec, `--force` (the last of `--force` and `--no-force` decides), `--refmap`,
      `--update-head-ok`, `--prune-tags`, `--stdin`, `--prune` with a destination, and a
@@ -178,11 +179,13 @@ For each shell tool call:
      makefile from standard input, a device or a pipe, also through a symbolic link, and
      `NAME=value` arguments of make on the environment's terms; `fd -x`; `rg --pre`;
      `man -P`, `-H` and `-C`; a compiler's `-wrapper`, `-B`, `-fplugin`, `-specs`, `-Xclang`,
-     `-fuse-ld=<path>` and a linker plugin; `rustc -C linker=`,
-     `link-arg` and `-Z`; `ccache` with a program other than a compiler, or `-o`; `cmake -E`
-     and `-P`; `ctest -S`, `--build-and-test` and `--test-command`; `just --command`/`-c` and
-     `--shell`; `tox exec` and `-x`/`--override`; `meson devenv` and `--wrapper`; `mypy
-     --python-executable`); builtins that evaluate a value as arithmetic (`let`,
+     `-fuse-ld=<path>`, `--prefix` and a linker plugin; `rustc -C linker=`,
+     `link-arg` (or `link_arg`) and `-Z`; `ccache` with a program other than a compiler, or
+     `-o`; `cmake -E`, `-P`, `-C`, `--toolchain` and `-D CMAKE_<...>_COMPILER`, `_LAUNCHER`,
+     `_LINKER` or `CMAKE_TOOLCHAIN_FILE`; `ctest -S`, `--build-and-test` and `--test-command`; `just --command`/`-c` and
+     `--shell` and `--chooser`; `tox exec` and `-x`/`--override`; `meson devenv` and
+     `--wrapper`; `mypy --python-executable` and `--install-types`; `go -ldflags` with
+     `-extld`; `npm run env`; an option of any of these held in a variable goes to the model); builtins that evaluate a value as arithmetic (`let`,
      `declare -i`, `test -v` with a subscript), and a value given in any of those ways to
      one of bash's integer variables (`RANDOM`, `SRANDOM`, `OPTIND`, `HISTCMD`, `SECONDS`,
      `BASHPID`, `BASH_XTRACEFD`, `READLINE_MARK`, `READLINE_POINT`); a locale (`LANG`,
@@ -288,7 +291,7 @@ For each shell tool call:
      configuration, hook or URL names a program, and for a program whose place the check
      cannot tell (`npm --version`, `cargo --version`: to the model). A pattern a program
      expands itself (`npm test -- '/tmp/d*/x.test.js'`) counts from the last `/` before its
-     first `*`, `?`, `[` or `{`; one in the first part of an absolute path could be anywhere. A write the check cannot place (an archive
+     first `*`, `?`, `[`, `{`, `(` or `\`; one in the first part of an absolute path could be anywhere. A write the check cannot place (an archive
      extraction, `patch`, `git apply`, a recursive copy) marks the directory it ran in; after a git command that writes the work tree
      (`pull`, `merge`, `checkout`, `rebase`, `stash pop`, `reset`) only the files git
      changed count, once the call is over. In a session that has written nothing in the
@@ -510,8 +513,8 @@ For each shell tool call:
    rebase under `merge.autoStash` or `rebase.autoStash`, `git apply` of a patch, a sparse
    checkout, a merge on a branch whose `branch.<name>.mergeOptions` holds `--autostash`,
    `git bisect reset <commit>` (a switch to a commit with the same version of the file,
-   `--abort`, `--continue`, `--skip` or `--quit` of a merge, rebase, cherry-pick, revert or
-   `git am` with nothing in progress, `git bisect reset` with no bisect, and `git apply
+   `--continue` or `--quit` of a merge, rebase, cherry-pick, revert or `git am` with nothing
+   in progress (`--abort` and `--skip` ask in any case, see Rules), `git bisect reset` with no bisect, and `git apply
    --check` run); `git stash -u` or `-a` when there is something to stash, in any
    repository, because it would also remove the empty `.opencode/` the plugin makes
    (unless git ignores it);
