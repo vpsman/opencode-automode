@@ -445,7 +445,7 @@ function wordsAreData(argv: string[]): number {
 }
 
 // (Round 9: by family, as Debian installs vim as `vim.basic` and `vim.tiny`, shells as `zsh-5.9`.)
-const STDIN_RUNNER = /^(?:(?:vim|vi|ex|view|rvim|rview|gvim|evim|vimdiff|nvim|vimx)(?:\.\w+)?|editor|sensible-editor|ed|red|rbash|bash-static|posh|busybox|tclsh[\d.]*|wish[\d.]*|octave[\d.-]*|as)$/;
+const STDIN_RUNNER = /^(?:(?:vim|vi|ex|view|rvim|rview|gvim|gview|rgvim|rgview|evim|eview|vimdiff|gvimdiff|nvim|vimx)(?:\.\w+)?|editor|sensible-editor|ed|red|rbash|bash-static|bsd-csh|posh|busybox|tclsh[\d.]*|wish[\d.]*|octave[\w.-]*|racket|erl|(?:[\w.-]+-)?as(?:-[\d.]+)?)$/;
 const STDIN_RUNNERS = { has: (name: string) => STDIN_RUNNER.test(name) || OTHER_SHELL.test(name) };
 // The first option among the leading words of `set` or of a shell that is not known to leave
 // the reading of code alone; "-O" for a shopt option wherever it stands in a cluster.
@@ -7748,8 +7748,9 @@ export function runnerPlaces(name: string, args: string[], cwd: string | undefin
     // Council project review 1, round 6: every path a word may hold counts, whatever the option
     // (`--start-directory=/tmp/d`, `-s/tmp/d`, `-wrapper /bin/sh,/tmp/x.sh`, `t.py::test_a`,
     // `/tmp/d/...`); a file of more words (`@args`) is not read, and leaves the place unknown.
-    // (Round 3, Mythos: a URL's `%xx` escapes and a `data:` URL's code name files no word shows.)
-    if (w.startsWith("@") || /%[0-9a-fA-F]{2}/.test(w) || /data:/i.test(w)) {
+    // (Round 3, Mythos: a URL's `%xx` escapes and a `data:` URL's code name files no word shows.
+    // Round 10, Mythos: nor does a word bash computes, `$P`, `$(...)`, `<(...)`.)
+    if (w.startsWith("@") || /%[0-9a-fA-F]{2}/.test(w) || /data:/i.test(w) || /[$`]|[<>]\(/.test(w)) {
       places.push(undefined);
       continue;
     }

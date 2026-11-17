@@ -378,3 +378,21 @@ test("round 9: a lone -h or -V asks for every name of the vim family and of the 
   }
   for (const c of ["vim.basic --version", "zsh --version", "git -h", "ls -h"]) assert.equal(await effect(c), "allow", c);
 });
+
+// ---- round 10 ----
+
+test("round 10: a runner word bash computes is a place the check cannot tell; more names of the stdin readers", async () => {
+  const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-exp-")));
+  try {
+    const s = new SessionState(repo);
+    assert.equal(await effect(`printf x > ${d}/x.test.js`, s), "allow");
+    fs.writeFileSync(path.join(d, "x.test.js"), "x");
+    for (const c of [`P=${d}/x.test.js; npm test -- $P`, `npm test -- $(echo ${d}/x.test.js)`, "npm test -- $TMPDIR/x.test.js", `pnpm test -- $P`, "jest --setupFiles=$P", "eslint --rulesdir $P .", "timeout 60 npm test -- $P"]) {
+      assert.notEqual(await effect(c, s), "allow", c);
+    }
+  } finally {
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+  for (const c of ["echo nop | x86_64-linux-gnu-as -V", "octave-cli -V", "bsd-csh -V", "gview -V", "rgvim -V", "eview -V", "gvimdiff -V"]) assert.notEqual(await effect(c), "allow", c);
+  assert.equal(await effect("npm test -- $X"), "allow", "with nothing written, as before");
+});

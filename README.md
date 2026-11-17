@@ -303,8 +303,8 @@ For each shell tool call:
      configuration, hook or URL names a program, and for a program whose place the check
      cannot tell (`npm --version`, `cargo --version`: to the model). A pattern a program
      expands itself (`npm test -- '/tmp/d*/x.test.js'`) counts from the last `/` before its
-     first `*`, `?`, `[`, `{`, `(` or `\`, and a word with a `%xx` escape or a `data:` URL is a
-     place the check cannot tell; one in the first part of an absolute path could be anywhere. A write the check cannot place (an archive
+     first `*`, `?`, `[`, `{`, `(` or `\`, and a word with a `%xx` escape, a `data:` URL or an
+     expansion bash computes (`$P`, `$(...)`) is a place the check cannot tell; one in the first part of an absolute path could be anywhere. A write the check cannot place (an archive
      extraction, `patch`, `git apply`, a recursive copy, and every gcc-family or rustc call that
      is not a pure query (`--version`, `--help`, `-print-*`, `-dumpmachine`; `-E` and
      `-fsyntax-only` count as compiles, as an option's value can hide or undo them), since a compiler and its options choose many names) marks the directory it ran
