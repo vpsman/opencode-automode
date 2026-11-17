@@ -692,3 +692,24 @@ test("round 25: a device only without .., descriptor paths that reopen a file, a
   }
   for (const c of ["npm test > /dev/null", "npm test 2>/dev/null", "echo hi > /dev/null"]) assert.equal(await effect(c), "allow", c);
 });
+
+// ---- round 26 ----
+
+test("round 26: a write through a link to a descriptor, every descriptor write, any function, rsync -a", async () => {
+  const b = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-r26-")));
+  try {
+    fs.symlinkSync("/dev/stdout", path.join(b, "stdout"));
+    fs.symlinkSync("/dev/stdin", path.join(b, "in"));
+    for (const c of [`{ echo hi > ${b}/stdout; } < package.json >&0`, `printf x < f > ${b}/in`, "echo hi > /dev/./stdin", "echo hi > /dev/stdout; echo hi > /dev/stdin"]) {
+      assert.notEqual(await effect(c), "allow", c);
+    }
+    for (const writer of [`ls() ( tar -xf ${b}/a.tar -C ${b}/o ); ls; ls`, `ls() if :; then tar -xf ${b}/a.tar -C ${b}/o; fi; ls; ls`, `rsync -a /dev/stdin ${b}/l && printf x > ${b}/w`]) {
+      const s = new SessionState(repo);
+      const wrote = await effect(writer, s);
+      assert.ok(wrote !== "allow" || (await effect("npm test", s)) !== "allow", writer);
+    }
+  } finally {
+    fs.rmSync(b, { recursive: true, force: true });
+  }
+  for (const c of ["npm test > /dev/null", "echo hi > /dev/stdout"]) assert.equal(await effect(c), "allow", c);
+});

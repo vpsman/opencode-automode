@@ -5094,6 +5094,33 @@ const isDevice = (word: string, cwd: string | undefined) => !/(^|\/)\.\.(\/|$)/.
 // A path to one of the shell's own descriptors: in the command's shell it is whatever file the
 // descriptor holds, and opening it for writing reopens that file (round 25, Mythos).
 const DESCRIPTOR = /^\/(dev\/(stdin|stdout|stderr|fd\/\d+)|proc\/(self|thread-self|\d+)\/fd\/\d+)$/;
+// The descriptor paths a write target reaches through its links, walked with readlink one link at
+// a time (round 26, Sol and Opus): never through `realpath`, which would follow the plugin's own
+// descriptors. Each step's directory is taken physically, as the kernel walks it.
+function descriptorsReached(p: string): string[] {
+  const out: string[] = [];
+  for (let hop = 0; hop < 16; hop++) {
+    if (DESCRIPTOR.test(p)) {
+      out.push(p);
+      return out;
+    }
+    let next: string;
+    try {
+      const dir = path.dirname(p);
+      const at = path.join(DESCRIPTOR.test(dir) ? dir : physical(dir), path.basename(p));
+      if (DESCRIPTOR.test(at)) {
+        out.push(at);
+        return out;
+      }
+      if (!fs.lstatSync(at).isSymbolicLink()) return out;
+      next = path.resolve(path.dirname(at), fs.readlinkSync(at));
+    } catch {
+      return out;
+    }
+    p = next;
+  }
+  return out;
+}
 // Whether a directory holds a symbolic link at any depth (council project review 2, round 22), or
 // is too large to tell within a small budget; a link to a place inside the directory counts too.
 function holdsLink(dir: string, budget = { left: 4000 }): boolean {
@@ -5117,7 +5144,9 @@ function holdsLink(dir: string, budget = { left: 4000 }): boolean {
 const makesLink = (argv: string[]) =>
   // (Round 14, Mythos: `patch` makes a link from a git diff's `new file mode 120000`.)
   argv.some((a) => /^(ln|link|patch)$/.test(path.basename(a))) ||
-  (argv.some((a) => path.basename(a) === "cp") && argv.some((a) => (/^-[a-zA-Z]+$/.test(a) && /[sldPrRa]/.test(a)) || /^--(sy|li|no-d|ar|pr|re)/.test(a)));
+  (argv.some((a) => path.basename(a) === "cp") && argv.some((a) => (/^-[a-zA-Z]+$/.test(a) && /[sldPrRa]/.test(a)) || /^--(sy|li|no-d|ar|pr|re)/.test(a))) ||
+  // (Round 26, Opus: rsync copies a link as a link with -a, -l or --links.)
+  (argv.some((a) => path.basename(a) === "rsync") && argv.some((a) => (/^-[a-zA-Z]+$/.test(a) && /[al]/.test(a)) || /^--(archive|links)$/.test(a)));
 export async function decideShell(guard: Guard, session: SessionState, cwd: string, command: string, signal?: AbortSignal, scan: Scan = new Scan(guard.allowedPaths)): Promise<Decision> {
   try {
   projectRoots(session, scan); // takes the git snapshot first (all git calls here run with fsmonitor and hooks off)
@@ -5395,7 +5424,8 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
     const others = [...found.writes.filter((w) => !isDevice(w.word, cwdOf(w.cmd))), ...found.unlisted].filter((w) => !extractors.some((e) => e.cmd === w.cmd));
     // (Round 25, Opus and Mythos: one writer the text names once may run more than once: in a
     // loop or a function, or unzip with a pattern for its archives.)
-    const repeats = /\b(for|while|until|select)\b|\(\s*\)\s*\{|\bfunction\b/.test(run) || extractors.some((u) => u.cmd.argv.some((a) => path.basename(a) === "unzip") && u.cmd.argv.some((a) => /[*?[]/.test(a)));
+    // (Round 26, Mythos: any function, `ls() ( ... )` and `ls() if ...` too.)
+    const repeats = /\b(for|while|until|select)\b/.test(run) || functionNames(run).size > 0 || extractors.some((u) => u.cmd.argv.some((a) => path.basename(a) === "unzip") && u.cmd.argv.some((a) => /[*?[]/.test(a)));
     if (extractors.length > 1 || (extractors.length === 1 && (others.length > 0 || repeats))) for (const w of [...found.writes, ...found.unlisted]) project(w.cmd);
   }
   const unplaced = unplacedAll[0];
@@ -5543,8 +5573,12 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   };
   // (Council project review 2, round 25, Mythos: a write to one of the shell's descriptors by its
   // path reopens the file the descriptor holds, one the call itself opened with `<` or a copy.)
-  const descriptorWrite = found.writes.find((w) => DESCRIPTOR.test(path.resolve(cwdOf(w.cmd) ?? "/", tilde(w.word))));
-  if (descriptorWrite && (/\/dev\/stdin$|\/fd\/0$/.test(descriptorWrite.word) || /(^|[^<])<(?![<(&])|[<>]&\s*\d|\bexec\b/.test(run))) return asked(askBy(`writes ${descriptorWrite.word}, a path to a descriptor that may hold a file this call opened, which the write then replaces`));
+  // (Round 26: every write, by its normalised path and through its links.)
+  const reopens = /(^|[^<])<(?![<(&])|[<>]&\s*\d|\bexec\b/.test(run);
+  for (const w of found.writes) {
+    const reached = descriptorsReached(path.resolve(cwdOf(w.cmd) ?? "/", tilde(w.word)));
+    if (reached.some((d) => /\/dev\/stdin$|\/fd\/0$/.test(d)) || (reached.length > 0 && reopens)) return asked(askBy(`writes ${w.word}, which leads to a descriptor (${reached[0]}) that may hold a file this call opened, which the write then replaces`));
+  }
   if (gitIssue) return asked(askBy(gitIssue));
   if (writeIssue) return asked(askBy(writeIssue));
   if (verdict.action === "ask") return asked(fromRules(verdict));
