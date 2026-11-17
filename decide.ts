@@ -5085,6 +5085,22 @@ function deniedAsIssued(guard: Guard, session: SessionState, cwd: string, comman
   }
 }
 
+// Whether a directory holds a symbolic link at any depth (council project review 2, round 22), or
+// is too large to tell within a small budget; a link to a place inside the directory counts too.
+function holdsLink(dir: string, budget = { left: 4000 }): boolean {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  for (const e of entries) {
+    if (--budget.left < 0) return true;
+    if (e.isSymbolicLink()) return true;
+    if (e.isDirectory() && holdsLink(path.join(dir, e.name), budget)) return true;
+  }
+  return false;
+}
 // Commands that make or copy a link: a write later in the same call may land where the link
 // leads, which the record does not walk (council project review 2, rounds 12 and 13). `ln`,
 // `link`, and `cp` with an option that makes a link or copies one as a link (`-s`, `-l`, `-d`,
@@ -5307,10 +5323,15 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   // have written too, `gcc -MF /tmp/d/x.test.js`, `git format-patch -o /tmp/d`.)
   // (Round 12, Sol and Astra: and every other directory a call may write, `allowedPaths`.)
   const project = (cmd: Simple) => note(cmd, [...new Set([...roots, ...tempDirs(), ...guard.allowedPaths, ...(guard.writable ?? [])].map(realish))]);
+  // (Council project review 2, round 22, Mythos: a writer the check cannot list follows a link
+  // it finds where it writes, one an earlier extraction left, `out/l -> <project>`: such a mark
+  // covers every place the call may write.)
   const mark = (dir: string | undefined, cmd: Simple) => {
     const at = cwdOf(cmd);
-    if (dir === undefined || (!path.isAbsolute(tilde(dir)) && at === undefined)) project(cmd);
-    else note(cmd, [physical(path.isAbsolute(tilde(dir)) ? tilde(dir) : `${at}/${dir}`)]);
+    if (dir === undefined || (!path.isAbsolute(tilde(dir)) && at === undefined)) return project(cmd);
+    const place = physical(path.isAbsolute(tilde(dir)) ? tilde(dir) : `${at}/${dir}`);
+    note(cmd, [place]);
+    if (holdsLink(place)) project(cmd);
   };
   // A git command that writes the work tree (decision D1): what git changed is marked once it is
   // over, from the commit and the status taken now; where they cannot be taken, its directories

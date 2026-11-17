@@ -4152,7 +4152,8 @@ function managerProblem(name: string, args: string[]): string | undefined {
     const packAt = args.findIndex((a) => ["pack", "view", "info", "show", "v"].includes(a));
     // (Round 17: by what may pass, not by what npm reads as git: `x@git+...`, `git@host:path`,
     // `GITHUB:u/r`. A registry name, scoped or not, with a version or tag, and a local path pass.)
-    const registry = /^(@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*(@[\w.^~<>=*| -]+)?$/i;
+    // (Round 22, Astra and Mythos: no `*`, which bash may expand into a git spec, `x@*`.)
+    const registry = /^(@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*(@[\w.^~<>=| -]+)?$/i;
     const local = /^(\.{1,2}(\/|$)|\/|~\/)/;
     // (Round 20, all four: an option's value may stand where the subcommand or the package is
     // looked for, `npm --loglevel info pack <spec>`, `npm view --loglevel silent <spec>`. So every
@@ -4186,6 +4187,19 @@ function managerProblem(name: string, args: string[]): string | undefined {
     if (own.some((a) => /ext(ld|ar)/.test(a))) return "go with -extld or -extar runs the linker or archiver the call names";
     const gccgo = own.find((a) => /^--?gccgoflags(=|$)/.test(a));
     if (gccgo) return "go -gccgoflags hands gccgo options, which can name a program it runs";
+    // (Round 22, Opus: `go tool test2json <command>` runs the command; `go tool cgo -- <words>`
+    // hands the words to gcc; `go tool pprof -tools=` names the programs pprof runs.)
+    const tool = args.indexOf("tool");
+    if (tool >= 0) {
+      const which = args.slice(tool + 1).find((a) => !a.startsWith("-"));
+      const after = which === undefined ? [] : args.slice(args.indexOf(which, tool + 1) + 1);
+      if (which === "test2json" && after.some((a) => !a.startsWith("-"))) return "go tool test2json runs the command after its options";
+      if (which === "cgo" && after.includes("--")) {
+        const gcc = buildToolProblem("gcc", after.slice(after.indexOf("--") + 1));
+        if (gcc) return `go tool cgo -- hands gcc its words: ${gcc}`;
+      }
+      if (which === "pprof" && after.some((a) => /^--?tools(=|$)/.test(a))) return "go tool pprof -tools names the programs pprof runs";
+    }
   }
   return undefined;
 }
@@ -5125,6 +5139,9 @@ function unnamedWriteDirs(name: string, args: string[]): (string | undefined)[] 
     return place([...(before ? ["."] : []), dirs[0].value ?? ""]);
   }
   if (name === "unzip") {
+    // (Council project review 2, round 22, Mythos: `-:` keeps `../` in member names, so the
+    // files land anywhere the call may write.)
+    if (args.some((a) => /^-[a-zA-Z0-9]*:/.test(a))) return [undefined];
     const dir = unzipWords(args).dir;
     return place(dir === undefined ? [] : [dir]);
   }

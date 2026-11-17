@@ -612,3 +612,25 @@ test("round 21: -fcompare-debug= passes only plain option words; npm field words
   for (const c of ["npm pack '*'", "npm view x '?'", "npm view lodash 'v[a-z]'"]) assert.equal(await effect(c), "ask", c);
   assert.equal(await effect("npm view lodash 'versions[0]'"), "allow");
 });
+
+// ---- round 22 ----
+
+test("round 22: unzip -:, npm x@*, an extraction through a link an earlier one left, go tool test2json/cgo/pprof", async () => {
+  const b = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-r22-")));
+  try {
+    const s = new SessionState(repo);
+    await effect(`unzip -: ${b}/a.zip -d ${b}/out`, s);
+    assert.notEqual(await effect("npm test", s), "allow", "unzip -:");
+    fs.mkdirSync(path.join(b, "out"), { recursive: true });
+    fs.symlinkSync(repo, path.join(b, "out", "l"));
+    const t = new SessionState(repo);
+    await effect(`tar -xf ${b}/b.tar -C ${b}/out`, t);
+    assert.notEqual(await effect("npm test", t), "allow", "a link an earlier extraction left");
+  } finally {
+    fs.rmSync(b, { recursive: true, force: true });
+  }
+  for (const c of ["npm pack x@*", "npm view x@*", "pnpm pack x@*", "go tool test2json git clean -fdx", "go tool test2json -t /bin/sh -c id", "go tool cgo -- -wrapper /bin/sh,-c,id x.go", "go tool pprof -tools=/tmp/x: bin prof"]) {
+    assert.notEqual(await effect(c), "allow", c);
+  }
+  for (const c of ["npm view lodash@^4", "go tool dist list"]) assert.equal(await effect(c), "allow", c);
+});
