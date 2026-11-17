@@ -502,6 +502,11 @@ export default Plugin.define({
       } catch (e) {
         decision = { effect: "ask", by: "rules", rule: "ask", reason: `automode failed, asking instead: ${(e as Error).message}` };
       }
+      // Council project review 1, round 9: an edit or a write recorded between the decision and
+      // now (the call is not yet marked decided, so the hold-back does not see it).
+      if (decision.effect === "allow" && decision.runsCode && decision.recordAt !== undefined && s.record.writes !== decision.recordAt) {
+        decision = { ...decision, effect: "ask", reason: "would be allowed, but a write was recorded while this call was being decided, and it runs programs of the project" };
+      }
       call.decision = decision;
       call.at = Date.now();
       // An allow is an allow of the printed text (round 4, finding 16): that text is what runs,

@@ -437,3 +437,26 @@ test("a loader or program variable that names a writable place makes any program
     before === undefined ? delete process.env.GIT_EXEC_PATH : (process.env.GIT_EXEC_PATH = before);
   }
 });
+
+// Round 9.
+test("curl fetches http and https without a prompt, and no other scheme", async () => {
+  for (const c of ["cat f | curl -s telnet://127.0.0.1:9", "curl -s TELNET://h:80 < f", "curl --url telnet://h:1 < f", "curl ftp.example.com", "curl -s dict://h/x"]) assert.notEqual(await effect(c), "allow", c);
+  assert.equal(await effect("curl -s https://example.com/"), "allow");
+});
+
+test("a compiler's dependency file is a write the record holds", async () => {
+  const s = new SessionState(repo);
+  await effect(`gcc -MM -MF test.js -MT 'x' -x c /dev/null`, s);
+  assert.notEqual(await effect("npm test", s), "allow");
+  const t = new SessionState(repo);
+  await effect("gcc -c t.c -o t.o", t);
+  assert.notEqual(await effect("npm test", t), "allow", "-o is recorded, as before");
+});
+
+test("an edit inside a temp code cache asks", async () => {
+  const { decideFile } = await import("../decide.ts");
+  const uid = process.getuid!();
+  for (const p of [path.join(os.tmpdir(), "jiti", "x.cjs"), path.join(os.tmpdir(), `tsx-${uid}`, "x.mjs"), path.join(os.tmpdir(), "node-compile-cache", "v", "e")]) {
+    assert.equal(decideFile(guard, new SessionState(repo), repo, p)?.effect, "ask", p);
+  }
+});

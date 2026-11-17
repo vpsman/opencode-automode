@@ -35,7 +35,7 @@ import {
   type Verdict,
 } from "./rules.ts";
 import { scoreCommand, type ClassifierConfig } from "./kev.ts";
-import { findGitEntries, gitArgs, Scan, gitEnv, gitReadsElsewhere, gitRun, inGitDir, located as followed, madeByPlan, pushHooksMissing, HOOK_MANAGER_FILES, OPENCODE_CONFIG_NAMES, OPENCODE_PROJECT_FILES, opencodeDirs, protectedPaths, realpath, safeGit, workTreeSubmodules } from "./sandbox.ts";
+import { TEMP_CODE_CACHES, findGitEntries, gitArgs, Scan, gitEnv, gitReadsElsewhere, gitRun, inGitDir, located as followed, madeByPlan, pushHooksMissing, HOOK_MANAGER_FILES, OPENCODE_CONFIG_NAMES, OPENCODE_PROJECT_FILES, opencodeDirs, protectedPaths, realpath, safeGit, workTreeSubmodules } from "./sandbox.ts";
 import { canonical, type Printed } from "./canon.ts";
 import { PathWalkError, PWD_LEAD, fetchDestination, functionNames, pathFinds, pathHas, procRelative, runsItsWords, tempDirs, unseenWriter } from "./guard.ts";
 import { bentEnv, bentPath, gitOnlyReads, runsAnyProgram, runsProjectCode } from "./guard.ts";
@@ -145,6 +145,8 @@ export interface Decision {
   // of the project (index.ts: a write waits for no such call that may still be running).
   writes?: boolean;
   runsCode?: boolean;
+  // The record's count when this allow was judged, its own write counted (round 9).
+  recordAt?: number;
   // On an ask: records what the call writes, as an allow does (its named writes, the marks of the
   // writes the checks cannot list, and the git work-tree changes it will make), for when the user
   // approves it (round 4, finding 4, second pass). The plugin calls it from its approval hook.
@@ -5446,7 +5448,7 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
     // (Round 6: judged on the record as it was when this decision began.)
     if (f.runsCode && session.record.writes !== recordAt) return asked(askBy("a write was recorded while this call was being decided, and it runs programs of the project, which may now be other than the ones judged"));
     commit();
-    return { ...d, ...f, ...(worktree.length ? { worktree } : {}) };
+    return { ...d, ...f, recordAt: session.record.writes, ...(worktree.length ? { worktree } : {}) };
   };
   if (gitIssue) return asked(askBy(gitIssue));
   if (writeIssue) return asked(askBy(writeIssue));
@@ -5531,6 +5533,13 @@ function protectedFile(guard: Guard, session: SessionState, target: string, scan
 
 // edit/write/patch: only ever tightens. Undefined means "leave opencode's own verdict alone".
 export function decideFile(guard: Guard, session: SessionState, cwd: string, target: string): Decision | undefined {
+  // Council project review 1, round 9: a temp directory's code cache (node's compile cache, tsx,
+  // jiti, ...), which a later node outside the sandbox runs: sandboxed calls get a private copy,
+  // and an edit there asks.
+  const at = realish(path.resolve(cwd, target));
+  const caches = [...new Set(["/tmp", "/var/tmp", os.tmpdir()].map(realish))].flatMap((t) => TEMP_CODE_CACHES.map((n) => path.join(t, n)));
+  const moved = process.env.NODE_COMPILE_CACHE;
+  if ([...caches, ...(moved && path.isAbsolute(moved) ? [realish(moved)] : [])].some((c) => within(at, c))) return withApproval(session, askBy(`edit inside ${at}, a cache of code that node runs later outside the sandbox`));
   // One walk of each root for this edit (round 3, finding 40).
   const scan = new Scan(guard.allowedPaths);
   projectRoots(session, scan);

@@ -2686,3 +2686,19 @@ describe("council project review 1, round 8: a shell that comes after its call's
     }
   });
 });
+
+describe("council project review 1, round 9: an edit while a runner's hook has not finished", () => {
+  test("a runner asks where an edit was recorded before it was marked decided", async () => {
+    const host = await start({ useClassifier: false });
+    const id = `r9-${++ids}`;
+    const decision = host.tool({ tool: "shell", sessionID: "cp1r9", messageID: "m9", id, input: { command: "make" } });
+    const edit: any = { sessionID: "cp1r9", action: "edit", resources: [path.join(project, "cp1r9.mk")], effect: "allow" };
+    await host.permission(edit);
+    await decision;
+    const shell = { command: "make", cwd: project, timeout: 120000, shell: "/bin/bash", env: baseEnv() as Record<string, string | undefined> };
+    await host.shell(shell);
+    const permission: any = { sessionID: "cp1r9", action: "shell", resources: ["make"], source: { type: "tool", messageID: "m9", id }, effect: "allow" };
+    await host.permission(permission);
+    assert.ok(edit.effect === "ask" || permission.effect === "ask", `edit ${edit.effect}, make ${permission.effect}`);
+  });
+});

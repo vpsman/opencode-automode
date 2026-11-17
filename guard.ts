@@ -4222,6 +4222,13 @@ function fetcherOptionProblem(name: string, args: string[]): string | undefined 
     // (B7-11: curl leaves `[]` and a bracketed IPv6 address as they are, `http://[::1]:8080/`.)
     const literal = (u: string) => u.replace(/\[([^\]]*)\]/g, (m, inner: string) => (inner === "" || net.isIPv6(inner.replace(/%25/, "%")) ? "" : m));
     if (globoff !== "-g" && globoff !== "--globoff" && urls.some((u) => /[{[]/.test(literal(u)))) return "curl expands a URL whose effect the check cannot compute";
+    // Council project review 1, round 9: only http and https (and `file:`, read as a file
+    // elsewhere): telnet sends standard input to the host, and other schemes send or store. A URL
+    // without a scheme whose host curl reads as one (`ftp.`, `dict.`, ...) counts as that scheme.
+    for (const u of urls) {
+      const scheme = /^\s*([A-Za-z][A-Za-z0-9+.-]*):\/\//.exec(u)?.[1]?.toLowerCase();
+      if (scheme !== undefined ? !["http", "https", "file"].includes(scheme) : /^\s*(ftp|dict|ldap|imap|smtp|pop3|telnet|gopher|mqtt|rtsp|smb|tftp|scp|sftp)\./i.test(u)) return `curl ${u}: only http and https URLs are fetched without a prompt; another scheme may send data or store it`;
+    }
   }
   // B7-6: wget globs an ftp URL against the server's listing (`*`, `?`, `[`) and writes every
   // name the server lists: names no check has read.
@@ -4792,6 +4799,9 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
   if ((name === "unzip" && unzipWords(args).writes) || name === "7z" || name === "cpio" || name === "rar" || name === "unrar") return `${name} writes the files the archive names`;
   // (Council project review 1, round 4: `-d` anywhere in a cluster, `gzip -dk`; and the other
   // compressors the write checks know.)
+  // (Council project review 1, round 9: a compiler's dependency and aux files, `-MF test.js -MT
+  // '<text>'`, are written with text the command chooses, where no check reads them.)
+  if (/^(gcc|cc|clang|g\+\+|c\+\+|clang\+\+)(-\d+(\.\d+)*)?$/.test(name) && args.some((a) => /^-(MF|MJ|MD|MMD|aux-info|save-temps|dumpdir|Wp,)/.test(a))) return `${name} writes dependency or auxiliary files the check does not place`;
   if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|unlz4)$/.test(name) || (/^(gzip|xz|zstd|bzip2|lzop|lz4|lzip|brotli)$/.test(name) && args.some((a) => /^(-[a-zA-Z]*d[a-zA-Z]*|--decompress|--uncompress)$/.test(a)))) return `${name} -d writes files next to its input`;
   if (name === "patch") {
     const got = getopt(args, PATCH_OPTIONS);
