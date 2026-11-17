@@ -199,3 +199,32 @@ test("round 2: node's extglob and a backslash in a runner's pattern count as pla
     fs.rmSync(d, { recursive: true, force: true });
   }
 });
+
+// ---- round 3 ----
+
+test("round 3: npm's env script wherever it stands after run, go's -extld anywhere, tox's subcommand anywhere, git clean but a dry run, cmake's make program and includes", async () => {
+  for (const c of [
+    "npm run -- env sh -c true", "npm --prefix . run env -- sh -c true", "npm run --prefix src env -- sh -c true", "npm --loglevel silent run env -- sh -c true", "npm run -w pk env -- sh -c true", "npm -w pk run env -- sh -c true", "npm run-script -- env sh -c true", "npm run --loglevel warn env -- sh -c true",
+    "go build -ldflags=-s -ldflags='-linkmode=external -extld=/tmp/prog' .", "go build -ldflags -s -ldflags '-extld=sh' .", "go tool link -extld sh x", "go build -compiler=gccgo -gccgoflags=-wrapper .",
+    "tox -e py exec -- sh -c true", "tox -c tox.ini e -- sh", "tox --workdir .tox exec -- sh",
+    "git clean", "git clean -dx", "git clean -d -x -q", "git clean -X",
+    "cmake -DCMAKE_MAKE_PROGRAM=/tmp/prog -S . -B build", "cmake -DCMAKE_PROJECT_INCLUDE=/tmp/x.cmake .", "cmake -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES=x.cmake .", "cmake -DCMAKE_USER_MAKE_RULES_OVERRIDE=x.cmake .", "cmake '-DCMAKE_C_FLAGS=-wrapper sh,-c,true' .",
+  ]) assert.equal(await effect(c), "ask", c);
+  for (const c of ["git clean -n", "git clean -dn", "git clean --dry-run -x", "go build -ldflags=-s .", "tox -e py", "npm run build", "cmake -DCMAKE_C_FLAGS=-O2 ."]) assert.notEqual(await effect(c), "ask", c);
+});
+
+test("round 3: a runner's word with a %xx escape or a data: URL is a place the check cannot tell", async () => {
+  const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-url-")));
+  try {
+    const s = new SessionState(repo);
+    fs.mkdirSync(path.join(d, "a.b"));
+    assert.equal(await effect(`printf x > ${d}/a.b/x.test.js`, s), "allow");
+    fs.writeFileSync(path.join(d, "a.b", "x.test.js"), "x");
+    const escaped = `${d}/a.b/x.test.js`.replace(/^\/(.)/, (_, c: string) => `/%${c.charCodeAt(0).toString(16)}`);
+    for (const c of [`npm test -- --import=file://${escaped}`, `npm test -- --import=file://${d}/a%2Eb/x.test.js`, `npm test -- --import 'data:text/javascript,import "file://${escaped}"'`]) {
+      assert.notEqual(await effect(c, s), "allow", c);
+    }
+  } finally {
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+});

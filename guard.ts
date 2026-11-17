@@ -1744,7 +1744,10 @@ function gitDestroys(sub: string, rest: string[], exists?: (word: string) => boo
   // the index and the work tree agree, and an operation's `--abort` or `--skip` resets the work
   // tree, the conflicts resolved so far with it (`merge --abort` is `reset --merge`).
   if (sub === "reset" && long("--merge")) return "git reset --merge discards staged changes, as --hard does";
-  if (sub === "clean" && has(["--interactive"], "i")) return "git clean -i deletes the untracked files its input picks, without -f";
+  // (Round 3, Mythos: under clean.requireForce=false a plain `git clean` deletes too; without it,
+  // it only fails. Only a dry run is left alone.)
+  // (`-f` is the rules' own ask; a word bash computes goes to the model, as before.)
+  if (sub === "clean" && !has(["--dry-run"], "n") && !has(["--force"], "f") && !own.some((w) => /[$`]/.test(w))) return "git clean deletes untracked files (with -f, -i, or clean.requireForce=false)";
   if (["merge", "rebase", "am", "cherry-pick", "revert"].includes(sub) && long("--abort", "--skip")) return `git ${sub} --abort or --skip resets the work tree, discarding the conflicts resolved so far`;
   if (sub === "fetch" || sub === "pull") return fetchMoves(sub, rest);
   return undefined;
@@ -4085,8 +4088,10 @@ function managerProblem(name: string, args: string[]): string | undefined {
     if (option) return `${name} ${option.split("=")[0]} picks the program scripts run with, or a config that does`;
     // (Council project review 2, round 2, Mythos: npm supplies an `env` script of its own where
     // package.json has none, which prints the environment or runs the words after it.)
-    const words = own.filter((a) => !a.startsWith("-"));
-    if (["run", "run-script", "rum", "urn"].includes(words[0] ?? "") && words[1] === "env") return `${name} run env prints the environment, or runs the words after it as a command`;
+    // (Round 3, all four: npm takes options with values and `--` anywhere, `npm --prefix . run --
+    // env`: any `env` after a word that names `run` counts.)
+    const run = args.findIndex((a) => ["run", "run-script", "rum", "urn"].includes(a));
+    if (run >= 0 && args.slice(run + 1).includes("env")) return `${name} run env prints the environment, or runs the words after it as a command`;
   }
   if (name === "cargo") {
     const option = own.find((a) => abbreviates(a, ["--config"]) || /^-[a-zA-Z]*Z/.test(a));
@@ -4096,8 +4101,11 @@ function managerProblem(name: string, args: string[]): string | undefined {
     const option = own.find((a) => /^--?(toolexec|exec|vettool)(=|$)/.test(a));
     if (option) return `go ${option.split("=")[0]} runs a program of the caller's choosing`;
     // (Council project review 2, round 2: `-ldflags=-extld=<prog>` names the external linker.)
-    const ld = own.findIndex((a) => /^--?ldflags(=|$)/.test(a));
-    if (ld >= 0 && /extld/.test(own[ld].includes("=") ? own[ld] : (own[ld + 1] ?? ""))) return "go -ldflags with -extld runs the linker the call names";
+    // (Round 3: in any `-ldflags`, the last of several decides, and `go tool link -extld`; and
+    // `-gccgoflags`, a compiler's options, `-wrapper` among them.)
+    if (own.some((a) => /extld/.test(a))) return "go with -extld runs the linker the call names";
+    const gccgo = own.find((a) => /^--?gccgoflags(=|$)/.test(a));
+    if (gccgo) return "go -gccgoflags hands gccgo options, which can name a program it runs";
   }
   return undefined;
 }
@@ -4130,8 +4138,13 @@ function buildToolProblem(name: string, args: string[]): string | undefined {
     const word = own.find((a) => /^-[EPC]/.test(a) || /^--toolchain(=|$)/.test(a));
     if (word) return `cmake ${word.slice(0, 2)} runs a command or a script the call names`;
     // (Round 2, Opus: a compiler, launcher or toolchain file named on the command line is run.)
-    const set = own.find((a, i) => /^-D/.test(a) && /CMAKE_\w*(COMPILER|LAUNCHER|LINKER|TOOLCHAIN_FILE)\w*(:\w+)?=/.test(a === "-D" ? (own[i + 1] ?? "") : a));
-    if (set) return "cmake -D CMAKE_..._COMPILER, _LAUNCHER, _LINKER or CMAKE_TOOLCHAIN_FILE names a program or a script cmake runs";
+    // (Round 3: the make program, the files cmake includes into the project, and compiler flags
+    // that name a program.)
+    const set = own.find((a, i) => {
+      const def = /^-D/.test(a) ? (a === "-D" ? (own[i + 1] ?? "") : a) : "";
+      return /CMAKE_\w*(COMPILER|LAUNCHER|LINKER|TOOLCHAIN_FILE|MAKE_PROGRAM|INCLUDE|INCLUDES|OVERRIDE)\w*(:\w+)?=/.test(def) || (/CMAKE_\w*FLAGS\w*(:\w+)?=/.test(def) && /-wrapper|-B|--prefix|plugin|-specs|-Xclang|-fuse-ld|extld/.test(def));
+    });
+    if (set) return "cmake -D names a program, a script or compiler options that run one, which cmake runs";
   }
   if (name === "ctest") {
     const word = own.find((a) => /^(-S.*|--script|--script-new-process|--build-and-test|--test-command)(=.*)?$/.test(a));
@@ -4142,7 +4155,9 @@ function buildToolProblem(name: string, args: string[]): string | undefined {
     if (word) return `just ${word.split("=")[0]} runs a command or a shell the call names`;
   }
   if (name === "tox") {
-    if (["exec", "e"].includes(operands[0] ?? "")) return `tox ${operands[0]} runs a command the call names`;
+    // (Round 3, Mythos: tox finds its subcommand among the words, behind an option's value too.)
+    const sub = operands.find((a) => a === "exec" || a === "e");
+    if (sub) return `tox ${sub} runs a command the call names`;
     const word = own.find((a) => (/^-[a-zA-Z]*x/.test(a) && !a.startsWith("--")) || abbreviates(a, ["--override"]));
     if (word) return `tox ${word.split("=")[0]} overrides tox's config, the commands it runs among it`;
   }
@@ -7602,7 +7617,8 @@ export function runnerPlaces(name: string, args: string[], cwd: string | undefin
     // Council project review 1, round 6: every path a word may hold counts, whatever the option
     // (`--start-directory=/tmp/d`, `-s/tmp/d`, `-wrapper /bin/sh,/tmp/x.sh`, `t.py::test_a`,
     // `/tmp/d/...`); a file of more words (`@args`) is not read, and leaves the place unknown.
-    if (w.startsWith("@")) {
+    // (Round 3, Mythos: a URL's `%xx` escapes and a `data:` URL's code name files no word shows.)
+    if (w.startsWith("@") || /%[0-9a-fA-F]{2}/.test(w) || /data:/i.test(w)) {
       places.push(undefined);
       continue;
     }
