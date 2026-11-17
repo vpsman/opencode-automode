@@ -4136,8 +4136,9 @@ function managerProblem(name: string, args: string[]): string | undefined {
     const option = own.find((a) => abbreviates(a, ["--config"]) || /^-[a-zA-Z]*Z/.test(a));
     if (option) return `cargo ${option.split("=")[0]} sets cargo config, which can name a program to run (build.rustc-wrapper)`;
     // (Council project review 2, round 4, Mythos: these hand the words after `--` to rustc.)
-    const sub = own.find((a) => !a.startsWith("-") && !a.startsWith("+"));
-    if (end >= 0 && ["clippy", "rustc", "rustdoc"].includes(sub ?? "")) {
+    // (Round 5: a global option's value, `--color never`, stands before it.)
+    const sub = own.find((a) => ["clippy", "rustc", "rustdoc"].includes(a));
+    if (end >= 0 && sub) {
       const rustc = buildToolProblem("rustc", args.slice(end + 1));
       if (rustc) return `cargo ${sub} -- hands rustc its words: ${rustc}`;
     }
@@ -4192,14 +4193,20 @@ function buildToolProblem(name: string, args: string[]): string | undefined {
       const def = /^-D/.test(a) ? (a === "-D" ? (own[i + 1] ?? "") : a.slice(2)) : "";
       const m = /^(CMAKE_\w+?)(:\w+)?=(.*)$/s.exec(def);
       if (!m) return false;
-      if (/FLAGS\w*$|_STANDARD_LIBRARIES$/.test(m[1])) return /-wrapper|-B|--prefix|plugin|-specs|-Xclang|-fuse-ld|ext(ld|ar)/.test(m[3]);
+      if (/FLAGS\w*$|_STANDARD_LIBRARIES$/.test(m[1])) return !!buildToolProblem("gcc", m[3].split(/[\s;]+/)) || /-wrapper|plugin|ext(ld|ar)/.test(m[3]);
       return !CMAKE_SAFE.test(m[1]);
+    }) ?? own.find((a, i) => {
+      // (Round 5, Opus: a find module's program or a package's config directory, `-DGIT_EXECUTABLE=`,
+      // `-DFoo_DIR=`, is run or loaded at configure time.)
+      const def = /^-D/.test(a) ? (a === "-D" ? (own[i + 1] ?? "") : a.slice(2)) : "";
+      return /^\w+_(EXECUTABLE|PROGRAM|COMMAND|DIR|ROOT|TOOL|LAUNCHER|COMPILER)(:\w+)?=/.test(def);
     });
     if (set) return "cmake -D sets a CMake variable outside a short list of harmless ones: many name a program, a script or compiler options the build runs";
     // `cmake --build <dir> -- <words>` hands the words to the build tool, make or ninja.
+    // (Round 5: read from an allowlist, as make's file and directory checks need a place.)
     if (own.includes("--build") && args.includes("--")) {
-      const made = makeProblem(args.slice(args.indexOf("--") + 1), undefined, undefined);
-      if (made) return `cmake --build -- hands its words to the build tool: ${made.reason}`;
+      const word = args.slice(args.indexOf("--") + 1).find((w) => !/^(-j\d*|-l\d*|\d+|-k|-v|-n|--keep-going|--dry-run|-s|--silent|VERBOSE=\d)$/.test(w));
+      if (word !== undefined) return `cmake --build -- ${word}: words for the build tool outside a short list (-j, -k, -v), which may name a makefile or a variable`;
     }
   }
   if (name === "ctest") {
@@ -4961,6 +4968,21 @@ export function unzipWords(args: string[]): { writes: boolean; dir?: string } {
 // Writers whose output names are not on the command line (finding 23).
 // `filesOnly`: for an `mv`, whether every source is a file that is there now and that nothing
 // else in the call touches (B7-11: then the move brings in no directory of files).
+// A gcc-family call that only prints: a version, help, a path or a spec, or the preprocessed
+// text, the dependencies or the diagnostics of its input, with no option that writes a file.
+const compilerNamesPlace = (args: string[]) => args.some((a) => /^(-M[FDJ]|-MMD|--write-(user-)?dependencies|--?save-temps|-dumpdir|-dumpbase|-Wa,|-Xassembler|--for-assembler|-Wl,|-Xlinker|--for-linker|-Wp,|-Xpreprocessor|--for-preprocessor|-fdump-|-fopt-info|-fdiagnostics-|-fcallgraph-info|-fstack-usage|-fprofile-|-ftest-coverage|--coverage|-aux-info|-fplugin|-fsave-optimization-record|-foptimization-record-file|-ftime-trace)/.test(a));
+function compilerQuery(args: string[]): boolean {
+  if (compilerNamesPlace(args) || args.some((a) => /^(-o|--output)/.test(a))) return false;
+  if (args.length && args.every((a) => /^(--version|--help.*|--target-help|-dumpversion|-dumpfullversion|-dumpmachine|-dumpspecs|-print-.*|--print-.*|-###|-v|-Q)$/.test(a))) return true;
+  return args.some((a) => /^(-E|-M|-MM|-fsyntax-only)$/.test(a));
+}
+// rustc that only prints: a version, help, an explanation, or `--print` kinds without `=FILE`
+// and no input to compile.
+function rustcQuery(args: string[]): boolean {
+  if (args.some((a) => /^(-V|-vV|--version|--explain|-h|--help)$/.test(a))) return true;
+  const prints = args.flatMap((a, i) => (a === "--print" ? [args[i + 1] ?? ""] : a.startsWith("--print=") ? [a.slice(8)] : []));
+  return prints.length > 0 && prints.every((k) => !k.includes("=")) && !args.some((a) => a === "-" || /\.rs$/.test(a));
+}
 function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string[]) => boolean): string | undefined {
   // A name the URL or the server chooses (round 4, finding 17, second pass).
   if (name === "curl" || name === "wget") return fetcherWrites(name, args).chosen[0]?.why;
@@ -4973,17 +4995,14 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
   // compressors the write checks know.)
   // (Council project review 1, round 9: a compiler's dependency and aux files, `-MF test.js -MT
   // '<text>'`, are written with text the command chooses, where no check reads them.)
-  if (/^(gcc|cc|clang|g\+\+|c\+\+|clang\+\+)(-\d+(\.\d+)*)?$/.test(name) && args.some((a) => /^-(MF|MJ|MD|MMD|aux-info|save-temps|dumpdir|Wp,)/.test(a))) return `${name} writes dependency or auxiliary files the check does not place`;
-  // Council project review 2, round 4 (Mythos): a linker's output named through `-Wl,`, `-Xlinker`
-  // or `--for-linker`, and the output a compiler names itself (`a.out`, `x.o`) where no `-o`
-  // names one; rustc's outputs in every spelling. `ccache` writes what its compiler writes.
-  if (COMPILER.test(name)) {
-    if (args.some((a) => /^(-Wl,|-Xlinker$|--for-linker)/.test(a))) return `${name} hands the linker options, which can name the file it writes`;
-    const informational = args.some((a) => /^(-E|-fsyntax-only|-M|-MM|--version|-v|--help|-###|-dump\w*|-print-.*|--print-.*)$/.test(a));
-    if (!informational && !args.some((a) => /^(-o|--output)/.test(a)) && args.some((a) => !a.startsWith("-") || a === "-")) return `${name} writes its output (a.out or an object file) under a name it chooses`;
-  }
-  if (name === "rustc" && !args.some((a) => /^(-V|-vV|--version|--print|--explain|-h|--help)/.test(a))) return "rustc writes its outputs, whose names the check does not place";
-  if (name === "ccache" && args.length && COMPILER.test(args[0])) return unnamedWrite(args[0], args.slice(1), filesOnly) ?? (args.some((a) => /^(-o|--output)/.test(a)) ? "ccache's compiler writes its output" : undefined);
+  // Council project review 2, rounds 4 and 5: a compiler writes files whose names it or one of
+  // its options chooses (`a.out`, `x.o`, `-MF`, `-Wa,-al=`, `-fdump-*=`, rustc's `--print
+  // K=FILE`), more than any list of options can keep up with. Every call that is not a pure query
+  // counts as a write the check cannot list: where it runs, or the whole project where an option
+  // can name the place (compilerNamesPlace). `ccache` writes what its compiler writes.
+  if (COMPILER.test(name) && !compilerQuery(args)) return `${name} writes files under names it or its options choose`;
+  if (name === "rustc" && !rustcQuery(args)) return "rustc writes its outputs, whose names the check does not place";
+  if (name === "ccache" && args.length && COMPILER.test(args[0])) return unnamedWrite(args[0], args.slice(1), filesOnly);
   if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|unlz4)$/.test(name) || (/^(gzip|xz|zstd|bzip2|lzop|lz4|lzip|brotli)$/.test(name) && args.some((a) => /^(-[a-zA-Z]*d[a-zA-Z]*|--decompress|--uncompress)$/.test(a)))) return `${name} -d writes files next to its input`;
   if (name === "patch") {
     const got = getopt(args, PATCH_OPTIONS);
@@ -5066,8 +5085,8 @@ function unnamedWriteDirs(name: string, args: string[]): (string | undefined)[] 
   // (Council project review 2, round 4: a compiler's own output is where it runs; one a linker
   // option or rustc's `-o`, `--out-dir`, `--emit` names is not placed.)
   if (name === "ccache" && args.length && COMPILER.test(args[0])) return unnamedWriteDirs(args[0], args.slice(1));
-  if (COMPILER.test(name)) return args.some((a) => /^(-Wl,|-Xlinker$|--for-linker)/.test(a)) ? [undefined] : [];
-  if (name === "rustc") return args.some((a) => /^(-o|--out-dir|--emit|-C|--codegen)/.test(a)) ? [undefined] : [];
+  if (COMPILER.test(name)) return compilerNamesPlace(args) ? [undefined] : [];
+  if (name === "rustc") return [undefined];
   if (name === "curl" || name === "wget") return place(fetcherWrites(name, args).chosen.map((c) => c.dir || "."));
   // (Round 4: an option that puts the output elsewhere, zstd's `--output-dir-flat=.`, lzop's
   // `-p`, a `-o`: the place is not read, and the project is marked.)
@@ -5137,7 +5156,12 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
         files.forEach((f) => add(f, true));
         for (const o of getopt(args, PATCH_OPTIONS).opts) if (["-o", "--output", "-r", "--reject-file"].includes(o.name)) add(o.value, false);
       }
-      else if (["gcc", "cc", "clang", "g++", "c++", "clang++"].includes(name)) valued(args, "o", "--output").forEach((f) => add(f, false));
+      // (Round 5: gcc's options are words of their own, `-fno-omit-frame-pointer` holds no `-o`.)
+      else if (COMPILER.test(name)) args.forEach((a, i) => {
+        if (a === "-o" || a === "--output") add(args[i + 1], false);
+        else if (/^-o./.test(a)) add(a.slice(2), false);
+        else if (a.startsWith("--output=")) add(a.slice(9), false);
+      });
       else if (name === "sort") {
         const got = getopt(args, { flags: "bdfghiMnrRsuVz", values: "otkS", long: Object.fromEntries([...longs("value", "output key field-separator buffer-size parallel temporary-directory files0-from compress-program"), ...longs("flag", "reverse unique numeric-sort general-numeric-sort human-numeric-sort month-sort version-sort random-sort stable ignore-case dictionary-order ignore-leading-blanks ignore-nonprinting zero-terminated")]) });
         for (const o of got.opts) if (["-o", "--output"].includes(o.name)) add(o.value, false);

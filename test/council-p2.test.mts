@@ -271,3 +271,38 @@ test("round 4: cargo hands rustc its words after --; make's values and cmake's v
   ]) assert.equal(await effect(c), "ask", c);
   for (const c of ["cargo clippy -- -D warnings", "cargo test -- --nocapture", "make CFLAGS=-O2", "cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON .", "cmake --build build -- -j4"]) assert.notEqual(await effect(c), "ask", c);
 });
+
+// ---- round 5 ----
+
+test("round 5: every compile that is not a pure query is a write; an option that can name the place marks the project", async () => {
+  const outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-cc-")));
+  try {
+    for (const [writer, cwd] of [
+      ["gcc -v t.c", repo], ["gcc -v -c t.c", repo], ["gcc -dumpbase x t.c", repo], ["gcc -I -o/tmp/zz t.c", repo],
+      ["gcc -c t.c -o /dev/null -Wa,-al=test.sh", repo], ["gcc -c t.c -o /dev/null -Xassembler -al=test.sh", repo],
+      ["gcc -E t.c --write-dependencies -MT x", repo], ["gcc -fsyntax-only -fdump-tree-original=build.sh t.c", repo],
+      ["rustc --print link-args t.rs -o tool", repo], ["rustc --print cfg=build.sh t.rs", repo], ["rustc --print native-static-libs t.rs", repo],
+      [`gcc -M -MF ${repo}/z.test.js -MT x -xc /dev/null`, outside],
+    ] as const) {
+      const s = new SessionState(repo);
+      const wrote = (await decideShell(guard, s, cwd, writer)).effect;
+      assert.ok(wrote !== "allow" || (await effect("npm test", s)) !== "allow", writer);
+    }
+    for (const query of ["gcc --version", "gcc -dumpmachine", "gcc -print-file-name=libc.so", "gcc -E t.c", "gcc -fsyntax-only t.c", "rustc --version", "rustc --print sysroot", "rustc -vV"]) {
+      const s = new SessionState(repo);
+      assert.equal(await effect(query, s), "allow", query);
+      assert.equal(await effect("npm test", s), "allow", query);
+    }
+  } finally {
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("round 5: gcc's options are words of their own; cargo's subcommand behind a global option's value; cmake's other program variables", async () => {
+  for (const c of ["gcc -fno-omit-frame-pointer t.c -o x", "gcc -fno-strict-aliasing -c t.c -o t.o", "g++ -fno-exceptions -c t.cc -o t.o"]) assert.equal(await effect(c), "allow", c);
+  for (const c of [
+    "cargo --color never clippy -- --emit=link -Clinker=/bin/false", "cargo --color always clippy -- -C linker=sh",
+    "cmake -DCMAKE_EXE_LINKER_FLAGS=--ld-path=./x .", "cmake -DCMAKE_C_FLAGS=--gcc-toolchain=./x .", "cmake -DGIT_EXECUTABLE=/tmp/g .", "cmake -DPKG_CONFIG_EXECUTABLE=/tmp/p .", "cmake -DFoo_DIR=/tmp/x .", "cmake --build build -- -f /tmp/x.mk",
+  ]) assert.equal(await effect(c), "ask", c);
+  for (const c of ["cmake --build build -- -j4 -k", "cmake -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug ."]) assert.notEqual(await effect(c), "ask", c);
+});
