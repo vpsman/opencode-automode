@@ -728,8 +728,10 @@ class Lexer {
       const name = this.run(this.i + 1, /[A-Za-z_]/, /[A-Za-z0-9_]/) || (next !== undefined && /[@*#?$!0-9-]/.test(next) ? next : "");
       // (Council project review 2, round 14, Mythos: in double quotes bash's reader pairs the
       // second `$` of `$$` with a `(` or `{` after it, `"$$(echo "c")"`, inner quotes and all,
-      // and expands `$$` and the text; and a line continuation after a `$` joins it to the next.)
-      if (quoted && ((name === "$" && /[({]/.test(this.ahead(2) ?? "")) || (name === "" && next === "\\" && this.ahead(2) === "\n"))) ask("$$ before ( or { inside double quotes, or a $ before a line continuation there, which bash reads as one piece");
+      // and expands `$$` and the text; and a line continuation after a `$` joins it to the next.
+      // Round 19, Mythos: read without `ahead`, which would drop the backslash-newline of an
+      // escaped `\\` and so make a later `\$(` live.)
+      if (quoted && ((name === "$" && /[({]/.test(this.ahead(2) ?? "")) || (name === "" && next === "\\" && this.s[this.i + 2] === "\n"))) ask("$$ before ( or { inside double quotes, or a $ before a line continuation there, which bash reads as one piece");
       if (name === "") {
         // A `$` that expands nothing is printed in quotes, which in a regular expression would
         // turn the end-of-line anchor into a literal dollar.

@@ -569,3 +569,22 @@ test("round 18: npm view and info of a non-registry spec ask", async () => {
   for (const c of [`npm view github:u/r#${sha}`, `npm info u/r#${sha} name`, `npm view git+ssh://git@github.com/u/r.git#${sha}`, `pnpm view gitlab:u/r#${sha}`]) assert.equal(await effect(c), "ask", c);
   for (const c of ["npm view lodash", "npm info lodash version", "npm view @scope/pkg dist.tarball"]) assert.equal(await effect(c), "allow", c);
 });
+
+test("round 19: an escaped \\ before a line end keeps a later \$( escaped; npm show; view's field words; npm pack .", async () => {
+  const run = (t: string, cwd: string) => spawnSync("bash", ["-c", t], { cwd, encoding: "utf8" }).stdout;
+  const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-r19-")));
+  try {
+    for (const c of ["cat <<E\n$\\\\\n\\$(touch f)\nE", 'echo "$\\\\\n$HOME"', "cat <<E\n$\\\\\nx\nE"]) {
+      const printed = canonical(c);
+      if ("ask" in printed) continue;
+      fs.rmSync(path.join(d, "f"), { force: true });
+      assert.equal(run(printed.text!, d), run(c, d), c);
+      assert.equal(fs.existsSync(path.join(d, "f")), false, c);
+    }
+  } finally {
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+  assert.ok("ask" in canonical('echo "$\\\n$(echo "c")"'), "a $ before a line continuation still asks");
+  for (const c of ["npm show github:u/r", "npm v u/r"]) assert.equal(await effect(c), "ask", c);
+  for (const c of ["npm view lodash 'versions[0]'", "npm pack .", "npm pack ..", "npm view ."]) assert.equal(await effect(c), "allow", c);
+});
