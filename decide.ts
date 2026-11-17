@@ -5384,7 +5384,8 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
       };
       // (Round 16, Mythos: a descriptor copied into standard input, `tee x <&3` with `3>&0` on a
       // group, does not read the pipe; the call has no fed tee then.)
-      const dupIn = /<&|\d>&0(?!\d)/.test(run);
+      // (Round 17: fd 0 in any spelling, `3>&00`, and standard input made a copy, `0>&3`.)
+      const dupIn = /<&|>&\s*0+(?!\d)|(^|[^\d])0+>&/.test(run);
       const fed = (c: Simple) => {
         const [from, to] = [cmds.indexOf(cmd), cmds.indexOf(c)];
         if (dupIn || pipe === undefined || where.pipes.get(c) !== pipe || to <= from || c.argv[0] !== "tee" || !stdinOnly(c)) return false;

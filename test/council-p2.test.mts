@@ -553,3 +553,13 @@ test("round 16: a tee fed from a copied descriptor, npm pack of a git spec", asy
   for (const c of ["npm pack github:u/r", "npm pack git+https://example.com/r.git", "npm pack u/r", "npm pack git://example.com/r", "npm pack https://example.com/r.tgz"]) assert.equal(await effect(c), "ask", c);
   for (const c of ["npm pack", "npm pack --dry-run", "npm test 2>&1 | tee test.log"]) assert.equal(await effect(c), "allow", c);
 });
+
+// ---- round 17 ----
+
+test("round 17: fd 0 in any spelling before a tee; npm pack passes only a registry name or a local path", async () => {
+  for (const c of [`{ npm test -s | tee x.test.js 0>&3; } <<< 'echo hi' 3>&00`, `{ npm test -s | tee x.test.js 0>&3; } <<< 'echo hi' 3>&0`, `{ npm test -s | tee x.test.js <&3; } <<< hi 3>& 0`]) {
+    assert.notEqual(await effect(c), "allow", c);
+  }
+  for (const c of ["npm pack foo@git+https://example.com/r", "npm pack git@github.com:u/r", "npm pack GIT+https://example.com/r", "npm pack GITHUB:u/r", "npm pack x@u/r", "npm pack a@b.c:d", "pnpm pack git@github.com:u/r"]) assert.equal(await effect(c), "ask", c);
+  for (const c of ["npm pack lodash", "npm pack lodash@4.17.21", "npm pack @scope/pkg@^1.0.0", "npm pack ./dir", "npm pack", "npm test 2>&1 | tee test.log"]) assert.equal(await effect(c), "allow", c);
+});

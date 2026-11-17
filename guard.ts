@@ -4148,7 +4148,11 @@ function managerProblem(name: string, args: string[]): string | undefined {
     // (Council project review 2, round 16, Mythos: `npm pack <git spec>` fetches the repository
     // and runs its `prepare` script, as an install does.)
     const packAt = args.indexOf("pack");
-    if (packAt >= 0 && args.slice(packAt + 1).some((a) => !a.startsWith("-") && /^(github:|gitlab:|bitbucket:|gist:|git\+|git:\/\/|https?:\/\/|ssh:\/\/)|^[\w.-]+\/[\w.-]+(#.*)?$|\.git(#.*)?$/.test(a))) return `${name} pack of a git repository or a URL runs that package's prepare script`;
+    // (Round 17: by what may pass, not by what npm reads as git: `x@git+...`, `git@host:path`,
+    // `GITHUB:u/r`. A registry name, scoped or not, with a version or tag, and a local path pass.)
+    const registry = /^(@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*(@[\w.^~<>=*| -]+)?$/i;
+    const local = /^(\.{1,2}\/|\/|~\/)/;
+    if (packAt >= 0 && args.slice(packAt + 1).some((a) => !a.startsWith("-") && !registry.test(a) && !local.test(a))) return `${name} pack of a git repository, a URL or another non-registry spec runs that package's prepare script`;
     const run = args.findIndex((a) => ["run", "run-script", "rum", "urn"].includes(a));
     if (run >= 0 && args.slice(run + 1).includes("env")) return `${name} run env prints the environment, or runs the words after it as a command`;
   }
