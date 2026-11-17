@@ -415,3 +415,25 @@ test("a bare $ ending a word after an expansion asks", () => {
   for (const c of ["printf '%s' $p$", "echo ${p}$", "echo $(id)$"]) assert.ok("ask" in canonical(c), c);
   for (const c of ["echo x$ $p", "echo $", "echo $p'$'", "grep 'x$' f"]) assert.ok(!("ask" in canonical(c)), c);
 });
+
+// Round 8.
+test("the printer asks on a bare $ after a word's last expansion, and on a quoted operator in [[ ]]", () => {
+  for (const c of ["echo $p$.x", "echo $p$/x", "echo ${p}$:", "[[ a '==' a ]]", "[[ '-f' f ]]", "[[ \\-f f ]]", "[[ 1 '-eq' 1 ]]"]) assert.ok("ask" in canonical(c), c);
+  for (const c of ["echo $p$/$e", "echo x$ $p", "[[ -f f ]]", "[[ a == 'b' ]]", "[[ $x == '*' ]]"]) assert.ok(!("ask" in canonical(c)), c);
+});
+
+test("a loader or program variable that names a writable place makes any program a runner; GIT_EXEC_PATH is cleaned", async () => {
+  const d = await withEnv({ LD_LIBRARY_PATH: ":/usr/lib" }, () => decideShell(guard, new SessionState(repo), repo, "cat f"));
+  assert.ok(d.runsCode);
+  setPluginWritable((p) => p === repo || p.startsWith(repo + "/"));
+  const before = process.env.GIT_EXEC_PATH;
+  try {
+    process.env.GIT_EXEC_PATH = `${repo}/helpers`;
+    assert.equal(gitEnv().GIT_EXEC_PATH, undefined);
+    process.env.GIT_EXEC_PATH = "/usr/lib/git-core";
+    assert.equal(gitEnv().GIT_EXEC_PATH, "/usr/lib/git-core");
+  } finally {
+    setPluginWritable(() => false);
+    before === undefined ? delete process.env.GIT_EXEC_PATH : (process.env.GIT_EXEC_PATH = before);
+  }
+});

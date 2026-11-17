@@ -222,10 +222,11 @@ export function setPluginWritable(writable: (p: string) => boolean): void {
 // (Round 7: the loader's lists too: LD_LIBRARY_PATH, LD_PRELOAD and LD_AUDIT keep only their
 // absolute entries outside the places a call can write; with none left, the variable goes.)
 function pluginLoader(env: NodeJS.ProcessEnv): void {
-  for (const name of ["LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT"]) {
+  // (Round 8: and GIT_EXEC_PATH, where git looks for what it runs before PATH: a filter's `cat`.)
+  for (const name of ["LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT", "GIT_EXEC_PATH"]) {
     const value = env[name];
     if (value === undefined) continue;
-    const kept = cleanList(value.split(name === "LD_LIBRARY_PATH" ? ":" : /[:\s]/));
+    const kept = cleanList(name === "GIT_EXEC_PATH" ? [value] : value.split(name === "LD_LIBRARY_PATH" ? ":" : /[:\s]/));
     if (kept.length) env[name] = kept.join(":");
     else delete env[name];
   }

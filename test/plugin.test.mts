@@ -2657,3 +2657,32 @@ describe("council project review 1, round 6: a runner waits for no write that ma
     assert.match(r.permission.message, /writes may still be running/);
   });
 });
+
+describe("council project review 1, round 8: a shell that comes after its call's window", () => {
+  test("an identical call whose shell came after the window asks; the one wrapped in it does not", async () => {
+    const host = await start({ useClassifier: false });
+    const mk = (id: string) => ({ tool: "shell", sessionID: "cp1r8", messageID: "m8", id, input: { command: "ls" } });
+    const shellEvent = () => ({ command: "ls", cwd: project, timeout: 120000, shell: "/bin/bash", env: baseEnv() as Record<string, string | undefined> });
+    const perm = (id: string) => ({ sessionID: "cp1r8", action: "shell", resources: ["ls"], source: { type: "tool", messageID: "m8", id }, effect: "allow" }) as any;
+    await host.tool(mk("r8a"));
+    await host.tool(mk("r8b"));
+    const s1 = shellEvent();
+    await host.shell(s1);
+    assert.ok(wrapped(s1));
+    const real = Date.now;
+    Date.now = () => real() + 16_000;
+    try {
+      const s2 = shellEvent();
+      await host.shell(s2);
+      assert.ok(!wrapped(s2), "left as it is");
+      const pa = perm("r8a");
+      await host.permission(pa);
+      const pb = perm("r8b");
+      await host.permission(pb);
+      assert.equal(pb.effect, "ask", "the call whose shell may be the second");
+      assert.equal(pa.effect, "ask", "either may be");
+    } finally {
+      Date.now = real;
+    }
+  });
+});

@@ -636,6 +636,10 @@ export default Plugin.define({
       // Calls whose shell never came (the tool failed first, or opencode denied it) drop out,
       // so they cannot take the place of a later identical command.
       const queue = waiting(key);
+      // Council project review 1, round 8: a call of this command and directory that is no longer
+      // waiting (decided more than the window ago) and not settled may be this shell's: it is left
+      // as it is, and that call's allow asks.
+      for (const c of calls.values()) if (!c.settled && !queue.includes(c) && wrapKey(c.command, c.cwd) === key) c.unsure = true;
       if (!queue.length) return void toWrap.delete(key);
       toWrap.set(key, queue);
       // Marks the processes of this shell, whichever of the waiting calls it belongs to.

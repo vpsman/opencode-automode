@@ -300,6 +300,8 @@ function plainCommands(tokens: Token[]): boolean {
 
 // ---- the reader ----
 
+// The unquoted expansions among a word's parts so far (round 8).
+const unquotedExpansions = (parts: Part[] | undefined) => (parts ?? []).filter((p) => (p.kind === "var" || p.kind === "param" || p.kind === "sub" || p.kind === "arith") && !p.quoted).length;
 class Lexer {
   // The text, shared with the readers of the substitutions in it. bash's reader drops a
   // backslash-newline before it forms any token, outside single quotes, comments and the body of
@@ -314,7 +316,7 @@ class Lexer {
   private inner: boolean;
   private tokens: Token[] = [];
   private parts: Part[] | undefined;
-  private bareDollarEnd = -1;
+  private bareDollars: number[] = [];
   private pending: { doc: Heredoc; delimiter: string; dash: boolean }[] = [];
   private commandStart = true;
   // 1 after the keyword `time`, 2 after its `-p`.
@@ -403,9 +405,12 @@ class Lexer {
     const parts = this.parts;
     this.parts = undefined;
     if (!parts) return;
-    // bash 5.2 does not split a word that ends in a bare `$` after an unquoted expansion
-    // (`$p$`): printed, the `$` is quoted, and the word would be split.
-    if (this.bareDollarEnd === this.i && parts.some((p) => (p.kind === "var" || p.kind === "param" || p.kind === "sub" || p.kind === "arith") && !p.quoted)) ask("a bare $ at the end of a word after an expansion");
+    // bash 5.2 does not split a word with a bare `$` after its last unquoted expansion (`$p$`,
+    // `$p$.x`, `$p$/x`; `$p$/$e` is split again): printed, the `$` is quoted, and the word would be.
+    const bareAt = this.bareDollars;
+    this.bareDollars = [];
+    const total = unquotedExpansions(parts);
+    if (total > 0 && bareAt.includes(total)) ask("a bare $ after an expansion in the same word");
     const word: Word = { type: "word", parts };
     const redir = this.wanting();
     if (redir) {
@@ -692,8 +697,8 @@ class Lexer {
         // A `$` that expands nothing is printed in quotes, which in a regular expression would
         // turn the end-of-line anchor into a literal dollar.
         if (this.regexWord && !quoted) ask("a $ inside a regular expression after =~");
-        // (Council project review 1, round 7: see endWord.)
-        if (!quoted) this.bareDollarEnd = this.i + 1;
+        // (Council project review 1, rounds 7 and 8: see endWord.)
+        if (!quoted) this.bareDollars.push(unquotedExpansions(this.parts));
         this.lit("$", true);
         this.i++;
       } else {
@@ -1815,7 +1820,13 @@ class Printer {
         // (a brace, a `#`) would become a literal one.
         if (item.parts.some((p) => p.kind === "lit" && !p.quoted && [...p.text].some((ch) => !PLAIN.test(ch) && !ACTIVE.includes(ch)))) ask("a regular expression after =~ with a character the printer would have to quote");
         out.push(this.parts(item.parts, true));
-      } else out.push(this.parts(this.braces(item, true)[0].parts));
+      } else {
+        // (Council project review 1, round 8: a quoted or escaped word that spells an operator,
+        // `'=='`, `\-f`, is a word to bash and would be an operator printed bare.)
+        const text = literal(item);
+        if (text !== undefined && item.parts.some((p) => p.kind === "lit" && p.quoted) && /^(==?|!=|<|>|=~|!|&&|\|\||\(|\)|-[A-Za-z]{1,2})$/.test(text)) ask("a quoted word inside [[ ]] that spells an operator");
+        out.push(this.parts(this.braces(item, true)[0].parts));
+      }
     }
     out.push(same("]]"));
     const all = join(out, " ");

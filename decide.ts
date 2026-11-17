@@ -38,7 +38,7 @@ import { scoreCommand, type ClassifierConfig } from "./kev.ts";
 import { findGitEntries, gitArgs, Scan, gitEnv, gitReadsElsewhere, gitRun, inGitDir, located as followed, madeByPlan, pushHooksMissing, HOOK_MANAGER_FILES, OPENCODE_CONFIG_NAMES, OPENCODE_PROJECT_FILES, opencodeDirs, protectedPaths, realpath, safeGit, workTreeSubmodules } from "./sandbox.ts";
 import { canonical, type Printed } from "./canon.ts";
 import { PathWalkError, PWD_LEAD, fetchDestination, functionNames, pathFinds, pathHas, procRelative, runsItsWords, tempDirs, unseenWriter } from "./guard.ts";
-import { bentPath, gitOnlyReads, runsAnyProgram, runsProjectCode } from "./guard.ts";
+import { bentEnv, bentPath, gitOnlyReads, runsAnyProgram, runsProjectCode } from "./guard.ts";
 import { abbreviates, allCommands, arithmeticAssignments, braceWords, expandNames, expandWord, gitMessageWords, EDITOR_ASSIGNMENT, editorCommand, programs, withoutGlobals, alsoByName, argvGuards, dangerousName, envAssignmentsOk, expansionProblem, gitCall, gitProblem, inputReads, landing, linkedReads, literalTargets, located, physical, placedReads, present, cdTo, type Place, type Places, observer, protectedNameIn, runtimeReads, single, stricter, strict, strictCommands, textGuards, tilde, tildeMismatch, unmodelled, writesOf, writtenBy, type Single, type StrictCommand, getopt, GIT_OPTIONS, lastOf, type Getopt, unreadableGlob, withoutExpansions } from "./guard.ts";
 
 export type Effect = "allow" | "ask" | "deny";
@@ -5438,7 +5438,8 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   // (Round 6: and the hooks it runs, `post-index-change` for a status: gitAfterWrite.)
   const gitReadRuns = () => cmds.some((cmd) => programs(cmd.argv).some((at) => path.basename(cmd.argv[at]) === "git" && gitOnlyReads(cmd.argv.slice(at + 1)) && gitAfterWrite(cmd, cmd.argv.slice(at + 1), true) !== undefined));
   // (Round 7: with a PATH entry the session can write, any program PATH finds may be the session's.)
-  const bentRuns = () => bentPath((p) => !!inProject(p) || canWrite(p)) !== undefined && runsAnyProgram(cmds);
+  // (Round 8: and with a variable of opencode's environment that names one, LD_PRELOAD say.)
+  const bentRuns = () => (bentPath((p) => !!inProject(p) || canWrite(p)) !== undefined || bentEnv((p) => !!inProject(p) || canWrite(p)) !== undefined) && runsAnyProgram(cmds);
   const flags = () => ({ ...(writes.length || marks.length || worktree.length || scope.pending.size || d0.unread ? { writes: true } : {}), ...(runsProjectCode(cmds) || gitReadRuns() || bentRuns() ? { runsCode: true } : {}) });
   const allowed = (d: Decision): Decision => {
     const f = flags();

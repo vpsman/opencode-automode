@@ -254,8 +254,9 @@ For each shell tool call:
      `GIT_SSH_COMMAND`, `EDITOR`, `PAGER`, `RIPGREP_CONFIG_PATH`, ...) with a path the session
      can write, and a shell given such a value where opencode's own has none asks, as for
      `PATH`; the loader's `LD_LIBRARY_PATH`, `LD_PRELOAD` and `LD_AUDIT` are read as `PATH` is
-     (an empty or relative entry counts), and with such an entry in `PATH` any program counts
-     as running code of the project for the hold-back below. A git
+     (an empty or relative entry counts), and with such an entry in `PATH` or such a variable
+     any program counts as running code of the project for the hold-back below. The plugin's
+     own git keeps only the entries of these, and of `GIT_EXEC_PATH`, that a call cannot write. A git
      command is on it only where the repository's own configuration, and every file it
      includes whatever the condition, holds no key that may name a program
      (`core.hooksPath` as husky sets it, `credential.helper`, `alias.*`, a URL whose scheme
