@@ -120,9 +120,10 @@ export const PLAIN_PATTERN = /^(\.{1,2}\/|\/)?[A-Za-z0-9_][\w.+\/-]*( [\w.+\/:=@
 // data out: an allowlist, because the list of programs that can is open-ended (awk, sed, make,
 // docker, tar, strace, ...). Project scripts (`./x *`) are mirrored: they run sandboxed.
 // (Council round 1: not `git stash` or `git restore`, whose only asks are the rules' asks for what
-// they discard; a saved `git stash *` made `git stash clear` an allow.)
+// they discard; a saved `git stash *` made `git stash clear` an allow. Council project review 2:
+// nor `git rm`, whose `-f` throws away uncommitted changes and is no ask of its own.)
 const MIRROR_OK =
-  /^(\.\/\S+|git (status|diff|log|show|add|commit|checkout|switch|branch|tag|fetch|pull|merge|cherry-pick|revert|rm|mv|blame)|cargo (build|check|test|clippy|fmt|doc|tree|metadata|bench|nextest)|go (build|test|vet|fmt)|(npm|pnpm|yarn|bun) (run|test)|pytest|tsc|eslint|prettier|ruff|mypy|black|isort|jest|vitest|ls|cat|head|tail|grep|wc|diff|stat|file|tree|du|df|ps|jq|yq|uniq|cut)( |$)/;
+  /^(\.\/\S+|git (status|diff|log|show|add|commit|checkout|switch|branch|tag|fetch|pull|merge|cherry-pick|revert|mv|blame)|cargo (build|check|test|clippy|fmt|doc|tree|metadata|bench|nextest)|go (build|test|vet|fmt)|(npm|pnpm|yarn|bun) (run|test)|pytest|tsc|eslint|prettier|ruff|mypy|black|isort|jest|vitest|ls|cat|head|tail|grep|wc|diff|stat|file|tree|du|df|ps|jq|yq|uniq|cut)( |$)/;
 export const mirrorable = (pattern: string) => PLAIN_PATTERN.test(pattern) && MIRROR_OK.test(pattern);
 
 export interface Decision {

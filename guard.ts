@@ -1740,6 +1740,11 @@ function gitDestroys(sub: string, rest: string[], exists?: (word: string) => boo
   // replaces a tag that may be there, and tags keep no reflog to get the old one back.)
   if (sub === "tag" && (has(["--delete"], "d") || (has(["--force"], "f") && operands.length > 0))) return discards;
   if (sub === "gc" && own.some((w) => /^--prune=/.test(w))) return "git gc --prune=<date> deletes objects nothing refers to, which git otherwise keeps for a while";
+  // Council project review 2 (Opus): `reset --merge` drops staged changes as `--hard` does where
+  // the index and the work tree agree, and an operation's `--abort` or `--skip` resets the work
+  // tree, the conflicts resolved so far with it (`merge --abort` is `reset --merge`).
+  if (sub === "reset" && long("--merge")) return "git reset --merge discards staged changes, as --hard does";
+  if (["merge", "rebase", "am", "cherry-pick", "revert"].includes(sub) && long("--abort", "--skip")) return `git ${sub} --abort or --skip resets the work tree, discarding the conflicts resolved so far`;
   if (sub === "fetch" || sub === "pull") return fetchMoves(sub, rest);
   return undefined;
 }
@@ -4089,6 +4094,57 @@ function managerProblem(name: string, args: string[]): string | undefined {
   return undefined;
 }
 
+// Council project review 2 (Mythos): what a compiler or build tool the rules allow by name runs
+// beyond the project's own build, read from its words. Python tools (argparse) take any unique
+// prefix of a long option.
+function buildToolProblem(name: string, args: string[]): string | undefined {
+  const own = args.slice(0, args.includes("--") ? args.indexOf("--") : args.length);
+  const operands = own.filter((a) => !a.startsWith("-"));
+  if (COMPILER.test(name)) {
+    const word = args.find((a, i) => /^(-wrapper|-B.*|-fplugin(=.*|-arg.*)?|-fpass-plugin=.*|--?specs(=.*)?|--ld-path(=.*)?|-Xclang|-ccc-.*|--gcc-toolchain(=.*)?|--gcc-install-dir(=.*)?)$/.test(a) || (/^-fuse-ld=/.test(a) && a.includes("/")) || (/^-Wl,/.test(a) && /plugin/.test(a)) || (a === "-Xlinker" && /plugin/.test(args[i + 1] ?? "")));
+    if (word) return `${name} ${word.split("=")[0]} runs a program or loads a plugin the call names`;
+  }
+  if (name === "rustc") {
+    const word = args.find((a, i) => /^-Z/.test(a) || /^(-C|--codegen)=?(linker|link-arg|link-args)=/.test(a) || ((a === "-C" || a === "--codegen") && /^(linker|link-arg|link-args)=/.test(args[i + 1] ?? "")) || /^-C(linker|link-arg|link-args)=/.test(a));
+    if (word) return `rustc ${word.split("=")[0]} runs a linker or passes it options the call names`;
+  }
+  if (name === "ccache") {
+    // `ccache <compiler> <args>`: the compiler is the program that runs, and its words are read
+    // as that compiler's.
+    const first = args.findIndex((a) => !a.startsWith("-"));
+    if (first === 0) return COMPILER.test(args[0]) ? buildToolProblem(args[0], args.slice(1)) : `ccache ${args[0]} runs ${args[0]}, which was not judged`;
+    if (first > 0) return "ccache with an option before a word: the word may be a program it runs, which was not judged";
+    if (args.some((a) => /^(-[a-zA-Z]*o|--set-config)/.test(a))) return "ccache -o sets ccache's config, which can name a program to run (compiler, prefix_command)";
+  }
+  if (name === "cmake") {
+    const word = own.find((a) => /^-[EP]/.test(a));
+    if (word) return `cmake ${word.slice(0, 2)} runs a command or a script the call names`;
+  }
+  if (name === "ctest") {
+    const word = own.find((a) => /^(-S.*|--script|--script-new-process|--build-and-test|--test-command)(=.*)?$/.test(a));
+    if (word) return `ctest ${word} runs a script or a command the call names`;
+  }
+  if (name === "just") {
+    const word = own.find((a) => /^--(command|shell|shell-command|shell-arg)(=|$)/.test(a) || (/^-[a-zA-Z]*c/.test(a) && !a.startsWith("--")));
+    if (word) return `just ${word.split("=")[0]} runs a command or a shell the call names`;
+  }
+  if (name === "tox") {
+    if (["exec", "e"].includes(operands[0] ?? "")) return `tox ${operands[0]} runs a command the call names`;
+    const word = own.find((a) => (/^-[a-zA-Z]*x/.test(a) && !a.startsWith("--")) || abbreviates(a, ["--override"]));
+    if (word) return `tox ${word.split("=")[0]} overrides tox's config, the commands it runs among it`;
+  }
+  if (name === "meson") {
+    if (operands[0] === "devenv") return "meson devenv runs a command the call names";
+    const word = own.find((a) => abbreviates(a, ["--wrapper", "--gdb-path"]));
+    if (word) return `meson ${word.split("=")[0]} runs a program the call names`;
+  }
+  if (name === "mypy") {
+    const word = own.find((a) => abbreviates(a, ["--python-executable"]));
+    if (word) return "mypy --python-executable runs the python the call names";
+  }
+  return undefined;
+}
+
 // Options that make a program run another one, by the option's name: asked about wherever the
 // program is named. Other allowed programs are judged by their own name alone (see Known gaps).
 function programProblem(name: string, args: string[], cwd?: string, inProject?: (p: string) => boolean): GuardVerdict | undefined {
@@ -4125,6 +4181,11 @@ function programProblem(name: string, args: string[], cwd?: string, inProject?: 
     if (args.some((a) => !a.startsWith("-") && /^[\w.@-]+:/.test(a)) && !args.includes("--force-local")) return ask("tar with an archive on a remote host runs a remote shell");
   }
   if (name === "sort" && longOption(args, ["--compress-program"])) return ask("sort --compress-program runs a program");
+  // Council project review 2 (Mythos): the compilers and build tools the rules allow by name, with
+  // the options and subcommands that run a program or command the call names or load a plugin. (A
+  // file of more options, `gcc @args`, is a place the runner check cannot tell: runnerPlaces.)
+  const tool = buildToolProblem(name, args);
+  if (tool) return ask(tool);
   if (MAKES.has(name)) return makeProblem(args, cwd, inProject);
   if ((name === "fd" || name === "fdfind") && (longOption(args, ["--exec", "--exec-batch"]) || args.some((a) => /^-[a-zA-Z]*[xX]/.test(a) && !a.startsWith("--")))) return ask("fd -x runs a command for every match");
   if (name === "rg" && longOption(args, ["--pre", "--pre-glob", "--hostname-bin"])) return ask("rg --pre runs a program on every file");
@@ -7533,6 +7594,17 @@ export function runnerPlaces(name: string, args: string[], cwd: string | undefin
       continue;
     }
     places.push(...existing(w));
+    // Council project review 2 (Mythos): a pattern the program expands itself (`npm test --
+    // '/t*p/d/x.test.js'`, node's own glob) names no path that exists. It counts from the last
+    // `/` before its first pattern character; one in the first part of an absolute path, or of a
+    // value after `=`, `,` or `:`, could be anywhere.
+    for (const head of [w, ...[...w].flatMap((c, k) => ("=,:".includes(c) ? [w.slice(k + 1)] : [])), ...(/^-[A-Za-z]./.test(w) && !w.startsWith("--") ? [w.slice(2)] : [])]) {
+      const at = head.search(/[*?[{]/);
+      if (at < 0 || head.startsWith("-") || /[$`]/.test(head.slice(0, at))) continue;
+      const fixed = head.slice(0, head.lastIndexOf("/", at) + 1);
+      if (fixed === "") continue;
+      places.push(fixed === "/" ? undefined : resolve(fixed.replace(/\/+$/, "")));
+    }
   }
   return places;
 }

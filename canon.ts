@@ -205,6 +205,36 @@ interface Source {
 // where a command begins: what its name word is (braces), whether it defines a function, and
 // the reader's own state (see `Lexer.endWord`). Three rounds of guessing this from the word
 // before each found one more way to be wrong (`time -p name() ...`, a word after a redirect).
+// The strings `xargs -I`/`-i`/`--replace` and `find -exec` replace with their input in the words
+// of the program at `at` (chain: the programs the walk runs, guard.ts chainOf). Every word between
+// xargs and the program is read as if it could be the `-I` option, so the real one is among them.
+function placeholders(argv: string[], chain: number[], at: number): string[] {
+  const out: string[] = [];
+  for (const c of chain) {
+    if (c >= at) continue;
+    const name = path.basename(argv[c]);
+    if (name === "find") out.push("{}");
+    if (name !== "xargs") continue;
+    for (let i = c + 1; i < at; i++) {
+      const w = argv[i];
+      if (w.startsWith("--")) {
+        const eq = w.indexOf("=");
+        const opt = eq < 0 ? w : w.slice(0, eq);
+        if (opt.length >= 3 && "--replace".startsWith(opt)) out.push(eq < 0 ? "{}" : w.slice(eq + 1));
+        continue;
+      }
+      if (!/^-./.test(w)) continue;
+      for (let j = 1; j < w.length; j++) {
+        if (w[j] === "I") out.push(j + 1 < w.length ? w.slice(j + 1) : (argv[i + 1] ?? ""));
+        else if (w[j] === "i") out.push(j + 1 < w.length ? w.slice(j + 1) : "{}");
+        else if (!"aLnPsdEle".includes(w[j])) continue;
+        break;
+      }
+    }
+  }
+  return out.filter(Boolean);
+}
+
 function headOf(words: Word[]): number {
   let k = 0;
   while (k < words.length && KEEPS_COMMAND_START.has(bare(words[k]) ?? "")) {
@@ -1705,9 +1735,17 @@ class Printer {
       // after it data: it cannot be printed as code, and left as written it would be code
       // nothing printed. Such a command is rare enough to ask about.
       if (this.plain) ask(`${name} in a command that defines a function: its words cannot be told from the function's arguments`);
+      // Council project review 2 (Sol): `xargs -I XX` and `find -exec` put their input into the
+      // words in place of `XX` or `{}`, the code among them, after the printer has printed it. A
+      // printed `"XX"` loses its quotes, and input with a `;` in it then runs as commands of its
+      // own. Where the code (or a word before it) holds such a placeholder, it asks.
+      const marks = placeholders(argv, chainOf(argv), at);
+      const filled = (upTo: number) => marks.length > 0 && values.slice(at, upTo + 1).some((v) => v !== undefined && marks.some((m) => v.includes(m)));
+      const fills = `code for ${name} that xargs -I or find -exec fills in with its input (${marks.join(", ")}), which printing would leave unquoted`;
       if (name === "eval") {
         const rest = values.slice(at + 1);
         if (!rest.length) continue;
+        if (filled(values.length - 1)) ask(fills);
         if (rest.some((v) => v === undefined)) ask("code for eval built from a variable, a substitution or a glob");
         const inner = print(rest.join(" "), this.depth + 1, "in the code eval runs");
         // What eval defines stays defined for the rest of the command, which was read as a
@@ -1732,6 +1770,7 @@ class Printer {
       if (!between.every((v, n) => v !== undefined && (/^[-+]/.test(v) || /^[-+][a-zA-Z]*[oO]$/.test(between[n - 1] ?? "")))) continue;
       const code = values[flag + 1];
       if (code === undefined) ask("code for a nested shell built from a variable, a substitution or a glob");
+      if (filled(flag + 1)) ask(fills);
       // The scanner asks about an option between -c and the code; such a word is left as it is.
       if (/^[-+]/.test(code!)) continue;
       const inner = print(code!, this.depth + 1, "in a command a nested shell runs");
