@@ -4164,7 +4164,7 @@ function buildToolProblem(name: string, args: string[]): string | undefined {
   const own = args.slice(0, args.includes("--") ? args.indexOf("--") : args.length);
   const operands = own.filter((a) => !a.startsWith("-"));
   if (COMPILER.test(name)) {
-    const word = args.find((a, i) => /^(-wrapper|-B.*|--prefix(=.*)?|-fplugin(=.*|-arg.*)?|-fpass-plugin=.*|--?specs(=.*)?|--ld-path(=.*)?|-Xclang|-ccc-.*|--gcc-toolchain(=.*)?|--gcc-install-dir(=.*)?)$/.test(a) || (/^-fuse-ld=/.test(a) && a.includes("/")) || (/^(-Wl,|-Wp,|--for-linker=)/.test(a) && /plugin/.test(a)) || ((a === "-Xlinker" || a === "--for-linker") && /plugin/.test(args[i + 1] ?? "")));
+    const word = args.find((a, i) => /^(-wrapper|-B.*|--prefix(=.*)?|-fmodule-mapper(=.*)?|-fplugin(=.*|-arg.*)?|-fpass-plugin=.*|--?specs(=.*)?|--ld-path(=.*)?|-Xclang|-ccc-.*|--gcc-toolchain(=.*)?|--gcc-install-dir(=.*)?)$/.test(a) || (/^-fuse-ld=/.test(a) && a.includes("/")) || (/^(-Wl,|-Wp,|--for-linker=)/.test(a) && /plugin/.test(a)) || ((a === "-Xlinker" || a === "--for-linker") && /plugin/.test(args[i + 1] ?? "")));
     if (word) return `${name} ${word.split("=")[0]} runs a program or loads a plugin the call names`;
   }
   if (name === "rustc") {
@@ -4193,13 +4193,13 @@ function buildToolProblem(name: string, args: string[]): string | undefined {
       const def = /^-D/.test(a) ? (a === "-D" ? (own[i + 1] ?? "") : a.slice(2)) : "";
       const m = /^(CMAKE_\w+?)(:\w+)?=(.*)$/s.exec(def);
       if (!m) return false;
-      if (/FLAGS\w*$|_STANDARD_LIBRARIES$/.test(m[1])) return !!buildToolProblem("gcc", m[3].split(/[\s;]+/)) || /-wrapper|plugin|ext(ld|ar)/.test(m[3]);
+      if (/FLAGS\w*$|_STANDARD_LIBRARIES$/.test(m[1])) return !!buildToolProblem("gcc", m[3].replace(/["']/g, "").split(/[\s;]+/)) || /-wrapper|plugin|ext(ld|ar)|module-mapper/.test(m[3]);
       return !CMAKE_SAFE.test(m[1]);
     }) ?? own.find((a, i) => {
       // (Round 5, Opus: a find module's program or a package's config directory, `-DGIT_EXECUTABLE=`,
       // `-DFoo_DIR=`, is run or loaded at configure time.)
       const def = /^-D/.test(a) ? (a === "-D" ? (own[i + 1] ?? "") : a.slice(2)) : "";
-      return /^\w+_(EXECUTABLE|PROGRAM|COMMAND|DIR|ROOT|TOOL|LAUNCHER|COMPILER)(:\w+)?=/.test(def);
+      return /^(\w+_(EXECUTABLE|PROGRAM|COMMAND|DIR|ROOT|TOOL|LAUNCHER|COMPILER)(_\w+)?|FETCHCONTENT_\w+)(:\w+)?=/.test(def);
     });
     if (set) return "cmake -D sets a CMake variable outside a short list of harmless ones: many name a program, a script or compiler options the build runs";
     // `cmake --build <dir> -- <words>` hands the words to the build tool, make or ninja.
@@ -4970,18 +4970,29 @@ export function unzipWords(args: string[]): { writes: boolean; dir?: string } {
 // else in the call touches (B7-11: then the move brings in no directory of files).
 // A gcc-family call that only prints: a version, help, a path or a spec, or the preprocessed
 // text, the dependencies or the diagnostics of its input, with no option that writes a file.
-const compilerNamesPlace = (args: string[]) => args.some((a) => /^(-M[FDJ]|-MMD|--write-(user-)?dependencies|--?save-temps|-dumpdir|-dumpbase|-Wa,|-Xassembler|--for-assembler|-Wl,|-Xlinker|--for-linker|-Wp,|-Xpreprocessor|--for-preprocessor|-fdump-|-fopt-info|-fdiagnostics-|-fcallgraph-info|-fstack-usage|-fprofile-|-ftest-coverage|--coverage|-aux-info|-fplugin|-fsave-optimization-record|-foptimization-record-file|-ftime-trace)/.test(a));
+// (Round 6: an `@file` of more options may hold any of them.)
+const compilerNamesPlace = (args: string[]) => args.some((a) => /^(@|-M[FDJ]|-MMD|--write-(user-)?dependencies|--?save-temps|-dumpdir|-dumpbase|-Wa,|-Xassembler|--for-assembler|-Wl,|-Xlinker|--for-linker|-Wp,|-Xpreprocessor|--for-preprocessor|-fdump-|-fopt-info|-fdiagnostics-|-fcallgraph-info|-fstack-usage|-fprofile-|-ftest-coverage|--coverage|-aux-info|-fplugin|-fsave-optimization-record|-foptimization-record-file|-ftime-trace)/.test(a));
+// The gcc options whose value is the next word: a query word there is that value (round 6:
+// `gcc -I -E t.c` compiles, with an include directory named `-E`).
+const GCC_SEPARATE_VALUE = /^(-[IDULlxoTuzeABb]|-include|-imacros|-isystem|-iquote|-idirafter|-iprefix|-iwithprefix|-iwithprefixbefore|-isysroot|-imultilib|-MF|-MT|-MQ|-Xlinker|-Xassembler|-Xpreprocessor|-Xclang|-aux-info|-dumpbase|-dumpdir|--param|-wrapper|--sysroot|-target|--target|-arch|-specs|--specs)$/;
 function compilerQuery(args: string[]): boolean {
   if (compilerNamesPlace(args) || args.some((a) => /^(-o|--output)/.test(a))) return false;
   if (args.length && args.every((a) => /^(--version|--help.*|--target-help|-dumpversion|-dumpfullversion|-dumpmachine|-dumpspecs|-print-.*|--print-.*|-###|-v|-Q)$/.test(a))) return true;
-  return args.some((a) => /^(-E|-M|-MM|-fsyntax-only)$/.test(a));
+  return args.some((a, i) => /^(-E|-M|-MM|-fsyntax-only)$/.test(a) && !GCC_SEPARATE_VALUE.test(args[i - 1] ?? ""));
 }
 // rustc that only prints: a version, help, an explanation, or `--print` kinds without `=FILE`
 // and no input to compile.
+// (Round 6: every word must be one of these, so a value or an input of any name is no query;
+// `--print link-args` and `native-static-libs` compile.)
 function rustcQuery(args: string[]): boolean {
-  if (args.some((a) => /^(-V|-vV|--version|--explain|-h|--help)$/.test(a))) return true;
-  const prints = args.flatMap((a, i) => (a === "--print" ? [args[i + 1] ?? ""] : a.startsWith("--print=") ? [a.slice(8)] : []));
-  return prints.length > 0 && prints.every((k) => !k.includes("=")) && !args.some((a) => a === "-" || /\.rs$/.test(a));
+  if (!args.length) return false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (/^(-V|-vV|--version|-h|--help|-v|--verbose)$/.test(a)) continue;
+    const valued = /^(--print|--explain|--target|--sysroot)$/.test(a) ? args[++i] : /^(--print|--explain|--target|--sysroot)=/.test(a) ? a.slice(a.indexOf("=") + 1) : undefined;
+    if (valued === undefined || valued.includes("=") || valued.startsWith("@") || (/^--print/.test(a) && /^(link-args|native-static-libs)$/.test(valued))) return false;
+  }
+  return true;
 }
 function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string[]) => boolean): string | undefined {
   // A name the URL or the server chooses (round 4, finding 17, second pass).
@@ -5085,7 +5096,8 @@ function unnamedWriteDirs(name: string, args: string[]): (string | undefined)[] 
   // (Council project review 2, round 4: a compiler's own output is where it runs; one a linker
   // option or rustc's `-o`, `--out-dir`, `--emit` names is not placed.)
   if (name === "ccache" && args.length && COMPILER.test(args[0])) return unnamedWriteDirs(args[0], args.slice(1));
-  if (COMPILER.test(name)) return compilerNamesPlace(args) ? [undefined] : [];
+  // (Round 6: a precompiled header lands beside its input, wherever that is: the project.)
+  if (COMPILER.test(name)) return [undefined];
   if (name === "rustc") return [undefined];
   if (name === "curl" || name === "wget") return place(fetcherWrites(name, args).chosen.map((c) => c.dir || "."));
   // (Round 4: an option that puts the output elsewhere, zstd's `--output-dir-flat=.`, lzop's
@@ -7707,6 +7719,11 @@ export function runnerPlaces(name: string, args: string[], cwd: string | undefin
     if (RUNNER_PLACE_OPTIONS.test(option)) {
       const value = w.startsWith("--") && eq > 0 ? w.slice(eq + 1) : option !== w ? w.slice(2) : words[++i];
       if (value === undefined) continue;
+      // (Round 6, Opus: `gcc -c @/tmp/rsp`: for gcc `-c` takes no value, and the word is read here.)
+      if (value.startsWith("@") || /%[0-9a-fA-F]{2}/.test(value) || /data:/i.test(value)) {
+        places.push(undefined);
+        continue;
+      }
       const p = resolve(value);
       place(value, !!p && isFile(p));
       places.push(...existing(value));

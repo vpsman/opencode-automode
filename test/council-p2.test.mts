@@ -306,3 +306,40 @@ test("round 5: gcc's options are words of their own; cargo's subcommand behind a
   ]) assert.equal(await effect(c), "ask", c);
   for (const c of ["cmake --build build -- -j4 -k", "cmake -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug ."]) assert.notEqual(await effect(c), "ask", c);
 });
+
+// ---- round 6 ----
+
+test("round 6: a query word that is an option's value, an input of any name, or an @file makes a compile a write", async () => {
+  for (const writer of [
+    "rustc --print link-args src -o output", "printf 'fn main(){}' | rustc -L -V - -o node_modules/.bin/node", "rustc --cfg --version x", "rustc --print native-static-libs /dev/stdin -o o", "rustc --print sysroot @rr2",
+    "gcc -I -E t.c", "gcc -L -fsyntax-only t.c", "printf 'int e;' | gcc -I -E -c -include /dev/stdin t.c", "gcc -E -P @/tmp/rsp", "gcc -E -C @/tmp/rsp",
+  ]) {
+    const s = new SessionState(repo);
+    const wrote = await effect(writer, s);
+    assert.ok(wrote !== "allow" || (await effect("npm test", s)) !== "allow", writer);
+  }
+  // A header compiled from elsewhere: its .gch lands beside it, in the project.
+  const outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-pch-")));
+  try {
+    const s = new SessionState(repo);
+    const wrote = (await decideShell(guard, s, outside, `gcc -x c-header ${repo}/x.h`)).effect;
+    assert.ok(wrote !== "allow" || (await effect("make", s)) !== "allow");
+  } finally {
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("round 6: an @file after -c or -S is a place the check cannot tell; -fmodule-mapper asks", async () => {
+  const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-rsp-")));
+  try {
+    const s = new SessionState(repo);
+    assert.equal(await effect(`printf x > ${d}/rsp`, s), "allow");
+    fs.writeFileSync(path.join(d, "rsp"), "x");
+    for (const c of [`gcc -c @${d}/rsp t.c`, `gcc -S @${d}/rsp t.c`, `npm test -- -c @${d}/rsp`]) assert.notEqual(await effect(c, s), "allow", c);
+  } finally {
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+  for (const c of ["g++ -fmodules-ts '-fmodule-mapper=|git push origin HEAD' -c x.cc", "ccache g++ '-fmodule-mapper=|sh' -c x.cc", "cmake '-DCMAKE_CXX_FLAGS=-fmodule-mapper=|sh' .", `cmake '-DCMAKE_C_FLAGS="-B/tmp/x"' .`, "cmake -DFETCHCONTENT_SOURCE_DIR_FOO=/tmp/x ."]) {
+    assert.equal(await effect(c), "ask", c);
+  }
+});

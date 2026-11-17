@@ -180,7 +180,8 @@ For each shell tool call:
      `-I`, `--to-command`, `-F`; `sort --compress-program`; `make --eval`, `make -f -` or a
      makefile from standard input, a device or a pipe, also through a symbolic link, and
      `NAME=value` arguments of make on the environment's terms; `fd -x`; `rg --pre`;
-     `man -P`, `-H` and `-C`; a compiler's `-wrapper`, `-B`, `-fplugin`, `-specs`, `-Xclang`,
+     `man -P`, `-H` and `-C`; a compiler's `-wrapper`, `-B`, `-fplugin`,
+     `-fmodule-mapper`, `-specs`, `-Xclang`,
      `-fuse-ld=<path>`, `--prefix` and a linker plugin; `rustc -C linker=`,
      `link-arg` (or `link_arg`) and `-Z`; `ccache` with a program other than a compiler, or
      `-o`; `cmake -E`, `-P`, `-C`, `--toolchain`, `-D` of a `CMAKE_` variable outside a short
@@ -298,9 +299,10 @@ For each shell tool call:
      expands itself (`npm test -- '/tmp/d*/x.test.js'`) counts from the last `/` before its
      first `*`, `?`, `[`, `{`, `(` or `\`, and a word with a `%xx` escape or a `data:` URL is a
      place the check cannot tell; one in the first part of an absolute path could be anywhere. A write the check cannot place (an archive
-     extraction, `patch`, `git apply`, a recursive copy, a compiler's own output name such as
-     `a.out`, rustc's outputs, a linker output named through `-Wl,`) marks the directory it ran
-     in, or the project where the place cannot be read; after a git command that writes the work tree
+     extraction, `patch`, `git apply`, a recursive copy, and every gcc-family or rustc call that
+     is not a pure query, `--version`, `-print-*`, or `-E`/`-fsyntax-only` with nothing that
+     writes, since a compiler and its options choose many names) marks the directory it ran
+     in, or the project where the place cannot be read (every compile); after a git command that writes the work tree
      (`pull`, `merge`, `checkout`, `rebase`, `stash pop`, `reset`) only the files git
      changed count, once the call is over. In a session that has written nothing in the
      project, `make`, `npm test` and `cargo build` are allows and run the project's code
