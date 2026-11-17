@@ -385,6 +385,10 @@ function shellProblem(cmds: Simple[]): string | undefined {
         const found = optionsProblem(rest, false);
         if (found) return `set ${found}, which changes how bash reads the rest of the command`;
       }
+      // Council project review 2, round 8 (Mythos): the rules allow any program whose one word is
+      // `-h` or `-V`, taken for help or a version. For these that word is an option, and they go
+      // on to run their standard input (`rbash -h` is hashall, `ex -V` is verbose).
+      if (at.has(i) && rest.length === 1 && /^-[hV]$/.test(rest[0]) && STDIN_RUNNERS.has(name)) return `${name} ${rest[0]}: an option of ${name}, which then runs what its standard input holds`;
       if (BASH_LIKE.has(name)) {
         const found = optionsProblem(rest, true);
         if (found === "-O") return `${name} -O, which changes how the shell reads its code`;
@@ -440,6 +444,7 @@ function wordsAreData(argv: string[]): number {
   return main;
 }
 
+const STDIN_RUNNERS = new Set(["rbash", "zsh", "ksh", "ksh93", "mksh", "pdksh", "oksh", "yash", "posh", "fish", "tcsh", "csh", "busybox", "ex", "vi", "vim", "view", "nvim", "rvim", "rview", "gvim", "evim", "vimdiff", "ed", "red"]);
 // The first option among the leading words of `set` or of a shell that is not known to leave
 // the reading of code alone; "-O" for a shopt option wherever it stands in a cluster.
 function optionsProblem(words: string[], shell: boolean): string | undefined {
@@ -4102,12 +4107,14 @@ function makeProblem(args: string[], cwd: string | undefined, inProject: ((p: st
   // program a recipe runs (`$(RM)`, `$(INSTALL)`), so a value that is not a plain word goes to
   // the model.
   let verdict: GuardVerdict | undefined;
-  for (const a of args) {
+  // (Round 8: after `--` make reads every word with `=` as an assignment, `-X!=cmd` too.)
+  const ended = args.indexOf("--");
+  for (const [n, a] of args.entries()) {
     const m = /^([A-Za-z_.][\w.-]*?)(\+|\?|::?|!)?=(.*)$/s.exec(a);
     // (Council project review 2, round 7, Opus: make reads more as an assignment, blanks around
     // the operator, `a/b:=`, `:::=`; one this reading does not take asks.)
     if (!m) {
-      if (a.includes("=") && !a.startsWith("-")) return ask(`make ${a}: an assignment make reads in a form the check does not, which may run a shell command`);
+      if (a.includes("=") && (!a.startsWith("-") || (ended >= 0 && n > ended))) return ask(`make ${a}: an assignment make reads in a form the check does not, which may run a shell command`);
       continue;
     }
     const [, name, op, value] = m;

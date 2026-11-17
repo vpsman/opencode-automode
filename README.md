@@ -189,7 +189,8 @@ For each shell tool call:
      `CMAKE_<...>FLAGS` with one of the compiler options above, and `cmake --build -- <words>`
      held to make's checks; `make NAME=value` whose value is one of the compiler options above,
      and a make argument with `=` in a form other than a plain `NAME=value` (`'X != cmd'`,
-     `a/b:=...`); `rustc +<path>`, `rustfmt +<path>` and the other rustup proxies with a
+     `a/b:=...`, any such word after `--`); a lone `-h` or `-V` given to a shell other than
+     bash, sh and dash or to `ex`/`vi`/`vim` (an option there, which then runs standard input); `rustc +<path>`, `rustfmt +<path>` and the other rustup proxies with a
      toolchain that is not a plain name;
      `cargo clippy`, `rustc` and `rustdoc` with rustc's options after `--`; `ctest -S`, `--build-and-test` and `--test-command`; `just --command`/`-c` and
      `--shell` and `--chooser`; `tox exec` and `-x`/`--override`; `meson devenv` and
