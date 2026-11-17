@@ -670,3 +670,25 @@ test("round 24: devices by their normalised path; git and mv beside a second wri
   for (const c of ["go tool -C . test2json /bin/sh -c id", "go tool --C . test2json sh", "go tool -C . cgo -- -wrapper /bin/sh,-c,id x.go"]) assert.notEqual(await effect(c), "allow", c);
   assert.equal(await effect("npm test > /dev/null"), "allow");
 });
+
+// ---- round 25 ----
+
+test("round 25: a device only without .., descriptor paths that reopen a file, a writer that runs more than once", async () => {
+  const b = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-r25-")));
+  try {
+    fs.mkdirSync(path.join(b, "t", "a", "b", "c", "d"), { recursive: true });
+    fs.symlinkSync(path.join(repo, ".git", "hooks"), path.join(b, "hk"));
+    assert.notEqual(await effect(`echo hi > ${b}/hk/../../../dev/null`), "allow", "a .. after a link is no device");
+    for (const writer of [`tar -xf ${b}/a.tar -C ${b}/h && printf x > ${b}/h/l/../../../../dev/null`, `for i in 1 2; do tar -xf ${b}/o/a.tar -C ${b}/o; done`, `until tar -xf ${b}/a.tar -C ${b}/o; do :; done`, `unzip -o -q '${b}/z/*.zip' -d ${b}/oz`]) {
+      const s = new SessionState(repo);
+      const wrote = await effect(writer, s);
+      assert.ok(wrote !== "allow" || (await effect("npm test", s)) !== "allow", writer);
+    }
+  } finally {
+    fs.rmSync(b, { recursive: true, force: true });
+  }
+  for (const c of ["{ printf x > /dev/stdout; } < package.json >&0", "exec < package.json >&0; printf x > /dev/stdout", "{ cp f /dev/stdout; } < package.json >&0", "{ printf x > /dev/stderr; } < package.json 2>&0", "{ printf x > /dev/stdin; } < package.json"]) {
+    assert.notEqual(await effect(c), "allow", c);
+  }
+  for (const c of ["npm test > /dev/null", "npm test 2>/dev/null", "echo hi > /dev/null"]) assert.equal(await effect(c), "allow", c);
+});

@@ -3952,7 +3952,7 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
         const full = path.isAbsolute(t) ? t : `${dir}/${t}`;
         // (Council project review 2, round 24, Mythos: a device by its normalised path, not a
         // `/dev/` prefix of the words, `/dev/../tmp/o/l/hooks/pre-commit`.)
-        if (DEVICE.test(path.resolve(full)) || procRelative(full)) continue;
+        if (isDevice(full, undefined) || procRelative(full)) continue;
         const landed = physical(full);
         const root = roots.find((r) => within(landed, r));
         const below = root === undefined ? landed : path.relative(root, landed);
@@ -5087,8 +5087,13 @@ function deniedAsIssued(guard: Guard, session: SessionState, cwd: string, comman
   }
 }
 
-// The devices a write to which writes no file (round 24: by the normalised path).
+// The devices a write to which writes no file (round 24: by the normalised path). Round 25: and
+// only where the words hold no `..`, which the kernel takes after a link, not before.
 const DEVICE = /^\/dev\/(null|zero|stdout|stderr|tty|fd\/\d+)$/;
+const isDevice = (word: string, cwd: string | undefined) => !/(^|\/)\.\.(\/|$)/.test(word) && DEVICE.test(path.resolve(cwd ?? "/", tilde(word)));
+// A path to one of the shell's own descriptors: in the command's shell it is whatever file the
+// descriptor holds, and opening it for writing reopens that file (round 25, Mythos).
+const DESCRIPTOR = /^\/(dev\/(stdin|stdout|stderr|fd\/\d+)|proc\/(self|thread-self|\d+)\/fd\/\d+)$/;
 // Whether a directory holds a symbolic link at any depth (council project review 2, round 22), or
 // is too large to tell within a small budget; a link to a place inside the directory counts too.
 function holdsLink(dir: string, budget = { left: 4000 }): boolean {
@@ -5387,9 +5392,11 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
     // a git switch or a moved directory as an extraction does; and a device is told by the
     // normalised path, `/dev/../tmp/...` is no device.)
     const extractors = found.unlisted;
-    const device = (w: { word: string; cmd: Simple }) => DEVICE.test(path.resolve(cwdOf(w.cmd) ?? "/", tilde(w.word)));
-    const others = [...found.writes.filter((w) => !device(w)), ...found.unlisted].filter((w) => !extractors.some((e) => e.cmd === w.cmd));
-    if (extractors.length > 1 || (extractors.length === 1 && others.length > 0)) for (const w of [...found.writes, ...found.unlisted]) project(w.cmd);
+    const others = [...found.writes.filter((w) => !isDevice(w.word, cwdOf(w.cmd))), ...found.unlisted].filter((w) => !extractors.some((e) => e.cmd === w.cmd));
+    // (Round 25, Opus and Mythos: one writer the text names once may run more than once: in a
+    // loop or a function, or unzip with a pattern for its archives.)
+    const repeats = /\b(for|while|until|select)\b|\(\s*\)\s*\{|\bfunction\b/.test(run) || extractors.some((u) => u.cmd.argv.some((a) => path.basename(a) === "unzip") && u.cmd.argv.some((a) => /[*?[]/.test(a)));
+    if (extractors.length > 1 || (extractors.length === 1 && (others.length > 0 || repeats))) for (const w of [...found.writes, ...found.unlisted]) project(w.cmd);
   }
   const unplaced = unplacedAll[0];
   for (const w of unplacedAll) project(w.cmd);
@@ -5534,6 +5541,10 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
     commit();
     return { ...d, ...f, recordAt: session.record.writes, ...(worktree.length ? { worktree } : {}) };
   };
+  // (Council project review 2, round 25, Mythos: a write to one of the shell's descriptors by its
+  // path reopens the file the descriptor holds, one the call itself opened with `<` or a copy.)
+  const descriptorWrite = found.writes.find((w) => DESCRIPTOR.test(path.resolve(cwdOf(w.cmd) ?? "/", tilde(w.word))));
+  if (descriptorWrite && (/\/dev\/stdin$|\/fd\/0$/.test(descriptorWrite.word) || /(^|[^<])<(?![<(&])|[<>]&\s*\d|\bexec\b/.test(run))) return asked(askBy(`writes ${descriptorWrite.word}, a path to a descriptor that may hold a file this call opened, which the write then replaces`));
   if (gitIssue) return asked(askBy(gitIssue));
   if (writeIssue) return asked(askBy(writeIssue));
   if (verdict.action === "ask") return asked(fromRules(verdict));
