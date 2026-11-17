@@ -634,3 +634,19 @@ test("round 22: unzip -:, npm x@*, an extraction through a link an earlier one l
   }
   for (const c of ["npm view lodash@^4", "go tool dist list"]) assert.equal(await effect(c), "allow", c);
 });
+
+// ---- round 23 ----
+
+test("round 23: unzip clusters with :, go -C tool, an extraction and a second write in one call", async () => {
+  const b = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-r23-")));
+  try {
+    for (const writer of [`unzip -^: ${b}/a.zip -d ${b}/out`, `unzip -q-o: ${b}/a.zip -d ${b}/out`, `unzip -oq-q: ${b}/a.zip -d ${b}/out`, `mkdir -p ${b}/o && tar -xf ${b}/a.tar -C ${b}/o && tar -xf ${b}/b.tar -C ${b}/o`, `unzip -q ${b}/a.zip -d ${b}/o && unzip -q ${b}/b.zip -d ${b}/o`, `tar -xf ${b}/a.tar -C ${b}/o && printf x > ${b}/o/l/x.test.js`]) {
+      const s = new SessionState(repo);
+      const wrote = await effect(writer, s);
+      assert.ok(wrote !== "allow" || (await effect("npm test", s)) !== "allow", writer);
+    }
+  } finally {
+    fs.rmSync(b, { recursive: true, force: true });
+  }
+  for (const c of ["go -C tool tool test2json /bin/sh -c id", "go -C tool tool cgo -- -wrapper /bin/sh,-c,id x.go", "go -C tool tool pprof -tools=/tmp/x: bin prof"]) assert.notEqual(await effect(c), "allow", c);
+});

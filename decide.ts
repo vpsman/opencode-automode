@@ -5375,6 +5375,14 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   // (Round 13, all four: `cp -s`, `-P`, `-a` and every other program that makes, copies or moves
   // a link.)
   if (cmds.some((c) => makesLink(c.argv))) for (const w of [...found.writes, ...found.unlisted]) project(w.cmd);
+  // (Round 23, Mythos: a writer the check cannot list, an extraction, may put a link in place
+  // that a second write of the same call follows, `tar -xf a.tar -C o && tar -xf b.tar -C o`. A
+  // lone such writer keeps its narrow mark.)
+  else {
+    const extractors = found.unlisted.filter((u) => u.cmd.argv.some((a) => /^(tar|gtar|bsdtar|unzip|7z|cpio|rsync)$/.test(path.basename(a))));
+    const others = [...found.writes.filter((w) => !/^\/dev\//.test(w.word)), ...found.unlisted].filter((w) => !extractors.some((e) => e.cmd === w.cmd));
+    if (extractors.length > 1 || (extractors.length === 1 && others.length > 0)) for (const w of [...found.writes, ...found.unlisted]) project(w.cmd);
+  }
   const unplaced = unplacedAll[0];
   for (const w of unplacedAll) project(w.cmd);
   const unknownWrite = found.unknown ?? (unplaced ? `writes ${unplaced.word} where the check cannot place it` : undefined);

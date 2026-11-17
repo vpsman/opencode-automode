@@ -4189,7 +4189,11 @@ function managerProblem(name: string, args: string[]): string | undefined {
     if (gccgo) return "go -gccgoflags hands gccgo options, which can name a program it runs";
     // (Round 22, Opus: `go tool test2json <command>` runs the command; `go tool cgo -- <words>`
     // hands the words to gcc; `go tool pprof -tools=` names the programs pprof runs.)
-    const tool = args.indexOf("tool");
+    // (Round 23, Opus, Sol and Mythos: the subcommand is read past `-C <dir>`, whose value may be
+    // `tool`.)
+    let at = 0;
+    while (at < args.length && args[at].startsWith("-")) at += args[at] === "-C" ? 2 : 1;
+    const tool = args[at] === "tool" ? at : -1;
     if (tool >= 0) {
       const which = args.slice(tool + 1).find((a) => !a.startsWith("-"));
       const after = which === undefined ? [] : args.slice(args.indexOf(which, tool + 1) + 1);
@@ -5141,7 +5145,8 @@ function unnamedWriteDirs(name: string, args: string[]): (string | undefined)[] 
   if (name === "unzip") {
     // (Council project review 2, round 22, Mythos: `-:` keeps `../` in member names, so the
     // files land anywhere the call may write.)
-    if (args.some((a) => /^-[a-zA-Z0-9]*:/.test(a))) return [undefined];
+    // (Round 23: unzip reads `^`, `-` and the rest letter by letter: any option word with a `:`.)
+    if (args.some((a) => /^-[^:]*:/.test(a))) return [undefined];
     const dir = unzipWords(args).dir;
     return place(dir === undefined ? [] : [dir]);
   }
