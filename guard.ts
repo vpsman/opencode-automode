@@ -464,7 +464,9 @@ function optionsProblem(words: string[], shell: boolean): string | undefined {
         const option = words[++i];
         // `set -o` alone prints the options.
         if (option !== undefined && !PLAIN_SET_O.has(option)) odd ??= `${w[0]}o ${option}`;
-      } else if (shell ? !SHELL_FLAG_LETTERS.test(letter) : "Hk".includes(letter)) odd ??= w;
+      // (Council project review 2, round 7: `B` too, as `-o braceexpand` is: `set +B` stops the
+      // brace expansion the printer has already done.)
+      } else if (shell ? !SHELL_FLAG_LETTERS.test(letter) : "HkB".includes(letter)) odd ??= w;
     }
   }
   return odd;
@@ -4102,7 +4104,12 @@ function makeProblem(args: string[], cwd: string | undefined, inProject: ((p: st
   let verdict: GuardVerdict | undefined;
   for (const a of args) {
     const m = /^([A-Za-z_.][\w.-]*?)(\+|\?|::?|!)?=(.*)$/s.exec(a);
-    if (!m) continue;
+    // (Council project review 2, round 7, Opus: make reads more as an assignment, blanks around
+    // the operator, `a/b:=`, `:::=`; one this reading does not take asks.)
+    if (!m) {
+      if (a.includes("=") && !a.startsWith("-")) return ask(`make ${a}: an assignment make reads in a form the check does not, which may run a shell command`);
+      continue;
+    }
     const [, name, op, value] = m;
     if (op === "!") return ask(`make ${name}!= runs a shell command to set the variable`);
     if (/\$[({]/.test(value)) return ask(`make ${name}=: the value calls a make function or names a variable, which make expands`);
@@ -4160,6 +4167,7 @@ function managerProblem(name: string, args: string[]): string | undefined {
 // beyond the project's own build, read from its words. Python tools (argparse) take any unique
 // prefix of a long option.
 const CMAKE_SAFE = /^CMAKE_(BUILD_TYPE|INSTALL_PREFIX|EXPORT_COMPILE_COMMANDS|(C|CXX|CUDA|OBJC|OBJCXX|HIP)_(STANDARD|STANDARD_REQUIRED|EXTENSIONS)|POSITION_INDEPENDENT_CODE|VERBOSE_MAKEFILE|COLOR_DIAGNOSTICS|COLOR_MAKEFILE|INTERPROCEDURAL_OPTIMIZATION|UNITY_BUILD|MESSAGE_LOG_LEVEL|FIND_DEBUG_MODE|SKIP_RPATH|SKIP_INSTALL_RPATH|BUILD_WITH_INSTALL_RPATH|OSX_ARCHITECTURES|OSX_DEPLOYMENT_TARGET|(RUNTIME|LIBRARY|ARCHIVE)_OUTPUT_DIRECTORY|EXPORT_PACKAGE_REGISTRY|FIND_PACKAGE_PREFER_CONFIG|DISABLE_PRECOMPILE_HEADERS|SUPPRESS_REGENERATION|WARN_DEPRECATED|ERROR_DEPRECATED|INSTALL_MESSAGE|BUILD_PARALLEL_LEVEL)$/;
+const RUSTUP_PROXIES = new Set(["rustc", "rustfmt", "rustdoc", "cargo", "cargo-clippy", "clippy-driver", "cargo-fmt", "rust-gdb", "rust-gdbgui", "rust-lldb", "rust-analyzer", "rls", "cargo-miri"]);
 function buildToolProblem(name: string, args: string[]): string | undefined {
   const own = args.slice(0, args.includes("--") ? args.indexOf("--") : args.length);
   const operands = own.filter((a) => !a.startsWith("-"));
@@ -4277,6 +4285,9 @@ function programProblem(name: string, args: string[], cwd?: string, inProject?: 
   // file of more options, `gcc @args`, is a place the runner check cannot tell: runnerPlaces.)
   const tool = buildToolProblem(name, args);
   if (tool) return ask(tool);
+  // (Council project review 2, round 7, Mythos: rustup's proxies take `+<toolchain>`, and a path
+  // there runs `<path>/bin/<tool>`; held to a name, as cargo's is.)
+  if (RUSTUP_PROXIES.has(name) && args[0]?.startsWith("+") && !/^\+[A-Za-z0-9][A-Za-z0-9._-]*$/.test(args[0])) return ask(`${name} ${args[0]}: a toolchain named by a path runs the program found there`);
   if (MAKES.has(name)) return makeProblem(args, cwd, inProject);
   if ((name === "fd" || name === "fdfind") && (longOption(args, ["--exec", "--exec-batch"]) || args.some((a) => /^-[a-zA-Z]*[xX]/.test(a) && !a.startsWith("--")))) return ask("fd -x runs a command for every match");
   if (name === "rg" && longOption(args, ["--pre", "--pre-glob", "--hostname-bin"])) return ask("rg --pre runs a program on every file");
@@ -4968,17 +4979,13 @@ export function unzipWords(args: string[]): { writes: boolean; dir?: string } {
 // Writers whose output names are not on the command line (finding 23).
 // `filesOnly`: for an `mv`, whether every source is a file that is there now and that nothing
 // else in the call touches (B7-11: then the move brings in no directory of files).
-// A gcc-family call that only prints: a version, help, a path or a spec, or the preprocessed
-// text, the dependencies or the diagnostics of its input, with no option that writes a file.
+// A gcc-family call that only prints: a version, help, a path or a spec.
 // (Round 6: an `@file` of more options may hold any of them.)
 const compilerNamesPlace = (args: string[]) => args.some((a) => /^(@|-M[FDJ]|-MMD|--write-(user-)?dependencies|--?save-temps|-dumpdir|-dumpbase|-Wa,|-Xassembler|--for-assembler|-Wl,|-Xlinker|--for-linker|-Wp,|-Xpreprocessor|--for-preprocessor|-fdump-|-fopt-info|-fdiagnostics-|-fcallgraph-info|-fstack-usage|-fprofile-|-ftest-coverage|--coverage|-aux-info|-fplugin|-fsave-optimization-record|-foptimization-record-file|-ftime-trace)/.test(a));
-// The gcc options whose value is the next word: a query word there is that value (round 6:
-// `gcc -I -E t.c` compiles, with an include directory named `-E`).
-const GCC_SEPARATE_VALUE = /^(-[IDULlxoTuzeABb]|-include|-imacros|-isystem|-iquote|-idirafter|-iprefix|-iwithprefix|-iwithprefixbefore|-isysroot|-imultilib|-MF|-MT|-MQ|-Xlinker|-Xassembler|-Xpreprocessor|-Xclang|-aux-info|-dumpbase|-dumpdir|--param|-wrapper|--sysroot|-target|--target|-arch|-specs|--specs)$/;
+// (Round 7: every word must be a query word. `-E` or `-fsyntax-only` can be another option's
+// value, `--include-directory -E`, or be undone, `-fno-syntax-only`; such a call compiles.)
 function compilerQuery(args: string[]): boolean {
-  if (compilerNamesPlace(args) || args.some((a) => /^(-o|--output)/.test(a))) return false;
-  if (args.length && args.every((a) => /^(--version|--help.*|--target-help|-dumpversion|-dumpfullversion|-dumpmachine|-dumpspecs|-print-.*|--print-.*|-###|-v|-Q)$/.test(a))) return true;
-  return args.some((a, i) => /^(-E|-M|-MM|-fsyntax-only)$/.test(a) && !GCC_SEPARATE_VALUE.test(args[i - 1] ?? ""));
+  return args.length > 0 && args.every((a) => /^(--version|--help.*|--target-help|-dumpversion|-dumpfullversion|-dumpmachine|-dumpspecs|-print-.*|--print-.*|-###|-v|-Q)$/.test(a));
 }
 // rustc that only prints: a version, help, an explanation, or `--print` kinds without `=FILE`
 // and no input to compile.

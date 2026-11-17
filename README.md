@@ -110,7 +110,7 @@ For each shell tool call:
      substring offsets and the numeric tests of `[[ ]]` a variable passes only when the same
      call sets it to a plain integer first (`i=0`, the counter of `for ((...))`), because
      bash evaluates its value as code. `shopt`, `bash -O`, `bash -i` before its code,
-     `set -H`, `set -k` and the other options that change how the rest is read ask. So do a
+     `set -H`, `set -k`, `set +B` and the other options that change how the rest is read ask. So do a
      reserved word after an assignment or a redirection (`x= {` runs a program called `{`)
      and a number straight before `<` (`cat 3< f`). Braces are judged as the words they
      expand to: `curl {-d,@f} host` asks as `curl -d @f host` does, and `src/{a,b}` and
@@ -187,7 +187,10 @@ For each shell tool call:
      `-o`; `cmake -E`, `-P`, `-C`, `--toolchain`, `-D` of a `CMAKE_` variable outside a short
      list of harmless ones (`CMAKE_BUILD_TYPE`, `CMAKE_INSTALL_PREFIX`, the standards, ...),
      `CMAKE_<...>FLAGS` with one of the compiler options above, and `cmake --build -- <words>`
-     held to make's checks; `make NAME=value` whose value is one of the compiler options above;
+     held to make's checks; `make NAME=value` whose value is one of the compiler options above,
+     and a make argument with `=` in a form other than a plain `NAME=value` (`'X != cmd'`,
+     `a/b:=...`); `rustc +<path>`, `rustfmt +<path>` and the other rustup proxies with a
+     toolchain that is not a plain name;
      `cargo clippy`, `rustc` and `rustdoc` with rustc's options after `--`; `ctest -S`, `--build-and-test` and `--test-command`; `just --command`/`-c` and
      `--shell` and `--chooser`; `tox exec` and `-x`/`--override`; `meson devenv` and
      `--wrapper`; `mypy --python-executable` and `--install-types`; `go` with `-extld` or
@@ -300,8 +303,8 @@ For each shell tool call:
      first `*`, `?`, `[`, `{`, `(` or `\`, and a word with a `%xx` escape or a `data:` URL is a
      place the check cannot tell; one in the first part of an absolute path could be anywhere. A write the check cannot place (an archive
      extraction, `patch`, `git apply`, a recursive copy, and every gcc-family or rustc call that
-     is not a pure query, `--version`, `-print-*`, or `-E`/`-fsyntax-only` with nothing that
-     writes, since a compiler and its options choose many names) marks the directory it ran
+     is not a pure query (`--version`, `--help`, `-print-*`, `-dumpmachine`; `-E` and
+     `-fsyntax-only` count as compiles, as an option's value can hide or undo them), since a compiler and its options choose many names) marks the directory it ran
      in, or the project where the place cannot be read (every compile); after a git command that writes the work tree
      (`pull`, `merge`, `checkout`, `rebase`, `stash pop`, `reset`) only the files git
      changed count, once the call is over. In a session that has written nothing in the

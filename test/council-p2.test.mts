@@ -288,7 +288,7 @@ test("round 5: every compile that is not a pure query is a write; an option that
       const wrote = (await decideShell(guard, s, cwd, writer)).effect;
       assert.ok(wrote !== "allow" || (await effect("npm test", s)) !== "allow", writer);
     }
-    for (const query of ["gcc --version", "gcc -dumpmachine", "gcc -print-file-name=libc.so", "gcc -E t.c", "gcc -fsyntax-only t.c", "rustc --version", "rustc --print sysroot", "rustc -vV"]) {
+    for (const query of ["gcc --version", "gcc -dumpmachine", "gcc -print-file-name=libc.so", "rustc --version", "rustc --print sysroot", "rustc -vV"]) {
       const s = new SessionState(repo);
       assert.equal(await effect(query, s), "allow", query);
       assert.equal(await effect("npm test", s), "allow", query);
@@ -342,4 +342,20 @@ test("round 6: an @file after -c or -S is a place the check cannot tell; -fmodul
   for (const c of ["g++ -fmodules-ts '-fmodule-mapper=|git push origin HEAD' -c x.cc", "ccache g++ '-fmodule-mapper=|sh' -c x.cc", "cmake '-DCMAKE_CXX_FLAGS=-fmodule-mapper=|sh' .", `cmake '-DCMAKE_C_FLAGS="-B/tmp/x"' .`, "cmake -DFETCHCONTENT_SOURCE_DIR_FOO=/tmp/x ."]) {
     assert.equal(await effect(c), "ask", c);
   }
+});
+
+// ---- round 7 ----
+
+test("round 7: -E and -fsyntax-only are compiles; make's other assignment forms, a rustup toolchain path and set +B ask", async () => {
+  for (const writer of ["gcc --include-directory -E t.c", "gcc --library-directory -E t.c", "gcc -F -E t.c", "gcc -fsyntax-only -fno-syntax-only -c t.c", "g++ --include-directory -fsyntax-only t.c", "ccache gcc --include-directory -E t.c", "gcc -E t.c", "gcc -fsyntax-only t.c"]) {
+    const s = new SessionState(repo);
+    const wrote = await effect(writer, s);
+    assert.ok(wrote !== "allow" || (await effect("npm test", s)) !== "allow", writer);
+  }
+  for (const c of [
+    "make 'X != git push origin HEAD'", "make 'X ?= $(shell id)'", "make 'a/b:=$(shell id)'", "make 'a@b!=id'", "make 'a,b!=id'", "make '%!=id'", "make 'X:::=$(shell id)'", "make 'SHELL =/tmp/x'", "make ' SHELL=/tmp/x'", "make 'MAKEFLAGS = --eval=x'", "make 'CFLAGS ?= -wrapper /tmp/x'",
+    "rustc +/tmp/d/tc --version", "rustfmt +/tmp/d/tc x.rs", "rustdoc +./tc x.rs",
+    "set +B; echo {a,b}", "set +eB; echo {a,b}", "set -e +B; echo {a,b}", "builtin set +B; echo {a,b}", "command set +B; echo {a,b}",
+  ]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["make", "make -j4 all", "make CFLAGS=-O2", "rustc +stable --version", "rustfmt +nightly x.rs", "set -e; echo {a,b}"]) assert.equal(await effect(c), "allow", c);
 });
