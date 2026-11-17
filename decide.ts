@@ -5099,7 +5099,9 @@ const DESCRIPTOR = /^\/(dev\/(stdin|stdout|stderr|fd\/\d+)|proc\/(self|thread-se
 // descriptors. Each step's directory is taken physically, as the kernel walks it.
 function descriptorsReached(p: string): string[] {
   const out: string[] = [];
-  for (let hop = 0; hop < 16; hop++) {
+  // (Round 27, all four: the kernel's 40 links, and a walk that runs out counts as reaching fd 0,
+  // so it asks, as the other walkers fail to a problem.)
+  for (let hop = 0; hop <= 40; hop++) {
     if (DESCRIPTOR.test(p)) {
       out.push(p);
       return out;
@@ -5119,6 +5121,7 @@ function descriptorsReached(p: string): string[] {
     }
     p = next;
   }
+  out.push("/dev/stdin");
   return out;
 }
 // Whether a directory holds a symbolic link at any depth (council project review 2, round 22), or
@@ -5146,7 +5149,7 @@ const makesLink = (argv: string[]) =>
   argv.some((a) => /^(ln|link|patch)$/.test(path.basename(a))) ||
   (argv.some((a) => path.basename(a) === "cp") && argv.some((a) => (/^-[a-zA-Z]+$/.test(a) && /[sldPrRa]/.test(a)) || /^--(sy|li|no-d|ar|pr|re)/.test(a))) ||
   // (Round 26, Opus: rsync copies a link as a link with -a, -l or --links.)
-  (argv.some((a) => path.basename(a) === "rsync") && argv.some((a) => (/^-[a-zA-Z]+$/.test(a) && /[al]/.test(a)) || /^--(archive|links)$/.test(a)));
+  (argv.some((a) => path.basename(a) === "rsync") && argv.some((a) => (/^-[a-zA-Z0-9]+$/.test(a) && /[al]/.test(a)) || /^--(archive|links)$/.test(a)));
 export async function decideShell(guard: Guard, session: SessionState, cwd: string, command: string, signal?: AbortSignal, scan: Scan = new Scan(guard.allowedPaths)): Promise<Decision> {
   try {
   projectRoots(session, scan); // takes the git snapshot first (all git calls here run with fsmonitor and hooks off)

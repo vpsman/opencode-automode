@@ -713,3 +713,21 @@ test("round 26: a write through a link to a descriptor, every descriptor write, 
   }
   for (const c of ["npm test > /dev/null", "echo hi > /dev/stdout"]) assert.equal(await effect(c), "allow", c);
 });
+
+// ---- round 27 ----
+
+test("round 27: a long chain of links to a descriptor asks", async () => {
+  const b = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-r27-")));
+  try {
+    for (const [n, end] of [[16, "/dev/stdin"], [21, "/dev/stdout"], [39, "/dev/stdin"]] as const) {
+      const d = path.join(b, `c${n}`);
+      fs.mkdirSync(d);
+      fs.symlinkSync(end, path.join(d, `l${n}`));
+      for (let i = n - 1; i >= 1; i--) fs.symlinkSync(`l${i + 1}`, path.join(d, `l${i}`));
+      assert.notEqual(await effect(`{ printf x > ${d}/l1; } < package.json >&0`), "allow", `${n} links to ${end}`);
+      assert.notEqual(await effect(`printf x < package.json > ${d}/l1`), "allow", `${n} links, stdin form`);
+    }
+  } finally {
+    fs.rmSync(b, { recursive: true, force: true });
+  }
+});
