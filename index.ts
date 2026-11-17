@@ -41,7 +41,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Plugin } from "@opencode/plugin";
 import { compileRules, compilePattern, within } from "./rules.ts";
-import { closeGitSnapshot, decideFile, decideRead, decideShell, EXPECT_MS, expectedRepos, gitDirectories, gitOnly, gitWriteDirectories, gitMaintainDirectories, gitStateTampered, gitTampered, mirrorable, noteGitCall, projectRoots, pushCandidate, pushDestinations, quarantineGitFiles, realish, sandboxBreaks, SessionState, unseenWrites, usesSsh, type Decision, type Expected, type GitCall, type Guard } from "./decide.ts";
+import { closeGitSnapshot, decideFile, decideRead, decideShell, EXPECT_MS, expectedRepos, gitDirectories, gitOnly, gitWriteDirectories, gitMaintainDirectories, gitStateTampered, gitTampered, mirrorable, noteGitCall, projectRoots, pushCandidate, pushDestinations, quarantineGitFiles, realish, sandboxBreaks, SessionState, unseenWrites, usesSsh, type Decision, type Expected, type GitCall, type Guard, markEverywhere } from "./decide.ts";
 import { envKept, envStringProblem, gitElsewhere, plan, realpath, Scan, setPluginWritable, shellOwn, type Plan } from "./sandbox.ts";
 import { loadConfig, type Config } from "./config.ts";
 import { bentEnv, bentPath, localeOk, pathFinds, pathHas, shellAlsoKeeps, shellCdpath } from "./guard.ts";
@@ -339,7 +339,7 @@ export default Plugin.define({
         // Round 2: a session an earlier process saw (opencode restarted) may have written
         // anywhere in the project then: the project is marked whole, as for an approved call
         // the checks could not read.
-        if (s.resumed) for (const r of projectRoots(s)) if (!s.unlisted.includes(r)) s.unlisted.push(r);
+        if (s.resumed) markEverywhere(s, [...config.allowedPaths, ...config.sandboxWritable]);
         // Round 3: while another session is paused, a new one starts paused: its baseline would
         // be the tree with what the pause is about in it.
         const paused = [...sessions.values()].find((o) => o.tampered)?.tampered;

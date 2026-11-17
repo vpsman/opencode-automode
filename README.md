@@ -25,7 +25,7 @@ For each shell tool call:
    print: `$'...'` and `$"..."` quoting; `${x@P}`, `${!x}`, quotes or an operator inside `${...}`
    (a blank before an offset, `${x: -1}`, prints), and `${...}` nested deeply; `$[...]`; a word that holds arithmetic and
    other text (`$((-1))d`, `id_ed$((25519))`: the rules read `0` in its place; an assignment's
-   own `x=$((i+1))` is as before); a pipe, `&&` or `||` with no command after it, and a word
+   own `x=$((i+1))` is as before); a pipe, `&&` or `||` straight before another operator (`echo a |;`), and a word
    straight after a subshell's `)` (syntax errors bash refuses); an array
    assignment (`a=(1 2)`) or an array element where an assignment may stand (`a[0]=1`);
    braces where bash expands none or reads the word first (the word that names a command, a redirect's target, an

@@ -5097,7 +5097,7 @@ export async function decideShell(guard: Guard, session: SessionState, cwd: stri
   try {
   projectRoots(session, scan); // takes the git snapshot first (all git calls here run with fsmonitor and hooks off)
   const tampered = gitTampered(session, guard.resumeFile, scan);
-  if (tampered) return withApproval(session, askBy(pauseReason(tampered, guard.resumeFile)));
+  if (tampered) return withApproval(session, extraOf(guard), askBy(pauseReason(tampered, guard.resumeFile)));
   // The git calls that are over get the files they changed marked (decision D1).
   settleWorktree(session);
   // What the rules deny on the text as it was issued stays denied, whatever the printer makes
@@ -5107,9 +5107,9 @@ export async function decideShell(guard: Guard, session: SessionState, cwd: stri
   // would ask, where the rules had denied it. Only a deny is taken from this reading: what the
   // rules ask about or allow is decided on the printed text.
   const issued = deniedAsIssued(guard, session, cwd, command);
-  if (issued) return withApproval(session, issued);
+  if (issued) return withApproval(session, extraOf(guard), issued);
   const printed = canonical(command);
-  if ("ask" in printed) return withApproval(session, askBy(`the command cannot be printed back in the plain spelling the rules and the shell read alike (${printed.ask})`));
+  if ("ask" in printed) return withApproval(session, extraOf(guard), askBy(`the command cannot be printed back in the plain spelling the rules and the shell read alike (${printed.ask})`));
   // Council round 3: a folded `"$(cat <<'X' ...)"` runs no `cat`. That is the command as written
   // only when the `cat` PATH finds is the real one: one in a directory a call can write (the
   // project, an allowed path, a temp directory) may be another program, and the call asks, as a
@@ -5120,24 +5120,30 @@ export async function decideShell(guard: Guard, session: SessionState, cwd: stri
     // (A relative PATH entry is not placed: a `cd` in the call may come before the substitution.)
     // (Council project review 1: and a PATH that finds no `cat` at all runs none.)
     const odd = pathFinds("cat", undefined, writable, () => false) ?? (pathHas("cat") ? undefined : { why: "PATH finds no cat" });
-    if (odd) return withApproval(session, askBy(`the command's "$(cat <<EOF ...)" is printed as the text it stands for, and the cat it would run is not plainly the real one (${odd.why})`));
+    if (odd) return withApproval(session, extraOf(guard), askBy(`the command's "$(cat <<EOF ...)" is printed as the text it stands for, and the cat it would run is not plainly the real one (${odd.why})`));
   }
   const decision = await decidePrinted(guard, session, cwd, printed, signal, scan);
-  return { ...withApproval(session, decision), printed: printed.text, ...(printed.bashOnly ? { bashOnly: true } : {}), ...(printed.folded ? { folded: true } : {}) };
+  return { ...withApproval(session, extraOf(guard), decision), printed: printed.text, ...(printed.bashOnly ? { bashOnly: true } : {}), ...(printed.folded ? { folded: true } : {}) };
   } catch (e) {
-    if (e instanceof PathWalkError) return withApproval(session, askBy(e.message));
+    if (e instanceof PathWalkError) return withApproval(session, extraOf(guard), askBy(e.message));
     throw e;
   }
 }
 // An ask whose writes the checks did not get to read (it asked before they ran: syntax the rules
 // cannot read, a cd they do not follow): once approved, it may have written anywhere in the
 // project, which is marked whole (round 4, finding 4, second pass).
-function withApproval(session: SessionState, d: Decision): Decision {
+// (Council project review 2, round 15, Mythos: and every other place the call could write, as an
+// unplaced write marks: the temp directories, `allowedPaths`, `writable`.)
+const extraOf = (guard: Guard) => [...guard.allowedPaths, ...(guard.writable ?? [])];
+export function markEverywhere(session: SessionState, extra: string[] = []) {
+  for (const r of [...new Set([...projectRoots(session), ...tempDirs(), ...extra].map(realish))]) if (!session.unlisted.includes(r)) session.unlisted.push(r);
+}
+function withApproval(session: SessionState, extra: string[], d: Decision): Decision {
   if (d.effect !== "ask" || d.approve) return d;
   return {
     ...d,
     approve: () => {
-      for (const r of projectRoots(session).map(realish)) if (!session.unlisted.includes(r)) session.unlisted.push(r);
+      markEverywhere(session, extra);
       session.record.writes++;
     },
   };
@@ -5347,7 +5353,7 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   // unplaced.)
   // (Round 13, all four: `cp -s`, `-P`, `-a` and every other program that makes, copies or moves
   // a link.)
-  if (cmds.some((c) => makesLink(c.argv))) for (const w of found.writes) project(w.cmd);
+  if (cmds.some((c) => makesLink(c.argv))) for (const w of [...found.writes, ...found.unlisted]) project(w.cmd);
   const unplaced = unplacedAll[0];
   for (const w of unplacedAll) project(w.cmd);
   const unknownWrite = found.unknown ?? (unplaced ? `writes ${unplaced.word} where the check cannot place it` : undefined);
@@ -5465,6 +5471,7 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   // what it writes, as before; so does a call the model allows.
   const unread = () => {
     for (const r of roots.map(realish)) if (!session.unlisted.includes(r)) session.unlisted.push(r);
+    markEverywhere(session, extraOf(guard));
   };
   const asked = (d: Decision): Decision => (d.effect === "ask" ? { ...d, approve: d.rule === "classify" ? () => (commit(), unread()) : commit, ...(worktree.length ? { worktree } : {}) } : d);
   const d0 = { unread: false };
@@ -5572,7 +5579,7 @@ export function decideFile(guard: Guard, session: SessionState, cwd: string, tar
   const at = realish(path.resolve(cwd, target));
   const caches = [...new Set(["/tmp", "/var/tmp", os.tmpdir()].map(realish))].flatMap((t) => TEMP_CODE_CACHES.map((n) => path.join(t, n)));
   const moved = process.env.NODE_COMPILE_CACHE;
-  if ([...caches, ...(moved && path.isAbsolute(moved) ? [realish(moved)] : [])].some((c) => within(at, c))) return withApproval(session, askBy(`edit inside ${at}, a cache of code that node runs later outside the sandbox`));
+  if ([...caches, ...(moved && path.isAbsolute(moved) ? [realish(moved)] : [])].some((c) => within(at, c))) return withApproval(session, extraOf(guard), askBy(`edit inside ${at}, a cache of code that node runs later outside the sandbox`));
   // One walk of each root for this edit (round 3, finding 40).
   const scan = new Scan(guard.allowedPaths);
   projectRoots(session, scan);

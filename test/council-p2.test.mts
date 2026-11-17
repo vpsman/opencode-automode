@@ -512,3 +512,24 @@ test("round 14: gzip's short prefixes, xz --files, a link patch makes, $$( in do
   for (const c of [`echo "$$(echo "c")"`, `echo "$\${x"y z"}"`, `echo "$$(echo "; echo INJECTED; ")"`, `echo "$\\\n$(echo "c")"`]) assert.ok("ask" in canonical(c), c);
   for (const c of [`echo "$$"`, `echo "$$ x"`, `echo "$x(y)"`]) assert.ok(!("ask" in canonical(c)), c);
 });
+
+// ---- round 15 ----
+
+test("round 15: an approved call the model judges marks every writable root; the link rule covers unlisted writes", async () => {
+  const b = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-r15-")));
+  try {
+    fs.writeFileSync(path.join(b, "package.json"), "{}");
+    const s = new SessionState(repo);
+    const d = await decideShell(guard, s, repo, `python3 -c "open('${b}/package.json','w').write('{}')"`);
+    assert.notEqual(d.effect, "allow");
+    d.approve?.();
+    assert.notEqual(await effect(`cd ${b} && npm test`, s), "allow", "after an approved model call");
+    fs.mkdirSync(path.join(b, "stage"));
+    fs.mkdirSync(path.join(b, "target"));
+    const l = new SessionState(repo);
+    await effect(`patch -d${b}/stage -p1 -i${b}/p.diff && gzip -d ${b}/stage/l/x.test.js.gz`, l);
+    assert.notEqual(await effect(`npm test -- ${b}/target/x.test.js`, l), "allow", "an unlisted write through a link patch made");
+  } finally {
+    fs.rmSync(b, { recursive: true, force: true });
+  }
+});
