@@ -3800,7 +3800,9 @@ export function withoutGlobals(manager: string, args: string[]): string[] | unde
 }
 
 function installProblem(manager: string, managerArgs: string[], placeOk?: (dir: string) => boolean): string | undefined {
-  if (/^(-v|-V|--version|-h|--help)$/.test(managerArgs[0] ?? "")) return undefined;
+  // A version or help query alone installs nothing. (Round 37, Mythos: with more words `-v` is
+  // verbose for pip, cargo and uv, `pip -v install x`; the subcommand is read as usual.)
+  if (managerArgs.length === 1 && /^(-v|-V|--version|-h|--help)$/.test(managerArgs[0])) return undefined;
   const at = afterGlobals(manager, managerArgs, placeOk);
   // Options with no subcommand at all (`npm --version`) install nothing.
   if (typeof at === "string") return managerArgs.some((a) => !a.startsWith("-")) ? at : undefined;
@@ -4222,7 +4224,7 @@ function managerProblem(name: string, args: string[]): string | undefined {
 // prefix of a long option.
 const CMAKE_SAFE = /^CMAKE_(BUILD_TYPE|INSTALL_PREFIX|EXPORT_COMPILE_COMMANDS|(C|CXX|CUDA|OBJC|OBJCXX|HIP)_(STANDARD|STANDARD_REQUIRED|EXTENSIONS)|POSITION_INDEPENDENT_CODE|VERBOSE_MAKEFILE|COLOR_DIAGNOSTICS|COLOR_MAKEFILE|INTERPROCEDURAL_OPTIMIZATION|UNITY_BUILD|MESSAGE_LOG_LEVEL|FIND_DEBUG_MODE|SKIP_RPATH|SKIP_INSTALL_RPATH|BUILD_WITH_INSTALL_RPATH|OSX_ARCHITECTURES|OSX_DEPLOYMENT_TARGET|(RUNTIME|LIBRARY|ARCHIVE)_OUTPUT_DIRECTORY|EXPORT_PACKAGE_REGISTRY|FIND_PACKAGE_PREFER_CONFIG|DISABLE_PRECOMPILE_HEADERS|SUPPRESS_REGENERATION|WARN_DEPRECATED|ERROR_DEPRECATED|INSTALL_MESSAGE|BUILD_PARALLEL_LEVEL)$/;
 const RUSTUP_PROXIES = new Set(["rustc", "rustfmt", "rustdoc", "cargo", "cargo-clippy", "clippy-driver", "cargo-fmt", "rust-gdb", "rust-gdbgui", "rust-lldb", "rust-analyzer", "rls", "cargo-miri"]);
-function buildToolProblem(name: string, args: string[]): string | undefined {
+function buildToolProblem(name: string, args: string[], cwd?: string): string | undefined {
   const own = args.slice(0, args.includes("--") ? args.indexOf("--") : args.length);
   const operands = own.filter((a) => !a.startsWith("-"));
   // (Council project review 2, round 35, Mythos: an `@file` of options, or clang's `--config`,
@@ -4232,8 +4234,12 @@ function buildToolProblem(name: string, args: string[]): string | undefined {
     // (Round 36, Opus, Sol, Mythos: by where the path leads, not its spelling: `//dev/stdin`,
     // `/./dev/stdin`, `/tmp/../dev/stdin`, a link. A relative name is the project's own option
     // file (the declined `gcc @file` class) unless it climbs with `..` towards a device.)
+    // (Round 37, Opus: a relative one is resolved where the command runs, through links, as the
+    // kernel walks it: `cd /dev && gcc @stdin`, a project link to /dev/stdin.)
     const stream = (file: string) =>
-      file === "-" || /[$`(<>]/.test(file) || (path.isAbsolute(file) ? codeFromDevice(file, undefined) !== undefined : /(^|\/)\.\.(\/|$)/.test(file) && /(^|\/)(dev|proc)(\/|$)/.test(file));
+      file === "-" ||
+      /[$`(<>]/.test(file) ||
+      (path.isAbsolute(file) || cwd !== undefined ? codeFromDevice(file, cwd) !== undefined : /(^|\/)\.\.(\/|$)/.test(file) && /(^|\/)(dev|proc)(\/|$)/.test(file));
     for (let k = 0; k < args.length; k++) {
       const a = args[k];
       const files = [
@@ -4370,7 +4376,7 @@ function programProblem(name: string, args: string[], cwd?: string, inProject?: 
   // Council project review 2 (Mythos): the compilers and build tools the rules allow by name, with
   // the options and subcommands that run a program or command the call names or load a plugin. (A
   // file of more options, `gcc @args`, is a place the runner check cannot tell: runnerPlaces.)
-  const tool = buildToolProblem(name, args);
+  const tool = buildToolProblem(name, args, cwd);
   if (tool) return ask(tool);
   // (Council project review 2, round 7, Mythos: rustup's proxies take `+<toolchain>`, and a path
   // there runs `<path>/bin/<tool>`; held to a name, as cargo's is.)

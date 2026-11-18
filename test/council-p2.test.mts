@@ -952,7 +952,7 @@ test("round 36: unittest paths and names after --, option files by where they le
     fs.rmSync(p, { recursive: true, force: true });
   }
   // Opus, Sol, Mythos: an option file by where its path leads.
-  for (const c of ["gcc @//dev/stdin g.c", "gcc @/./dev/stdin g.c", "gcc @/tmp/../dev/stdin g.c", "gcc @../../../../dev/stdin g.c", "rustc @//dev/stdin m.rs", "gcc -Wl,@//dev/stdin g.c"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["gcc @//dev/stdin g.c", "gcc @/./dev/stdin g.c", "gcc @/tmp/../dev/stdin g.c", `gcc @${"../".repeat(repo.split("/").length)}dev/stdin g.c`, "rustc @//dev/stdin m.rs", "gcc -Wl,@//dev/stdin g.c"]) assert.notEqual(await effect(c), "allow", c);
   assert.equal(await effect("gcc @flags.rsp g.c"), "allow");
   // Opus, Sol: `--strip-` is a prefix getopt takes. Mythos: `-St` is suffix t; `-pw` prints a patch.
   for (const c of ["install -s --strip-=/bin/sh f out/x", "cp -St .env out/x", "install -St .env out/i", "cp --suffix -t .env out/y", "git log -pw .env", "git log -pz .env", "gcc -include.env g.c", "gcc -Wl,@.env g.c", "python3 -m mypy --python-exec=./x ."]) assert.notEqual(await effect(c), "allow", c);
@@ -962,4 +962,34 @@ test("round 36: unittest paths and names after --, option files by where they le
   assert.deepEqual(parse("echo {a}b,c}").cmds[0].argv, ["echo", "a}b", "c"]);
   assert.equal(parse("echo {a..c..+1}").opaque, true);
   assert.equal(parse("echo {Z..a}").opaque, true);
+});
+
+// ---- round 37 ----
+
+test("round 37: option files where the command runs, declare's compound values, pip -v, unittest's loaded modules, brace expansion as bash does it", async () => {
+  // Opus: a relative option file, resolved where the command runs.
+  for (const c of ["cd /dev && gcc @stdin g.c", "cd / && gcc @dev/stdin g.c", "cd /dev && rustc @stdin m.rs"]) assert.notEqual(await effect(c), "allow", c);
+  // Mythos: declare and its kin read `a=(...)` again, as a compound assignment.
+  for (const c of ["declare -a 'a=($(git push --force origin main))'", "declare -a 'a=($(cat .env))'", "typeset -A 'm=([$(id)]=1)'", "x='($(id))'; declare -a \"a=$x\""]) assert.notEqual(await effect(c), "allow", c);
+  // Mythos: `-v` is verbose for pip, cargo and uv.
+  for (const c of ["pip -v install x", "cargo -v add serde", "uv -v sync", "python3 -m pip config set global.x y", "gcc -Wp,-include.env g.c", "pytest -o python_functions=interact x.py"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["npm -v", "pip --version", "python3 -m pip list"]) assert.equal(await effect(c), "allow", c);
+  // Mythos: a built-in module, or one unittest has loaded, is not the project's.
+  const p = fs.realpathSync(fs.mkdtempSync(path.join(base, "r37-")));
+  try {
+    fs.mkdirSync(path.join(p, "builtins"));
+    fs.writeFileSync(path.join(p, "builtins", "__init__.py"), "");
+    fs.writeFileSync(path.join(p, "builtins", "breakpoint.py"), "");
+    execFileSync("git", ["init", "-q", p]);
+    for (const c of ["echo x | python3 -m unittest builtins.breakpoint", "echo x | python3 -m unittest builtins/breakpoint.py"]) assert.notEqual((await decideShell(guard, new SessionState(p), p, c)).effect, "allow", c);
+  } finally {
+    fs.rmSync(p, { recursive: true, force: true });
+  }
+  // Astra, Sol, Mythos: words as bash makes them.
+  const words = (w: string) => parse(`echo ${w}`).cmds[0].argv.slice(1);
+  assert.deepEqual(words("{}x,y}"), ["{}x,y}"]);
+  assert.deepEqual(words("{{a},b},c}"), ["{a},c}", "b,c}"]);
+  assert.deepEqual(words("{..{,}}"), ["..", ".."]);
+  assert.deepEqual(words("{1..{2,3}}"), ["1..2", "1..3"]);
+  assert.deepEqual(words("{x,{y,z}}w"), ["xw", "yw", "zw"]);
 });

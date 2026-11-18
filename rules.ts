@@ -479,7 +479,7 @@ function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope)
       ...words,
       ...args.flatMap((a) => [
         ...(/^-(include|imacros)./.test(a) && !a.startsWith("--") ? [a.replace(/^-(include|imacros)/, "")] : []),
-        ...(/^-W[lap],/.test(a) ? a.split(",").slice(1).map((w) => w.replace(/^@/, "")) : []),
+        ...(/^-W[lap],/.test(a) ? a.split(",").slice(1).map((w) => w.replace(/^@/, "").replace(/^-(include|imacros)(?=.)/, "")) : []),
       ]),
     ];
   }
@@ -1209,64 +1209,85 @@ function arithmeticSafe(command: string, names: Set<string>): boolean {
 // `1 2 3`. Quoted braces, `${`, and braces without a comma or a sequence stay as they are.
 // Undefined when the expansion would be too large to follow.
 function expandBraces(word: string, mask: string, budget = { n: 0 }): [string, string][] | undefined {
+  // As bash does it (round 37): the first `{` that opens an expansion splits the word into a
+  // preamble, the alternatives (or a sequence) and a postamble. Each alternative and the postamble
+  // are expanded on their own, never the joined text again. `{}` opens nothing; a `{` opens an
+  // expansion when a comma stands in it at any depth, or it holds a sequence.
+  const isSeq = (body: string) => /^([-+]?\d+|[A-Za-z])\.\.([-+]?\d+|[A-Za-z])(\.\.[-+]?\d+)?$/.test(body);
   for (let open = 0; open < word.length; open++) {
     if (word[open] !== "{" || mask[open] !== "u") continue;
+    if (word[open + 1] === "}" && mask[open + 1] === "u") {
+      open++;
+      continue;
+    }
     let depth = 0;
+    let nested = false;
     const commas: number[] = [];
     let close = -1;
     for (let k = open + 1; k < word.length; k++) {
       if (mask[k] !== "u") continue;
       if (word[k] === "{") depth++;
       else if (word[k] === "}") {
-        // (Round 36, Mythos: before a top-level comma, a `}` that does not end a sequence is
-        // text, `{a}b,c}` is `a}b c`.)
-        if (depth === 0 && (commas.length || /^[-+]?\w+\.\.[-+]?\w+(\.\.[-+]?\d+)?$/.test(word.slice(open + 1, k)) || !word.slice(k + 1).includes(","))) {
+        if (depth > 0) {
+          depth--;
+          continue;
+        }
+        // Before a comma, a `}` that does not end a sequence is text: `{a}b,c}` is `a}b c`.
+        if (commas.length || nested || isSeq(word.slice(open + 1, k)) || !word.slice(k + 1).includes(",")) {
           close = k;
           break;
         }
-        if (depth > 0) depth--;
-      } else if (word[k] === "," && depth === 0) commas.push(k);
+      } else if (word[k] === ",") {
+        if (depth === 0) commas.push(k);
+        else nested = true;
+      }
     }
-    // An unmatched `{` is text; a later pair may still expand (`x{y{1,2}`).
     if (close < 0) continue;
-    const pre = [word.slice(0, open), mask.slice(0, open)];
-    const post = [word.slice(close + 1), mask.slice(close + 1)];
+    const body = word.slice(open + 1, close);
     let alternatives: [string, string][] = [];
+    let expandEach = true;
     if (commas.length) {
       let from = open + 1;
       for (const k of [...commas, close]) {
         alternatives.push([word.slice(from, k), mask.slice(from, k)]);
         from = k + 1;
       }
-    } else {
-      const body = word.slice(open + 1, close);
-      // (A `+` sign in a range, which bash also takes, is not modelled.)
-      // (Round 36, Astra: nor a letter range with a `+` step, nor one that crosses the characters
-      // between Z and a, which bash quotes and removes.)
-      const ranged = /^([-+]?\d+|[A-Za-z])\.\.([-+]?\d+|[A-Za-z])(\.\.[-+]?\d+)?$/.exec(body);
-      if (ranged && !/[^u]/.test(mask.slice(open, close + 1)) && (body.includes("+") || (/^[A-Za-z]$/.test(ranged[1]) && /^[A-Za-z]$/.test(ranged[2]) && Math.min(ranged[1].charCodeAt(0), ranged[2].charCodeAt(0)) <= 90 && Math.max(ranged[1].charCodeAt(0), ranged[2].charCodeAt(0)) >= 97))) return undefined;
-      const seq = /^(-?\d+|[A-Za-z])\.\.(-?\d+|[A-Za-z])(\.\.(-?\d+))?$/.exec(body);
-      if (!seq || /[^u]/.test(mask.slice(open, close + 1))) continue;
+    } else if (isSeq(body) && !/[^u]/.test(mask.slice(open, close + 1))) {
+      const seq = /^([-+]?\d+|[A-Za-z])\.\.([-+]?\d+|[A-Za-z])(\.\.([-+]?\d+))?$/.exec(body)!;
+      // A `+` sign, and a letter range across the characters between Z and a: not modelled.
+      if (body.includes("+")) return undefined;
       const numeric = /\d/.test(seq[1]) && /\d/.test(seq[2]);
       if (!numeric && (/\d/.test(seq[1]) || /\d/.test(seq[2]))) continue;
       const a = numeric ? Number(seq[1]) : seq[1].charCodeAt(0);
       const b = numeric ? Number(seq[2]) : seq[2].charCodeAt(0);
+      if (!numeric && Math.min(a, b) <= 90 && Math.max(a, b) >= 97) return undefined;
       const step = Math.abs(Number(seq[4] ?? 1)) || 1;
-      // (Round 33, Astra: past 2^53 adding the step changes nothing, and the loop would not end.)
+      // Past 2^53 adding the step changes nothing, and the loop would not end.
       if (![a, b, step].every(Number.isSafeInteger) || Math.abs(b - a) / step > 1000) return undefined;
       const width = numeric && [seq[1], seq[2]].some((x) => /^-?0\d/.test(x)) ? Math.max(seq[1].length, seq[2].length) : 0;
       for (let v = a; a <= b ? v <= b : v >= b; v += a <= b ? step : -step) {
-        // (Round 34, Astra and Sol: the sign comes before the zeros, `-02 -01 000 001`.)
+        // The sign comes before the zeros, `-02 -01 000 001`.
         const text = numeric ? (v < 0 ? "-" : "") + String(Math.abs(v)).padStart(v < 0 ? width - 1 : width, "0") : String.fromCharCode(v);
         alternatives.push([text, "u".repeat(text.length)]);
       }
-    }
+      expandEach = false;
+    } else if (nested) {
+      // One alternative, with a comma further in: `{..{,}}` is `.. ..`.
+      alternatives = [[body, mask.slice(open + 1, close)]];
+    } else continue;
+    const pre: [string, string] = [word.slice(0, open), mask.slice(0, open)];
+    const post = expandBraces(word.slice(close + 1), mask.slice(close + 1), budget);
+    if (!post) return undefined;
     const out: [string, string][] = [];
-    for (const [w, m] of alternatives) {
-      if (++budget.n > 1000) return undefined;
-      const more = expandBraces(pre[0] + w + post[0], pre[1] + m + post[1], budget);
-      if (!more) return undefined;
-      out.push(...more);
+    for (const alt of alternatives) {
+      const inner = expandEach ? expandBraces(alt[0], alt[1], budget) : [alt];
+      if (!inner) return undefined;
+      for (const [w, m] of inner) {
+        for (const [pw, pm] of post) {
+          if (++budget.n > 1000) return undefined;
+          out.push([pre[0] + w + pw, pre[1] + m + pm]);
+        }
+      }
     }
     return out;
   }
@@ -1842,6 +1863,15 @@ function tarProblem(args: string[]): string | undefined {
   return undefined;
 }
 
+// Modules that are built in, or that `python3 -m unittest` has imported before it looks a name up
+// (CPython 3.13); a project package of the same name does not take their place.
+const UNITTEST_LOADED = new Set(
+  `abc argparse array ast atexit binascii builtins bz2 cmath codecs collections contextlib copy copyreg dataclasses difflib dis encodings enum
+   errno faulthandler fcntl fnmatch functools gc genericpath gettext grp heapq importlib inspect io itertools keyword linecache locale lzma
+   marshal math opcode operator os posix posixpath pprint pwd pyexpat re reprlib runpy select shutil signal site sitecustomize stat sys syslog
+   textwrap time token tokenize traceback types unicodedata unittest warnings weakref zipimport zlib`.split(/\s+/),
+);
+
 // The names `python3 -m unittest` is given (it imports and calls each): files or modules of the
 // project, read from where the command runs, or `discover` with its options.
 function unittestNamesOwn(args: string[], scope: Scope): boolean {
@@ -1870,6 +1900,9 @@ function unittestNamesOwn(args: string[], scope: Scope): boolean {
     // reaches; a directory without __init__.py does not shadow a standard module.)
     const parts = n.split(".");
     if (!parts.every((p) => /^[A-Za-z_]\w*$/.test(p))) return false;
+    // A built-in module, or one python -m unittest has loaded by then, is never the project's
+    // (round 37, Mythos: `builtins.breakpoint` with a `builtins/` package).
+    if (UNITTEST_LOADED.has(parts[0]) || parts[0].startsWith("_")) return false;
     let dir = cwd;
     for (let i = 0; i < parts.length; i++) {
       const file = path.join(dir, `${parts[i]}.py`);
@@ -2470,6 +2503,20 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   // here. `--help` and `--version` stay.)
   if (args.length === 1 && (/^--(version|help)$/.test(args[0]) || (/^-[Vh]$/.test(args[0]) && (READ_ONLY.has(name) || DEV_TOOLS.has(name) || !!SUBCOMMANDS[name] || !!RUNNERS[name] || INTERPRETERS.has(name))))) return verdict;
 
+  // (Round 37, Mythos: declare and its kin read an assignment word again, `a=(...)` as a compound
+  // assignment that expands what it holds, `declare -a 'a=($(cmd))'`. The parenthesised text is
+  // read as commands; a value the outer shell expands is not modelled.)
+  if (["declare", "typeset", "local", "readonly", "export"].includes(name)) {
+    for (let k = 0; k < args.length; k++) {
+      const m = /^[A-Za-z_]\w*(\[[^\]]*\])?\+?=(.*)$/s.exec(args[k]);
+      if (!m) continue;
+      if (dyn(k)) {
+        verdict = worst(verdict, classify(`${name} of a value the shell expands, which ${name} reads again`));
+        continue;
+      }
+      if (m[2].startsWith("(")) verdict = worst(verdict, classify(`${name} of a compound assignment`), evaluateParsed(parse(m[2].replace(/^\(|\)$/g, "")), scope, depth + 1));
+    }
+  }
   if (SHELLS.has(name)) return worst(verdict, shell(name, args, dyn, cmd, scope, depth));
   // eval runs its words joined, after the shell has expanded them: a variable in them is code
   // the rules cannot see.
@@ -2574,12 +2621,16 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   }
   if (SUBCOMMANDS[name]) return worst(verdict, subcommand(name, args, scope));
   // (Round 35: whatever feeds its standard input, a group, a subshell, `exec <`, and in addopts.)
+  // (Round 37, Mythos: `-o python_functions=interact` makes pytest call a function the call names.)
+  if ((name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) && args.some((a, k) => /^python_(functions|classes|files)=/.test(a) && /^(-o|--override-ini)$/.test(args[k - 1] ?? ""))) return worst(verdict, classify("pytest collecting functions the call names"));
   if ((name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) && args.some((a) => /(^|[\s=])--(pdb|trace)/.test(a))) return worst(verdict, classify("pytest's debugger, which reads commands from standard input"));
   if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "mypy" && args.some((a) => (longIs(a, "install-types") || longIs(a, "python-executable")) && a.split("=")[0].length > 4)) return worst(verdict, classify("mypy that installs packages or runs another interpreter"));
   if (READ_ONLY.has(name) || DEV_TOOLS.has(name)) return verdict;
   // (Council project review 2, round 34, Mythos: unittest imports and calls any name it is given,
   // `python3 -m unittest code.interact` then runs standard input as Python; its names must be the
   // project's own files or modules. pytest's debugger, below, reads commands from standard input.)
+  // (Round 37, Mythos: `python3 -m pip` is pip, with pip's subcommand table.)
+  if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pip") return worst(verdict, subcommand("pip", args.slice(2), scope));
   if (/^python3?$/.test(name) && args[0] === "-m" && PY_MODULES.has(args[1]) && !cmd.heredoc && (args[1] !== "unittest" || unittestNamesOwn(args.slice(2), scope))) return verdict;
   // `node --test`: the test runner over the project's test files, as `npm test` runs it.
   if (name === "node" && args[0] === "--test" && !cmd.heredoc) {
