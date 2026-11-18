@@ -323,7 +323,9 @@ describe("B11-6: the Sonnet check's finds", () => {
     "ln -s ../elsewhere/plain o8; cp -P o8 o9; echo x > o9/x",
   ]);
   rows("6 S5", "ask", ['echo x > "$PWD/pl/../x"', "echo x > ${PWD}/pl/../x", 'touch "$PWD/pl/../x"', 'tee "$PWD/pl/../x" < f']);
-  rows("6 S5 (an expansion before a ..)", "classify", ["d=$PWD; echo x > $d/pl/../x", "d=$PWD; touch $d/pl/../x", "d=$PWD; tee $d/pl/../x < f"]);
+  // (rules.ts follows a variable the call sets to plain text, so `$d` is `$PWD` here: an ask, as
+  // for the spelling above. It used to leave these to the model.)
+  rows("6 S5 (an expansion before a ..)", "ask", ["d=$PWD; echo x > $d/pl/../x", "d=$PWD; touch $d/pl/../x", "d=$PWD; tee $d/pl/../x < f"]);
   // (`tar --directory=<outside> -xf` is a rule allow without any link too: the sandbox stops the
   // write, and with it off decision 16 asks for every extraction.)
   rows("6 S6", "classify", ["tar cf z.tar f; tar xf z.tar -C pl/..", "tar cf z.tar f; tar -xf z.tar -C pl/../plain"]);

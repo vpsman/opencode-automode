@@ -54,7 +54,7 @@ For each shell tool call:
    `test/differential.test.mts` runs the printed text against the text as written (see
    Tests).
 2. **Rules.** [pi-automode-classifier](https://github.com/deepu105/pi-automode-classifier)'s
-   `rules.ts` (v0.4.1, MIT, vendored unchanged) parses the whole printed command, including
+   `rules.ts` (derived from v0.4.1, MIT, and maintained here) parses the whole printed command, including
    `$(...)`, `bash -c`, wrappers like `sudo`/`timeout`, redirects and pipelines:
    - **deny**: wipes of `/`, `$HOME` or system dirs, `mkfs`, `dd` to disks, fork bombs
    - **ask**: `sudo`, pushes, `ssh`/`scp`, outbound data, `curl | sh`, credential reads, writes
@@ -629,7 +629,7 @@ defaults would silently drop `enabled: false` and your own ask and deny rules.
 | `enabled` | `true` | Off: the plugin changes nothing and opencode's own rules apply. |
 | `useClassifier` | `true` | Off: what the rules leave open asks instead of going to Kev. |
 | `classifier` | the unix socket above, `askAbove` 0.2, `timeoutMs` 5000 | Kev server (`endpoint`: `unix:/path` or an http URL), threshold (above 0, at most 1) and reply timeout. |
-| `rules` | empty | Your own `allow`/`ask`/`deny`/`classify` patterns: a glob over one simple command (`*` any text, trailing ` *` optional) or `re:` + regex. Rules in the plugin's options are added to the file's. |
+| `rules` | empty | Your own `allow`/`ask`/`deny`/`classify` patterns: a glob over one simple command (`*` any text, trailing ` *` optional) or `re:` + regex. A pattern sees the command's words, not where it redirects: an ask rule for a file does not match `echo x > file`. `deny`/`ask`/`classify` patterns also match a program named by its path (`/usr/bin/npm install` for `npm install *`); `allow` patterns match only as written. Rules in the plugin's options are added to the file's. |
 | `allowedPaths` | none | Extra directories counted as the project (writable, writes there allowed). Absolute or `~/...`. |
 | `sshHosts` | none | `ssh` to these targets runs when it is the whole tool call, in plain words, and the remote command only uses read-only programs with options from a per-program allowlist (`cat`, `df`, `journalctl`, `systemctl status`, `ip addr`, ...), with no variables, substitutions or redirects except to `/dev/null` (no recursive `grep`, `rg` only to list files, no `printf -v` or `test -v`: they print or run more than the words say; `ps` only with field names and sort keys from a list, so no `environ` and no BSD `e`; `journalctl`/`systemctl` `-o` only with an output format's name; no raw reads of `/dev` or `/proc` apart from a short list of `/proc` files such as `meminfo` and `<pid>/status`, and no `..` in an absolute path), and ssh itself only uses harmless options (`-q`, `-T`, `-p`, `-l`, `-o BatchMode/ConnectTimeout/...`). A target matches as listed: `lab` covers `ssh lab ...` only; list `admin@lab` to allow that user. |
 | `sshReadOnlySudo` | `false` | On `sshHosts`: also allow `sudo [-n] <read-only command>`. |
@@ -739,6 +739,10 @@ stub server.
   accepts, the nearest inputs that must still ask or go to the model (`npx`, `set -x`,
   `awk`, `read`, variables that hold a literal, `gh` and `docker`).
 - `test/guard.test.mts`: the syntax check, the strict tokenizer, git option parsing, globs.
+- `test/rules.test.mts`: `rules.ts` on its own. `bashVerdict()` with no guard, printer or model, for
+  each reading of a command the reviews found the rules got wrong, with the plain spelling as a
+  control and routine commands that must stay allowed. `RULES_FILE=<path>` runs it against another
+  copy of the file, such as the one this project started from.
 - `test/decide.test.mts`: the decision rules. Each assertion says whether the rules asked or
   merely left the command to the (absent) model.
 - `test/sandbox.test.mts`: commands through the real wrapper, including the git-write mode.

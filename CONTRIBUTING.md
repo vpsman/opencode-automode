@@ -41,11 +41,14 @@ A few things keep the plugin trustworthy, so please keep them true:
   about the rest; it does not list the spellings known to be dangerous.
 - **Only the plugin's own decisions are sandboxed and auto-allowed.** What a user approves in a
   prompt runs exactly as shown.
-- **`rules.ts` is vendored unchanged** from
-  [pi-automode-classifier](https://github.com/deepu105/pi-automode-classifier). Fixes to the
-  shell rules belong upstream; once released, re-vendor the file. Until then a gap in the
-  rules is closed around them, in `guard.ts`. Rules specific to this plugin go in `decide.ts`
-  (`DEFAULT_ASK`, the ssh and push matchers).
+- **`rules.ts` is this project's own**, derived from
+  [pi-automode-classifier](https://github.com/deepu105/pi-automode-classifier) v0.4.1 (commit
+  e61ea96). A bug in the shell rules is fixed in `rules.ts`, with a case in
+  `test/rules.test.mts` that calls `bashVerdict()` on its own and fails without the fix. The
+  checks around it (`guard.ts`, `canon.ts`, `decide.ts`) stay as a second layer: removing one
+  that a fixed rule makes redundant is a change of its own, with its own evidence. Upstream
+  releases are read by hand against e61ea96, not copied over the file. Rules specific to this
+  plugin go in `decide.ts` (`DEFAULT_ASK`, the ssh and push matchers).
 - **Changes to rules, thresholds or the model come with numbers.** Run the bench before and
   after and put both in the pull request:
 

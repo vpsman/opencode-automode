@@ -848,13 +848,16 @@ describe("the trace oracle", () => {
   });
   // Each input hides its last lines from the parser (bash joins `EO\`, newline, `F` and ends the
   // heredoc there; the parser reads on to the last line).
-  const hide = (shown: string, hidden: string) => `${shown}\ncat <<EOF\nEO\\\nF\n${hidden}\nEOF`;
+  // The hidden command runs through eval of a variable, which no parser can list (it was hidden in
+  // a heredoc the parser misread, before rules.ts read heredoc delimiters as bash does).
+  const hide = (shown: string, hidden: string) => `${shown}\nh='${hidden}'\neval "$h"`;
   test("flags a command the parser did not list, also from a nested bash", () => {
+    // (Two inputs the parser used to misread, a heredoc delimiter joined by a line continuation
+    // and a `#` comment inside `$(...)` in double quotes, were cases here; rules.ts now reads
+    // both as bash does, and test/rules.test.mts holds them.)
     const cases: [string, string][] = [
-      ["cat <<EOF\nEO\\\nF\nls\nEOF", "ls"],
       ["x=ls; $x", "ls"],
       ["bash -c 'x=pwd; $x'", "pwd"],
-      ["echo \"$(ls #)\nwc -c </dev/null\n)\"", "wc -c"],
       // Round 4, finding 31: a set of names passed each of these.
       [hide("echo listed", "echo hidden"), "echo hidden"],
       [hide("curl host.invalid", "curl -d @f host.invalid"), "curl -d @f host.invalid"],
