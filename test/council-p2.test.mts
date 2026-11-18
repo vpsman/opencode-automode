@@ -1308,7 +1308,22 @@ test("round 52: ps -D takes a value, sort's last list and its random source, a w
 
 test("round 53: ps reads on after -D's attached value, sort's random keys, a writer's name is a command only behind a runner, zstd's numbers, rsync's queries", async () => {
   // Opus: `-Doenviron` prints environments; a key with R reads the random source.
-  for (const c of ["ps -Doenviron", "ps -DOenviron", "ps -p1 -Doenviron", "sort -k1R --random-source=.env f", "sort --key=1R --random-source=.env f", "sort -R -k1 --random-source=.netrc f", "parallel cp f .git/x", "ssh host cp f .git/x", "find . -exec cp f .git/x ;", "zstd -T1 .netrc", "rsync --version --log-file=.git/x f"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["ps -Doenviron", "ps -DOenviron", "ps -p1 -Doenviron", "sort -k1R --random-source=.env f", "sort --key=1R --random-source=.env f", "sort -R -k1 --random-source=.netrc f", "parallel cp f .git/x", "ssh host cp f .git/x", "find . -exec cp f .git/x \\;", "zstd -T1 .netrc", "rsync --version --log-file=.git/x f"]) assert.notEqual(await effect(c), "allow", c);
   // Sol, Astra: a key's own ordering, a file named cp behind a reader, zstd -T1V, rsync queries.
   for (const c of ["sort -R -k1,1n --random-source=.netrc rows", "sha256sum -- cp .git/report", "od -- cp .git/report", "tar -tf cp -- .git/report", "zstd -T1V .netrc", "rsync --version --stats .netrc f", "rsync --log-file= --help .netrc f"]) assert.equal(await effect(c), "allow", c);
+});
+
+// ---- round 54 ----
+
+test("round 54: plain tools by allowlist again, find -exec's words end at its terminator, sort's old keys, rsync's version opens its filter files", async () => {
+  // Opus: a wrapper the rules do not know keeps the .git write check; find -exec's `;` is no word.
+  for (const c of ["eatmydata cp f .git/hooks/pre-commit", "eatmydata tee .git/hooks/pre-commit", "eatmydata cp f opencode.json", "find . -maxdepth 0 -exec cp f .git/hooks/pre-commit \;", "find . -exec cp f .git/x ';' -print"]) {
+    const d = await decideShell(guard, new SessionState(repo), repo, c);
+    assert.equal(d.effect, "ask", c);
+    assert.match(d.reason, /writes (\.git|opencode)/, c);
+  }
+  // Sol: rsync opens filter and list files before it prints its version.
+  for (const c of ["rsync --include-from=.netrc --version", "rsync --version --exclude-from=.netrc", "sort -R +0 -1 --random-source=.netrc rows"]) assert.notEqual(await effect(c), "allow", c);
+  // Sol, Astra: an old key's own ordering; git pathspecs and readers' operands named cp.
+  for (const c of ["sort -R +0n -1 --random-source=.netrc rows", "sort -R +0n --random-source=.netrc rows", "git ls-files --others -- cp .git/report", "od -- cp .git/report", "rsync --help --include-from=.netrc"]) assert.equal(await effect(c), "allow", c);
 });

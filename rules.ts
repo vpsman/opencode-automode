@@ -441,8 +441,19 @@ const PATTERN_FIRST = new Set(["grep", "egrep", "fgrep", "rg", "ag", "ack", "sed
 // The credential file a simple command would read, if any.
 function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope): string | undefined {
   if (NAMES_ONLY.has(name)) return undefined;
-  // (Round 51, Sol and Astra: a call that only prints its help or version reads no file.)
-  if (printsOnly(name, args) || (name === "rsync" && rsyncReading(args).prints)) return undefined;
+  // (Round 51, Sol and Astra: a call that only prints its help or version reads no file. Round 54,
+  // Sol: rsync opens its filter and list files before it prints its version, so those are read
+  // there; its help exits first.)
+  if (name === "rsync" && rsyncReading(args).prints && !rsyncReading(args).help) {
+    const r = rsyncReading(args);
+    const lists = [...["include-from", "exclude-from", "files-from", "filter"].flatMap((n) => r.values(n)), ...r.shorts.filter(([l]) => l === "f").map(([, v]) => v ?? "")];
+    for (const v of lists) {
+      const secret = secretIn(v.replace(/^(merge|dir-merge|\.|:)[,_ ]?\s*/, ""), scope, false, true) ?? secretIn(v, scope);
+      if (secret) return secret;
+    }
+    return undefined;
+  }
+  if (printsOnly(name, args)) return undefined;
   // (Round 51, Sol: sort's files are its operands and its option values, read by position.)
   if (name === "sort") {
     for (const w of sortReading(args).reads) {
@@ -2526,6 +2537,12 @@ export function sortReading(args: string[]): { compressor: boolean; outputs: str
       if (name === "random-sort" || (name === "sort" && value !== undefined && "random".startsWith(value) && value !== "")) random = true;
       if (name === "key" && value !== undefined) keys.push(value);
       if (name === "help" || name === "version") prints = true;
+    } else if (/^\+\d+(\.\d+)?[a-zA-Z]*$/.test(a)) {
+      // (Round 54, Sol and Astra: the old key syntax, `+POS1 [-POS2]`, with its modifiers at
+      // either end, `sort -R +0n -1`.)
+      let key = a.slice(1);
+      if (/^-\d+(\.\d+)?[a-zA-Z]*$/.test(args[i + 1] ?? "")) key += `,${args[++i].slice(1)}`;
+      keys.push(key);
     } else if (a.startsWith("-") && a.length > 1) {
       for (let k = 1; k < a.length; k++) {
         // (`-y` takes only a value in its own word, `-yk`; alone it takes nothing: `sort -y --
@@ -2591,7 +2608,9 @@ export function printsOnly(name: string, args: string[]): boolean {
   // (Round 53, Sol: a version query reads nothing; it writes its log, which rsync's own checks read.)
   if (name === "rsync") {
     const r = rsyncReading(args);
-    return r.help || (r.prints && !r.values("log-file").length);
+    // (Round 54, Sol: a version query with a filter or list file opens it.)
+    const lists = ["include-from", "exclude-from", "files-from", "filter"].some((n) => r.values(n).length) || r.shorts.some(([l]) => l === "f");
+    return r.help || (r.prints && !r.values("log-file").length && !lists);
   }
   // (The compressors' queries are read by compressorReading, as writing nothing.)
   return false;
