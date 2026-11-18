@@ -1474,7 +1474,12 @@ const RUNNER_OPTIONS: Record<string, OptionTable> = {
   pnpm: { flags: "r", long: ["recursive", "parallel"] },
 };
 
-const operands = (args: string[]) => args.filter((a) => !a.startsWith("-"));
+// The operands: words that are no option, and every word after `--` (round 39, Opus: `rm -rf --
+// -/../.git` names a path).
+const operands = (args: string[]) => {
+  const dashes = args.indexOf("--");
+  return [...(dashes < 0 ? args : args.slice(0, dashes)).filter((a) => !a.startsWith("-")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
+};
 // Drops a wrapper's leading options; `takesValue` matches the ones followed by a value.
 function afterFlags(args: string[], takesValue: RegExp): string[] {
   let i = 0;
@@ -1878,11 +1883,24 @@ const UNITTEST_LOADED = new Set(
 
 // The names `python3 -m unittest` is given (it imports and calls each): files or modules of the
 // project, read from where the command runs, or `discover` with its options.
+// What a tool that deletes files as a side effect (rsync --delete or --remove-source-files, tar
+// --remove-files) may delete: outside the project and in a .git directory, as rm -r would; the
+// project's own files are left to the decider as before (the maintainer's d-fixes D5 decisions).
+function deletion(target: string, scope: Scope): Verdict {
+  const v = rm(["-r", target], scope);
+  if (v.action === "ask" && /deletes the whole project/.test(v.reason)) {
+    const p = resolveWord(target, scope);
+    return p && /(^|\/)\.git(\/|$)/.test(p) ? v : ALLOW;
+  }
+  return v;
+}
+
 // `python3 -m venv DIR...` and `uv venv [DIR]`: each directory is written; with `--clear` it is
 // emptied first, as `rm -r` would.
 function venvTargets(args: string[], valued: string[], scope: Scope): Verdict {
-  const dirs = args.filter((a, k) => !a.startsWith("-") && !valued.includes(args[k - 1] ?? ""));
-  const clear = args.some((a) => longIs(a, "clear") && a.length > 3);
+  const dashes = args.indexOf("--");
+  const dirs = [...(dashes < 0 ? args : args.slice(0, dashes)).filter((a, k) => !a.startsWith("-") && !valued.includes(args[k - 1] ?? "")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
+  const clear = args.some((a) => (longIs(a, "clear") && a.length > 3) || a === "-c");
   let verdict = ALLOW;
   for (const d of dirs) {
     const p = resolveWord(d, scope);
@@ -1994,7 +2012,8 @@ function shell(name: string, args: string[], dyn: (k: number) => boolean, cmd: S
 // ---- rules for one simple command ----
 
 function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = false): Verdict {
-  const paths = FIRST_OPERAND_NOT_PATH.has(cmd) ? operands(args).slice(1) : operands(args);
+  // (Round 39, Mythos: with `--reference=FILE` chmod/chown/chgrp take no mode or owner operand.)
+  const paths = FIRST_OPERAND_NOT_PATH.has(cmd) && !args.some((a) => /^--reference(=|$)/.test(a)) ? operands(args).slice(1) : operands(args);
   const sources = paths.slice(0, -1);
   const dest = paths.length > 1 ? resolveWord(paths.at(-1)!, scope) : undefined;
   const intoDir = COPIERS.has(cmd) && paths.length > 1 && (sources.length > 1 || paths.at(-1)!.endsWith("/") || (!!dest && fs.statSync(dest, { throwIfNoEntry: false })?.isDirectory()));
@@ -2165,7 +2184,8 @@ function git(args: string[], scope: Scope): Verdict {
   if (sub === "rebase" && (opt("interactive", "i", "xsX") || opt("exec", "x", "sX") || opt("edit-todo"))) return classify("git rebase that runs commands or an editor");
   // (Round 38, Mythos: `git bisect view <words>` runs `git <words>`, or the program when it is tig
   // or git-something; with options only it is git log.)
-  if (sub === "bisect" && (words[0] === "run" || (["view", "visualize"].includes(words[0] ?? "") && words.length > 1))) return classify(`git bisect ${words[0]} runs a command`);
+  const viewAt = rest.findIndex((a) => a === "view" || a === "visualize");
+  if (sub === "bisect" && (words[0] === "run" || (["view", "visualize"].includes(words[0] ?? "") && rest[viewAt + 1] !== undefined && !rest[viewAt + 1].startsWith("-")))) return classify(`git bisect ${words[0]} runs a command`);
   if (sub === "grep" && (opt("open-files-in-pager", "O", "eABCfm"))) return classify("git grep -O runs a pager program");
   if (sub === "reset" || sub === "clean" || sub === "restore") return ALLOW;
   if (sub === "config") return gitConfig(opts, rest, dir, scope);
@@ -2564,7 +2584,21 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   }
   // (Round 35, Mythos: a colon before the first slash makes an operand remote for rsync, with an
   // empty host too (`:x`), and `-e` then runs locally.)
-  if (name === "rsync" && operands(args).some((a) => /^[^/]*:/.test(a))) return worst(verdict, ask("rsync copies to or from a remote host"));
+  // rsync's operands, past the values of its options that take one (round 39, Sol: `--out-format
+  // '%n:%l'` is no remote).
+  const rsyncValued = /^(--(out-format|log-file-format|rsh|exclude|include|filter|files-from|exclude-from|include-from|password-file|log-file|partial-dir|temp-dir|backup-dir|suffix|compare-dest|copy-dest|link-dest|chmod|chown|usermap|groupmap|timeout|contimeout|bwlimit|max-size|min-size|block-size|port|sockopts|outbuf|remote-option|iconv|checksum-choice|compress-choice|skip-compress|info|debug|modify-window|max-delete|max-alloc|stop-after|stop-at|write-batch|read-batch|only-write-batch|protocol|address|rsync-path|config)|-[eTfBM])$/;
+  const rsyncOperands = name === "rsync" ? operands(args.filter((a, k) => !rsyncValued.test(args[k - 1] ?? ""))) : [];
+  if (name === "rsync" && rsyncOperands.some((a) => /^[^/]*:/.test(a))) return worst(verdict, ask("rsync copies to or from a remote host"));
+  // (Round 39, Mythos: --remove-source-files deletes its sources, and --delete what is in the
+  // destination and not in the source: held to rm's test.)
+  if (name === "rsync" && rsyncOperands.length > 1) {
+    const removes = args.some((a) => /^--remove-(source|sent)-files$/.test(a));
+    const deletes = args.some((a) => /^--(delete|del)(-\w+)?$/.test(a));
+    let gone = ALLOW;
+    if (removes) for (const src of rsyncOperands.slice(0, -1)) gone = worst(gone, deletion(src, scope));
+    if (deletes) gone = worst(gone, deletion(rsyncOperands.at(-1)!, scope));
+    if (gone.action !== "allow") return worst(verdict, gone);
+  }
   if (name === "rsync" && args.some((a) => longIs(a, "daemon") && a.length > 3)) return worst(verdict, ask("rsync --daemon starts a server"));
   if (name === "rsync") {
     // Files rsync writes besides its destination (round 38): held to the write test, as the README says.
@@ -2577,7 +2611,23 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
       if (w.action !== "allow") return worst(verdict, { ...w, reason: w.reason.replace(/^tee/, "rsync") });
     }
   }
-  if (name === "nm" && args.some((a) => longIs(a, "plugin") && a.length > 4)) return worst(verdict, classify("nm --plugin loads a shared object"));
+  // Files written by an option (round 39, Mythos): held to the write test.
+  const optionWrites: Record<string, RegExp> = { journalctl: /^--cursor-file$/, zip: /^(-O|--out|-b|--temp-path)$/, docker: /^--(iidfile|metadata-file)$/ };
+  if (optionWrites[name]) {
+    const named = args.flatMap((a, k) => {
+      const eq = a.indexOf("=");
+      if (eq > 0 && optionWrites[name].test(a.slice(0, eq))) return [a.slice(eq + 1)];
+      if (optionWrites[name].test(a)) return [args[k + 1] ?? ""];
+      const attached = name === "zip" ? /^-(O|b)(.+)$/.exec(a) : null;
+      return attached ? [attached[2]] : [];
+    });
+    if (named.some((f) => /(^|\/)\.git(\/|$)/.test(resolveWord(f, scope) ?? f))) return worst(verdict, ask(`${name} writes a file in a .git directory`));
+    if (named.length) {
+      const w = writeTargets("tee", ["--", ...named], scope);
+      if (w.action !== "allow") return worst(verdict, { ...w, reason: w.reason.replace(/^tee/, name) });
+    }
+  }
+  if (name === "nm" && args.some((a) => longIs(a, "plugin") && a.split("=")[0].length >= 4)) return worst(verdict, classify("nm --plugin loads a shared object"));
   if (name === "xargs") {
     const k = leadingOptions(args, { flags: "0oprtx", valued: "adEILnPs", long: ["null", "interactive", "no-run-if-empty", "verbose", "exit", "open-tty", "show-limits"], longValued: ["arg-file", "delimiter", "eof", "replace", "max-lines", "max-args", "max-procs", "max-chars", "process-slot-var"] });
     if (k < 0 || args.slice(0, k).some((a) => /^-[eil]/.test(a))) return worst(verdict, classify("xargs with options the rules do not model"));
@@ -2627,6 +2677,15 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   if (name === "install" && args.some((a) => a.split("=")[0].startsWith("--strip-") && longIs(a, "strip-program"))) return worst(verdict, classify("install --strip-program runs a program on the file it writes"));
   if (WRITERS[name]) return worst(verdict, writeTargets(name, args, scope, !!cmd.heredoc && !cmd.expands));
   if (name === "tar" || name === "zip" || name === "unzip" || name === "gzip" || name === "gunzip" || name === "xz" || name === "zstd") {
+    // (Round 39, Mythos: --remove-files deletes the members after archiving them: held to rm's test,
+    // and unread under a -C/--directory.)
+    if (name === "tar" && args.some((a) => longIs(a, "remove-files") && a.length > 4)) {
+      if (args.some((a, k) => /^(-C|--directory)/.test(a) || /^-[a-zA-Z]*C/.test(a) || (k === 0 && /^[a-zA-Z]*C/.test(a)))) return worst(verdict, classify("tar --remove-files under another directory"));
+      const members = operands(args).filter((a, k, all) => !/f$/.test(args[args.indexOf(a) - 1] ?? "") && !(k === 0 && /^[a-zA-Z]+$/.test(a) && !args[0].startsWith("-") && a === args[0]));
+      let gone = ALLOW;
+      for (const m of members) gone = worst(gone, deletion(m, scope));
+      if (gone.action !== "allow") return worst(verdict, gone);
+    }
     const problem = name === "tar" ? tarProblem(args) : undefined;
     if (problem) return worst(verdict, classify(problem));
     // Archives read and write paths given as operands and after -f / -C / -d.
@@ -2658,12 +2717,24 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
     }
   }
   if (name === "uv" && operands(args)[0] === "venv") {
-    const v = venvTargets(args.slice(args.indexOf("venv") + 1), ["--python", "-p", "--prompt", "--index-url", "--extra-index-url", "--seed"], scope);
+    const v = venvTargets(args.slice(args.indexOf("venv") + 1), ["--python", "-p", "--prompt", "--index-url", "--extra-index-url"], scope);
     if (v.action !== "allow") return worst(verdict, v);
   }
   if (SUBCOMMANDS[name]) return worst(verdict, subcommand(name, args, scope));
   // (Round 35: whatever feeds its standard input, a group, a subshell, `exec <`, and in addopts.)
   // (Round 37, Mythos: `-o python_functions=interact` makes pytest call a function the call names.)
+  // (Round 39: pytest empties --basetemp before it uses it: held to rm's test.)
+  if (name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) {
+    const base = args.flatMap((a, k) => (/^--basetemp=/.test(a) ? [a.slice(11)] : a === "--basetemp" ? [args[k + 1] ?? ""] : []));
+    for (const b of base) {
+      const gone = rm(["-r", b], scope);
+      if (gone.action !== "allow") return worst(verdict, gone);
+    }
+  }
+  if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "compileall") {
+    const out = operands(args.slice(2)).map((d) => writeTargets("mkdir", [d], scope)).find((v) => v.action !== "allow");
+    if (out) return worst(verdict, out);
+  }
   if ((name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) && args.some((a) => /python_(functions|classes|files)=/.test(a))) return worst(verdict, classify("pytest collecting functions the call names"));
   if ((name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) && args.some((a) => /(^|[\s=])--(pdb|trace)/.test(a))) return worst(verdict, classify("pytest's debugger, which reads commands from standard input"));
   if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "mypy" && args.some((a) => (longIs(a, "install-types") || longIs(a, "python-executable")) && a.split("=")[0].length > 4)) return worst(verdict, classify("mypy that installs packages or runs another interpreter"));
@@ -2675,7 +2746,8 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   // version or help query is one.)
   if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pip") return args.length === 3 && /^(-V|--version|-h|--help)$/.test(args[2]) ? verdict : worst(verdict, subcommand("pip", args.slice(2), scope));
   // (Round 38, Mythos: venv writes its directory, and --clear empties it first.)
-  if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "venv") return worst(verdict, venvTargets(args.slice(2), ["--prompt"], scope));
+  // (`--upgrade-deps` runs pip install in the new environment.)
+  if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "venv") return worst(verdict, args.some((a) => longIs(a, "upgrade-deps") && a.length > 4) ? classify("venv --upgrade-deps installs packages") : ALLOW, venvTargets(args.slice(2), ["--prompt"], scope));
   if (/^python3?$/.test(name) && args[0] === "-m" && PY_MODULES.has(args[1]) && !cmd.heredoc && (args[1] !== "unittest" || unittestNamesOwn(args.slice(2), scope))) return verdict;
   // `node --test`: the test runner over the project's test files, as `npm test` runs it.
   if (name === "node" && args[0] === "--test" && !cmd.heredoc) {

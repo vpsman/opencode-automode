@@ -5299,7 +5299,9 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
     for (const at of programs(cmd.argv)) {
       const name = path.basename(cmd.argv[at]);
       const args = cmd.argv.slice(at + 1);
-      const files = args.filter((a) => !a.startsWith("-"));
+      // Every word after `--` is a file, `-/../x` included (round 39, Opus).
+      const dashes = args.indexOf("--");
+      const files = [...(dashes < 0 ? args : args.slice(0, dashes)).filter((a) => !a.startsWith("-")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
       const add = (word: string | undefined, checked: boolean, extra: Partial<Write> = {}) => void (word !== undefined && writes.push({ word, cmd, checked, by: name, ...extra }));
       const blind = unnamedWrite(name, args, filesOnly && ((sources) => filesOnly(sources, cmd)));
       const call = name === "git" ? gitCall(args) : undefined;

@@ -1007,8 +1007,23 @@ test("round 38: git bisect view's command, venv targets, systemctl -H anywhere, 
   // Mythos: systemctl and loginctl read -H anywhere.
   for (const c of ["systemctl status -H user@host", "systemctl is-active x --host=user@host", "loginctl list-sessions -H h", "systemctl status x -M foo"]) assert.notEqual(await effect(c), "allow", c);
   // Opus, Mythos: every spelling of pytest's -o.
-  for (const c of ["pytest -opython_functions=interact x.py", "pytest --override-ini=python_functions=interact x.py", "rsync -a f g --log-file=../x", "rsync --daemon", "nm --plugin x.so f", "docker build --push ."]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["pytest -opython_functions=interact x.py", "pytest --override-ini=python_functions=interact x.py", "rsync -a f g --log-file=/opt/cp2-r38/x", "rsync --daemon", "nm --plugin x.so f", "docker build --push ."]) assert.notEqual(await effect(c), "allow", c);
   for (const c of ["python3 -m pip --version", "cd -P . && ls"]) assert.equal(await effect(c), "allow", c);
   // Astra, Sol, Mythos: bash's brace quirks are not modelled.
   for (const w of ["{{{x,y}}}", "1{},}", "{{a,b}}", "a{},0}"]) assert.equal(parse(`echo ${w}`).opaque, true, w);
+});
+
+// ---- round 39 ----
+
+test("round 39: operands after --, option-named write places outside, deletions by rsync and tar, \\😀 printed whole", async () => {
+  // Opus: every word after `--` is an operand, `-/../.git` included.
+  for (const c of ["mkdir - && rm -rf -- -/../.git", "mkdir - && echo x | tee -a -- -/../.git/config", "tee -- -/../../outside.txt < f", "python3 -m venv --clear -- -/../.git"]) assert.notEqual(await effect(c), "allow", c);
+  // Mythos: places the guard reads right are held to the outside test.
+  for (const c of ["cp f ~/.bashrc -S bak", "install f ~/.local/bin/x -m 755", "tar -xf a.tar -C../out", "tar -xf a.tar --directory=../out", "find . -name f -fprint0 ~/.bashrc", "rsync -aT../out f g", "chmod --reference=f ~/.bashrc"]) assert.notEqual(await effect(c), "allow", c);
+  // Mythos: deletions held to rm's test.
+  for (const c of ["rsync -a --remove-source-files ~/Documents/ d/", "tar -cf a.tar --remove-files .git", "rsync -a --delete sub/ ~/x", "pytest --basetemp=.", "python3 -m venv --upgrade-deps .venv", "journalctl --cursor-file=.git/hooks/pre-commit -n 1", "nm --pl ./x.so f", "python3 -m compileall ~/"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["cp f g", "tar -cf a.tar f", "git bisect visualize -n 1 --oneline", "rsync -ani --out-format '%n:%l' f g"]) assert.equal(await effect(c), "allow", c);
+  // Astra: a backslash quotes the whole code point.
+  const p = canonical("echo \\😀");
+  assert.ok(!("ask" in p) && p.text === "echo '😀'", JSON.stringify(p));
 });

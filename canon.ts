@@ -540,11 +540,13 @@ class Lexer {
         if (before?.type === "word" && bare(before) === "=~" && this.regex()) continue;
       }
       if (c === "\\") {
-        // A backslash quotes the character after it (a newline was dropped above).
-        const quoted = this.s[this.i + 1];
+        // A backslash quotes the character after it (a newline was dropped above): the whole code
+        // point, both halves of a surrogate pair (round 39, Astra: `\😀`).
+        const quoted = this.s.codePointAt(this.i + 1);
         if (quoted === undefined) ask("a backslash at the end");
-        this.lit(quoted!, true);
-        this.i += 2;
+        const ch = String.fromCodePoint(quoted!);
+        this.lit(ch, true);
+        this.i += 1 + ch.length;
       } else if (c === "'") {
         const end = this.s.indexOf("'", this.i + 1);
         if (end < 0) ask("an unterminated quote");

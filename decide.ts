@@ -5392,6 +5392,25 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
       if (v.action !== "allow") writeIssue = v.reason.replace(/^edit /, `${path.basename(w.cmd.argv[0] ?? "")} writes `);
     }
   }
+  // (Council project review 2, round 39, Mythos: the places the guard reads by a program's own
+  // options, which the rules "checked" by their plainer reading of the words, are held to the
+  // rules' write test too: `cp f ~/.bashrc -S bak`, `tar -xf a.tar -C../out`, `find -fprint0 ~/x`,
+  // `rsync -aT../out`. Not redirects, tee, truncate, sed -i or dd, which the rules read as bash
+  // does. Tested on a copy of the pending record; a directory by a path inside it. Asked about
+  // after every other check, whose reasons say more.)
+  let placedIssue: string | undefined;
+  for (const w of found.writes.filter((x) => x.checked && !["tee", "truncate", "sed", "dd", ">"].includes(x.by ?? ""))) {
+    if (placedIssue) break;
+    if (/^\/dev\/(null|zero|full|stdout|stderr|tty|fd\/\d+)$/.test(tilde(w.word))) continue;
+    const p = resolve(w.word, w.cmd);
+    if (!p || (!path.isAbsolute(tilde(w.word)) && where.cwd.get(w.cmd) === undefined)) continue;
+    let at = p;
+    try {
+      if (w.dir || w.word.endsWith("/") || fs.statSync(p).isDirectory()) at = path.join(p, "x");
+    } catch {}
+    const v = fileVerdict("edit", at, { ...scope, pending: new Map(scope.pending) });
+    if (v.action !== "allow") placedIssue = v.reason.replace(/^edit /, `${path.basename(w.cmd.argv[0] ?? "")} writes `);
+  }
   const cwdOf = (c: Simple) => where.cwd.get(c);
   // Directories where this call writes files the check cannot list (round 4, finding 4, signed
   // off): the session keeps them once the call is allowed, and a file run by its path below one
@@ -5638,6 +5657,7 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   if (writeIssue) return asked(askBy(writeIssue));
   if (verdict.action === "ask") return asked(fromRules(verdict));
   if (extra?.action === "ask") return asked(askBy(extra.reason));
+  if (placedIssue) return asked(askBy(placedIssue));
   if (unseen) return asked(askBy(`the project's git layout cannot be checked whole: ${unseen}`));
   if (verdict.action === "allow" && !extra) return allowed(fromRules(verdict));
   const why = extra?.reason ?? reword(verdict.reason);

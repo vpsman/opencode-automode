@@ -328,6 +328,8 @@ describe("B11-6: the Sonnet check's finds", () => {
   rows("6 S5 (an expansion before a ..)", "ask", ["d=$PWD; echo x > $d/pl/../x", "d=$PWD; touch $d/pl/../x", "d=$PWD; tee $d/pl/../x < f"]);
   // (`tar --directory=<outside> -xf` is a rule allow without any link too: the sandbox stops the
   // write, and with it off decision 16 asks for every extraction.)
-  rows("6 S6", "classify", ["tar cf z.tar f; tar xf z.tar -C pl/..", "tar cf z.tar f; tar -xf z.tar -C pl/../plain"]);
+  // (Council project review 2, round 39: the place tar's -C names is held to the write test, and
+  // `pl/..` leads outside the project: an ask, where it used to be left to the model.)
+  rows("6 S6", "ask", ["tar cf z.tar f; tar xf z.tar -C pl/..", "tar cf z.tar f; tar -xf z.tar -C pl/../plain"]);
   rows("6 C1 (as before)", "allow", ["ln -s ../.. up", "ln -s ../.. sub/x", "cd sub && ln -s ../.. up", `ln -s ${E}/.config/plain pa && mv pa pb`, "ln -s src s8 && cp -P s8 s9 && cat s9/main.c"]);
 });

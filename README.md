@@ -656,7 +656,7 @@ your whole environment. The plugin judges that approval like any command, whoeve
 schedule, and at most lets it ask, never auto-allows.
 
 **Invalid settings.** If `automode.json` (or the plugin's options) cannot be parsed, holds
-`null`, has a value of the wrong type, a setting the plugin does not know, a relative path, or
+`null` (the file; empty plugin options are no options), has a value of the wrong type, a setting the plugin does not know, a relative path, or
 an `allowedPaths`/`sandboxWritable` entry that is `/`, a top-level directory or your home,
 nothing is auto-allowed until you fix it: every command that would have run asks, and the prompt says what is wrong. Falling back to
 defaults would silently drop `enabled: false` and your own ask and deny rules.
