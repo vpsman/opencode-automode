@@ -2469,8 +2469,11 @@ const SORT_LONGS = `ignore-leading-blanks dictionary-order ignore-case general-n
 const SORT_LONG_VALUED = ["random-source", "sort", "batch-size", "compress-program", "files0-from", "key", "output", "buffer-size", "field-separator", "temporary-directory", "parallel"];
 // (Round 49, Opus, Sol, Astra: the same reading gives the files `-o`/`--output` name, for the
 // guard's write record: `sort --random-source -- -o .git/config f` writes `.git/config`.)
-export function sortReading(args: string[]): { compressor: boolean; outputs: string[] } {
+// (Round 50, Opus: `-y` takes a value too, an attached one, GNU sort's `-bcCdfghik:mMno:rRsS:t:T:uVy::z`; Sol,
+// Astra: `--help`/`--version` as options print and write nothing.)
+export function sortReading(args: string[]): { compressor: boolean; outputs: string[]; prints: boolean } {
   let compressor = false;
+  let prints = false;
   const outputs: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -2483,8 +2486,12 @@ export function sortReading(args: string[]): { compressor: boolean; outputs: str
       const value = name && SORT_LONG_VALUED.includes(name) ? (eq >= 0 ? a.slice(eq + 1) : args[++i]) : undefined;
       if (name === "compress-program") compressor = true;
       if (name === "output" && value !== undefined) outputs.push(value);
+      if (name === "help" || name === "version") prints = true;
     } else if (a.startsWith("-") && a.length > 1) {
       for (let k = 1; k < a.length; k++) {
+        // (`-y` takes only a value in its own word, `-yk`; alone it takes nothing: `sort -y --
+        // -output` sorts the file `-output`, tried.)
+        if (a[k] === "y") break;
         if ("koStT".includes(a[k])) {
           const value = k === a.length - 1 ? args[++i] : a.slice(k + 1);
           if (a[k] === "o" && value !== undefined) outputs.push(value);
@@ -2493,9 +2500,34 @@ export function sortReading(args: string[]): { compressor: boolean; outputs: str
       }
     }
   }
-  return { compressor, outputs };
+  return prints ? { compressor: false, outputs: [], prints } : { compressor, outputs, prints };
 }
 export const sortRunsCompressor = (args: string[]) => sortReading(args).compressor;
+
+// Whether a call only prints its help or version and exits (round 50, Sol and Astra), read by the
+// tool's own reader so an option's value is no such word: sort, tar, ps, cp/mv/ln/install, the
+// compressors, and rsync with its help before any log (a version query still writes its log, and
+// is read by rsync's own checks).
+export function printsOnly(name: string, args: string[]): boolean {
+  if (name === "sort") return sortReading(args).prints;
+  if (name === "tar" || name === "gtar") {
+    const t = tarReading(args);
+    return t.has("help") || t.has("usage") || t.has("version") || t.clusters.some((c) => c.includes("?"));
+  }
+  if (name === "ps") {
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (/^--(help|version|info)(=|$)/.test(a) || a === "-V" || a === "V") return true;
+      if (/^--(format|sort|cols|columns|width|rows|lines|pid|ppid|tty|user|User|group|Group|sid|quick-pid)$/.test(a)) i++;
+      else if (/^-?[A-Za-z]*[CGgoOpqstuUkN]$/.test(a)) i++;
+    }
+    return false;
+  }
+  if (["cp", "mv", "ln", "install"].includes(name)) return copiesNothing(name, args);
+  if (name === "rsync") return rsyncReading(args).help;
+  // (The compressors' queries are read by compressorReading, as writing nothing.)
+  return false;
+}
 
 // A directory there now; false for anything else, a link loop included (round 40, Sol: ELOOP).
 const isDirectory = (p: string) => {
@@ -3086,6 +3118,8 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
       return worst(verdict, inner.length ? simple(tail(inner), scope, depth + 1) : ALLOW);
     }
   }
+  // (Round 50, Sol and Astra: a call that only prints its help or version does nothing else.)
+  if (printsOnly(name, args)) return verdict;
   // (Round 35, Mythos: a colon before the first slash makes an operand remote for rsync, with an
   // empty host too (`:x`), and `-e` then runs locally.)
   // rsync, read by position (rsyncReading, round 41): a remote operand asks, so does --daemon;
@@ -3096,7 +3130,7 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   if (name === "rsync") {
     const r = rsyncReading(args);
     if (r.operands.some((a) => /^[^/]*:/.test(a))) return worst(verdict, ask("rsync copies to or from a remote host"));
-    if (r.daemon) return worst(verdict, ask("rsync --daemon starts a server"));
+    if (r.daemon && !r.prints) return worst(verdict, ask("rsync --daemon starts a server"));
     if (r.server) return worst(verdict, classify("rsync --server writes what its standard input sends"));
     // (Round 44, Opus: what `-M`/`--remote-option` hands the receiving side, which for a local
     // copy is this machine, is read as rsync's own words: `-M--log-file=../x`.)

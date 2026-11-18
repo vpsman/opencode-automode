@@ -26,6 +26,7 @@ import {
   makeScope,
   psEnvironments,
   copiesNothing,
+  printsOnly,
   readVerdict,
   realish,
   within,
@@ -3880,7 +3881,8 @@ function optionNamedPath(cmds: Simple[], dirsOf: (cmd: Simple) => string[] | und
     return undefined;
   };
   for (const cmd of cmds) {
-    const makers = programs(cmd.argv).filter((at) => Object.hasOwn(PARENT_MAKERS, path.basename(cmd.argv[at])) && cmd.argv.slice(at + 1).some((a) => PARENT_MAKERS[path.basename(cmd.argv[at])].test(a)));
+    // (Round 50, Sol: a copy that copies nothing makes nothing, `rsync --info=HELP -- --literal`.)
+    const makers = programs(cmd.argv).filter((at) => Object.hasOwn(PARENT_MAKERS, path.basename(cmd.argv[at])) && cmd.argv.slice(at + 1).some((a) => PARENT_MAKERS[path.basename(cmd.argv[at])].test(a)) && !copiesNothing(path.basename(cmd.argv[at]), cmd.argv.slice(at + 1)));
     for (const at of programs(cmd.argv)) {
       if (path.basename(cmd.argv[at]) !== "sed") continue;
       for (const arg of cmd.argv.slice(at + 1)) {
@@ -3928,6 +3930,8 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
     cmd.argv.forEach((word, at) => {
       const how = Object.hasOwn(WRITER_OPERANDS, path.basename(word)) ? WRITER_OPERANDS[path.basename(word)] : undefined;
       const args = cmd.argv.slice(at + 1);
+      // (Round 50, Sol: a copy that copies nothing names no destination and makes no file.)
+      if (how && (copiesNothing(path.basename(word), args) || printsOnly(path.basename(word), args))) return;
       // Every word after `--` is a file, one that begins with `-` too (round 40, Opus).
       const dashes = args.indexOf("--");
       const files = [...(dashes < 0 ? args : args.slice(0, dashes)).filter((a) => !a.startsWith("-")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];

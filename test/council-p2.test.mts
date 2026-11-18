@@ -1264,3 +1264,20 @@ test("round 49: sort's outputs read by position, rsync's help in order with its 
   // Sol, Astra: format macros, help words in any case or list, a help first, a value's `-o`.
   for (const c of ["ps -e -O THREAD", "ps -eT -O DefSysV", "rsync --info=HELP --log-file=.git/info.log", "rsync --info=name,help --log-file=.git/info.log", "rsync --debug=help0 --log-file=.git/debug.log", "rsync --help --log-file=.git/a", "sort -c --random-source -o .git/sample", "rsync --version -M--log-file=.git/remote-version.log f dst/"]) assert.equal(await effect(c), "allow", c);
 });
+
+// ---- round 50 ----
+
+test("round 50: sort's -y takes a value, help and version queries do nothing else in every check", async () => {
+  // Opus: in `-yk` the `k` is -y's value, so -o and --compress-program are read.
+  for (const c of ["sort -yk -o .git/config f", "sort -yk -o ../outside f", "sort -yk --compress-program=sh f", "rsync --log-file=.git/config --help", "rsync --daemon"]) assert.notEqual(await effect(c), "allow", c);
+  const w = new SessionState(repo);
+  assert.equal(await effect("printf x | sort -yk -o t.test.js", w), "allow");
+  assert.notEqual(await effect("npm test", w), "allow");
+  // Sol, Astra: a help or version query writes, reads and runs nothing.
+  for (const c of ["sort --help --output=.git/example", "sort --version --output=.git/example", "rsync --daemon --help", "rsync --help --files-from=.netrc", "cp -S -- --version", "rsync --info=HELP -- --literal", "ps --help=all -eTH"]) assert.equal(await effect(c), "allow", c);
+  for (const c of ["sort --help --output=report", "tar --help --index-file=report"]) {
+    const s = new SessionState(repo);
+    assert.equal(await effect(c, s), "allow", c);
+    assert.equal(await effect("npm test", s), "allow", `npm test after ${c}`);
+  }
+});

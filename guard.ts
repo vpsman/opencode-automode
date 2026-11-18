@@ -16,7 +16,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { bare, bashVerdict, compressorReading, copiesNothing, sortReading, sortRunsCompressor, fileVerdict, parse, readVerdict, rsyncReading, tarReading, within, type Matcher, type Scope, type Simple } from "./rules.ts";
+import { bare, bashVerdict, compressorReading, copiesNothing, printsOnly, sortReading, sortRunsCompressor, fileVerdict, parse, readVerdict, rsyncReading, tarReading, within, type Matcher, type Scope, type Simple } from "./rules.ts";
 import { gitArgs, gitEnv } from "./sandbox.ts";
 
 const HOME = os.homedir();
@@ -5323,6 +5323,8 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
     for (const at of programs(cmd.argv)) {
       const name = path.basename(cmd.argv[at]);
       const args = cmd.argv.slice(at + 1);
+      // (Round 50, Sol: a call that only prints its help or version writes nothing.)
+      if (printsOnly(name, args)) continue;
       // Every word after `--` is a file, `-/../x` included (round 39, Opus).
       const dashes = args.indexOf("--");
       const files = [...(dashes < 0 ? args : args.slice(0, dashes)).filter((a) => !a.startsWith("-")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
@@ -7735,6 +7737,8 @@ const LIST_OPTIONS: Record<string, ListSpec> = {
   find: { single: ["-files0-from"] },
 };
 function listOptions(name: string, args: string[]): string[] {
+  // (Round 50, Astra: a help or version query reads no list, `rsync --help --files-from=.netrc`.)
+  if (printsOnly(name, args) || (name === "rsync" && rsyncReading(args).prints)) return [];
   // (B8-8: git's are its subcommand's, read after git's own leading options.)
   const call = name === "git" ? gitCall(args) : undefined;
   if (typeof call === "string") return [];
