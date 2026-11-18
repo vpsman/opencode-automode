@@ -1044,3 +1044,24 @@ test("round 40: -- in every reader, chmod modes and --ref, option writes by pref
   // Astra: "$@" beside other text in a word asks rather than being printed in parts.
   assert.ok("ask" in canonical('printf "<%s>" "$*$@" END'));
 });
+
+// ---- round 41 ----
+
+test("round 41: rsync and tar read by position, a copy into a directory by the source's name, chmod -700, ps e clusters, dash-led paths walked, self-describing variables", async () => {
+  // Opus, Mythos, Sol: rsync's dry run, listing and option values by position.
+  for (const c of ["rsync -a --delete --exclude -n ./d/ ~/", "rsync -aen f ~/.bashrc", "rsync --daemon --config -n", "rsync -an --log-file=.git/hooks/pre-commit f g"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["rsync -ani f g", "rsync --list-only f"]) {
+    const s = new SessionState(repo);
+    assert.equal(await effect(c, s), "allow", c);
+    assert.equal(await effect("npm test", s), "allow", `npm test after ${c}`);
+  }
+  // Opus, Mythos: tar's members and options by position.
+  for (const c of ["tar -cf a.tar --remove-files conf .git", "tar -c --exclude -- -I ./x.sh -f a.tar f", "tar --remove-files -cf a.tar --add-fil=/opt/x"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["tar -tf a.tar --exclude -F", "tar -tf a.tar -- a:b", "tar -cf a.tar f"]) assert.equal(await effect(c), "allow", c);
+  // Opus: a copy into a directory writes the source's name there.
+  for (const c of ["cp -r /opt/ev/.git .", "chmod -700 ~/.bashrc", "ps axeg", "ps ep 1", "mkdir - && awk 1 -/../.env", "mkdir - && uniq -- f -/../.git/hooks/pre-commit", "mkdir - && ln -s ~ ./-/h && echo evil >> -/h/.bashrc"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["ps aux", "ps -p 1 -o pid=environ", "gzip -l .git/qa.gz", "cp f g"]) assert.equal(await effect(c), "allow", c);
+  // Astra: a command that reads its own text or line asks when printing changes it.
+  assert.ok("ask" in canonical('printf "%s\\n" "$BASH_COMMAND"'));
+  assert.ok("ask" in canonical('# heading\nprintf "%s\\n" "$LINENO"'));
+});

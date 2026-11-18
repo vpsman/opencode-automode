@@ -3926,6 +3926,19 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       if (path.basename(word) === "sed" && !args.some((a) => /^(-[a-zA-Z]*i|--in-place)/.test(a))) return;
       if (path.basename(word) === "dd") targets.push(...args.filter((a) => a.startsWith("of=")).map((a) => a.slice(3)));
       else if (how) targets.push(...(how === "last" ? files.slice(-1) : files));
+      // (Round 41, Opus: a copy into a directory writes each source's name there: `cp -r ev/.git .`
+      // writes `./.git`. Judged by where each lands.)
+      if (how === "last" && files.length > 1) {
+        const dest = files.at(-1)!;
+        const dir = cwdOf(cmd);
+        let into = dest.endsWith("/") || files.length > 2;
+        if (!into && dir !== undefined) {
+          try {
+            into = fs.statSync(path.resolve(dir, tilde(dest))).isDirectory();
+          } catch {}
+        }
+        if (into) targets.push(...files.slice(0, -1).map((src) => `${dest.replace(/\/+$/, "")}/${path.basename(src.replace(/\/+$/, ""))}`));
+      }
       if (how && !NAME_KEEPERS.has(path.basename(word))) {
         const end = args.indexOf("--");
         const operands = end < 0 ? files : [...files.filter((f) => args.indexOf(f) < end), ...args.slice(end + 1)];

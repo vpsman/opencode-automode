@@ -421,7 +421,9 @@ function secretIn(word: string, scope: Scope, isPath = false, operand = false): 
   // An operand (after `--`) is a path whatever it starts with (round 40, Opus: `cat -- -/../.env`).
   const text = operand ? word : word.replace(/^[^=/]*=/, "").replace(/^@/, "");
   for (const candidate of new Set([text, text.slice(text.lastIndexOf(":") + 1)])) {
-    if (!candidate || (candidate.startsWith("-") && !operand)) continue;
+    // (Round 41, Mythos: a word that starts with `-` and holds a slash, `-/../.env`, is a path
+    // through a directory named like an option, as an option's value or an awk operand reads it.)
+    if (!candidate || (candidate.startsWith("-") && !operand && !/^-[^=]*\//.test(candidate))) continue;
     const p = resolveWord(candidate, scope);
     if (isSecretPath(expandHome(candidate)) || (p && (isSecretPath(p) || isSecretPath(followLinks(p, scope))))) return candidate;
   }
@@ -486,7 +488,10 @@ function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope)
   }
   // `--env-file .env` hands the file to a program and shows nothing.
   words = words.filter((w, i) => !/^--env-file(=|$)/.test(w) && words[i - 1] !== "--env-file");
-  for (const word of [...words, ...(cmd.in ?? [])]) {
+  // (Round 41, Mythos: a word that starts with `-` and holds a slash is a path to the programs that
+  // read it as an operand, `awk 1 -/../.env`.)
+  const dashPaths = args.filter((a) => /^-[^=]*\//.test(a) && !words.includes(a));
+  for (const word of [...words, ...dashPaths, ...(cmd.in ?? [])]) {
     const secret = secretIn(word, scope) ?? globSecret(word, scope);
     if (secret) return secret;
   }
@@ -1869,18 +1874,14 @@ function make(args: string[], scope: Scope): Verdict {
 // tar options that run a program: a checkpoint action, a compressor, --to-command, the volume
 // scripts, a remote shell; and an archive named host:file, which tar opens through rsh.
 function tarProblem(args: string[]): string | undefined {
+  const t = tarReading(args);
   const running = ["checkpoint-action", "use-compress-program", "to-command", "info-script", "new-volume-script", "rsh-command", "rmt-command"];
-  for (let k = 0; k < args.length; k++) {
-    const a = args[k];
-    // After `--`, words are members (round 40, Sol: `tar -tf a.tar -- -F`).
-    if (a === "--") break;
-    if (running.some((name) => longIs(a, name))) return `tar ${a.split("=")[0]} runs a program`;
-    // Short clusters, and the old style where the first word is a cluster without its dash.
-    const cluster = /^-[A-Za-z]+$/.test(a) ? a.slice(1) : k === 0 && /^[A-Za-z]+$/.test(a) ? a : "";
-    if (/[IF]/.test(cluster)) return "tar -I or -F runs a program";
-    const archive = /^--file=/.test(a) ? a.slice(7) : a === "--file" || /f$/.test(cluster) ? args[k + 1] : /^-f./.test(a) && !a.startsWith("--") ? a.slice(2) : undefined;
-    if (archive !== undefined && /^[^/]*:/.test(archive) && !args.includes("--force-local")) return "tar on a remote archive runs a remote shell";
-  }
+  const run = running.find((name) => t.has(name));
+  if (run) return `tar --${run} runs a program`;
+  // Short clusters, and the old style where the first word is a cluster without its dash, read by
+  // position: the letters before one that takes a value.
+  if (t.clusters.some((c) => /[IF]/.test(c.split(/[bCfgHKLNTVX]/)[0] + (/[IF]/.test(c[c.search(/[bCfFgHIKLNTVX]/)] ?? "") ? c[c.search(/[bCfFgHIKLNTVX]/)] : "")))) return "tar -I or -F runs a program";
+  if (t.archives.some((f) => /^[^/]*:/.test(f)) && !t.has("force-local")) return "tar on a remote archive runs a remote shell";
   return undefined;
 }
 
@@ -2021,6 +2022,99 @@ function shell(name: string, args: string[], dyn: (k: number) => boolean, cmd: S
   return evaluateParsed(parse(text), scope, depth + 1);
 }
 
+// rsync's command line read by position, as its option parser reads it (round 41, all four):
+// options anywhere until `--`, a value after each option that takes one (attached, after `=`, or
+// the next word, and in a short cluster the rest of the word after a letter that takes one).
+const RSYNC_LONG_VALUED = `out-format log-file-format rsh exclude include filter files-from exclude-from include-from password-file log-file
+  partial-dir temp-dir backup-dir suffix compare-dest copy-dest link-dest chmod chown usermap groupmap timeout contimeout bwlimit max-size
+  min-size block-size port sockopts outbuf remote-option iconv checksum-choice compress-choice skip-compress info debug modify-window
+  max-delete max-alloc stop-after stop-at write-batch read-batch only-write-batch protocol address rsync-path config dparam compress-level
+  checksum-seed early-input munge-links`.split(/\s+/);
+export function rsyncReading(args: string[]) {
+  const longs: [string, string | undefined][] = [];
+  const letters: string[] = [];
+  const shorts: [string, string | undefined][] = [];
+  const operands: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") {
+      operands.push(...args.slice(i + 1));
+      break;
+    }
+    if (a.startsWith("--")) {
+      const eq = a.indexOf("=");
+      const head = eq < 0 ? a : a.slice(0, eq);
+      const full = RSYNC_LONG_VALUED.find((n) => head.length >= 4 && `--${n}`.startsWith(head));
+      longs.push([head, eq >= 0 ? a.slice(eq + 1) : full ? args[++i] : undefined]);
+    } else if (a.startsWith("-") && a.length > 1) {
+      for (let k = 1; k < a.length; k++) {
+        letters.push(a[k]);
+        if ("eTfBM@".includes(a[k])) {
+          shorts.push([a[k], k < a.length - 1 ? a.slice(k + 1) : args[++i]]);
+          break;
+        }
+      }
+    } else operands.push(a);
+  }
+  const has = (name: string) => longs.some(([h]) => h.length >= 4 && `--${name}`.startsWith(h));
+  const dryRun = letters.includes("n") || has("dry-run");
+  const listOnly = has("list-only");
+  return { longs, letters, shorts, operands, dryRun, listOnly, daemon: has("daemon"), copiesNothing: dryRun || listOnly || operands.length < 2, values: (name: string) => longs.filter(([h]) => h.length >= 4 && `--${name}`.startsWith(h)).map(([, v]) => v ?? "") };
+}
+
+// tar's command line read by position (round 41): the old style (a first word of letters without
+// a dash, whose letters that take a value take the next words in turn), short clusters, long
+// options by prefix with their values, and `--` ending the options only where an option stands.
+const TAR_LONG_VALUED = `file directory files-from exclude-from exclude transform xform owner group mode mtime newer newer-mtime after-date label
+  suffix rsh-command rmt-command to-command use-compress-program checkpoint-action info-script new-volume-script index-file volno-file
+  tape-length blocking-factor record-size strip-components hole-detection format quoting-style quote-chars no-quote-chars sort warning
+  add-file listed-incremental exclude-ignore exclude-ignore-recursive exclude-tag exclude-tag-all exclude-tag-under owner-map group-map
+  pax-option occurrence backup checkpoint level`.split(/\s+/);
+export function tarReading(args: string[]) {
+  const clusters: string[] = [];
+  const longs: [string, string | undefined][] = [];
+  const archives: string[] = [];
+  const dirs: string[] = [];
+  const members: string[] = [];
+  const takeShort = (letter: string, value: string | undefined) => {
+    if (letter === "f" && value !== undefined) archives.push(value);
+    if (letter === "C" && value !== undefined) dirs.push(value);
+  };
+  let i = 0;
+  if (args[0] && /^[A-Za-z]+$/.test(args[0])) {
+    clusters.push(args[0]);
+    i = 1;
+    for (const letter of args[0]) if ("bCfFgHIKLNTVX".includes(letter)) takeShort(letter, args[i++]);
+  }
+  for (; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") {
+      members.push(...args.slice(i + 1));
+      break;
+    }
+    if (a.startsWith("--")) {
+      const eq = a.indexOf("=");
+      const head = eq < 0 ? a : a.slice(0, eq);
+      const full = TAR_LONG_VALUED.find((n) => head.length >= 4 && `--${n}`.startsWith(head));
+      const value = eq >= 0 ? a.slice(eq + 1) : full ? args[++i] : undefined;
+      longs.push([head, value]);
+      if (full === "file" && value !== undefined) archives.push(value);
+      if (full === "directory" && value !== undefined) dirs.push(value);
+    } else if (a.startsWith("-") && a.length > 1) {
+      clusters.push(a.slice(1));
+      for (let k = 1; k < a.length; k++) {
+        if ("bCfFgHIKLNTVX".includes(a[k])) {
+          takeShort(a[k], k < a.length - 1 ? a.slice(k + 1) : args[++i]);
+          break;
+        }
+      }
+    } else members.push(a);
+  }
+  const has = (name: string) => longs.some(([h]) => h.length >= 4 && `--${name}`.startsWith(h));
+  const values = (name: string) => longs.filter(([h]) => h.length >= 4 && `--${name}`.startsWith(h)).map(([, v]) => v ?? "");
+  return { clusters, longs, archives, dirs, members, has, values };
+}
+
 // A directory there now; false for anything else, a link loop included (round 40, Sol: ELOOP).
 const isDirectory = (p: string) => {
   try {
@@ -2038,7 +2132,8 @@ function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = 
   // prefix; its value, as a separate word, is the file read, not a target.)
   const head = args.indexOf("--") < 0 ? args : args.slice(0, args.indexOf("--"));
   const reference = head.findIndex((a) => longIs(a, "reference") && a.split("=")[0].length >= 4);
-  const modeAsOption = cmd === "chmod" && head.some((a) => /^-[rwxXstugoa+=,-]+$/.test(a) && /[rwxXst]/.test(a));
+  // (Round 41, Mythos: an octal mode after a dash too, `chmod -700 f`.)
+  const modeAsOption = cmd === "chmod" && head.some((a) => (/^-[rwxXstugoa+=,-]+$/.test(a) && /[rwxXst]/.test(a)) || /^-[0-7]{1,4}$/.test(a));
   const words = reference >= 0 && !head[reference].includes("=") ? args.filter((_, k) => k !== reference + 1) : args;
   const paths = FIRST_OPERAND_NOT_PATH.has(cmd) && reference < 0 && !modeAsOption ? operands(words).slice(1) : operands(words);
   const sources = paths.slice(0, -1);
@@ -2611,47 +2706,28 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   }
   // (Round 35, Mythos: a colon before the first slash makes an operand remote for rsync, with an
   // empty host too (`:x`), and `-e` then runs locally.)
-  // rsync's operands, past the values of its options that take one (round 39, Sol: `--out-format
-  // '%n:%l'` is no remote).
-  const rsyncValued = /^(--(out-format|log-file-format|rsh|exclude|include|filter|files-from|exclude-from|include-from|password-file|log-file|partial-dir|temp-dir|backup-dir|suffix|compare-dest|copy-dest|link-dest|chmod|chown|usermap|groupmap|timeout|contimeout|bwlimit|max-size|min-size|block-size|port|sockopts|outbuf|remote-option|iconv|checksum-choice|compress-choice|skip-compress|info|debug|modify-window|max-delete|max-alloc|stop-after|stop-at|write-batch|read-batch|only-write-batch|protocol|address|rsync-path|config)|-[eTfBM])$/;
-  const rsyncOperands = name === "rsync" ? operands(args.filter((a, k) => !rsyncValued.test(args[k - 1] ?? ""))) : [];
-  if (name === "rsync" && rsyncOperands.some((a) => /^[^/]*:/.test(a))) return worst(verdict, ask("rsync copies to or from a remote host"));
-  // (Round 39, Mythos: --remove-source-files deletes its sources, and --delete what is in the
-  // destination and not in the source: held to rm's test.)
-  // A dry run (`-n`, `--dry-run`) deletes nothing (round 40, Sol).
-  const dryRun = name === "rsync" && args.some((a) => longIs(a, "dry-run") || (/^-[a-zA-Z]+$/.test(a) && a.includes("n")));
-  if (name === "rsync" && dryRun) {
-    // (A dry run writes only its log, checked above.)
-    if (args.some((a) => /^--(log-file|write-batch|only-write-batch)/.test(a))) {
-      // fall through to the log check below
-    } else return verdict;
-  }
-  if (name === "rsync" && rsyncOperands.length > 1 && !dryRun) {
-    const removes = args.some((a) => /^--remove-(source|sent)-files$/.test(a));
-    const deletes = args.some((a) => /^--(delete|del)(-\w+)?$/.test(a));
-    let gone = ALLOW;
-    if (removes) for (const src of rsyncOperands.slice(0, -1)) gone = worst(gone, deletion(src, scope));
-    if (deletes) gone = worst(gone, deletion(rsyncOperands.at(-1)!, scope));
-    if (gone.action !== "allow") return worst(verdict, gone);
-  }
-  if (name === "rsync" && args.some((a) => longIs(a, "daemon") && a.length > 3)) return worst(verdict, ask("rsync --daemon starts a server"));
+  // rsync, read by position (rsyncReading, round 41): a remote operand asks, so does --daemon;
+  // the files it writes besides its destination (log, batch, backup, temp, partial places) are
+  // held to the write test, a dry run's too; a dry run, a listing or one operand copies and deletes
+  // nothing; --remove-source-files deletes its sources and --delete what the destination holds
+  // beyond the source (held to rm's test outside the project and for .git, rounds 39 and 40).
   if (name === "rsync") {
-    // Files rsync writes besides its destination (round 38): held to the write test, as the README says.
-    // By position: a word that is another option's value is no option (round 40, Sol:
-    // `--out-format --log-file`).
-    const outputs: string[] = [];
-    for (let k = 0; k < args.length; k++) {
-      const a = args[k];
-      if (a === "--") break;
-      const m = /^--(log-file|write-batch|only-write-batch|backup-dir|partial-dir|temp-dir)(=(.*))?$/.exec(a);
-      if (m) outputs.push(m[2] ? m[3] : (args[++k] ?? ""));
-      else if (a === "-T") outputs.push(args[++k] ?? "");
-      else if (rsyncValued.test(a)) k++;
-    }
+    const r = rsyncReading(args);
+    if (r.operands.some((a) => /^[^/]*:/.test(a))) return worst(verdict, ask("rsync copies to or from a remote host"));
+    if (r.daemon) return worst(verdict, ask("rsync --daemon starts a server"));
+    const outputs = [...["log-file", "write-batch", "only-write-batch", "backup-dir", "partial-dir", "temp-dir"].flatMap((n) => r.values(n)), ...r.shorts.filter(([l]) => l === "T").map(([, v]) => v ?? "")];
+    if (outputs.some((f) => /(^|\/)\.git(\/|$)/.test(resolveWord(f, scope) ?? f))) return worst(verdict, ask("rsync writes a file in a .git directory"));
     if (outputs.length) {
       const w = writeTargets("tee", ["--", ...outputs], scope);
       if (w.action !== "allow") return worst(verdict, { ...w, reason: w.reason.replace(/^tee/, "rsync") });
     }
+    if (r.copiesNothing) return verdict;
+    const removes = r.longs.some(([h]) => /^--remove-(source|sent)-files$/.test(h) || (h.length >= 9 && "--remove-source-files".startsWith(h)));
+    const deletes = r.longs.some(([h]) => /^--del/.test(h));
+    let gone = ALLOW;
+    if (removes) for (const src of r.operands.slice(0, -1)) gone = worst(gone, deletion(src, scope));
+    if (deletes) gone = worst(gone, deletion(r.operands.at(-1)!, scope));
+    if (gone.action !== "allow") return worst(verdict, gone);
   }
   // Files written by an option (round 39, Mythos): held to the write test.
   // Long options by any prefix the tool takes (round 40, Mythos: `--cursor-fil=`).
@@ -2674,7 +2750,10 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
     }
   }
   // (Round 40, Mythos: ps prints other processes' environments with BSD `e` or `environ`.)
-  if (name === "ps" && args.some((a, k) => (/^[aAcefhjlmrsSTuvwxXZ]+$/.test(a) && a.includes("e") && !/^-[a-zA-Z]*[CpuUgGtoOqs]$|^--\w+$/.test(args[k - 1] ?? "")) || /environ/.test(a))) return worst(verdict, ask("ps that prints other processes' environments"));
+  // (Round 41: in any BSD cluster, letters that take a value and a pid included, `ps ep 1`,
+  // `ps e1`; `environ` as a field, not as a heading after `=`.)
+  const psFields = (a: string) => a.split(",").map((f) => f.split("=")[0]);
+  if (name === "ps" && args.some((a, k) => (/^[A-Za-z][A-Za-z0-9]*$/.test(a) && a.includes("e") && (k === 0 || !/^-[a-zA-Z]*[CpuUgGtoOqsk]$|^--\w+$|^[A-Za-z]*[oOkpUtgq]$/.test(args[k - 1] ?? ""))) || ((/^(-[a-zA-Z]*[oO]|[a-zA-Z]*[oO]|--format|--sort|k)$/.test(args[k - 1] ?? "") || /^--format=/.test(a)) && psFields(a.replace(/^--format=/, "")).some((f) => f === "environ")))) return worst(verdict, ask("ps that prints other processes' environments"));
   // (setfacl --restore takes its paths from a file.)
   if (name === "setfacl" && args.some((a) => longIs(a, "restore") && a.split("=")[0].length >= 4)) return worst(verdict, classify("setfacl --restore changes the files a list names"));
   if (name === "nm" && args.some((a) => longIs(a, "plugin") && a.split("=")[0].length >= 4)) return worst(verdict, classify("nm --plugin loads a shared object"));
@@ -2729,25 +2808,25 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   if (name === "tar" || name === "zip" || name === "unzip" || name === "gzip" || name === "gunzip" || name === "xz" || name === "zstd") {
     // (Round 39, Mythos: --remove-files deletes the members after archiving them: held to rm's test,
     // and unread under a -C/--directory.)
-    if (name === "tar" && args.some((a) => longIs(a, "remove-files") && a.length > 4)) {
-      // (Round 40, Mythos: `--dir=` and the other prefixes of --directory, members from a list,
-      // and `--add-file=` are read too.)
-      if (args.some((a, k) => (longIs(a, "directory") && a.split("=")[0].length >= 4) || /^-[a-zA-Z]*[CT]/.test(a) || (k === 0 && /^[a-zA-Z]*[CT]/.test(a)) || longIs(a, "files-from"))) return worst(verdict, classify("tar --remove-files under another directory or from a list"));
-      for (const a of args) if (/^--add-file=/.test(a)) {
-        const gone = deletion(a.slice(11), scope);
-        if (gone.action !== "allow") return worst(verdict, gone);
-      }
-      const members = operands(args).filter((a, k, all) => !/f$/.test(args[args.indexOf(a) - 1] ?? "") && !(k === 0 && /^[a-zA-Z]+$/.test(a) && !args[0].startsWith("-") && a === args[0]));
+    // (Round 39, Mythos: --remove-files deletes the members after archiving them: held to rm's
+    // test, and unread under a -C/--directory or from a list. Read by position, round 41.)
+    const t = name === "tar" ? tarReading(args) : undefined;
+    if (t && t.has("remove-files")) {
+      if (t.dirs.length || t.has("files-from") || t.clusters.some((c) => c.includes("T"))) return worst(verdict, classify("tar --remove-files under another directory or from a list"));
       let gone = ALLOW;
-      for (const m of members) gone = worst(gone, deletion(m, scope));
+      for (const m of [...t.members, ...t.values("add-file")]) gone = worst(gone, deletion(m, scope));
       if (gone.action !== "allow") return worst(verdict, gone);
     }
+    // --add-file names a member like an operand (round 41, Mythos: held to the same outside test).
+    if (t) for (const f of t.values("add-file")) if (!isLocal(resolveWord(f, scope), scope)) return worst(verdict, classify(`tar with a path outside the working directory`));
     const problem = name === "tar" ? tarProblem(args) : undefined;
     if (problem) return worst(verdict, classify(problem));
     // Archives read and write paths given as operands and after -f / -C / -d.
     // A compressor replaces its input with the compressed file beside it: one in a .git directory
     // is a write there (round 40, Opus: `gzip -- -/../.git/config`).
-    if (/^(gzip|gunzip|xz|zstd)$/.test(name) && operands(args).some((a) => /(^|\/)\.git(\/|$)/.test(resolveWord(a, scope) ?? a))) return worst(verdict, ask(`${name} writes in a .git directory`));
+    // (Not a listing, a test, or output to standard output, round 41, Sol.)
+    const inPlace = !args.some((a) => /^(-[a-zA-Z0-9]*[ltc][a-zA-Z0-9]*|--(list|test|stdout|to-stdout))$/.test(a));
+    if (/^(gzip|gunzip|xz|zstd)$/.test(name) && inPlace && operands(args).some((a) => /(^|\/)\.git(\/|$)/.test(resolveWord(a, scope) ?? a))) return worst(verdict, ask(`${name} writes in a .git directory`));
     for (const a of operands(args)) {
       if (!isLocal(resolveWord(a, scope), scope)) return worst(verdict, classify(`${name} with a path outside the working directory`));
     }

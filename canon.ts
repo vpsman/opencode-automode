@@ -2030,6 +2030,10 @@ export function canonical(command: string): Canonical {
     const { text, judged, bashOnly, inputs, judgedInputs, arithLed, literals } = print(command, 0);
     if (/^[-+]/.test(text)) return { ask: "a command line that starts with - or + once blanks, comments and line continuations are gone, which the shell would read as its own options" };
     if (Buffer.byteLength(text) > MAX_TEXT) return { ask: "a command too long to hand to the shell in one piece once printed" };
+    // A command that reads its own text or place (`$LINENO`, `$BASH_COMMAND`,
+    // `$BASH_EXECUTION_STRING`, `$BASH_LINENO`, `$_`) sees the printed text, not the written one
+    // (council project review 2, round 41, Astra; declined in rounds 30 and 39, closed here).
+    if (text !== command && /\$\{?(LINENO|BASH_COMMAND|BASH_EXECUTION_STRING|BASH_LINENO|_)\b/.test(command)) return { ask: "a command that reads its own text or line number, which printing it would change" };
     return { text, judged, bashOnly, inputs, judgedInputs, arithLed, literals, ...(folds ? { folded: true } : {}) };
   } catch (e) {
     if (e instanceof Ask) return { ask: e.message };

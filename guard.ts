@@ -16,7 +16,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { bashVerdict, fileVerdict, parse, readVerdict, within, type Matcher, type Scope, type Simple } from "./rules.ts";
+import { bashVerdict, fileVerdict, parse, readVerdict, rsyncReading, tarReading, within, type Matcher, type Scope, type Simple } from "./rules.ts";
 import { gitArgs, gitEnv } from "./sandbox.ts";
 
 const HOME = os.homedir();
@@ -4368,11 +4368,11 @@ function programProblem(name: string, args: string[], cwd?: string, inProject?: 
     // Bundled short options, with or without the dash (`tar cIf`): -I and -F name a program; -M
     // and -L make tar prompt for the next volume, where `!` runs a shell on standard input
     // (council project review 2, round 28, Mythos).
-    // Options end at `--`; the words after it are members (round 40, Sol: `tar -tf a.tar -- -F`).
-    const head = args.indexOf("--") < 0 ? args : args.slice(0, args.indexOf("--"));
-    const bundles = head.filter((a, i) => (/^-[a-zA-Z]+/.test(a) && !a.startsWith("--")) || (i === 0 && /^[a-zA-Z]+$/.test(a)));
+    // Read by position (round 41, Mythos and Sol): an option's value is no option, and `--` ends
+    // the options only where an option could stand.
+    const bundles = tarReading(args).clusters;
     if (bundles.some((a) => /[IFML]/.test(a))) return ask("tar -I or -F runs a program, and -M or -L prompts for the next volume, where ! runs a shell on standard input");
-    if (args.some((a) => !a.startsWith("-") && /^[\w.@-]+:/.test(a)) && !args.includes("--force-local")) return ask("tar with an archive on a remote host runs a remote shell");
+    if (tarReading(args).archives.some((a) => /^[^/]*:/.test(a)) && !args.includes("--force-local")) return ask("tar with an archive on a remote host runs a remote shell");
   }
   if (name === "sort" && longOption(args, ["--compress-program"])) return ask("sort --compress-program runs a program");
   // Council project review 2 (Mythos): the compilers and build tools the rules allow by name, with
@@ -5168,7 +5168,9 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
     if (got.unknown || !got.opts.some((o) => ["--dry-run", "-o", "--output"].includes(o.name))) return "patch writes the files the diff names";
   }
   // (A dry run writes nothing but a log the rules hold, round 40, Sol.)
-  if (name === "rsync" && !args.some((a) => (a.length > 3 && "--dry-run".startsWith(a)) || (/^-[a-zA-Z]+$/.test(a) && a.includes("n")))) return "rsync writes the files it copies";
+  // (A dry run, a listing, or one operand writes nothing but a log the rules hold; read by
+  // position, round 41.)
+  if (name === "rsync" && !rsyncReading(args).copiesNothing) return "rsync writes the files it copies";
   // Read by the tool's own options (round 4, finding 4, second pass: `--recur`, `--arc`).
   if (["cp", "mv", "install"].includes(name)) {
     const words = copyWords(name, args);
@@ -5313,9 +5315,9 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       if (name === "tee" || name === "truncate") files.forEach((f) => add(f, true));
       else if (name === "sed" && args.some((a) => /^(-[a-zA-Z]*i|--in-place)/.test(a))) files.slice(args.some((a) => /^(-[a-zA-Z]*e$|--expression)/.test(a)) ? 0 : 1).forEach((f) => add(f, true));
       else if ((name === "perl" || name === "ruby") && args.some((a) => /^-[a-zA-Z]*i/.test(a))) files.slice(args.some((a) => /^-[a-zA-Z]*e$/.test(a)) ? 1 : 0).forEach((f) => add(f, false));
-      // An rsync dry run copies nothing (round 40, Sol).
-      else if (name === "rsync" && args.some((a) => (a.length > 3 && "--dry-run".startsWith(a)) || (/^-[a-zA-Z]+$/.test(a) && a.includes("n")))) continue;
-      else if (["cp", "mv", "ln", "install", "rsync"].includes(name)) {
+      // An rsync that copies nothing (a dry run, a listing, one operand) writes no destination; its
+      // option places are still read below (round 41).
+      else if (["cp", "mv", "ln", "install", "rsync"].includes(name) && !(name === "rsync" && rsyncReading(args).copiesNothing)) {
         // `-t DIR` / `--target-directory=DIR`: every operand is a source (the rules read the last
         // one as the destination and never look at DIR).
         // Read by the tool's own options (round 4, finding 4, second pass: `--target-dir=`,
@@ -5351,11 +5353,15 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       // (Council project review 1, round 6: `python3 -m json.tool IN OUT` writes OUT.)
       else if (/^python[0-9.]*$/.test(name) && args.some((a, k) => (a === "-m" && args[k + 1] === "json.tool") || a === "-mjson.tool")) {
         const at = args.findIndex((a, k) => (a === "-m" && args[k + 1] === "json.tool") || a === "-mjson.tool");
-        const operands = args.slice(at + (args[at] === "-m" ? 2 : 1)).filter((a) => a === "-" || !a.startsWith("-"));
+        const rest = args.slice(at + (args[at] === "-m" ? 2 : 1));
+        const end = rest.indexOf("--");
+        const operands = [...(end < 0 ? rest : rest.slice(0, end)).filter((a) => a === "-" || !a.startsWith("-")), ...(end < 0 ? [] : rest.slice(end + 1))];
         if (operands.length > 1) add(operands[1], true);
       }
       else if (name === "uniq" || name === "xxd") {
-        const operands = args.filter((a) => a === "-" || !a.startsWith("-"));
+        // (Round 41, Mythos: the words after `--` are operands, `-/../x` too.)
+        const end = args.indexOf("--");
+        const operands = [...(end < 0 ? args : args.slice(0, end)).filter((a) => a === "-" || !a.startsWith("-")), ...(end < 0 ? [] : args.slice(end + 1))];
         add(operands.length > 1 ? operands.at(-1) : undefined, false);
       }
       else if ((name === "yq" || name === "jq") && args.some((a) => /^(-[a-zA-Z]*i|--inplace)$/.test(a))) files.slice(1).forEach((f) => add(f, false));
@@ -6765,7 +6771,9 @@ function linkWalk(abs: string, made: Map<string, string[]>, missingToo: boolean)
 // The physical paths a word names from `dir` that differ from the path its text names; none for
 // an expansion, a glob, `~user`, nothing there or a walk the check cannot make.
 function leadsTo(value: string, dir: string, made: Map<string, string[]>): string[] {
-  if (!value || value.startsWith("-") || /[$`*?[]/.test(value) || /^~(?![/+]|$)/.test(value) || /^~\+[^/]/.test(value)) return [];
+  // (Round 41, Mythos: `-/h/.bashrc` is a path through the directory `-`; a word with a slash
+  // before any `=` is walked whatever it starts with.)
+  if (!value || (value.startsWith("-") && !/^-[^=]*\//.test(value)) || /[$`*?[]/.test(value) || /^~(?![/+]|$)/.test(value) || /^~\+[^/]/.test(value)) return [];
   const abs = homeOrHere(value, dir);
   return walks(abs, made).filter((p) => p !== path.normalize(abs));
 }
@@ -6777,7 +6785,7 @@ function writesTo(value: string, dir: string, made: Map<string, string[]>): stri
   // (S5: `$PWD` and `${PWD}` at the start are where the command runs.)
   const here = /^\$(?:PWD|\{PWD\})(?=\/|$)/.exec(value);
   if (here) value = `${dir}${value.slice(here[0].length)}`;
-  if (!value || value.startsWith("-") || /[$`*?[]/.test(value) || /^~(?![/+]|$)/.test(value) || /^~\+[^/]/.test(value)) return [];
+  if (!value || (value.startsWith("-") && !/^-[^=]*\//.test(value)) || /[$`*?[]/.test(value) || /^~(?![/+]|$)/.test(value) || /^~\+[^/]/.test(value)) return [];
   const abs = homeOrHere(value, dir);
   if (/^\/(?:proc|dev)(?:\/|$)/.test(path.normalize(abs))) return [];
   return linkWalk(abs, made, true).filter((p) => p.parted && p.at !== path.resolve(abs)).map((p) => p.at);
