@@ -1,4 +1,8 @@
-rules.ts is vendored from pi-automode-classifier
+rules.ts is derived from rules.ts of pi-automode-classifier v0.4.1 (commit e61ea96)
 (https://github.com/deepu105/pi-automode-classifier), MIT, copyright (c) 2026
 Deepu K Sasidharan; see LICENSE.pi-automode-classifier. checkouts() and
 inCheckout() in decide.ts are adapted from the same project.
+
+This project has changed rules.ts since and maintains it: its shell parser and command rules
+were rewritten in places to fix how they read some commands. The MIT licence above covers the
+upstream code it keeps.

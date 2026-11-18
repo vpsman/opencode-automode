@@ -1,4 +1,5 @@
-// Checks that run around the vendored rules (rules.ts), which is kept byte-identical to upstream.
+// Checks that run around the rules (rules.ts), as a second layer: rules.ts fixes its own bugs, and
+// these checks stay in place.
 // The rules grant an allow by ruling out the spellings they know; bash, git and the GNU tools
 // accept more. Everything here works the other way round: it accepts the exact forms it
 // understands and sends the rest to a prompt (or, where a prompt would be too much, to the model).
@@ -3273,7 +3274,8 @@ const WRAPPER_NAMES = new Set(["env", "nice", "ionice", "timeout", "time", "comm
 // `NAME=value`, signal and variable names, xargs' `{}`.
 const WRAPPER_WORD = /^(-.*|\d+(\.\d+)?[smhd]?|[A-Z_][A-Z0-9_]*(=.*)?|\{\})$/;
 
-// The rules' own reading (rules.ts `unwrap`, `command`): kept in step with the vendored file.
+// The rules' own reading (rules.ts `unwrap`, `command`), as it was when this was written; rules.ts
+// now reads wrapper options more strictly, and asks or leaves to the decider where this does not.
 const RULES_KEYWORDS = new Set(["if", "then", "elif", "else", "do", "while", "until", "!", "{", "}"]);
 const RULES_NOOP = new Set(["fi", "done", "esac", "for", "in"]);
 const RULES_WRAPPERS = new Set(["env", "nice", "ionice", "timeout", "time", "command", "builtin", "nohup", "setsid", "stdbuf", "exec", "chrt", "taskset"]);
@@ -5550,7 +5552,11 @@ function walk(command: string, starts: Places, depth: number, ctx: WalkContext):
   };
   const pushWord = () => {
     if (hasWord) {
-      const expanded = word.replace(/\$\{HOME\}|\$HOME\b/g, HOME);
+      // `$HOME` where bash expands it, as the rules' parser reads it: not in single quotes, not
+      // escaped. (A word that mixes those with an expanded `$HOME` is left as written, and then
+      // does not line up with the parser's reading: such a call is not placed.)
+      const raw = s.slice(rawStart, i);
+      const expanded = /'|\\\$/.test(raw) ? word : word.replace(/\$\{HOME\}|\$HOME\b/g, HOME);
       if (redirect === "out") cur.out.push(expanded);
       else if (redirect === "") {
         if (!quoted) keyword(word);
@@ -6148,7 +6154,7 @@ export function placedReads(where: Located, scope: Scope, judgeAt: (dir: string,
 // follows the link first (`pl -> ~/.config/plain`: `cat pl/../gh/hosts.yml` reads
 // ~/.config/gh/hosts.yml). And a link made in the call itself does not exist when the call is
 // judged (`ln -s ~/.config/gh g1; cat g1/hosts.yml`). The maintainer's decision (consult 19):
-// around the vendored rules, every word of a command that exists as a path and leads, as the
+// around the rules, every word of a command that exists as a path and leads, as the
 // kernel walks it from where the command runs, somewhere else than its text says is judged again
 // by the rules as that physical path (the whole command, the word replaced: which words a program
 // reads is the rules' own reading); an ask of theirs for a credential read asks, naming both
