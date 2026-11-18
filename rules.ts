@@ -2111,7 +2111,9 @@ export function tarReading(args: string[]) {
   const archives: string[] = [];
   const dirs: string[] = [];
   const members: string[] = [];
+  const shortValues: (string | undefined)[] = [];
   const takeShort = (letter: string, value: string | undefined) => {
+    if (letter !== "f") shortValues.push(value);
     if (letter === "f" && value !== undefined) archives.push(value);
     if (letter === "C" && value !== undefined) dirs.push(value);
   };
@@ -2154,7 +2156,9 @@ export function tarReading(args: string[]) {
   const has = (name: string) => longs.some(([h]) => h === `--${name}`);
   const values = (name: string) => longs.filter(([h]) => h === `--${name}`).map(([, v]) => v ?? "");
   const letter = (l: string) => clusters.some((c) => c.includes(l));
-  return { clusters, longs, archives, dirs, members, has, values, letter };
+  // The words an option other than `-f`/`--file` took as its value (round 44, Sol and Astra).
+  const optionValues = [...longs.filter(([h]) => h !== "--file").map(([, v]) => v), ...shortValues].filter((v): v is string => v !== undefined);
+  return { clusters, longs, archives, dirs, members, has, values, letter, optionValues };
 }
 
 // Whether ps prints environments (round 42, all four), read as procps-ng 4 reads its words: a
@@ -2191,8 +2195,9 @@ export function psEnvironments(args: string[]): boolean {
       if (!unix && a[k] === "e") return true;
       if (valued.includes(a[k])) {
         const value = k < a.length - 1 ? a.slice(k + 1) : args[++i];
-        // A value the UNIX reading may refuse (`-uaxe` names the user `axe`) sends it to BSD.
-        if (unix && (value === undefined || (k < a.length - 1 && !"oO".includes(a[k])))) again = true;
+        // A value the UNIX reading may refuse (`-uaxe` names the user `axe`) sends it to BSD; a
+        // process list of digits or a command name it takes (round 44, Sol and Astra: `-p1`).
+        if (unix && (value === undefined || (k < a.length - 1 && !"oOC".includes(a[k]) && !("pqs".includes(a[k]) && /^\d+(,\d+)*$/.test(value))))) again = true;
         if ("oO".includes(a[k]) && value !== undefined) formats.push(value);
         break;
       }
@@ -2200,6 +2205,20 @@ export function psEnvironments(args: string[]): boolean {
     }
   }
   if (unixE && again) return true;
+  // (Round 44, Opus: read again as BSD, `-u` in `ps -xu -e` takes no value, so `-e` is BSD `e`.)
+  if (again) {
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (!a.startsWith("-") || a.startsWith("--")) continue;
+      for (let k = 1; k < a.length; k++) {
+        if (a[k] === "e") return true;
+        if (PS_BSD_VALUED.includes(a[k])) {
+          if (k === a.length - 1) i++;
+          break;
+        }
+      }
+    }
+  }
   return formats.some((f) => {
     for (const field of f.split(/[\s,]+/)) {
       if (field.split(/[=:]/)[0].replace(/^[+-]/, "") === "environ") return true;
@@ -2225,7 +2244,7 @@ const XZ_LONGS = `compress decompress uncompress test list keep force stdout to-
 const COMPRESSORS: Record<string, CompressorTable> = {
   gzip: { family: "gzip", valued: "Sb", attached: "", prefixes: true, longValued: ["suffix", "bits"], longs: "ascii to-stdout stdout decompress uncompress force help keep list license no-name name quiet silent synchronous recursive suffix test verbose version fast best lzw bits rsyncable".split(" ") },
   xz: { family: "xz", valued: "SFCTM", attached: "", prefixes: true, longValued: ["suffix", "format", "check", "threads", "block-size", "block-list", "flush-timeout", "memlimit-compress", "memlimit-decompress", "memlimit-mt-decompress", "memlimit", "filters", ...[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `filters${n}`)], longs: XZ_LONGS },
-  zstd: { family: "zstd", valued: "D", attached: "TBMbei", prefixes: false, longValued: ["trace", "filelist", "output-dir-flat", "output-dir-mirror", "patch-from"], longs: [] },
+  zstd: { family: "zstd", valued: "", attached: "TBMbei", prefixes: false, longValued: ["trace", "filelist", "output-dir-flat", "output-dir-mirror", "patch-from"], longs: [] },
   bzip2: { family: "bzip2", valued: "", attached: "", prefixes: false, longValued: [], longs: [] },
 };
 for (const [alias, base, extra] of [["gunzip", "gzip", "d"], ["zcat", "gzip", "dc"], ["unxz", "xz", "d"], ["xzcat", "xz", "dc"], ["lzma", "xz", ""], ["unlzma", "xz", "d"], ["lzcat", "xz", "dc"], ["unzstd", "zstd", "d"], ["zstdcat", "zstd", "dc"], ["zstdmt", "zstd", ""], ["bunzip2", "bzip2", "d"], ["bzcat", "bzip2", "dc"]] as const) {
@@ -2259,12 +2278,13 @@ export function compressorReading(name: string, args: string[]) {
     } else if (a.startsWith("-") && a.length > 1) {
       for (let k = 1; k < a.length; k++) {
         letters.push(a[k]);
-        if (table.family === "zstd" && a[k] === "o") {
+        // (zstd's `-o` and `-D` each take the next word, the cluster going on: `-Do DICT OUT`.)
+        if (table.family === "zstd" && (a[k] === "o" || a[k] === "D")) {
           if (a[k + 1] === "=") {
-            outputs.push(a.slice(k + 2));
+            if (a[k] === "o") outputs.push(a.slice(k + 2));
             break;
           }
-          if (i + 1 < args.length) outputs.push(args[++i]);
+          if (i + 1 < args.length) (a[k] === "o" ? outputs : []).push(args[++i]);
           continue;
         }
         if (table.attached.includes(a[k])) break;
@@ -2282,7 +2302,9 @@ export function compressorReading(name: string, args: string[]) {
   // A decompression by any prefix getopt would take: the side that adds a write.
   const decompress = !!table.decompress || letters.includes("d") || longs.some((h) => h.length > 0 && ("decompress".startsWith(h.replace(/^--/, "")) || "uncompress".startsWith(h.replace(/^--/, ""))));
   const removes = long("rm");
-  return { operands, outputs, decompress, inPlace: !(stdout || test || list) && (!outputs.length || removes), family: table.family };
+  // (Round 44, Sol: a listing or a test writes no `-o` file either.)
+  const reads = test || list;
+  return { operands, outputs: reads ? [] : outputs, decompress, reads, inPlace: !(stdout || reads) && (!outputs.length || removes), family: table.family };
 }
 
 // A directory there now; false for anything else, a link loop included (round 40, Sol: ELOOP).
@@ -2886,7 +2908,11 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
     if (r.operands.some((a) => /^[^/]*:/.test(a))) return worst(verdict, ask("rsync copies to or from a remote host"));
     if (r.daemon) return worst(verdict, ask("rsync --daemon starts a server"));
     if (r.server) return worst(verdict, classify("rsync --server writes what its standard input sends"));
-    const outputs = [...["log-file", "write-batch", "only-write-batch", "backup-dir", "partial-dir", "temp-dir"].flatMap((n) => r.values(n)), ...r.shorts.filter(([l]) => l === "T").map(([, v]) => v ?? "")];
+    // (Round 44, Opus: what `-M`/`--remote-option` hands the receiving side, which for a local
+    // copy is this machine, is read as rsync's own words: `-M--log-file=../x`.)
+    const remote = rsyncReading([...r.shorts.filter(([l]) => l === "M").map(([, v]) => v ?? ""), ...r.values("remote-option")]);
+    const places = (x: ReturnType<typeof rsyncReading>) => [...["log-file", "write-batch", "only-write-batch", "backup-dir", "partial-dir", "temp-dir"].flatMap((n) => x.values(n)), ...x.shorts.filter(([l]) => l === "T").map(([, v]) => v ?? "")];
+    const outputs = [...places(r), ...places(remote)];
     if (outputs.some((f) => /(^|\/)\.git(\/|$)/.test(resolveWord(f, scope) ?? f))) return worst(verdict, ask("rsync writes a file in a .git directory"));
     if (outputs.length) {
       const w = writeTargets("tee", ["--", ...outputs], scope);
@@ -3003,6 +3029,9 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
     // (Round 42, Mythos: read by position, compressorReading; `-o` names a file it writes.)
     const z = compressorReading(name, args);
     if (z && [...(z.inPlace ? z.operands : []), ...z.outputs].some((a) => /(^|\/)\.git(\/|$)/.test(resolveWord(a, scope) ?? a))) return worst(verdict, ask(`${name} writes in a .git directory`));
+    // (Round 44, Opus: a decompression in place names its output by the input less its suffix:
+    // `gzip -d sub/.git.gz` writes `sub/.git`.)
+    if (z && z.decompress && z.inPlace && z.operands.some((a) => /^\.git(?!ignore|attributes|modules|keep|blame)./.test(a.split("/").at(-1) ?? ""))) return worst(verdict, ask(`${name} -d writes a file named .git`));
     for (const a of operands(args)) {
       if (!isLocal(resolveWord(a, scope), scope)) return worst(verdict, classify(`${name} with a path outside the working directory`));
     }

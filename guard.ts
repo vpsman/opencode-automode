@@ -4377,7 +4377,7 @@ function programProblem(name: string, args: string[], cwd?: string, inProject?: 
     // (Round 42, Opus: any word that could name a remote archive, not only those the reader takes
     // for one, so this check does not lean on the reader's option values; a member the reader
     // lists is no archive, round 43, Sol and Astra: `tar -tf a.tar notes:today`.)
-    if ((t.archives.some((a) => /^[^/]*:/.test(a)) || args.some((a) => /^(-[a-zA-Z]*f)?[^-/][^/]*:/.test(a) && !t.members.includes(a))) && !t.has("force-local")) return ask("tar with an archive on a remote host runs a remote shell");
+    if ((t.archives.some((a) => /^[^/]*:/.test(a)) || args.some((a) => /^(-[a-zA-Z]*f)?[^-/][^/]*:/.test(a) && !t.members.includes(a) && !t.optionValues.includes(a))) && !t.has("force-local")) return ask("tar with an archive on a remote host runs a remote shell");
   }
   if (name === "sort" && longOption(args, ["--compress-program"])) return ask("sort --compress-program runs a program");
   // Council project review 2 (Mythos): the compilers and build tools the rules allow by name, with
@@ -4954,6 +4954,8 @@ function tarOutputsPlain(words: string[]): string[] {
 function compressorWrites(name: string, args: string[]): { files: string[]; dirs: string[] } {
   const files: string[] = [];
   const dirs: string[] = [];
+  // (Round 44, Sol: a listing or a test writes nothing, `zstd --list -o out f.zst`.)
+  if (compressorReading(name, args)?.reads) return { files, dirs };
   const short = (letter: string, into: string[]) => {
     for (let i = 0; i < args.length; i++) {
       const a = args[i];
@@ -5358,8 +5360,16 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
         else if (a.startsWith("--output=")) add(a.slice(9), false);
       });
       else if (name === "sort") {
-        const got = getopt(args, { flags: "bdfghiMnrRsuVz", values: "otkS", long: Object.fromEntries([...longs("value", "output key field-separator buffer-size parallel temporary-directory files0-from compress-program"), ...longs("flag", "reverse unique numeric-sort general-numeric-sort human-numeric-sort month-sort version-sort random-sort stable ignore-case dictionary-order ignore-leading-blanks ignore-nonprinting zero-terminated")]) });
+        // (Round 44, Opus: -c, -C and -m are flags, -T takes a value; an option the table does
+        // not hold is a write the check cannot place.)
+        const got = getopt(args, { flags: "bcCdfghimMnrRsuVz", values: "otkST", long: Object.fromEntries([...longs("value", "output key field-separator buffer-size parallel temporary-directory files0-from compress-program"), ...longs("flag", "reverse unique numeric-sort general-numeric-sort human-numeric-sort month-sort version-sort random-sort stable ignore-case dictionary-order ignore-leading-blanks ignore-nonprinting zero-terminated")]) });
         for (const o of got.opts) if (["-o", "--output"].includes(o.name)) add(o.value, false);
+        // (Only where an `-o` could stand behind the option the table does not hold.)
+        if (got.unknown && args.some((a) => /^-[a-zA-Z]*o|^--o/.test(a))) {
+          const why = `sort ${got.unknown}: an option the check cannot read, so it cannot list what is written`;
+          unlisted.push({ cmd, reason: why, dirs: [] });
+          unknown ??= why;
+        }
       }
       else if (name === "tree") valued(args, "o", "--never").forEach((f) => add(f, false));
       else if (name === "less") [...valued(args, "o", "--log-file"), ...valued(args, "O", "--LOG-FILE")].forEach((f) => add(f, false));

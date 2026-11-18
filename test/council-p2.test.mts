@@ -1073,7 +1073,7 @@ test("round 42: rsync and tar options by their real tables, compressors by posit
   const tars = ["tar --backup -I ./x.sh -cf a.tar f", "tar --occurrence -I ./x.sh -xf a.tar", "tar --backup -F ./x.sh -cf a.tar f", "tar --backup -L 1 -cf a.tar f", "tar -c --backup -f h:a.tar f", "tar --list -I ./x.sh -f a.tar", "tar --list -M -f a.tar", "tar --list -f host:a.tar", "tar -cf a.tar --remove-files --backup .git", "tar -tf host:x --xattrs-include --force-local"];
   const rsyncs = ["rsync -e ./x.sh --munge-links x:y z", "rsync --munge-links --remove-source-files ../out/victim g", "rsync --munge-links --daemon", "rsync f --checksum host:dst", "rsync --backup host:/etc/passwd d/", "rsync --partial f ~/.bashrc", "rsync -a --backup --remove-source-files ~/docs/ d/", "rsync --partial --daemon", "rsync --read-batch=b ~/", "rsync --log-format -n f ~/.bashrc"];
   // Mythos: a compressor's option value is no listing, test or stdout letter.
-  const zips = ["gzip -Sc .git/HEAD", "gzip -dSc .git/hooks/pre-commitc", "xz -Flzma .git/HEAD", "xz -Ccrc32 .git/HEAD", "zstd -Ddict .git/HEAD", "zstd -o .git/x f"];
+  const zips = ["gzip -Sc .git/HEAD", "gzip -dSc .git/hooks/pre-commitc", "xz -Flzma .git/HEAD", "xz -Ccrc32 .git/HEAD", "zstd -D dict .git/HEAD", "zstd -o .git/x f"];
   // Opus, Mythos: a directory's contents bring the .git they hold; `~+` is where it runs.
   fs.mkdirSync(path.join(base, "ev", ".git"), { recursive: true });
   const copies = ["cp -r ../ev/. .", "cp -rT ../ev .", "cp -r --no-target-directory ../ev .", "rsync -a ../ev/ .", "cp -r ../ev/.git ~+", "cp -r ../ev/.git ~+/."];
@@ -1131,4 +1131,36 @@ test("round 43: tables hold no inherited names, tar's old style with a dash and 
   const s = new SessionState(repo);
   assert.equal(await effect("tar -xf a.tar --program-name -O", s), "allow");
   assert.notEqual(await effect("npm test", s), "allow");
+});
+
+// ---- round 44 ----
+
+test("round 44: ps read again as BSD takes no UNIX value, rsync -M words, sort -m/-c/-C, a decompression to .git, copies that copy nothing or follow links, option values no tar archive", async () => {
+  fs.mkdirSync(path.join(base, "ev", ".git"), { recursive: true });
+  fs.mkdirSync(path.join(base, "o2", "in", ".git"), { recursive: true });
+  fs.mkdirSync(path.join(base, "ev2"), { recursive: true });
+  if (!fs.existsSync(path.join(base, "ev2", "l"))) fs.symlinkSync("../ev", path.join(base, "ev2", "l"));
+  fs.mkdirSync(path.join(repo, "dst"), { recursive: true });
+  const asks = [
+    // Opus: `-x` sends procps to BSD, where `-u` takes nothing and `-e` is `e`.
+    "ps -xu -e", "ps -xg -e", "ps -xs -e", "ps -xu -eww",
+    // Opus: what -M hands the receiving side is held to the write test.
+    "rsync -a -M--log-file=../outside.log f g", "rsync -a -M --log-file=.git/x f g", "rsync -a --remote-option=--log-file=.git/x f g",
+    // Opus: sort's -m, -c and -C are flags before -o.
+    "sort -mo ../x f", "sort -co../x f", "sort -Co../x f", "sort -mo.git/hooks/pre-commit f",
+    // Opus: a decompression in place to a name .git; a copy that follows links.
+    "gzip -d sub/.git.gz", "xz -d sub/.git.xz", "zstd -d sub/.git.zst", "zstd -Do dict .git/out f", "cp -rL ../ev2 dst",
+  ];
+  for (const c of asks) assert.notEqual(await effect(c), "allow", c);
+  // Sol, Astra: an option's value is no archive; a process list of digits stays UNIX; a copy that
+  // copies nothing brings nothing; a listing writes no -o file.
+  // (Round 44: zstd's `-D` takes the next word, the cluster going on, as its `-o` does: in
+  // `zstd -Ddict .git/HEAD` the dictionary is `.git/HEAD`, and nothing is written; tried, 1.5.7.)
+  for (const c of ["zstd -Ddict .git/HEAD", "tar -tf a.tar --exclude notes:today", "ps -e -p1", "ps -e -p1 -o pid,comm", "rsync -an ../o2 dst/", "rsync --list-only -r ../o2 dst/", "cp --version ../o2 dst/", "zstd --list -of .git/out f.zst"]) assert.equal(await effect(c), "allow", c);
+  const s = new SessionState(repo);
+  assert.equal(await effect("zstd --list -o dst/out f.zst", s), "allow");
+  assert.equal(await effect("npm test", s), "allow");
+  const m = new SessionState(repo);
+  assert.equal(await effect("sort -mo x.test.js f", m), "allow");
+  assert.notEqual(await effect("npm test", m), "allow");
 });

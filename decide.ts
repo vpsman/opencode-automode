@@ -25,6 +25,7 @@ import {
   bare,
   makeScope,
   psEnvironments,
+  rsyncReading,
   readVerdict,
   realish,
   within,
@@ -3955,7 +3956,11 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
         }
       }
       const given = tdir !== undefined ? files.filter((f, k) => !(f === tWord && k === files.indexOf(tWord))) : files.slice(0, -1);
-      if (how === "last" && given.length && (tdir !== undefined || files.length > 1)) {
+      // (Round 44, Sol: a copy that copies nothing, an rsync dry run or listing, `cp --version`,
+      // brings nothing. Opus: `-L` copies what links lead to, so the walk follows them.)
+      const copiesNothing = (tool === "rsync" && rsyncReading(args).copiesNothing) || args.some((a) => a === "--help" || a === "--version");
+      const follow = args.some((a) => a === "--dereference" || a === "--copy-links" || /^-[a-zA-Z]*L/.test(a));
+      if (how === "last" && !copiesNothing && given.length && (tdir !== undefined || files.length > 1)) {
         const dest = herePlus(tdir ?? files.at(-1)!);
         const dir = cwdOf(cmd);
         const asFile = tdir === undefined && tool !== "rsync" && args.some((a) => a === "--no-target-directory" || /^-[a-zA-Z]*T/.test(a));
@@ -3978,7 +3983,7 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
             if (dir === undefined || tool === "ln") continue;
             const from = path.resolve(dir, tilde(src));
             if ((roots ?? []).some((r) => physical(r) === physical(from))) continue;
-            const found = gitIn(from);
+            const found = gitIn(from, follow);
             if (found !== undefined) targets.push(`${landing.replace(/\/+$/, "")}/${found}`);
           }
         }
@@ -5195,7 +5200,8 @@ function descriptorsReached(raw: string): string[] {
 }
 // Where a directory holds a `.git` at any depth (council project review 2, round 43, Mythos), as
 // a path below it; `.git` itself where the walk runs out of its budget before it could tell.
-function gitIn(dir: string, budget = { left: 4000 }, below = ""): string | undefined {
+// With `follow`, links are walked as the copy that dereferences them walks them (round 44, Opus).
+function gitIn(dir: string, follow = false, budget = { left: 4000 }, below = ""): string | undefined {
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(path.join(dir, below), { withFileTypes: true });
@@ -5206,8 +5212,14 @@ function gitIn(dir: string, budget = { left: 4000 }, below = ""): string | undef
     if (--budget.left < 0) return ".git";
     const rel = below ? `${below}/${e.name}` : e.name;
     if (e.name === ".git") return rel;
-    if (e.isDirectory()) {
-      const found = gitIn(dir, budget, rel);
+    let isDir = e.isDirectory();
+    if (follow && e.isSymbolicLink()) {
+      try {
+        isDir = fs.statSync(path.join(dir, rel)).isDirectory();
+      } catch {}
+    }
+    if (isDir) {
+      const found = gitIn(dir, follow, budget, rel);
       if (found !== undefined) return found;
     }
   }
