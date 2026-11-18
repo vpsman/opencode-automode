@@ -1193,3 +1193,29 @@ test("round 45: --help after -- is a file, copies that follow links by -k or --d
     assert.equal(await effect("npm test", s), "allow", `npm test after ${c}`);
   }
 });
+
+// ---- round 46 ----
+
+test("round 46: copies read by position before --help, zstd's other suffixes, glob classes, --copy-unsafe-links, ps lists and terminals, version queries write nothing", async () => {
+  fs.mkdirSync(path.join(base, "ev", ".git"), { recursive: true });
+  fs.mkdirSync(path.join(base, "ev2"), { recursive: true });
+  if (!fs.existsSync(path.join(base, "ev2", "l"))) fs.symlinkSync("../ev", path.join(base, "ev2", "l"));
+  fs.mkdirSync(path.join(repo, "dst"), { recursive: true });
+  fs.mkdirSync(path.join(repo, "sub"), { recursive: true });
+  for (const n of [".git.gz", ".git.xz"]) fs.writeFileSync(path.join(repo, "sub", n), "x");
+  const asks = [
+    // Opus: an option's value is no --help.
+    "cp -S --help f .git/hooks/pre-commit", "mv -S --help f .git/hooks/pre-commit", "install -S --version f .git/hooks/pre-commit", "cp --suffix --help f .git/hooks/pre-commit", "cp -S --help f ../outside",
+    // Opus: zstd strips gzip's and xz's suffixes too; classes bash reads; links out of the tree.
+    "zstd -d sub/.git.gz", "zstd -d sub/.git.xz", "gzip -d sub/.[[:alpha:]]it.gz", "gzip -d sub/.[^x]it.gz", "rsync -r --copy-unsafe-links ../ev2 dst/",
+  ];
+  for (const c of asks) assert.notEqual(await effect(c), "allow", c);
+  const s = new SessionState(repo);
+  assert.equal(await effect("cp -S --help f x.test.js", s), "allow");
+  assert.notEqual(await effect("npm test", s), "allow");
+  // Sol, Astra: lists and terminals ps takes; `-S`'s value `--`; version queries.
+  for (const c of ["ps -e -u0,root -o pid", "ps -e -t- -o pid", "ps -e -t'?' -o pid,comm", "ps -e -C -x -o pid", "cp -S -- --version f .git/fixtures/", "rsync -ani --partial-dir=.git/fixtures f dst/", "rsync --version f .git/fixtures/", "install --strip-program=strip --version", "gzip --version .git/fixtures/", "xz --version .git/fixtures/", "zstd --version -o .git/fixtures/out f"]) assert.equal(await effect(c), "allow", c);
+  const d = new SessionState(repo);
+  assert.equal(await effect("rsync -ani --partial-dir=scratch f dst/", d), "allow");
+  assert.equal(await effect("npm test", d), "allow");
+});

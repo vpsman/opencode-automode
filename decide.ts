@@ -3963,7 +3963,7 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       // `--deref` follow links too.)
       const nothing = copiesNothing(tool, args);
       const head = args.indexOf("--") < 0 ? args : args.slice(0, args.indexOf("--"));
-      const follow = head.some((a) => (a.length >= 5 && "--dereference".startsWith(a)) || a === "--copy-links" || a === "--copy-dirlinks" || (tool === "rsync" ? /^-[a-zA-Z]*[Lk]/.test(a) : /^-[a-zA-Z]*L/.test(a)));
+      const follow = head.some((a) => (a.length >= 5 && "--dereference".startsWith(a)) || a === "--copy-links" || a === "--copy-dirlinks" || a === "--copy-unsafe-links" || (tool === "rsync" ? /^-[a-zA-Z]*[Lk]/.test(a) : /^-[a-zA-Z]*L/.test(a)));
       if (how === "last" && !nothing && given.length && (tdir !== undefined || files.length > 1)) {
         const dest = herePlus(tdir ?? files.at(-1)!);
         const dir = cwdOf(cmd);

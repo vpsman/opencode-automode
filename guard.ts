@@ -5430,9 +5430,12 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       compressed.files.forEach((f) => add(f, false));
       compressed.dirs.forEach((d) => add(d, false, { dir: true }));
       if (name === "find") args.forEach((a, k) => void (/^-(fprint0?|fprintf|fls)$/.test(a) && place(args[k + 1], false)));
-      if (name === "rsync") for (const o of getopt(args, COPY_OPTIONS.rsync).opts) {
+      // (Round 46, Sol: a dry run or listing writes no backup, temp or partial files, as the rules
+      // read it; a version or help query nothing.)
+      const rs = name === "rsync" ? rsyncReading(args) : undefined;
+      if (rs && !rs.prints) for (const o of getopt(args, COPY_OPTIONS.rsync).opts) {
         if (["--log-file", "--write-batch", "--only-write-batch"].includes(o.name)) place(o.value, false);
-        if (["--backup-dir", "--temp-dir", "-T", "--partial-dir"].includes(o.name)) place(o.value, true);
+        if (["--backup-dir", "--temp-dir", "-T", "--partial-dir"].includes(o.name) && !(rs.dryRun || rs.listOnly)) place(o.value, true);
       }
       if (name === "curl" || name === "wget") {
         // Round 4, finding 17, second pass: every file each writes, where it writes it, and the

@@ -531,7 +531,9 @@ function globSecret(word: string, scope: Scope): string | undefined {
 // The names a glob in the last part of a word matches where the command runs, spelled as the
 // word spells its directory; undefined where a directory part holds a glob or cannot be read.
 function globNames(word: string, scope: Scope): string[] | undefined {
-  if (/[*?[]/.test(path.dirname(word)) || /\s/.test(word)) return undefined;
+  // (Round 46, Opus: a POSIX class, `[^`, an equivalence or collating class, or a backslash is
+  // left to the model, as this reader does not match them as bash does.)
+  if (/[*?[]/.test(path.dirname(word)) || /\s/.test(word) || /\[[:=.^]|\\/.test(word)) return undefined;
   const dir = resolveWord(path.dirname(word), scope);
   if (!dir) return undefined;
   const base = path.basename(word);
@@ -2092,7 +2094,9 @@ export function rsyncReading(args: string[]) {
   // (Round 43, Mythos: `--server` writes what standard input sends into its operand, which is no
   // source; Sol: a dry run of a batch writes nothing.)
   const server = prefixed("server") || prefixed("sender");
-  return { longs, letters, shorts, operands, dryRun, listOnly, batch, server, daemon: prefixed("daemon"), copiesNothing: !server && (dryRun || listOnly || (!batch && operands.length < 2)), values: (name: string) => longs.filter(([h]) => h === `--${name}`).map(([, v]) => v ?? "") };
+  // (Round 46, Sol: `--version`, `-V` and `--help` print and copy nothing.)
+  const prints = has("version") || has("help") || letters.includes("V");
+  return { longs, letters, shorts, operands, dryRun, listOnly, batch, server, prints, daemon: prefixed("daemon"), copiesNothing: prints || (!server && (dryRun || listOnly || (!batch && operands.length < 2))), values: (name: string) => longs.filter(([h]) => h === `--${name}`).map(([, v]) => v ?? "") };
 }
 
 // tar's command line read by position (round 41): the old style (a first word of letters without
@@ -2213,10 +2217,16 @@ const namesHere = () => {
 // Whether the UNIX reading takes a value attached to its letter (round 45, Sol and Astra): a list
 // of numbers (`-p1`, `-p+1`, `-u0`, `-p'1 2'`) for a letter that takes ids, a command name for
 // `-C`, and, where ps runs here, names this machine knows for `-u`/`-U`/`-g`/`-G`.
+// (Round 46, Sol and Astra: a list mixing ids and names, `-u0,root`; a terminal `-t-`, `-t'?'`
+// or one this machine has.)
 function psValueTaken(letter: string, value: string, here: boolean): boolean {
   if ("oOC".includes(letter)) return true;
-  if ("pqsuUgG".includes(letter) && /^\+?\d+([,\s]+\+?\d+)*$/.test(value)) return true;
-  return here && "uUgG".includes(letter) && value.split(/[,\s]+/).every((n) => n !== "" && namesHere().has(n));
+  const items = value.split(/[,\s]+/);
+  if (!items.length || items.some((n) => n === "")) return false;
+  if ("pqs".includes(letter)) return items.every((n) => /^\+?\d+$/.test(n));
+  if ("uUgG".includes(letter)) return items.every((n) => /^\+?\d+$/.test(n) || (here && namesHere().has(n)));
+  if (letter === "t") return items.every((n) => n === "-" || n === "?" || (here && /^[\w/]+$/.test(n) && ["", "tty", "pts/"].some((p) => fs.existsSync(`/dev/${p}${n}`))));
+  return false;
 }
 export function psEnvironments(args: string[], here = true): boolean {
   const formats: string[] = [];
@@ -2242,7 +2252,8 @@ export function psEnvironments(args: string[], here = true): boolean {
         // A value the UNIX reading may refuse (`-uaxe` names the user `axe`) sends it to BSD; a
         // value it takes does not (round 44 and 45, Sol and Astra). A separate word that starts
         // with `-` is refused, and the BSD reading takes it (round 45, Opus: `ps -e -u -x`).
-        if (unix && (value === undefined || (k < a.length - 1 ? !psValueTaken(a[k], value, here) : value.startsWith("-")))) again = true;
+        // (`-C` takes any word as a command's name, `-C -x` too, round 46, Astra.)
+        if (unix && (value === undefined || (k < a.length - 1 ? !psValueTaken(a[k], value, here) : value.startsWith("-") && !"oOC".includes(a[k])))) again = true;
         if ("oO".includes(a[k]) && value !== undefined) formats.push(value);
         break;
       }
@@ -2346,15 +2357,18 @@ export function compressorReading(name: string, args: string[]) {
   const long = (...names: string[]) => longs.some((h) => names.includes(h));
   const stdout = !!table.stdout || letters.includes("c") || long("stdout", "to-stdout");
   const test = letters.includes("t") || long("test");
-  const list = letters.includes("l") || long("list");
+  // (Round 46, Sol: a version, help or licence query prints and writes nothing.)
+  const prints = letters.some((l) => "VhH".includes(l) || (l === "L" && table.family !== "xz")) || long("version", "help", "long-help", "license");
+  const list = letters.includes("l") || long("list") || prints;
   // A decompression by any prefix getopt would take: the side that adds a write.
   const decompress = !!table.decompress || letters.includes("d") || longs.some((h) => h.length > 0 && ("decompress".startsWith(h.replace(/^--/, "")) || "uncompress".startsWith(h.replace(/^--/, ""))));
   const removes = long("rm");
   // (Round 44, Sol: a listing or a test writes no `-o` file either.)
   const reads = test || list;
   // (Round 45, Opus: what a decompression names its output: the input less its suffix, `-S`'s
-  // first; gzip's `-N` takes the name the archive holds, and `-r` the files a directory holds.)
-  const DEFAULT_SUFFIXES: Record<string, string[]> = { gzip: [".gz", "-gz", ".z", "-z", "_z", ".Z"], xz: [".xz", ".lzma", ".lz"], zstd: [".zst", ".zstd"], bzip2: [".bz2", ".bz"] };
+  // first; gzip's `-N` takes the name the archive holds, and `-r` the files a directory holds.
+  // Round 46, Opus: zstd also takes gzip, xz, lzma and lz4 files and strips their suffixes.)
+  const DEFAULT_SUFFIXES: Record<string, string[]> = { gzip: [".gz", "-gz", ".z", "-z", "_z", ".Z"], xz: [".xz", ".lzma", ".lz"], zstd: [".zst", ".tzst", ".gz", ".tgz", ".xz", ".txz", ".lzma", ".tlz", ".lz4", ".tlz4"], bzip2: [".bz2", ".bz"] };
   const unnamed = letters.includes("N") && table.family === "gzip" ? "-N" : letters.includes("r") || long("recursive") ? "-r" : long("name") && table.family === "gzip" ? "--name" : undefined;
   const outputName = (input: string) => {
     for (const s of [...suffixes, ...(DEFAULT_SUFFIXES[table.family] ?? [])]) if (s && input.length > s.length && input.endsWith(s)) return input.slice(0, -s.length);
@@ -2366,11 +2380,36 @@ export function compressorReading(name: string, args: string[]) {
 // A copy that copies nothing (round 45, Sol and Opus): an rsync dry run, listing or single
 // operand, and a `--help`/`--version` (by a prefix getopt takes) among the option words before
 // `--` of cp, mv, ln or install.
+// (Round 46, Opus and Astra: read by position, an option's value is no `--help`, `cp -S --help`,
+// and no `--` either, `cp -S -- --version`.)
+const COPY_VALUED: Record<string, { short: string; long: string[] }> = {
+  cp: { short: "St", long: ["suffix", "target-directory", "no-preserve", "sparse"] },
+  mv: { short: "St", long: ["suffix", "target-directory"] },
+  ln: { short: "St", long: ["suffix", "target-directory"] },
+  install: { short: "Stgmo", long: ["suffix", "target-directory", "group", "mode", "owner", "strip-program"] },
+};
 export function copiesNothing(name: string, args: string[]): boolean {
   if (name === "rsync") return rsyncReading(args).copiesNothing;
-  if (!["cp", "mv", "ln", "install"].includes(name)) return false;
-  const head = args.indexOf("--") < 0 ? args : args.slice(0, args.indexOf("--"));
-  return head.some((a) => (a.length >= 3 && "--help".startsWith(a)) || (a.length >= 6 && "--version".startsWith(a)));
+  const table = Object.hasOwn(COPY_VALUED, name) ? COPY_VALUED[name] : undefined;
+  if (!table) return false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") return false;
+    if (a.startsWith("--")) {
+      const word = a.slice(2).split("=")[0];
+      if (word && "help".startsWith(word)) return true;
+      if (word.length >= 4 && "version".startsWith(word)) return true;
+      if (!a.includes("=") && word && table.long.some((n) => n.startsWith(word))) i++;
+    } else if (a.startsWith("-") && a.length > 1) {
+      for (let k = 1; k < a.length; k++) {
+        if (table.short.includes(a[k])) {
+          if (k === a.length - 1) i++;
+          break;
+        }
+      }
+    }
+  }
+  return false;
 }
 
 // A directory there now; false for anything else, a link loop included (round 40, Sol: ELOOP).
@@ -3071,7 +3110,7 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   if ((name === "zip" && args.some((a) => a === "-TT" || longIs(a, "unzip-command"))) ) return worst(verdict, classify("zip -TT runs a program"));
   // (Round 35, Mythos: install -s runs the strip program on what it copied.)
   // (Round 36: `--strip-` is already a prefix getopt takes.)
-  if (name === "install" && args.some((a) => a.split("=")[0].startsWith("--strip-") && longIs(a, "strip-program"))) return worst(verdict, classify("install --strip-program runs a program on the file it writes"));
+  if (name === "install" && !copiesNothing(name, args) && args.some((a) => a.split("=")[0].startsWith("--strip-") && longIs(a, "strip-program"))) return worst(verdict, classify("install --strip-program runs a program on the file it writes"));
   // (Round 45, Sol: a copy that copies nothing writes nothing, `cp --version f dst/`.)
   if (WRITERS[name] && copiesNothing(name, args)) return verdict;
   if (WRITERS[name]) return worst(verdict, writeTargets(name, args, scope, !!cmd.heredoc && !cmd.expands));
