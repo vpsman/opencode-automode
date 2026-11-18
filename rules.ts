@@ -442,7 +442,7 @@ const PATTERN_FIRST = new Set(["grep", "egrep", "fgrep", "rg", "ag", "ack", "sed
 function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope): string | undefined {
   if (NAMES_ONLY.has(name)) return undefined;
   // (Round 51, Sol and Astra: a call that only prints its help or version reads no file.)
-  if (printsOnly(name, args)) return undefined;
+  if (printsOnly(name, args) || (name === "rsync" && rsyncReading(args).prints)) return undefined;
   // (Round 51, Sol: sort's files are its operands and its option values, read by position.)
   if (name === "sort") {
     for (const w of sortReading(args).reads) {
@@ -2112,7 +2112,7 @@ export function rsyncReading(args: string[]) {
   // help written into it (Opus): help writes nothing only where it comes first.)
   const isHelp = ([h, v]: [string, string | undefined]) => h === "--help" || ((h === "--info" || h === "--debug") && (v ?? "").split(",").some((t) => /^help\d*$/i.test(t)));
   const firstHelp = longs.findIndex(isHelp);
-  const firstLog = longs.findIndex(([h]) => h === "--log-file");
+  const firstLog = longs.findIndex(([h, v]) => h === "--log-file" && v !== "");
   const help = firstHelp >= 0 && (firstLog < 0 || firstHelp < firstLog);
   const prints = has("version") || firstHelp >= 0 || letters.includes("V");
   return { longs, letters, shorts, operands, dryRun, listOnly, batch, server, prints, help, daemon: prefixed("daemon"), copiesNothing: prints || (!server && (dryRun || listOnly || (!batch && operands.length < 2))), values: (name: string) => {
@@ -2287,6 +2287,9 @@ export function psEnvironments(args: string[], here = true): boolean {
     if (unix && a.slice(1).split(/[oO]/)[0].includes("e")) unixE = true;
     for (let k = unix ? 1 : 0; k < a.length; k++) {
       if (!unix && a[k] === "e") return true;
+      // (Round 53, Opus: procps takes the rest of the word as `-D`'s date format and still reads
+      // its letters as options, `ps -Doenviron`: they are read on.)
+      if (unix && a[k] === "D" && k < a.length - 1) continue;
       if (valued.includes(a[k])) {
         const value = k < a.length - 1 ? a.slice(k + 1) : args[++i];
         // (Round 48, Opus: a UNIX `-O` given BSD sort keys, `-O p`, `-O +pt`, is refused by the
@@ -2397,7 +2400,15 @@ export function compressorReading(name: string, args: string[]) {
           if (i + 1 < args.length) (a[k] === "o" ? outputs : []).push(args[++i]);
           continue;
         }
-        if (table.attached.includes(a[k])) break;
+        // (Round 53, Astra: zstd reads the number after `-T` and goes on, `-T1V` is `-T1 -V`.)
+        if (table.attached.includes(a[k])) {
+          if (table.family !== "zstd") break;
+          while (k + 1 < a.length && /[0-9]/.test(a[k + 1])) k++;
+          if (k + 1 < a.length && /[KM]/.test(a[k + 1])) k++;
+          if (k + 1 < a.length && a[k + 1] === "i") k++;
+          if (k + 1 < a.length && a[k + 1] === "B") k++;
+          continue;
+        }
         if (table.valued.includes(a[k])) {
           const value = k === a.length - 1 ? args[++i] : a.slice(k + 1);
           if (a[k] === "S" && value !== undefined) suffixes.push(value);
@@ -2492,6 +2503,7 @@ export function sortReading(args: string[]): { compressor: boolean; outputs: str
   const lists: string[] = [];
   let source: string | undefined;
   let random = false;
+  const keys: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--") {
@@ -2512,6 +2524,7 @@ export function sortReading(args: string[]): { compressor: boolean; outputs: str
       if (name === "files0-from" && value !== undefined) lists.splice(0, lists.length, value);
       if (name === "random-source" && value !== undefined) source = value;
       if (name === "random-sort" || (name === "sort" && value !== undefined && "random".startsWith(value) && value !== "")) random = true;
+      if (name === "key" && value !== undefined) keys.push(value);
       if (name === "help" || name === "version") prints = true;
     } else if (a.startsWith("-") && a.length > 1) {
       for (let k = 1; k < a.length; k++) {
@@ -2522,12 +2535,18 @@ export function sortReading(args: string[]): { compressor: boolean; outputs: str
         if ("koStT".includes(a[k])) {
           const value = k === a.length - 1 ? args[++i] : a.slice(k + 1);
           if (a[k] === "o" && value !== undefined) outputs.push(value);
+          if (a[k] === "k" && value !== undefined) keys.push(value);
           break;
         }
       }
     } else reads.push(a);
   }
-  reads.push(...lists, ...(random && source !== undefined ? [source] : []));
+  // (Round 53, Opus, Sol, Astra: a key with `R` among its modifiers sorts at random; a key with
+  // any modifier of its own takes none of the global ordering options, so a global `-R` is a
+  // random sort only where some key has none, or there are no keys.)
+  const modifiers = (key: string) => key.replace(/[0-9.,]/g, "");
+  const randomized = keys.some((key) => modifiers(key).includes("R")) || (random && (keys.length === 0 || keys.some((key) => modifiers(key) === "")));
+  reads.push(...lists, ...(randomized && source !== undefined ? [source] : []));
   return prints ? { compressor: false, outputs: [], prints, reads: [], lists: [] } : { compressor, outputs, prints, reads, lists };
 }
 export const sortRunsCompressor = (args: string[]) => sortReading(args).compressor;
@@ -2557,6 +2576,7 @@ export function printsOnly(name: string, args: string[]): boolean {
       if (a === "-V" || a === "V") return true;
       const valued = unix ? PS_UNIX_VALUED : PS_BSD_VALUED;
       for (let k = unix ? 1 : 0; k < a.length; k++) {
+        if (unix && a[k] === "D" && k < a.length - 1) continue;
         if (valued.includes(a[k])) {
           if (k === a.length - 1) i++;
           break;
@@ -2568,7 +2588,11 @@ export function printsOnly(name: string, args: string[]): boolean {
   const z = compressorReading(name, args);
   if (z) return z.prints;
   if (["cp", "mv", "ln", "install"].includes(name)) return copiesNothing(name, args);
-  if (name === "rsync") return rsyncReading(args).help;
+  // (Round 53, Sol: a version query reads nothing; it writes its log, which rsync's own checks read.)
+  if (name === "rsync") {
+    const r = rsyncReading(args);
+    return r.help || (r.prints && !r.values("log-file").length);
+  }
   // (The compressors' queries are read by compressorReading, as writing nothing.)
   return false;
 }

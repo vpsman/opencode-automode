@@ -3918,10 +3918,12 @@ function optionNamedPath(cmds: Simple[], dirsOf: (cmd: Simple) => string[] | und
 // word. The landed path is walked as the kernel walks it (a link to `.git` counts), and read from
 // the project's top down where it lies in the project (a project kept under a directory of such
 // a name is not written "into" it by every write).
-// File tools that run no program of their words (round 52): a word behind one is no command.
-const PLAIN_TOOLS = new Set(
-  `sort cat head tail wc grep egrep fgrep ls cut tr uniq diff cmp comm nl tac rev fold paste join column stat file du basename dirname readlink
-   realpath echo printf jq yq tree bat seq cp mv ln install rsync tee truncate touch mkdir rmdir chmod chown chgrp setfacl shred unlink rm`.split(/\s+/),
+// Programs that may run a command their words name, which the parser (`programs`) does not look
+// through (round 53): behind one, a word named like a writer is still taken for that writer.
+const MAY_RUN = new Set(
+  `parallel watch ssh su script flock chroot unshare nsenter setsid stdbuf ionice chrt taskset runuser doas firejail bwrap strace ltrace gdb
+   valgrind time nohup exec busybox toybox fakeroot proot catchsegv systemd-run xvfb-run dbus-run-session npx bunx pnpx uvx pipx npm pnpm yarn bun
+   deno uv poetry pipenv pdm hatch bundle cargo go make just task mise asdf direnv nix nix-shell devbox docker podman kubectl git`.split(/\s+/),
 );
 // `~+` is the directory the command runs in (round 42, Mythos).
 const herePlus = (word: string) => (word === "~+" ? "." : word.startsWith("~+/") ? `.${word.slice(2)}` : word);
@@ -3939,9 +3941,12 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
     cmd.argv.forEach((word, at) => {
       if (!placed.includes(at) && quiet.some((p) => p < at)) return;
       // (Round 52, Astra: behind a plain file tool, which runs no program, a word named like a
-      // writer is an operand: `sort -- cp .git/report` sorts two files.)
+      // writer is an operand: `sort -- cp .git/report` sorts two files. Round 53, Sol and Astra:
+      // the other way round, so every reader is covered (`od`, `sha256sum`, `tar -tf cp`): a word
+      // the parser places no command at is one only behind a program that may run a command its
+      // words name and that the parser does not look through, MAY_RUN.)
       const owner = placed.filter((p) => p < at).at(-1);
-      if (!placed.includes(at) && owner !== undefined && PLAIN_TOOLS.has(path.basename(cmd.argv[owner]))) return;
+      if (!placed.includes(at) && owner !== undefined && !MAY_RUN.has(path.basename(cmd.argv[owner]))) return;
       const how = Object.hasOwn(WRITER_OPERANDS, path.basename(word)) ? WRITER_OPERANDS[path.basename(word)] : undefined;
       const args = cmd.argv.slice(at + 1);
       // (Round 50, Sol: a copy that copies nothing names no destination and makes no file.)

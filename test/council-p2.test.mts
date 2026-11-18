@@ -1303,3 +1303,12 @@ test("round 52: ps -D takes a value, sort's last list and its random source, a w
   // Sol, Astra: what sort does not read, a file named cp, a version query.
   for (const c of ["ps --date-format=x --help aux e", "ps -D x -p 1", "sort -- cp .git/report", "sort --random-source=.netrc f", "sort --files0-from=.netrc --files0-from=files", "rsync --version example:foo"]) assert.equal(await effect(c), "allow", c);
 });
+
+// ---- round 53 ----
+
+test("round 53: ps reads on after -D's attached value, sort's random keys, a writer's name is a command only behind a runner, zstd's numbers, rsync's queries", async () => {
+  // Opus: `-Doenviron` prints environments; a key with R reads the random source.
+  for (const c of ["ps -Doenviron", "ps -DOenviron", "ps -p1 -Doenviron", "sort -k1R --random-source=.env f", "sort --key=1R --random-source=.env f", "sort -R -k1 --random-source=.netrc f", "parallel cp f .git/x", "ssh host cp f .git/x", "find . -exec cp f .git/x ;", "zstd -T1 .netrc", "rsync --version --log-file=.git/x f"]) assert.notEqual(await effect(c), "allow", c);
+  // Sol, Astra: a key's own ordering, a file named cp behind a reader, zstd -T1V, rsync queries.
+  for (const c of ["sort -R -k1,1n --random-source=.netrc rows", "sha256sum -- cp .git/report", "od -- cp .git/report", "tar -tf cp -- .git/report", "zstd -T1V .netrc", "rsync --version --stats .netrc f", "rsync --log-file= --help .netrc f"]) assert.equal(await effect(c), "allow", c);
+});
