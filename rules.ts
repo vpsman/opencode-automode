@@ -2221,10 +2221,11 @@ export function tarReading(args: string[]) {
 // (Round 43, Mythos: where the UNIX reading fails, a letter that is no UNIX option, `-ex`, or a
 // letter that takes a value with none left, `-e -t`, procps reads the dash words again as BSD
 // ones, and a UNIX `e` then prints environments. Opus: `-N` is a flag; `--format:` takes a value.)
-const PS_UNIX_VALUED = "CGgoOpqstuU";
+// (Round 52, Opus: procps-ng 4's `-D`/`--date-format` takes a value too.)
+const PS_UNIX_VALUED = "CDGgoOpqstuU";
 const PS_UNIX_FLAGS = "AacdefFHjLlMmNPTVwyZ";
 const PS_BSD_VALUED = "oOkpqtU";
-const PS_LONG_VALUED = /^--(format|sort|cols|columns|width|rows|lines|pid|ppid|tty|user|User|group|Group|sid|quick-pid)$/;
+const PS_LONG_VALUED = /^--(format|sort|cols|columns|width|rows|lines|pid|ppid|tty|user|User|group|Group|sid|quick-pid|date-format)$/;
 // The user and group names this machine knows (round 45: an attached name the UNIX reading takes).
 let knownNames: Set<string> | undefined;
 const namesHere = () => {
@@ -2244,7 +2245,7 @@ const namesHere = () => {
 // (Round 46, Sol and Astra: a list mixing ids and names, `-u0,root`; a terminal `-t-`, `-t'?'`
 // or one this machine has.)
 function psValueTaken(letter: string, value: string, here: boolean): boolean {
-  if ("oOC".includes(letter)) return true;
+  if ("oOCD".includes(letter)) return true;
   const items = value.split(/[,\s]+/);
   if (!items.length || items.some((n) => n === "")) return false;
   if ("pqs".includes(letter)) return items.every((n) => /^\+?\d+$/.test(n));
@@ -2298,7 +2299,7 @@ export function psEnvironments(args: string[], here = true): boolean {
         // with `-` is refused, and the BSD reading takes it (round 45, Opus: `ps -e -u -x`).
         // (`-C` takes any word as a command's name, `-C -x` too, round 46, Astra.)
         // (Round 47, Sol and Astra: `-t -` names no terminal, as `-t-` does.)
-        if (unix && (value === undefined || (k < a.length - 1 ? !psValueTaken(a[k], value, here) : value.startsWith("-") && !"oOC".includes(a[k]) && !(a[k] === "t" && value === "-")))) again = true;
+        if (unix && (value === undefined || (k < a.length - 1 ? !psValueTaken(a[k], value, here) : value.startsWith("-") && !"oOCD".includes(a[k]) && !(a[k] === "t" && value === "-")))) again = true;
         if ("oO".includes(a[k]) && value !== undefined) formats.push(value);
         break;
       }
@@ -2489,6 +2490,8 @@ export function sortReading(args: string[]): { compressor: boolean; outputs: str
   const outputs: string[] = [];
   const reads: string[] = [];
   const lists: string[] = [];
+  let source: string | undefined;
+  let random = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--") {
@@ -2504,14 +2507,18 @@ export function sortReading(args: string[]): { compressor: boolean; outputs: str
       if (!name) prints = true;
       if (name === "compress-program") compressor = true;
       if (name === "output" && value !== undefined) outputs.push(value);
-      if ((name === "files0-from" || name === "random-source") && value !== undefined) reads.push(value);
-      if (name === "files0-from" && value !== undefined) lists.push(value);
+      // (Round 52, Sol and Astra: only the last `--files0-from` is read, and `--random-source` only
+      // in a random sort.)
+      if (name === "files0-from" && value !== undefined) lists.splice(0, lists.length, value);
+      if (name === "random-source" && value !== undefined) source = value;
+      if (name === "random-sort" || (name === "sort" && value !== undefined && "random".startsWith(value) && value !== "")) random = true;
       if (name === "help" || name === "version") prints = true;
     } else if (a.startsWith("-") && a.length > 1) {
       for (let k = 1; k < a.length; k++) {
         // (`-y` takes only a value in its own word, `-yk`; alone it takes nothing: `sort -y --
         // -output` sorts the file `-output`, tried.)
         if (a[k] === "y") break;
+        if (a[k] === "R") random = true;
         if ("koStT".includes(a[k])) {
           const value = k === a.length - 1 ? args[++i] : a.slice(k + 1);
           if (a[k] === "o" && value !== undefined) outputs.push(value);
@@ -2520,6 +2527,7 @@ export function sortReading(args: string[]): { compressor: boolean; outputs: str
       }
     } else reads.push(a);
   }
+  reads.push(...lists, ...(random && source !== undefined ? [source] : []));
   return prints ? { compressor: false, outputs: [], prints, reads: [], lists: [] } : { compressor, outputs, prints, reads, lists };
 }
 export const sortRunsCompressor = (args: string[]) => sortReading(args).compressor;
@@ -3165,7 +3173,8 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   // beyond the source (held to rm's test outside the project and for .git, rounds 39 and 40).
   if (name === "rsync") {
     const r = rsyncReading(args);
-    if (r.operands.some((a) => /^[^/]*:/.test(a))) return worst(verdict, ask("rsync copies to or from a remote host"));
+    // (Round 52, Astra: a version query reaches no host.)
+    if (!r.prints && r.operands.some((a) => /^[^/]*:/.test(a))) return worst(verdict, ask("rsync copies to or from a remote host"));
     if (r.daemon && !r.prints) return worst(verdict, ask("rsync --daemon starts a server"));
     if (r.server && !r.prints) return worst(verdict, classify("rsync --server writes what its standard input sends"));
     // (Round 44, Opus: what `-M`/`--remote-option` hands the receiving side, which for a local

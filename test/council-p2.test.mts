@@ -1294,3 +1294,12 @@ test("round 51: help and version queries read and run nothing, in every layer; s
   assert.equal(await effect("sort --ver --output=report", s), "allow");
   assert.equal(await effect("npm test", s), "allow");
 });
+
+// ---- round 52 ----
+
+test("round 52: ps -D takes a value, sort's last list and its random source, a writer's name behind a plain tool, rsync's version reaches no host", async () => {
+  // Opus: `--help` as -D's value is no help, and `e` then prints environments.
+  for (const c of ["ps -D --help aux e", "ps -eD --help e", "ps -D V axe", "ps --date-format --help e", "sort --files0-from=files --files0-from=.netrc", "sort -R --random-source=.netrc f", "sort --sort=random --random-source=.netrc f", "rsync -a f example:foo"]) assert.notEqual(await effect(c), "allow", c);
+  // Sol, Astra: what sort does not read, a file named cp, a version query.
+  for (const c of ["ps --date-format=x --help aux e", "ps -D x -p 1", "sort -- cp .git/report", "sort --random-source=.netrc f", "sort --files0-from=.netrc --files0-from=files", "rsync --version example:foo"]) assert.equal(await effect(c), "allow", c);
+});

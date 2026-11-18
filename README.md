@@ -155,7 +155,11 @@ For each shell tool call:
      function; the message of `git stash push -m` is read like any other
      word. A word named like a credential file is read as a file wherever it stands, except
      where git only names it to filter commits: `git show HEAD:secrets.json`, `git diff` and
-     `git log -p secrets.json` ask, `git log -1 secrets.json` (no patch) does not.
+     `git log -p secrets.json` ask, `git log -1 secrets.json` (no patch) does not; and except
+     in a call that only prints its help or version (sort, tar, ps, cp/mv/ln/install, rsync and
+     the compressors, read by each tool's own options: `gzip --help .netrc` reads nothing), and
+     for sort's own reading (only its last `--files0-from`, and `--random-source` only in a
+     random sort).
    - **Per command**, also inside `sh -c`, `sudo`, `xargs`, with the program named by path
      (`/usr/bin/npm`), and behind every wrapper and runner the rules look through
      (`timeout 60`, `nice -n 5`, `uv run`, `poetry run`, `pipenv run`, `pdm run`,
