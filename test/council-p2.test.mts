@@ -901,3 +901,34 @@ test("round 34: a second ~ in a made word's prefix, signed brace padding, unitte
   const { scoreCommand } = await import("../kev.ts");
   assert.ok("error" in (await scoreCommand({ ...DEFAULT_CLASSIFIER, timeoutMs: 4294967296 }, { tool: "bash", cwd: repo, command: "ls" })));
 });
+
+// ---- round 35 ----
+
+test("round 35: unittest names the project defines, compiler options from a stream, install --strip-program, rsync's empty host, cp -vt, git log past -C, brace words bash drops", async () => {
+  // All four: unittest walks any attribute after the module and calls what it reaches.
+  const p = fs.realpathSync(fs.mkdtempSync(path.join(base, "r35-")));
+  try {
+    fs.mkdirSync(path.join(p, "tests"));
+    fs.writeFileSync(path.join(p, "tests", "__init__.py"), "");
+    fs.writeFileSync(path.join(p, "tests", "test_a.py"), "import unittest\n\nclass TestA(unittest.TestCase):\n    def test_one(self):\n        pass\n");
+    fs.mkdirSync(path.join(p, "code"));
+    fs.mkdirSync(path.join(p, "json"));
+    execFileSync("git", ["init", "-q", p]);
+    const at = async (c: string) => (await decideShell(guard, new SessionState(p), p, c)).effect;
+    for (const c of ["python3 -m unittest tests.test_a", "python3 -m unittest tests.test_a.TestA", "python3 -m unittest tests.test_a.TestA.test_one", "python3 -m unittest tests/test_a.py"]) assert.equal(await at(c), "allow", c);
+    for (const c of ["echo x | python3 -m unittest tests.test_a.unittest.case.sys.breakpointhook", "echo x | python3 -m unittest code.interact", "python3 -m unittest json.dumps", "python3 -m unittest tests.test_a.TestB"]) assert.notEqual(await at(c), "allow", c);
+  } finally {
+    fs.rmSync(p, { recursive: true, force: true });
+  }
+  // Mythos: options from standard input, a descriptor or a process substitution.
+  for (const c of ["printf x | rustc @/dev/stdin m.rs", "rustc @<(printf x) m.rs", "gcc @/dev/stdin g.c", "gcc -Wl,@/dev/stdin g.c", "clang --config /dev/stdin g.c"]) assert.notEqual(await effect(c), "allow", c);
+  // Mythos: install runs its strip program; rsync's `:x` is remote; cp -vt reads every operand.
+  for (const c of ["printf x | install -s --strip-program=/bin/sh /dev/stdin out/x", "rsync -e 'sh -c id' f :x", "cp -vt out .env", "mv -vt out .env", "cp --target out .env", "git log --check .env", "echo c | ( pytest --pdb )", "python3 -m mypy --install-types"]) assert.notEqual(await effect(c), "allow", c);
+  // Sol: git's own options before log, and --full-diff alone, show no content.
+  for (const c of ["git -C . log -1 --oneline -- secrets.json", "git log -1 --full-diff --oneline secrets.json"]) assert.equal(await effect(c), "allow", c);
+  // Astra, Opus, Sol: words as bash makes them.
+  assert.deepEqual(parse("printf %s {,x}").cmds[0].argv, ["printf", "%s", "x"]);
+  assert.deepEqual(parse("printf %s ''{,x}").cmds[0].argv, ["printf", "%s", "", "x"]);
+  assert.deepEqual(parse("echo x{y{1,2}").cmds[0].argv, ["echo", "x{y1", "x{y2"]);
+  assert.equal(parse("echo {+1..3}").opaque, true);
+});

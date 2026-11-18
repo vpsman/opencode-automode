@@ -4225,6 +4225,23 @@ const RUSTUP_PROXIES = new Set(["rustc", "rustfmt", "rustdoc", "cargo", "cargo-c
 function buildToolProblem(name: string, args: string[]): string | undefined {
   const own = args.slice(0, args.includes("--") ? args.indexOf("--") : args.length);
   const operands = own.filter((a) => !a.startsWith("-"));
+  // (Council project review 2, round 35, Mythos: an `@file` of options, or clang's `--config`,
+  // read from standard input, a descriptor, a device or a process substitution holds options the
+  // call chose, `-wrapper` or `-C link-arg` included. For the linker or assembler too.)
+  if (COMPILER.test(name) || /^(rustc|rustdoc|ccache|ld|ld\.\w+|as)$/.test(name)) {
+    const stream = (file: string) => file === "-" || /^\/(dev|proc)\//.test(file) || /[$`(<>]/.test(file);
+    for (let k = 0; k < args.length; k++) {
+      const a = args[k];
+      const files = [
+        ...(a.startsWith("@") ? [a.slice(1)] : []),
+        ...(/^-W[lap],/.test(a) ? a.split(",").slice(1).filter((w) => w.startsWith("@")).map((w) => w.slice(1)) : []),
+        ...(/^-X(linker|assembler|preprocessor)$/.test(a) && (args[k + 1] ?? "").startsWith("@") ? [args[k + 1].slice(1)] : []),
+        ...(a === "--config" ? [args[k + 1] ?? ""] : /^--config=/.test(a) ? [a.slice(9)] : []),
+      ];
+      const found = files.find(stream);
+      if (found !== undefined) return `${name} reads more options from ${found || "a stream"}, which the call chose`;
+    }
+  }
   if (COMPILER.test(name)) {
     // (Round 20, Mythos: `-fcompare-debug=<options>` compiles again with those options. Round 21,
     // Opus and Mythos: gcc reads them as spec text, where `%Y`, `\`, `%{...}` and `%:include()`
