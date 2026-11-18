@@ -2344,9 +2344,10 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   }
   if (ALWAYS_ASK[name]) return worst(verdict, (name === "su" || name === "pkexec" ? criticalAsk : ask)(`${name} ${ALWAYS_ASK[name]}`));
   // (opencode-automode: a lone `-h` or `-V` is an option of many programs, hashall to a shell,
-  // verbose to vim, after which they read standard input; only the programs these rules allow
-  // read-only or as dev tools take it as help or a version here. `--help` and `--version` stay.)
-  if (args.length === 1 && (/^--(version|help)$/.test(args[0]) || (/^-[Vh]$/.test(args[0]) && (READ_ONLY.has(name) || DEV_TOOLS.has(name))))) return verdict;
+  // verbose to vim, after which they read standard input; only the programs these rules know (read
+  // only, dev tools, tools with subcommands, runners, interpreters) take it as help or a version
+  // here. `--help` and `--version` stay.)
+  if (args.length === 1 && (/^--(version|help)$/.test(args[0]) || (/^-[Vh]$/.test(args[0]) && (READ_ONLY.has(name) || DEV_TOOLS.has(name) || !!SUBCOMMANDS[name] || !!RUNNERS[name] || INTERPRETERS.has(name))))) return verdict;
 
   if (SHELLS.has(name)) return worst(verdict, shell(name, args, dyn, cmd, scope, depth));
   // eval runs its words joined, after the shell has expanded them: a variable in them is code
