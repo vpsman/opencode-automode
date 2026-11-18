@@ -16,7 +16,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { bare, bashVerdict, compressorReading, copiesNothing, sortRunsCompressor, fileVerdict, parse, readVerdict, rsyncReading, tarReading, within, type Matcher, type Scope, type Simple } from "./rules.ts";
+import { bare, bashVerdict, compressorReading, copiesNothing, sortReading, sortRunsCompressor, fileVerdict, parse, readVerdict, rsyncReading, tarReading, within, type Matcher, type Scope, type Simple } from "./rules.ts";
 import { gitArgs, gitEnv } from "./sandbox.ts";
 
 const HOME = os.homedir();
@@ -5362,16 +5362,10 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
         else if (a.startsWith("--output=")) add(a.slice(9), false);
       });
       else if (name === "sort") {
-        // (Round 44, Opus: -c, -C and -m are flags, -T takes a value; an option the table does
-        // not hold is a write the check cannot place.)
-        const got = getopt(args, { flags: "bcCdfghimMnrRsuVz", values: "otkST", long: Object.fromEntries([...longs("value", "output key field-separator buffer-size parallel temporary-directory files0-from compress-program"), ...longs("flag", "reverse unique numeric-sort general-numeric-sort human-numeric-sort month-sort version-sort random-sort stable ignore-case dictionary-order ignore-leading-blanks ignore-nonprinting zero-terminated")]) });
-        for (const o of got.opts) if (["-o", "--output"].includes(o.name)) add(o.value, false);
-        // (Only where an `-o` could stand behind the option the table does not hold.)
-        if (got.unknown && (args.includes("--") ? args.slice(0, args.indexOf("--")) : args).some((a) => /^-[a-zA-Z]*o|^--o/.test(a))) {
-          const why = `sort ${got.unknown}: an option the check cannot read, so it cannot list what is written`;
-          unlisted.push({ cmd, reason: why, dirs: [] });
-          unknown ??= why;
-        }
+        // (Round 44, Opus: -c, -C and -m are flags, -T takes a value. Round 49, Opus, Sol, Astra:
+        // read by rules.ts `sortReading`, GNU sort 9.7's whole table, so an option's value, `--`
+        // included, is no option; an option sort does not know stops it before it writes.)
+        for (const o of sortReading(args).outputs) add(o, false);
       }
       else if (name === "tree") valued(args, "o", "--never").forEach((f) => add(f, false));
       else if (name === "less") [...valued(args, "o", "--log-file"), ...valued(args, "O", "--LOG-FILE")].forEach((f) => add(f, false));

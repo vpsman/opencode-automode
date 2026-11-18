@@ -2096,12 +2096,19 @@ export function rsyncReading(args: string[]) {
   const server = prefixed("server") || prefixed("sender");
   // (Round 46, Sol: `--version`, `-V` and `--help` print and copy nothing.)
   // (Round 47, Sol: `--version` still opens its `--log-file`; `--help` opens nothing.)
-  // (Round 48, Astra: `--info=help` and `--debug=help` print their lists and exit too.)
-  const help = has("help") || longs.some(([h, v]) => (h === "--info" || h === "--debug") && v === "help");
-  const prints = has("version") || help || letters.includes("V");
+  // (Round 48, Astra: `--info=help` and `--debug=help` print their lists and exit too. Round 49:
+  // a `help` among the words of the list, in any case, `--info=name,HELP`, `--debug=help0`; and
+  // rsync reads its options in order, so a `--log-file` before the help word is opened and the
+  // help written into it (Opus): help writes nothing only where it comes first.)
+  const isHelp = ([h, v]: [string, string | undefined]) => h === "--help" || ((h === "--info" || h === "--debug") && (v ?? "").split(",").some((t) => /^help\d*$/i.test(t)));
+  const firstHelp = longs.findIndex(isHelp);
+  const firstLog = longs.findIndex(([h]) => h === "--log-file");
+  const help = firstHelp >= 0 && (firstLog < 0 || firstHelp < firstLog);
+  const prints = has("version") || firstHelp >= 0 || letters.includes("V");
   return { longs, letters, shorts, operands, dryRun, listOnly, batch, server, prints, help, daemon: prefixed("daemon"), copiesNothing: prints || (!server && (dryRun || listOnly || (!batch && operands.length < 2))), values: (name: string) => {
       // (Round 48, Sol: the last `--log-file` is the one rsync opens, and an empty one none.)
-      const all = longs.filter(([h]) => h === `--${name}`).map(([, v]) => v ?? "");
+      // A help word stops the reading where it stands: a log named after it is never opened.
+      const all = (firstHelp >= 0 ? longs.slice(0, firstHelp) : longs).filter(([h]) => h === `--${name}`).map(([, v]) => v ?? "");
       return name === "log-file" ? all.slice(-1).filter((v) => v !== "") : all;
     } };
 }
@@ -2273,7 +2280,9 @@ export function psEnvironments(args: string[], here = true): boolean {
         const value = k < a.length - 1 ? a.slice(k + 1) : args[++i];
         // (Round 48, Opus: a UNIX `-O` given BSD sort keys, `-O p`, `-O +pt`, is refused by the
         // format reader and read again as BSD: procps-ng 4.0.4.)
-        if (unix && a[k] === "O" && value !== undefined && /^([+-]?[A-Za-z])+$/.test(value) && (/[+-]/.test(value) || !PS_LETTER_FIELDS.has(value))) again = true;
+        // (Round 49, Astra: only BSD's sort-key letters; a format macro, `THREAD`, `DefSysV`, is
+        // read as one.)
+        if (unix && a[k] === "O" && value !== undefined && /^([+-]?[gjkmnoprtuvyCGJKMNPRSTU])+$/.test(value) && (/[+-]/.test(value) || !PS_LETTER_FIELDS.has(value))) again = true;
         // A value the UNIX reading may refuse (`-uaxe` names the user `axe`) sends it to BSD; a
         // value it takes does not (round 44 and 45, Sol and Astra). A separate word that starts
         // with `-` is refused, and the BSD reading takes it (round 45, Opus: `ps -e -u -x`).
@@ -2458,28 +2467,35 @@ const SORT_LONGS = `ignore-leading-blanks dictionary-order ignore-case general-n
   numeric-sort random-sort random-source reverse sort version-sort batch-size check compress-program debug files0-from key merge output stable
   buffer-size field-separator temporary-directory parallel unique zero-terminated help version`.split(/\s+/);
 const SORT_LONG_VALUED = ["random-source", "sort", "batch-size", "compress-program", "files0-from", "key", "output", "buffer-size", "field-separator", "temporary-directory", "parallel"];
-export function sortRunsCompressor(args: string[]): boolean {
+// (Round 49, Opus, Sol, Astra: the same reading gives the files `-o`/`--output` name, for the
+// guard's write record: `sort --random-source -- -o .git/config f` writes `.git/config`.)
+export function sortReading(args: string[]): { compressor: boolean; outputs: string[] } {
+  let compressor = false;
+  const outputs: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === "--") return false;
+    if (a === "--") break;
     if (a.startsWith("--")) {
       const eq = a.indexOf("=");
       const word = (eq < 0 ? a : a.slice(0, eq)).slice(2);
       const all = SORT_LONGS.filter((n) => n.startsWith(word));
       const name = SORT_LONGS.includes(word) ? word : all.length === 1 ? all[0] : undefined;
-      if (name === "compress-program") return true;
-      if (name && eq < 0 && SORT_LONG_VALUED.includes(name)) i++;
+      const value = name && SORT_LONG_VALUED.includes(name) ? (eq >= 0 ? a.slice(eq + 1) : args[++i]) : undefined;
+      if (name === "compress-program") compressor = true;
+      if (name === "output" && value !== undefined) outputs.push(value);
     } else if (a.startsWith("-") && a.length > 1) {
       for (let k = 1; k < a.length; k++) {
         if ("koStT".includes(a[k])) {
-          if (k === a.length - 1) i++;
+          const value = k === a.length - 1 ? args[++i] : a.slice(k + 1);
+          if (a[k] === "o" && value !== undefined) outputs.push(value);
           break;
         }
       }
     }
   }
-  return false;
+  return { compressor, outputs };
 }
+export const sortRunsCompressor = (args: string[]) => sortReading(args).compressor;
 
 // A directory there now; false for anything else, a link loop included (round 40, Sol: ELOOP).
 const isDirectory = (p: string) => {
@@ -3087,7 +3103,8 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
     const remote = rsyncReading([...r.shorts.filter(([l]) => l === "M").map(([, v]) => v ?? ""), ...r.values("remote-option")]);
     // (Round 45, Sol: a dry run writes its log and batch, but no backup, partial or temp files.)
     const places = (x: ReturnType<typeof rsyncReading>) => (r.help ? [] : r.prints ? x.values("log-file") : [...["log-file", "write-batch", "only-write-batch", ...(r.dryRun || r.listOnly ? [] : ["backup-dir", "partial-dir", "temp-dir"])].flatMap((n) => x.values(n)), ...(r.dryRun || r.listOnly ? [] : x.shorts.filter(([l]) => l === "T").map(([, v]) => v ?? ""))]);
-    const outputs = [...places(r), ...places(remote)];
+    // (Round 49, Sol: a version or help query starts no receiver, so its `-M` words open nothing.)
+    const outputs = [...places(r), ...(r.prints ? [] : places(remote))];
     if (outputs.some((f) => /(^|\/)\.git(\/|$)/.test(resolveWord(f, scope) ?? f))) return worst(verdict, ask("rsync writes a file in a .git directory"));
     if (outputs.length) {
       const w = writeTargets("tee", ["--", ...outputs], scope);

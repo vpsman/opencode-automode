@@ -1251,3 +1251,16 @@ test("round 48: sort read by position, ps -O given BSD keys, parsed ps flags onl
   assert.equal(await effect("rsync --version --log-file=unused.log --log-file= f dst/", s), "allow");
   assert.equal(await effect("npm test", s), "allow");
 });
+
+// ---- round 49 ----
+
+test("round 49: sort's outputs read by position, rsync's help in order with its log, ps -O macros, help tokens", async () => {
+  fs.mkdirSync(path.join(repo, "dst"), { recursive: true });
+  // Opus: `--random-source --` takes `--` as its value; a log before a help word is written.
+  for (const c of ["sort --random-source -- -o .git/config f", "sort --random-source -- --output=.git/config f", "sort --random-source -- -o ../x f", "rsync --log-file=.git/config --help", "rsync --log-file=.git/config --info=help", "rsync --log-file=../outside.log --help", "ps -eT -O p"]) assert.notEqual(await effect(c), "allow", c);
+  const s = new SessionState(repo);
+  assert.equal(await effect("printf x | sort --random-source -- -o t.test.js", s), "allow");
+  assert.notEqual(await effect("npm test", s), "allow");
+  // Sol, Astra: format macros, help words in any case or list, a help first, a value's `-o`.
+  for (const c of ["ps -e -O THREAD", "ps -eT -O DefSysV", "rsync --info=HELP --log-file=.git/info.log", "rsync --info=name,help --log-file=.git/info.log", "rsync --debug=help0 --log-file=.git/debug.log", "rsync --help --log-file=.git/a", "sort -c --random-source -o .git/sample", "rsync --version -M--log-file=.git/remote-version.log f dst/"]) assert.equal(await effect(c), "allow", c);
+});
