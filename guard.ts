@@ -16,7 +16,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { bare, bashVerdict, compressorReading, fileVerdict, parse, readVerdict, rsyncReading, tarReading, within, type Matcher, type Scope, type Simple } from "./rules.ts";
+import { bare, bashVerdict, compressorReading, copiesNothing, fileVerdict, parse, readVerdict, rsyncReading, tarReading, within, type Matcher, type Scope, type Simple } from "./rules.ts";
 import { gitArgs, gitEnv } from "./sandbox.ts";
 
 const HOME = os.homedir();
@@ -5113,6 +5113,8 @@ function rustcQuery(args: string[]): boolean {
   return true;
 }
 function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string[]) => boolean): string | undefined {
+  // (Round 45, Sol: `cp --version f dst/` copies nothing.)
+  if (copiesNothing(name, args)) return undefined;
   // A name the URL or the server chooses (round 4, finding 17, second pass).
   if (name === "curl" || name === "wget") return fetcherWrites(name, args).chosen[0]?.why;
   if (name === "tar" || name === "gtar" || name === "bsdtar") {
@@ -5334,7 +5336,7 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       else if ((name === "perl" || name === "ruby") && args.some((a) => /^-[a-zA-Z]*i/.test(a))) files.slice(args.some((a) => /^-[a-zA-Z]*e$/.test(a)) ? 1 : 0).forEach((f) => add(f, false));
       // An rsync that copies nothing (a dry run, a listing, one operand) writes no destination; its
       // option places are still read below (round 41).
-      else if (["cp", "mv", "ln", "install", "rsync"].includes(name) && !(name === "rsync" && rsyncReading(args).copiesNothing)) {
+      else if (["cp", "mv", "ln", "install", "rsync"].includes(name) && !copiesNothing(name, args)) {
         // `-t DIR` / `--target-directory=DIR`: every operand is a source (the rules read the last
         // one as the destination and never look at DIR).
         // Read by the tool's own options (round 4, finding 4, second pass: `--target-dir=`,
@@ -5365,7 +5367,7 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
         const got = getopt(args, { flags: "bcCdfghimMnrRsuVz", values: "otkST", long: Object.fromEntries([...longs("value", "output key field-separator buffer-size parallel temporary-directory files0-from compress-program"), ...longs("flag", "reverse unique numeric-sort general-numeric-sort human-numeric-sort month-sort version-sort random-sort stable ignore-case dictionary-order ignore-leading-blanks ignore-nonprinting zero-terminated")]) });
         for (const o of got.opts) if (["-o", "--output"].includes(o.name)) add(o.value, false);
         // (Only where an `-o` could stand behind the option the table does not hold.)
-        if (got.unknown && args.some((a) => /^-[a-zA-Z]*o|^--o/.test(a))) {
+        if (got.unknown && (args.includes("--") ? args.slice(0, args.indexOf("--")) : args).some((a) => /^-[a-zA-Z]*o|^--o/.test(a))) {
           const why = `sort ${got.unknown}: an option the check cannot read, so it cannot list what is written`;
           unlisted.push({ cmd, reason: why, dirs: [] });
           unknown ??= why;

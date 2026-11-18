@@ -25,7 +25,7 @@ import {
   bare,
   makeScope,
   psEnvironments,
-  rsyncReading,
+  copiesNothing,
   readVerdict,
   realish,
   within,
@@ -1806,7 +1806,7 @@ const psSortOk = (value: string) => value.split(",").every((k) => PS_FIELDS.has(
 function psOk(argv: string[]): boolean {
   // (Round 43, Mythos: procps reads `-ex` and the like again as BSD words, where `e` prints
   // environments: the rules' reading of ps decides that first.)
-  if (psEnvironments(argv.slice(1))) return false;
+  if (psEnvironments(argv.slice(1), false)) return false;
   const FLAGS = "eAfFlwHjTLMyZaxu";
   const SELECT = new Set(["-p", "-u", "-U", "-C", "--pid", "--ppid"]);
   for (let i = 1; i < argv.length; i++) {
@@ -3933,7 +3933,8 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       const files = [...(dashes < 0 ? args : args.slice(0, dashes)).filter((a) => !a.startsWith("-")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
       if (path.basename(word) === "sed" && !args.some((a) => /^(-[a-zA-Z]*i|--in-place)/.test(a))) return;
       if (path.basename(word) === "dd") targets.push(...args.filter((a) => a.startsWith("of=")).map((a) => a.slice(3)));
-      else if (how) targets.push(...(how === "last" ? files.slice(-1) : files));
+      // (Round 45, Sol: a copy that copies nothing writes no destination.)
+      else if (how && !copiesNothing(path.basename(word), args)) targets.push(...(how === "last" ? files.slice(-1) : files));
       // (Round 41, Opus: a copy into a directory writes each source's name there: `cp -r ev/.git .`
       // writes `./.git`. Judged by where each lands.)
       // (Round 42, Mythos: `~+` is where it runs. Opus: a copy of a directory's contents, `src/.`,
@@ -3958,9 +3959,12 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       const given = tdir !== undefined ? files.filter((f, k) => !(f === tWord && k === files.indexOf(tWord))) : files.slice(0, -1);
       // (Round 44, Sol: a copy that copies nothing, an rsync dry run or listing, `cp --version`,
       // brings nothing. Opus: `-L` copies what links lead to, so the walk follows them.)
-      const copiesNothing = (tool === "rsync" && rsyncReading(args).copiesNothing) || args.some((a) => a === "--help" || a === "--version");
-      const follow = args.some((a) => a === "--dereference" || a === "--copy-links" || /^-[a-zA-Z]*L/.test(a));
-      if (how === "last" && !copiesNothing && given.length && (tdir !== undefined || files.length > 1)) {
+      // (Round 45, Opus: `--help` after `--` is a file; rsync's `-k`/`--copy-dirlinks` and cp's
+      // `--deref` follow links too.)
+      const nothing = copiesNothing(tool, args);
+      const head = args.indexOf("--") < 0 ? args : args.slice(0, args.indexOf("--"));
+      const follow = head.some((a) => (a.length >= 5 && "--dereference".startsWith(a)) || a === "--copy-links" || a === "--copy-dirlinks" || (tool === "rsync" ? /^-[a-zA-Z]*[Lk]/.test(a) : /^-[a-zA-Z]*L/.test(a)));
+      if (how === "last" && !nothing && given.length && (tdir !== undefined || files.length > 1)) {
         const dest = herePlus(tdir ?? files.at(-1)!);
         const dir = cwdOf(cmd);
         const asFile = tdir === undefined && tool !== "rsync" && args.some((a) => a === "--no-target-directory" || /^-[a-zA-Z]*T/.test(a));

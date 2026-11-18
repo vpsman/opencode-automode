@@ -1146,7 +1146,8 @@ test("round 44: ps read again as BSD takes no UNIX value, rsync -M words, sort -
     "ps -xu -e", "ps -xg -e", "ps -xs -e", "ps -xu -eww",
     // Opus: what -M hands the receiving side is held to the write test.
     "rsync -a -M--log-file=../outside.log f g", "rsync -a -M --log-file=.git/x f g", "rsync -a --remote-option=--log-file=.git/x f g",
-    // Opus: sort's -m, -c and -C are flags before -o.
+    // Opus: sort's -m, -c and -C are flags before -o (sort refuses -c or -C with -o, round 45,
+    // Sol: those two rows ask only as the conservative reading).
     "sort -mo ../x f", "sort -co../x f", "sort -Co../x f", "sort -mo.git/hooks/pre-commit f",
     // Opus: a decompression in place to a name .git; a copy that follows links.
     "gzip -d sub/.git.gz", "xz -d sub/.git.xz", "zstd -d sub/.git.zst", "zstd -Do dict .git/out f", "cp -rL ../ev2 dst",
@@ -1163,4 +1164,32 @@ test("round 44: ps read again as BSD takes no UNIX value, rsync -M words, sort -
   const m = new SessionState(repo);
   assert.equal(await effect("sort -mo x.test.js f", m), "allow");
   assert.notEqual(await effect("npm test", m), "allow");
+});
+
+// ---- round 45 ----
+
+test("round 45: --help after -- is a file, copies that follow links by -k or --deref, a decompression's output name, ps values the UNIX reading takes or refuses, copies and dry runs that write nothing", async () => {
+  fs.mkdirSync(path.join(base, "ev", ".git"), { recursive: true });
+  fs.mkdirSync(path.join(base, "o2", "in", ".git"), { recursive: true });
+  fs.mkdirSync(path.join(base, "ev2"), { recursive: true });
+  if (!fs.existsSync(path.join(base, "ev2", "l"))) fs.symlinkSync("../ev", path.join(base, "ev2", "l"));
+  fs.mkdirSync(path.join(repo, "dst"), { recursive: true });
+  fs.mkdirSync(path.join(repo, "sub"), { recursive: true });
+  for (const n of [".git.gz", ".gitignore.gz", "innocent.gz"]) fs.writeFileSync(path.join(repo, "sub", n), "x");
+  const asks = [
+    // Opus: `--help` after `--` names a file; -k, --copy-dirlinks and --deref follow links.
+    "cp -r -- --help ../o2 dst/", "rsync -a -- --help ../o2 dst/", "rsync -rk ../ev2 dst/", "rsync -r --copy-dirlinks ../ev2 dst/", "cp -r --deref ../ev2 dst/",
+    // Opus: the output name by glob, -S, -N and -r.
+    "gzip -d sub/.g*.gz", "gzip -d sub/.[g]it.gz", "gzip -d -S ignore.gz sub/.gitignore.gz", "gzip -dN sub/innocent.gz", "gunzip --name sub/innocent.gz", "gzip -dr sub",
+    // Opus: a separate value that starts with `-` is refused by the UNIX reading.
+    "ps -e -u -x", "ps -e -g -x", "ps -eg -x",
+  ];
+  for (const c of asks) assert.notEqual(await effect(c), "allow", c);
+  // Sol, Astra: values the UNIX reading takes; output names exactly `.git`; no-copy copies.
+  for (const c of ["ps -e -u0 -o pid", "ps -e -p'1 2' -o pid", "ps -e -p+1 -o pid,comm", "ps -e -uroot -o pid,comm", "gzip -d .gitlab-ci.yml.gz", "gzip -dn -- .git.notes.gz", "rsync --list-only .git/fixtures/", "rsync -ani f .git/fixtures/", "cp --version f .git/fixtures/", "rsync -abi --dry-run -M--backup-dir=.git/fixtures f dst/"]) assert.equal(await effect(c), "allow", c);
+  for (const c of ["sort --check=quiet -- -output", "sort -y -- -output", "cp --version f dst/"]) {
+    const s = new SessionState(repo);
+    assert.equal(await effect(c, s), "allow", c);
+    assert.equal(await effect("npm test", s), "allow", `npm test after ${c}`);
+  }
 });
