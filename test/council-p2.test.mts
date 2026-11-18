@@ -820,3 +820,26 @@ test("round 31: unzip reads options past a bare - and an x, npm version writes p
   await effect("npm version", v);
   assert.equal(await effect("npm test", v), "allow", "npm version alone prints versions");
 });
+
+// ---- round 32 ----
+
+test("round 32: unzip -l - --l extracts; npm version past an option's value; rules.ts sinks and the lone -h", async () => {
+  const b = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cp2-r32-")));
+  try {
+    for (const writer of [`unzip -l - --l ${b}/a.zip`, `unzip -p - --p ${b}/a.zip -d ${b}/o`]) {
+      const s = new SessionState(repo);
+      const wrote = await effect(writer, s);
+      assert.ok(wrote !== "allow" || (await effect("npm test", s)) !== "allow", writer);
+    }
+    assert.notEqual(await effect(`unzip -l - --l ${b}/a.zip -d .git/hooks`), "allow", "into .git/hooks");
+  } finally {
+    fs.rmSync(b, { recursive: true, force: true });
+  }
+  for (const writer of ["npm --loglevel silent version 1.2.3 --no-git-tag-version", "npm -w sub version 1.2.3", "npm --prefix sub version 1.2.3", "pnpm --dir sub version 1.2.3", "yarn version"]) {
+    const s = new SessionState(repo);
+    const wrote = await effect(writer, s);
+    assert.ok(wrote !== "allow" || (await effect("npm test", s)) !== "allow", writer);
+  }
+  for (const c of ["echo hi > /dev/stderr", "echo hi > /dev/stdout", "npm test 2>/dev/null", "cp f /dev/null", "ls -h", "git --version", "node --version"]) assert.equal(await effect(c), "allow", c);
+  for (const c of ["echo x | zsh -h", "echo x | mytool -V"]) assert.notEqual(await effect(c), "allow", c);
+});

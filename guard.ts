@@ -5019,8 +5019,14 @@ export function unzipWords(args: string[]): { writes: boolean; dir?: string } {
   let lists = false;
   let negated = false;
   let dir: string | undefined;
-  for (; k < args.length && args[k].startsWith("-") && args[k] !== "-"; k++) {
+  for (; k < args.length && args[k].startsWith("-"); k++) {
     const w = args[k];
+    // (Council project review 2, round 32, Mythos: unzip reads a bare `-` as an option word, a
+    // dash that negates what follows, `-l - --l` extracts.)
+    if (w === "-") {
+      negated = true;
+      continue;
+    }
     for (let i = 1; i < w.length; i++) {
       if (w[i] === "-") negated = true;
       else if ("dPOI".includes(w[i])) {
@@ -5090,8 +5096,12 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
   // (Council project review 2, round 31, Sol: `npm version <v>` and `npm pkg set|delete|fix`
   // rewrite package.json where they run.)
   if (["npm", "pnpm", "yarn"].includes(name)) {
+    // (Round 32, all four: wherever the word stands, as an option's value may come first; yarn's
+    // bare `version` prompts for the new one.)
     const words = args.filter((a) => !a.startsWith("-"));
-    if ((words[0] === "version" && words.length > 1) || (words[0] === "pkg" && ["set", "delete", "fix"].includes(words[1] ?? ""))) return `${name} ${words[0]} rewrites package.json`;
+    const v = words.indexOf("version");
+    const k = words.indexOf("pkg");
+    if ((v >= 0 && (words.length > v + 1 || name === "yarn" || args.some((a) => /^--(major|minor|patch|pre\w*|new-version)/.test(a)))) || (k >= 0 && ["set", "delete", "fix"].includes(words[k + 1] ?? ""))) return `${name} ${v >= 0 ? "version" : "pkg"} rewrites package.json`;
   }
   if (name === "ccache" && args.length && COMPILER.test(args[0])) return unnamedWrite(args[0], args.slice(1), filesOnly);
   if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|unlz4)$/.test(name) || (/^(gzip|xz|zstd|bzip2|lzop|lz4|lzip|brotli)$/.test(name) && args.some((a) => /^-[a-zA-Z0-9]*d[a-zA-Z0-9]*$/.test(a) || (a.length > 2 && ("--decompress".startsWith(a) || "--uncompress".startsWith(a))))) || (name === "lzop" && args.some((a) => /^-[a-zA-Z0-9]*x/.test(a)))) return `${name} -d writes files next to its input`;
@@ -5185,6 +5195,8 @@ function unnamedWriteDirs(name: string, args: string[]): (string | undefined)[] 
   // (Round 6: a precompiled header lands beside its input, wherever that is: the project.)
   if (COMPILER.test(name)) return [undefined];
   if (name === "rustc") return [undefined];
+  // (Round 32: an option that moves the package manager to another directory moves its write.)
+  if (["npm", "pnpm", "yarn"].includes(name)) return args.some((a) => /^(--prefix|-w|--workspace|--dir|-C|--cwd|--filter)(=|$)/.test(a)) ? [undefined] : [];
   if (name === "go") {
     const c = args.findIndex((a) => /^--?C$/.test(a));
     return c >= 0 && args[c + 1] !== undefined ? place([args[c + 1]]) : [];

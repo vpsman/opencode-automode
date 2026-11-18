@@ -56,7 +56,7 @@ For each shell tool call:
    `test/differential.test.mts` runs the printed text against the text as written (see
    Tests).
 2. **Rules.** [pi-automode-classifier](https://github.com/deepu105/pi-automode-classifier)'s
-   `rules.ts` (v0.4.1, MIT, vendored unchanged) parses the whole printed command, including
+   `rules.ts` (from v0.4.1, MIT, changed here since: see NOTICE) parses the whole printed command, including
    `$(...)`, `bash -c`, wrappers like `sudo`/`timeout`, redirects and pipelines:
    - **deny**: wipes of `/`, `$HOME` or system dirs, `mkfs`, `dd` to disks, fork bombs
    - **ask**: `sudo`, pushes, `ssh`/`scp`, outbound data, `curl | sh`, credential reads, writes

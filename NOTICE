@@ -2,3 +2,8 @@ rules.ts is vendored from pi-automode-classifier
 (https://github.com/deepu105/pi-automode-classifier), MIT, copyright (c) 2026
 Deepu K Sasidharan; see LICENSE.pi-automode-classifier. checkouts() and
 inCheckout() in decide.ts are adapted from the same project.
+
+rules.ts has been changed in this project since it was vendored (council project review 2):
+a device sink is told by the path as written, not resolved through this process's own
+descriptors; and a lone -h or -V is taken as help or a version only for the programs the rules
+allow read-only or as dev tools.
