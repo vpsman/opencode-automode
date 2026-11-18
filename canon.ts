@@ -1228,6 +1228,10 @@ class Printer {
         if (part.kind === "lit" && last?.kind === "lit" && last.quoted === part.quoted) last.text += part.text;
         else word.parts.push(part.kind === "lit" ? { ...part } : part);
       };
+      // (Council project review 2, round 34, Astra: a made word that begins with `~` keeps its
+      // tilde's prefix up to the first slash; a `~` quoted inside that prefix (`{~,x}:~`) stops
+      // bash expanding the first. Such a word asks.)
+      if (text.startsWith("~") && text.slice(1, text.indexOf("/") < 0 ? undefined : text.indexOf("/")).includes("~")) ask("a word the braces make that begins with `~` and holds another `~` before its first slash, which the printer would quote");
       [...text].forEach((ch, at) => {
         const code = ch.charCodeAt(0);
         if (code >= PRIVATE && code < PRIVATE + table.length) push(table[code - PRIVATE]);

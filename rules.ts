@@ -441,13 +441,27 @@ function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope)
   // git log and its kin name paths to filter commits by, and show their content only with a patch.
   if (name === "git") {
     const sub = operands(args)[0];
-    if (["log", "shortlog", "rev-list", "whatchanged"].includes(sub ?? "") && !args.some((a) => /^(-p|-u|--patch|--patch-with-\w+|-L.*|--full-diff|-[a-zA-Z]*[pu])$/.test(a))) return undefined;
+    // (Round 34, Mythos and Opus: every option that makes git log print a patch: -U<n>, --unified,
+    // the merge diffs (-c, --cc, --dd, -m, --remerge-diff, --diff-merges= other than off/none),
+    // --binary, word diffs and function context; long ones by any prefix git accepts.)
+    const patchLong = ["patch", "unified", "cc", "dd", "remerge-diff", "binary", "word-diff", "color-words", "function-context", "full-diff", "patch-with-stat", "patch-with-raw"];
+    const shows = (a: string) =>
+      /^(-[a-zA-Z]*[pumcW]|-U\d*|-L.*)$/.test(a) ||
+      (/^--diff-merges(=|$)/.test(a) && !/^--diff-merges=(off|none)$/.test(a)) ||
+      patchLong.some((name) => longIs(a, name));
+    if (["log", "shortlog", "rev-list", "whatchanged"].includes(sub ?? "") && !args.some(shows)) return undefined;
   }
   // An in-place edit shows nothing, and a destination is written, not read.
   if (name === "sed" && args.some((a) => /^(-i|--in-place)/.test(a) || /^-[a-zA-Z]*i/.test(a))) return undefined;
   let words = args;
   if (PATTERN_FIRST.has(name)) words = operands(args).slice(1);
-  else if (COPIERS.has(name)) words = operands(args).slice(0, -1);
+  else if (COPIERS.has(name)) {
+    // With `-t DIR` (`--target-directory`) the destination is named first and every operand is a
+    // source (round 34, Mythos).
+    const t = args.findIndex((a) => a === "-t" || a === "--target-directory");
+    const target = t >= 0 || args.some((a) => /^--target-directory=/.test(a) || /^-[a-zA-Z]*t./.test(a));
+    words = target ? operands(args.filter((_, k) => k !== t + 1 || t < 0)) : operands(args).slice(0, -1);
+  }
   // `--env-file .env` hands the file to a program and shows nothing.
   words = words.filter((w, i) => !/^--env-file(=|$)/.test(w) && words[i - 1] !== "--env-file");
   for (const word of [...words, ...(cmd.in ?? [])]) {
@@ -538,6 +552,8 @@ export interface Simple {
   dyn?: boolean[];
   // The operator that follows the command: `;`, a newline, `&&`, `||`, `|`, `&`, `(` or `)`.
   next?: string;
+  // Its standard input is a pipe from the command before it.
+  piped?: boolean;
   // Inside a command substitution (or a heredoc body's): it runs while the command that holds it
   // is expanded, and is listed before it.
   nested?: boolean;
@@ -889,7 +905,7 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
       cur.subshell = true;
       if (c === "|" && next === "&") i++;
       pushCmd(c);
-      if (c === "|") cur.subshell = true;
+      if (c === "|") cur.subshell = cur.piped = true;
     } else if (c === "(" && cases.at(-1) === "pattern" && !hasWord && cur.argv.length === 0) {
       // A pattern may open with `(`.
     } else if (c === ")" && cases.at(-1) === "pattern") {
@@ -1195,7 +1211,8 @@ function expandBraces(word: string, mask: string, budget = { n: 0 }): [string, s
       if (![a, b, step].every(Number.isSafeInteger) || Math.abs(b - a) / step > 1000) return undefined;
       const width = numeric && [seq[1], seq[2]].some((x) => /^-?0\d/.test(x)) ? Math.max(seq[1].length, seq[2].length) : 0;
       for (let v = a; a <= b ? v <= b : v >= b; v += a <= b ? step : -step) {
-        const text = numeric ? String(v).padStart(width, "0") : String.fromCharCode(v);
+        // (Round 34, Astra and Sol: the sign comes before the zeros, `-02 -01 000 001`.)
+        const text = numeric ? (v < 0 ? "-" : "") + String(Math.abs(v)).padStart(v < 0 ? width - 1 : width, "0") : String.fromCharCode(v);
         alternatives.push([text, "u".repeat(text.length)]);
       }
     }
@@ -1778,6 +1795,21 @@ function tarProblem(args: string[]): string | undefined {
     if (archive !== undefined && /^[^/]*:/.test(archive) && !args.includes("--force-local")) return "tar on a remote archive runs a remote shell";
   }
   return undefined;
+}
+
+// The names `python3 -m unittest` is given (it imports and calls each): files or modules of the
+// project, read from where the command runs, or `discover` with its options.
+function unittestNamesOwn(args: string[], scope: Scope): boolean {
+  if (args[0] === "discover") return true;
+  const names = args.filter((a, k) => !a.startsWith("-") && !/^(-k|--durations)$/.test(args[k - 1] ?? ""));
+  if (!names.length) return true;
+  if (!scope.cwd) return false;
+  return names.every((n) => {
+    if (/[$`]/.test(n)) return false;
+    const first = n.includes("/") ? n : n.split(".")[0];
+    const p = resolveWord(first, scope);
+    return !!p && isLocal(p, scope) && (fs.existsSync(p) || fs.existsSync(`${p}.py`));
+  });
 }
 
 // ---- nested shells ----
@@ -2390,7 +2422,7 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
     const p = resolveWord(of, scope);
     if (p && /^\/dev\//.test(p) && !DEV_SINKS.test(p) && !inTmp(p)) return deny(`dd writes to the device ${of}`);
     if (isPiFile(p, scope)) return worst(verdict, piAsk(`dd writes Pi's own files: ${of}`));
-    return worst(verdict, isLocal(p, scope) ? classify("dd") : outside(`dd writes outside the working directory: ${of}`, p));
+    return worst(verdict, isLocal(p, scope) || (!!p && DEV_SINKS.test(p)) ? classify("dd") : outside(`dd writes outside the working directory: ${of}`, p));
   }
   if ((name === "chmod" || name === "chown" || name === "chgrp") && hasFlag(args, "R", "--recursive")) {
     for (const t of operands(args).slice(1)) {
@@ -2450,8 +2482,12 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
     }
   }
   if (SUBCOMMANDS[name]) return worst(verdict, subcommand(name, args, scope));
+  if ((name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) && !!(cmd.heredoc || cmd.piped || cmd.in?.length) && args.some((a) => /^--(pdb|trace)/.test(a))) return worst(verdict, classify("pytest's debugger reading commands from standard input"));
   if (READ_ONLY.has(name) || DEV_TOOLS.has(name)) return verdict;
-  if (/^python3?$/.test(name) && args[0] === "-m" && PY_MODULES.has(args[1]) && !cmd.heredoc) return verdict;
+  // (Council project review 2, round 34, Mythos: unittest imports and calls any name it is given,
+  // `python3 -m unittest code.interact` then runs standard input as Python; its names must be the
+  // project's own files or modules. pytest's debugger, below, reads commands from standard input.)
+  if (/^python3?$/.test(name) && args[0] === "-m" && PY_MODULES.has(args[1]) && !cmd.heredoc && (args[1] !== "unittest" || unittestNamesOwn(args.slice(2), scope))) return verdict;
   // `node --test`: the test runner over the project's test files, as `npm test` runs it.
   if (name === "node" && args[0] === "--test" && !cmd.heredoc) {
     const k = leadingOptions(args, { long: ["test", "test-only", "test-force-exit", "experimental-test-coverage", "experimental-strip-types", "no-warnings", "enable-source-maps"], longValued: ["test-name-pattern", "test-skip-pattern", "test-concurrency", "test-timeout", "disable-warning"] });

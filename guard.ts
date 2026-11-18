@@ -391,8 +391,9 @@ function shellProblem(cmds: Simple[]): string | undefined {
       // on to run their standard input (`rbash -h` is hashall, `ex -V` is verbose).
       if (at.has(i) && rest.length === 1 && /^-[hV]$/.test(rest[0]) && STDIN_RUNNERS.has(name)) return `${name} ${rest[0]}: an option of ${name}, which then runs what its standard input holds`;
       // (Round 33, Opus: Tcl's shells and erl take any first word that begins with `-` as an
-      // argument for the script, `--help` and `--version` included, and then run standard input.)
-      if (at.has(i) && rest.length === 1 && /^--(help|version)$/.test(rest[0]) && /^(tclsh|wish|expect|expectk|jimsh|erl)[\d.]*$/.test(name)) return `${name} ${rest[0]}: an argument for ${name}'s script, which then runs what its standard input holds`;
+      // argument for the script, `--help` and `--version` included, and then run standard input.
+      // Round 34, Mythos: BSD csh reads `--help` as its letters, and runs standard input too.)
+      if (at.has(i) && rest.length === 1 && /^--(help|version)$/.test(rest[0]) && /^(tclsh|tclkit|tclkitsh|itclsh|wish|wishx|expect|expectk|jimsh|erl|csh|bsd-csh)[\d.]*$/.test(name)) return `${name} ${rest[0]}: an argument for ${name}'s script, which then runs what its standard input holds`;
       if (BASH_LIKE.has(name)) {
         const found = optionsProblem(rest, true);
         if (found === "-O") return `${name} -O, which changes how the shell reads its code`;
@@ -5106,8 +5107,9 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
     // (Round 33, Sol: only where the subcommand stands. `npm view x version` names a field. The
     // subcommand is the first word after the options; a known option that takes a value skips it,
     // and after an option this check does not know either word may be the subcommand.)
-    const valued = /^(--loglevel|--prefix|-w|--workspace|--registry|--userconfig|--globalconfig|--cache|--tag|--otp|--access|-C|--dir|-F|--filter|--cwd|--reporter|--color|--workspace-concurrency)$/;
-    const known = /^(-[sqdgyvr]+|--(silent|quiet|verbose|workspaces|include-workspace-root|if-present|no-color|offline|prefer-offline|global|yes|recursive|workspace-root|frozen-lockfile|immutable|json|parseable|long|no-git-tag-version|git-tag-version|allow-same-version|force)|--[\w-]+=.*)$/;
+    const valued = /^(--loglevel|--prefix|-w|--workspace|--registry|--userconfig|--globalconfig|--cache|--tag|--otp|--access|-C|--dir|-F|--filter|--cwd|--reporter|--workspace-concurrency)$/;
+    // (Round 34: `--color` is a flag, as PM_GLOBALS and the rules read it.)
+    const known = /^(-[sqdgyvr]+|--(silent|quiet|verbose|workspaces|include-workspace-root|if-present|color|no-color|offline|prefer-offline|global|yes|recursive|workspace-root|frozen-lockfile|immutable|json|parseable|long|no-git-tag-version|git-tag-version|allow-same-version|force)|--[\w-]+=.*)$/;
     const at: number[] = [];
     for (let i = 0; i < args.length; i++) {
       const a = args[i];

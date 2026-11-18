@@ -875,3 +875,29 @@ test("round 33: a quote inside a tilde's prefix, npm field words, Tcl's --help, 
   assert.match(loadConfig(path.join(base, "no-such-config.json"), { classifier: { timeoutMs: 100.5 } }).problem ?? "", /timeoutMs/);
   assert.equal(loadConfig(path.join(base, "no-such-config.json"), { classifier: { timeoutMs: 5000 } }).problem, undefined);
 });
+
+// ---- round 34 ----
+
+test("round 34: a second ~ in a made word's prefix, signed brace padding, unittest names, git log patch options, pnpm --color, cp -t, csh --help, dd of=/dev/full, the timer's limit", async () => {
+  // Astra: `{~,x}:~` makes `~:~`, whose tilde prefix holds the second `~`.
+  assert.ok("ask" in canonical("printf %s {~,x}:~"));
+  assert.equal(canonical("echo {~,x}/a").text, "echo ~/a x/a");
+  // Astra, Sol: the sign comes before the zeros, as bash prints them.
+  assert.deepEqual(parse("echo {-02..1}").cmds[0].argv.slice(1), ["-02", "-01", "000", "001"]);
+  // Mythos: unittest calls a name it is given; stdlib callables run standard input.
+  for (const c of ["echo 'import os' | python3 -m unittest code.interact", "python3 -m unittest builtins.breakpoint <<< c", "echo c | python3 -m pytest --pdb"]) assert.notEqual(await effect(c), "allow", c);
+  assert.equal(await effect("python3 -m json.tool < package.json"), "allow");
+  // Mythos, Opus: git log's patch options print a credential file's content.
+  for (const c of ["git log -U3 .env", "git log --unified=3 .env", "git log --cc .env", "git log -c .env", "git log --binary .env", "git log --remerge-diff .env", "git whatchanged -U1 .env"]) assert.notEqual(await effect(c), "allow", c);
+  assert.equal(await effect("git log -1 --oneline secrets.json"), "allow");
+  // Mythos, Opus: pnpm's --color is a flag, so `version` after it is the subcommand.
+  const s = new SessionState(repo);
+  const wrote = await effect("pnpm --color version 1.2.3", s);
+  assert.ok(wrote !== "allow" || (await effect("npm test", s)) !== "allow", "pnpm --color version");
+  // Mythos: with cp -t every operand is a source.
+  for (const c of ["cp -t /tmp/cp2-r34 .env", "cp --target-directory=/tmp/cp2-r34 .env"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["echo x | csh --help", "echo x | tclkit --version"]) assert.notEqual(await effect(c), "allow", c);
+  // Astra, Sol: a timeout past what the timer holds fails to ask, before any request.
+  const { scoreCommand } = await import("../kev.ts");
+  assert.ok("error" in (await scoreCommand({ ...DEFAULT_CLASSIFIER, timeoutMs: 4294967296 }, { tool: "bash", cwd: repo, command: "ls" })));
+});
