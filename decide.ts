@@ -120,9 +120,10 @@ export const PLAIN_PATTERN = /^(\.{1,2}\/|\/)?[A-Za-z0-9_][\w.+\/-]*( [\w.+\/:=@
 // data out: an allowlist, because the list of programs that can is open-ended (awk, sed, make,
 // docker, tar, strace, ...). Project scripts (`./x *`) are mirrored: they run sandboxed.
 // (Council round 1: not `git stash` or `git restore`, whose only asks are the rules' asks for what
-// they discard; a saved `git stash *` made `git stash clear` an allow.)
+// they discard; a saved `git stash *` made `git stash clear` an allow. Council project review 2:
+// nor `git rm`, whose `-f` throws away uncommitted changes and is no ask of its own.)
 const MIRROR_OK =
-  /^(\.\/\S+|git (status|diff|log|show|add|commit|checkout|switch|branch|tag|fetch|pull|merge|cherry-pick|revert|rm|mv|blame)|cargo (build|check|test|clippy|fmt|doc|tree|metadata|bench|nextest)|go (build|test|vet|fmt)|(npm|pnpm|yarn|bun) (run|test)|pytest|tsc|eslint|prettier|ruff|mypy|black|isort|jest|vitest|ls|cat|head|tail|grep|wc|diff|stat|file|tree|du|df|ps|jq|yq|uniq|cut)( |$)/;
+  /^(\.\/\S+|git (status|diff|log|show|add|commit|checkout|switch|branch|tag|fetch|pull|merge|cherry-pick|revert|mv|blame)|cargo (build|check|test|clippy|fmt|doc|tree|metadata|bench|nextest)|go (build|test|vet|fmt)|(npm|pnpm|yarn|bun) (run|test)|pytest|tsc|eslint|prettier|ruff|mypy|black|isort|jest|vitest|ls|cat|head|tail|grep|wc|diff|stat|file|tree|du|df|ps|jq|yq|uniq|cut)( |$)/;
 export const mirrorable = (pattern: string) => PLAIN_PATTERN.test(pattern) && MIRROR_OK.test(pattern);
 
 export interface Decision {
@@ -3949,7 +3950,9 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       if (/[$`*?[\]{}]/.test(target) || /^~[^/]/.test(t) || /^&/.test(target) || roots === undefined) continue;
       for (const dir of path.isAbsolute(t) ? ["/"] : (dirsOf?.(cmd) ?? [])) {
         const full = path.isAbsolute(t) ? t : `${dir}/${t}`;
-        if (/^\/dev\//.test(full) || procRelative(full)) continue;
+        // (Council project review 2, round 24, Mythos: a device by its normalised path, not a
+        // `/dev/` prefix of the words, `/dev/../tmp/o/l/hooks/pre-commit`.)
+        if (isDevice(full, undefined) || procRelative(full)) continue;
         const landed = physical(full);
         const root = roots.find((r) => within(landed, r));
         const below = root === undefined ? landed : path.relative(root, landed);
@@ -5084,11 +5087,118 @@ function deniedAsIssued(guard: Guard, session: SessionState, cwd: string, comman
   }
 }
 
+// The devices a write to which writes no file (round 24: by the normalised path). Round 25: and
+// only where the words hold no `..`, which the kernel takes after a link, not before.
+const DEVICE = /^\/dev\/(null|zero|stdout|stderr|tty|fd\/\d+)$/;
+const isDevice = (word: string, cwd: string | undefined) => !/(^|\/)\.\.(\/|$)/.test(word) && DEVICE.test(path.resolve(cwd ?? "/", tilde(word)));
+// A path to one of the shell's own descriptors: in the command's shell it is whatever file the
+// descriptor holds, and opening it for writing reopens that file (round 25, Mythos).
+const DESCRIPTOR = /^\/(dev\/(stdin|stdout|stderr|fd\/\d+)|proc\/(self|thread-self|\d+)\/fd\/\d+)$/;
+// The descriptor paths a write target reaches through its links, walked with readlink one link at
+// a time (round 26, Sol and Opus): never through `realpath`, which would follow the plugin's own
+// descriptors. Each step's directory is taken physically, as the kernel walks it.
+function descriptorsReached(raw: string): string[] {
+  // (Round 28, Astra, Opus and Mythos: part by part as the kernel walks, a link followed before
+  // the `..` after it, in the words and in a link's target. `/proc/self`, `/proc/thread-self`
+  // and `/dev/fd` lead into the plugin's own process, so they are kept as written; a descriptor
+  // path is judged before what it leads to. Past 40 links the walk counts as reaching fd 0.)
+  const todo = raw.split("/").filter((c) => c !== "" && c !== ".");
+  let cur = "/";
+  let links = 0;
+  while (todo.length) {
+    const c = todo.shift()!;
+    if (c === ".") continue;
+    if (c === "..") {
+      cur = path.dirname(cur);
+      continue;
+    }
+    const next = cur === "/" ? `/${c}` : `${cur}/${c}`;
+    if (DESCRIPTOR.test(next)) return [next];
+    if (/^\/(proc\/(self|thread-self)|dev\/fd)$/.test(next)) {
+      cur = next;
+      continue;
+    }
+    let link: string | undefined;
+    try {
+      if (fs.lstatSync(next).isSymbolicLink()) link = fs.readlinkSync(next);
+    } catch {
+      link = undefined;
+    }
+    if (link === undefined) {
+      cur = next;
+      continue;
+    }
+    if (++links > 40) return ["/dev/stdin"];
+    if (link.startsWith("/")) cur = "/";
+    todo.unshift(...link.split("/").filter((p) => p !== "" && p !== "."));
+  }
+  return DESCRIPTOR.test(cur) ? [cur] : [];
+}
+// Whether a directory holds a symbolic link at any depth (council project review 2, round 22), or
+// is too large to tell within a small budget; a link to a place inside the directory counts too.
+function holdsLink(dir: string, budget = { left: 4000 }): boolean {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  for (const e of entries) {
+    if (--budget.left < 0) return true;
+    if (e.isSymbolicLink()) return true;
+    if (e.isDirectory() && holdsLink(path.join(dir, e.name), budget)) return true;
+  }
+  return false;
+}
+// Whether unzip's words set overwrite-all (`-o`) or never-overwrite (`-n`) for good, as unzip reads
+// them (council project review 2, round 29): only the option words before the archive (after it,
+// and after `-x`, words are member names); `-d`, `-P`, `-O` and `-I` take the rest of the word or
+// the next one; a `-` inside a word, or a word starting `--`, negates the letters after it.
+function unzipNeverPrompts(args: string[]): boolean {
+  let o = false;
+  let n = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    // (Round 31, Astra: a bare `-` is an option word to unzip, a dash that carries.)
+    if (a === "-") return false;
+    if (!a.startsWith("-")) break;
+    // (Round 30, all four: unzip counts each `-` and carries the count into the next word until an
+    // option letter uses it, `-o--o`, `-q- -o`, `---o`: any such word may leave it prompting.)
+    if (a.slice(1).includes("-")) return false;
+    let negate = false;
+    for (let j = 1; j < a.length; j++) {
+      const c = a[j];
+      if (c === "-") {
+        negate = !negate;
+        continue;
+      }
+      if ("dPOI".includes(c)) {
+        if (j === a.length - 1) i++;
+        break;
+      }
+      // (Round 31, Mythos and Opus: an `x` before the archive changes nothing, and the options
+      // go on; the member list starts after the archive.)
+      if (c === "o") o = !negate;
+      if (c === "n") n = !negate;
+    }
+  }
+  return o || n;
+}
+// Commands that make or copy a link: a write later in the same call may land where the link
+// leads, which the record does not walk (council project review 2, rounds 12 and 13). `ln`,
+// `link`, and `cp` with an option that makes a link or copies one as a link (`-s`, `-l`, `-d`,
+// `-P`, `-r`/`-R` and `-a`, which copy links as links).
+const makesLink = (argv: string[]) =>
+  // (Round 14, Mythos: `patch` makes a link from a git diff's `new file mode 120000`.)
+  argv.some((a) => /^(ln|link|patch)$/.test(path.basename(a))) ||
+  (argv.some((a) => path.basename(a) === "cp") && argv.some((a) => (/^-[a-zA-Z]+$/.test(a) && /[sldPrRa]/.test(a)) || /^--(sy|li|no-d|ar|pr|re)/.test(a))) ||
+  // (Round 26, Opus: rsync copies a link as a link with -a, -l or --links.)
+  (argv.some((a) => path.basename(a) === "rsync") && argv.some((a) => (/^-[a-zA-Z0-9]+$/.test(a) && /[al]/.test(a)) || /^--(archive|links)$/.test(a)));
 export async function decideShell(guard: Guard, session: SessionState, cwd: string, command: string, signal?: AbortSignal, scan: Scan = new Scan(guard.allowedPaths)): Promise<Decision> {
   try {
   projectRoots(session, scan); // takes the git snapshot first (all git calls here run with fsmonitor and hooks off)
   const tampered = gitTampered(session, guard.resumeFile, scan);
-  if (tampered) return withApproval(session, askBy(pauseReason(tampered, guard.resumeFile)));
+  if (tampered) return withApproval(session, extraOf(guard), askBy(pauseReason(tampered, guard.resumeFile)));
   // The git calls that are over get the files they changed marked (decision D1).
   settleWorktree(session);
   // What the rules deny on the text as it was issued stays denied, whatever the printer makes
@@ -5098,9 +5208,9 @@ export async function decideShell(guard: Guard, session: SessionState, cwd: stri
   // would ask, where the rules had denied it. Only a deny is taken from this reading: what the
   // rules ask about or allow is decided on the printed text.
   const issued = deniedAsIssued(guard, session, cwd, command);
-  if (issued) return withApproval(session, issued);
+  if (issued) return withApproval(session, extraOf(guard), issued);
   const printed = canonical(command);
-  if ("ask" in printed) return withApproval(session, askBy(`the command cannot be printed back in the plain spelling the rules and the shell read alike (${printed.ask})`));
+  if ("ask" in printed) return withApproval(session, extraOf(guard), askBy(`the command cannot be printed back in the plain spelling the rules and the shell read alike (${printed.ask})`));
   // Council round 3: a folded `"$(cat <<'X' ...)"` runs no `cat`. That is the command as written
   // only when the `cat` PATH finds is the real one: one in a directory a call can write (the
   // project, an allowed path, a temp directory) may be another program, and the call asks, as a
@@ -5111,24 +5221,30 @@ export async function decideShell(guard: Guard, session: SessionState, cwd: stri
     // (A relative PATH entry is not placed: a `cd` in the call may come before the substitution.)
     // (Council project review 1: and a PATH that finds no `cat` at all runs none.)
     const odd = pathFinds("cat", undefined, writable, () => false) ?? (pathHas("cat") ? undefined : { why: "PATH finds no cat" });
-    if (odd) return withApproval(session, askBy(`the command's "$(cat <<EOF ...)" is printed as the text it stands for, and the cat it would run is not plainly the real one (${odd.why})`));
+    if (odd) return withApproval(session, extraOf(guard), askBy(`the command's "$(cat <<EOF ...)" is printed as the text it stands for, and the cat it would run is not plainly the real one (${odd.why})`));
   }
   const decision = await decidePrinted(guard, session, cwd, printed, signal, scan);
-  return { ...withApproval(session, decision), printed: printed.text, ...(printed.bashOnly ? { bashOnly: true } : {}), ...(printed.folded ? { folded: true } : {}) };
+  return { ...withApproval(session, extraOf(guard), decision), printed: printed.text, ...(printed.bashOnly ? { bashOnly: true } : {}), ...(printed.folded ? { folded: true } : {}) };
   } catch (e) {
-    if (e instanceof PathWalkError) return withApproval(session, askBy(e.message));
+    if (e instanceof PathWalkError) return withApproval(session, extraOf(guard), askBy(e.message));
     throw e;
   }
 }
 // An ask whose writes the checks did not get to read (it asked before they ran: syntax the rules
 // cannot read, a cd they do not follow): once approved, it may have written anywhere in the
 // project, which is marked whole (round 4, finding 4, second pass).
-function withApproval(session: SessionState, d: Decision): Decision {
+// (Council project review 2, round 15, Mythos: and every other place the call could write, as an
+// unplaced write marks: the temp directories, `allowedPaths`, `writable`.)
+const extraOf = (guard: Guard) => [...guard.allowedPaths, ...(guard.writable ?? [])];
+export function markEverywhere(session: SessionState, extra: string[] = []) {
+  for (const r of [...new Set([...projectRoots(session), ...tempDirs(), ...extra].map(realish))]) if (!session.unlisted.includes(r)) session.unlisted.push(r);
+}
+function withApproval(session: SessionState, extra: string[], d: Decision): Decision {
   if (d.effect !== "ask" || d.approve) return d;
   return {
     ...d,
     approve: () => {
-      for (const r of projectRoots(session).map(realish)) if (!session.unlisted.includes(r)) session.unlisted.push(r);
+      markEverywhere(session, extra);
       session.record.writes++;
     },
   };
@@ -5288,11 +5404,19 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
     marks.push(...dirs);
     marksBy.set(cmd, [...(marksBy.get(cmd) ?? []), ...dirs]);
   };
-  const project = (cmd: Simple) => note(cmd, roots.map(realish));
+  // (Council project review 2, round 11, Opus: and the temp directories, where such a writer may
+  // have written too, `gcc -MF /tmp/d/x.test.js`, `git format-patch -o /tmp/d`.)
+  // (Round 12, Sol and Astra: and every other directory a call may write, `allowedPaths`.)
+  const project = (cmd: Simple) => note(cmd, [...new Set([...roots, ...tempDirs(), ...guard.allowedPaths, ...(guard.writable ?? [])].map(realish))]);
+  // (Council project review 2, round 22, Mythos: a writer the check cannot list follows a link
+  // it finds where it writes, one an earlier extraction left, `out/l -> <project>`: such a mark
+  // covers every place the call may write.)
   const mark = (dir: string | undefined, cmd: Simple) => {
     const at = cwdOf(cmd);
-    if (dir === undefined || (!path.isAbsolute(tilde(dir)) && at === undefined)) project(cmd);
-    else note(cmd, [physical(path.isAbsolute(tilde(dir)) ? tilde(dir) : `${at}/${dir}`)]);
+    if (dir === undefined || (!path.isAbsolute(tilde(dir)) && at === undefined)) return project(cmd);
+    const place = physical(path.isAbsolute(tilde(dir)) ? tilde(dir) : `${at}/${dir}`);
+    note(cmd, [place]);
+    if (holdsLink(place)) project(cmd);
   };
   // A git command that writes the work tree (decision D1): what git changed is marked once it is
   // over, from the commit and the status taken now; where they cannot be taken, its directories
@@ -5330,6 +5454,34 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   // A write the check cannot place (after `mkdir x && cd x`, through a variable) is a file it
   // cannot name either: what runs by its path afterwards may be that file.
   const unplacedAll = found.writes.filter((w) => /[$`]/.test(pwdPlaced(w.word, w.cmd)) || (!path.isAbsolute(tilde(w.word)) && cwdOf(w.cmd) === undefined));
+  // (Council project review 2, round 12, Mythos: a write through a link the same call makes or
+  // re-points lands where the new link leads, which the record does not walk: such writes are
+  // unplaced.)
+  // (Round 13, all four: `cp -s`, `-P`, `-a` and every other program that makes, copies or moves
+  // a link.)
+  // (Round 28, Mythos: unzip without -o or -n asks at a file that is there, and reads a new name
+  // from its standard input, whatever feeds it: the name may lead anywhere, so such an unzip marks
+  // every writable root. Round 29, all four: the overwrite mode as unzip reads it.)
+  for (const u of found.unlisted) {
+    const unzip = u.cmd.argv.findIndex((a) => path.basename(a) === "unzip");
+    if (unzip >= 0 && !unzipNeverPrompts(u.cmd.argv.slice(unzip + 1))) project(u.cmd);
+  }
+  if (cmds.some((c) => makesLink(c.argv))) for (const w of [...found.writes, ...found.unlisted]) project(w.cmd);
+  // (Round 23, Mythos: a writer the check cannot list, an extraction, may put a link in place
+  // that a second write of the same call follows, `tar -xf a.tar -C o && tar -xf b.tar -C o`. A
+  // lone such writer keeps its narrow mark.)
+  else {
+    // (Round 24, Opus and Mythos: every writer the check cannot list may put a link in place,
+    // a git switch or a moved directory as an extraction does; and a device is told by the
+    // normalised path, `/dev/../tmp/...` is no device.)
+    const extractors = found.unlisted;
+    const others = [...found.writes.filter((w) => !isDevice(w.word, cwdOf(w.cmd))), ...found.unlisted].filter((w) => !extractors.some((e) => e.cmd === w.cmd));
+    // (Round 25, Opus and Mythos: one writer the text names once may run more than once: in a
+    // loop or a function, or unzip with a pattern for its archives.)
+    // (Round 26, Mythos: any function, `ls() ( ... )` and `ls() if ...` too.)
+    const repeats = /\b(for|while|until|select)\b/.test(run) || functionNames(run).size > 0 || extractors.some((u) => u.cmd.argv.some((a) => path.basename(a) === "unzip") && u.cmd.argv.some((a) => /[*?[]/.test(a)));
+    if (extractors.length > 1 || (extractors.length === 1 && (others.length > 0 || repeats))) for (const w of [...found.writes, ...found.unlisted]) project(w.cmd);
+  }
   const unplaced = unplacedAll[0];
   for (const w of unplacedAll) project(w.cmd);
   const unknownWrite = found.unknown ?? (unplaced ? `writes ${unplaced.word} where the check cannot place it` : undefined);
@@ -5347,7 +5499,26 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
       // (A `tee` further down the command's own pipeline writes the command's own output, as a
       // redirect of it does: `npm test 2>&1 | tee test.log`.)
       const pipe = where.pipes.get(cmd);
-      const fed = (c: Simple) => pipe !== undefined && where.pipes.get(c) === pipe && cmds.indexOf(c) > cmds.indexOf(cmd) && c.argv[0] === "tee" && !c.out.length;
+      // (Round 12, Mythos: a tee that reads the pipe, after nothing but filters that pass on what
+      // they read, `grep -v warning`, `head -n 50`, a bare `cat`; not after `printf`.)
+      const stdinOnly = (c: Simple) => !c.out.length && !c.in?.length && !c.heredoc;
+      // (Round 13: only the plain forms, where no word can be a file: `grep` with flags that take
+      // no value and one pattern; `head`/`tail` with a count.)
+      const passes = (c: Simple) => {
+        const [name, ...args] = c.argv;
+        if (/^(grep|egrep|fgrep)$/.test(name)) return args.filter((a) => !/^-[vicnwxFEGPsqhHUzbo]+$/.test(a)).length === 1 && !args.at(-1)!.startsWith("-") && args.filter((a) => !a.startsWith("-")).length === 1;
+        if (/^(head|tail)$/.test(name)) return args.every((a, i) => /^-[nc]?\d+$/.test(a) || (/^-[nc]$/.test(a) && /^\d+$/.test(args[i + 1] ?? "")) || (/^\d+$/.test(a) && /^-[nc]$/.test(args[i - 1] ?? "")));
+        return name === "cat" && args.length === 0;
+      };
+      // (Round 16, Mythos: a descriptor copied into standard input, `tee x <&3` with `3>&0` on a
+      // group, does not read the pipe; the call has no fed tee then.)
+      // (Round 17: fd 0 in any spelling, `3>&00`, and standard input made a copy, `0>&3`.)
+      const dupIn = /<&|>&\s*0+(?!\d)|(^|[^\d])0+>&/.test(run);
+      const fed = (c: Simple) => {
+        const [from, to] = [cmds.indexOf(cmd), cmds.indexOf(c)];
+        if (dupIn || pipe === undefined || where.pipes.get(c) !== pipe || to <= from || c.argv[0] !== "tee" || !stdinOnly(c)) return false;
+        return cmds.slice(from + 1, to).every((m) => where.pipes.get(m) === pipe && stdinOnly(m) && passes(m));
+      };
       const rest = cmds.filter((c) => c !== cmd && !fed(c));
       const theirs = writtenBy(rest, resolve, expand, () => {});
       known = { written: new Set([...session.files.keys(), ...session.touched, ...theirs]), unlisted: [...new Set([...session.unlisted, ...session.worktree.map((w) => w.top), ...rest.flatMap((c) => marksBy.get(c) ?? [])])] };
@@ -5428,12 +5599,16 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   // B7-2: a call that was the model's to judge (code the checks do not read: `python3 -c`, a
   // script, a place they cannot tell) may have written, moved or renamed anything in the project
   // once the user approves it: the project is marked whole then, as for an ask the checks never
-  // got to read (withApproval). An ask the rules make of a command they read (`git push`) records
-  // what it writes, as before; so does a call the model allows.
+  // got to read (withApproval). Since round 16 every approved ask is marked so (asked), and a call
+  // the model allows too.
   const unread = () => {
     for (const r of roots.map(realish)) if (!session.unlisted.includes(r)) session.unlisted.push(r);
+    markEverywhere(session, extraOf(guard));
   };
-  const asked = (d: Decision): Decision => (d.effect === "ask" ? { ...d, approve: d.rule === "classify" ? () => (commit(), unread()) : commit, ...(worktree.length ? { worktree } : {}) } : d);
+  // (Council project review 2, round 16, Opus: any ask, once approved, runs outside the sandbox,
+  // and a rule ask may sit beside code the checks do not read, `python3 gen.py && git push`: the
+  // project and every other writable place are marked, whatever made the call ask.)
+  const asked = (d: Decision): Decision => (d.effect === "ask" ? { ...d, approve: () => (commit(), unread()), ...(worktree.length ? { worktree } : {}) } : d);
   const d0 = { unread: false };
   // (Round 5: a git that only reads runs what the repository's configuration names, as the
   // safe list reads it: a filter, a textconv, fsmonitor.)
@@ -5450,6 +5625,15 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
     commit();
     return { ...d, ...f, recordAt: session.record.writes, ...(worktree.length ? { worktree } : {}) };
   };
+  // (Council project review 2, round 25, Mythos: a write to one of the shell's descriptors by its
+  // path reopens the file the descriptor holds, one the call itself opened with `<` or a copy.)
+  // (Round 26: every write, by its normalised path and through its links.)
+  const reopens = /(^|[^<])<(?![<(&])|[<>]&\s*\d|\bexec\b/.test(run);
+  for (const w of found.writes) {
+    const target = tilde(w.word);
+    const reached = descriptorsReached(target.startsWith("/") ? target : `${cwdOf(w.cmd) ?? "/"}/${target}`);
+    if (reached.some((d) => /\/dev\/stdin$|\/fd\/0$/.test(d)) || (reached.length > 0 && reopens)) return asked(askBy(`writes ${w.word}, which leads to a descriptor (${reached[0]}) that may hold a file this call opened, which the write then replaces`));
+  }
   if (gitIssue) return asked(askBy(gitIssue));
   if (writeIssue) return asked(askBy(writeIssue));
   if (verdict.action === "ask") return asked(fromRules(verdict));
@@ -5539,7 +5723,7 @@ export function decideFile(guard: Guard, session: SessionState, cwd: string, tar
   const at = realish(path.resolve(cwd, target));
   const caches = [...new Set(["/tmp", "/var/tmp", os.tmpdir()].map(realish))].flatMap((t) => TEMP_CODE_CACHES.map((n) => path.join(t, n)));
   const moved = process.env.NODE_COMPILE_CACHE;
-  if ([...caches, ...(moved && path.isAbsolute(moved) ? [realish(moved)] : [])].some((c) => within(at, c))) return withApproval(session, askBy(`edit inside ${at}, a cache of code that node runs later outside the sandbox`));
+  if ([...caches, ...(moved && path.isAbsolute(moved) ? [realish(moved)] : [])].some((c) => within(at, c))) return withApproval(session, extraOf(guard), askBy(`edit inside ${at}, a cache of code that node runs later outside the sandbox`));
   // One walk of each root for this edit (round 3, finding 40).
   const scan = new Scan(guard.allowedPaths);
   projectRoots(session, scan);

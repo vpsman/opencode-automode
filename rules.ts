@@ -122,6 +122,11 @@ export function within(p: string, dir: string, strict = false): boolean {
 
 const TMP_DIRS = [...new Set(["/tmp", "/var/tmp", os.tmpdir()].map(realish))];
 const DEV_SINKS = /^\/dev\/(null|zero|stdout|stderr|tty|fd\/\d+)$/;
+// (opencode-automode: a sink is told by the path as written, absolute and without `..`, not by
+// resolving it in this process, whose own descriptors are not the command's: `/dev/stderr` led to
+// a terminal here and to a pipe there. A word that resolves to /dev/null through links is a sink
+// too; any other device it reaches is not.)
+const devSink = (word: string, p: string | undefined) => (word.startsWith("/") && !/(^|\/)\.\.(\/|$)/.test(word) && DEV_SINKS.test(path.normalize(word))) || p === "/dev/null";
 
 // Where the content of a file written in this session came from: the agent itself (write tool,
 // heredoc, echo, printf), a download, or a command whose output the rules cannot know.
@@ -1826,7 +1831,7 @@ function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = 
     // Copied into a directory, the files land inside it: `cp a.rs /tmp` writes /tmp/a.rs.
     const written = intoDir && t === paths.at(-1) && dest ? sources.map((s) => path.join(dest, path.basename(s))) : [resolveWord(t, scope)];
     for (const p of written) {
-      if (p && DEV_SINKS.test(p)) continue;
+      if (devSink(t, p)) continue;
       if (isGuarded(p, scope)) return guardAsk(`${cmd} changes the auto-mode guard's own files`);
       if (isPiFile(p, scope)) return piAsk(`${cmd} changes Pi's own files: ${t}`);
       if (!isLocal(p, scope)) return outside(`${cmd} writes outside the working directory: ${t}`, p);
@@ -2109,7 +2114,7 @@ function network(cmd: string, args: string[], scope: Scope): Verdict {
   const values = (flags: string[]) => opts.filter(([flag]) => flags.includes(flag)).map(([, value]) => value ?? "");
   const writes = (file: string) => {
     const p = resolveWord(file, scope);
-    if (file === "-" || (p && DEV_SINKS.test(p))) return { p: undefined };
+    if (file === "-" || devSink(file, p)) return { p: undefined };
     if (isPiFile(p, scope)) return { p, outside: piAsk(`${cmd} writes Pi's own files: ${file}`) };
     return isLocal(p, scope) ? { p } : { p, outside: outside(`${cmd} writes outside the working directory: ${file}`, p) };
   };
@@ -2248,7 +2253,7 @@ function redirects(cmd: Simple, scope: Scope): Verdict {
   const origin = cmd.out.length ? outputOrigin(cmd, scope) : "other";
   for (const target of cmd.out) {
     const p = resolveWord(target, scope);
-    if (p && DEV_SINKS.test(p)) continue;
+    if (devSink(target, p)) continue;
     if (p && /^\/dev\//.test(p)) return deny(`writes to the device ${target}`);
     if (isGuarded(p, scope)) verdict = worst(verdict, guardAsk("redirect overwrites the auto-mode guard's own files"));
     else if (isPiFile(p, scope)) verdict = worst(verdict, piAsk(`redirect writes Pi's own files: ${target}`));
@@ -2338,7 +2343,11 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
     return worst(verdict, criticalAsk(`${name} runs as root`), inner.length ? simple(tail(inner), scope, depth + 1) : ALLOW);
   }
   if (ALWAYS_ASK[name]) return worst(verdict, (name === "su" || name === "pkexec" ? criticalAsk : ask)(`${name} ${ALWAYS_ASK[name]}`));
-  if (args.length === 1 && /^(--version|-V|--help|-h)$/.test(args[0])) return verdict;
+  // (opencode-automode: a lone `-h` or `-V` is an option of many programs, hashall to a shell,
+  // verbose to vim, after which they read standard input; only the programs these rules know (read
+  // only, dev tools, tools with subcommands, runners, interpreters) take it as help or a version
+  // here. `--help` and `--version` stay.)
+  if (args.length === 1 && (/^--(version|help)$/.test(args[0]) || (/^-[Vh]$/.test(args[0]) && (READ_ONLY.has(name) || DEV_TOOLS.has(name) || !!SUBCOMMANDS[name] || !!RUNNERS[name] || INTERPRETERS.has(name))))) return verdict;
 
   if (SHELLS.has(name)) return worst(verdict, shell(name, args, dyn, cmd, scope, depth));
   // eval runs its words joined, after the shell has expanded them: a variable in them is code

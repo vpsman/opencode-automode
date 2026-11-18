@@ -25,7 +25,7 @@ For each shell tool call:
    print: `$'...'` and `$"..."` quoting; `${x@P}`, `${!x}`, quotes or an operator inside `${...}`
    (a blank before an offset, `${x: -1}`, prints), and `${...}` nested deeply; `$[...]`; a word that holds arithmetic and
    other text (`$((-1))d`, `id_ed$((25519))`: the rules read `0` in its place; an assignment's
-   own `x=$((i+1))` is as before); a pipe, `&&` or `||` with no command after it, and a word
+   own `x=$((i+1))` is as before); a pipe, `&&` or `||` straight before another operator (`echo a |;`), and a word
    straight after a subshell's `)` (syntax errors bash refuses); an array
    assignment (`a=(1 2)`) or an array element where an assignment may stand (`a[0]=1`);
    braces where bash expands none or reads the word first (the word that names a command, a redirect's target, an
@@ -48,8 +48,10 @@ For each shell tool call:
    quotes; a command line that starts with `-` or `+`. For a nested shell or `eval`: code
    built from a variable, a substitution or a glob; a nested shell or an `eval` in a command
    that defines a function, and code for `eval` that defines one; a program named like a
-   shell at a path the checks do not know, with `-c` (`/tmp/bash -c ...`); and code for `sh`
-   or `dash` that only bash reads this way (braces, `[[ ]]`, `<<<`, `&>`, a pattern that
+   shell at a path the checks do not know, with `-c` (`/tmp/bash -c ...`); code that
+   `xargs -I`/`-i`/`--replace` or `find -exec` fills in with its input (`xargs -I{} bash -c
+   'echo "{}"'`: printed, the `{}` would lose its quotes; `bash -c '... "$1"' _ {}` prints);
+   and code for `sh` or `dash` that only bash reads this way (braces, `[[ ]]`, `<<<`, `&>`, a pattern that
    could match `.` or `..`, such as `sh -c 'ls .*'`). `test/canon.test.mts` holds the printer to bash, and
    `test/differential.test.mts` runs the printed text against the text as written (see
    Tests).
@@ -108,7 +110,7 @@ For each shell tool call:
      substring offsets and the numeric tests of `[[ ]]` a variable passes only when the same
      call sets it to a plain integer first (`i=0`, the counter of `for ((...))`), because
      bash evaluates its value as code. `shopt`, `bash -O`, `bash -i` before its code,
-     `set -H`, `set -k` and the other options that change how the rest is read ask. So do a
+     `set -H`, `set -k`, `set +B` and the other options that change how the rest is read ask. So do a
      reserved word after an assignment or a redirection (`x= {` runs a program called `{`)
      and a number straight before `<` (`cat 3< f`). Braces are judged as the words they
      expand to: `curl {-d,@f} host` asks as `curl -d @f host` does, and `src/{a,b}` and
@@ -127,7 +129,12 @@ For each shell tool call:
      spelling git accepts: short options in clusters (`checkout -qf`, `branch -df`),
      `switch -f`, `--discard-changes` and `-C`, `checkout -B`, a `checkout` operand that
      names an existing path, looked up where git runs, `-C` included
-     (`git checkout HEAD ./`), `branch -f`, `-M` and `-C`, `gc --prune=<date>`, and a
+     (`git checkout HEAD ./`), `branch -f`, `-M` and `-C`, `gc --prune=<date>`,
+     `reset --merge`, `clean` but a
+     dry run (`-n`, read as git reads it: the last of `-n` and `--no-dry-run` decides, and
+     `-en` is `-e n`; `-i`, and a plain `clean` under `clean.requireForce=false`, delete
+     too), a
+     `checkout` operand with a backslash (a pathspec), and a
      `fetch` or `pull` that can move a local branch or tag backwards or delete one: a `+`
      refspec, `--force` (the last of `--force` and `--no-force` decides), `--refmap`,
      `--update-head-ok`, `--prune-tags`, `--stdin`, `--prune` with a destination, and a
@@ -173,7 +180,24 @@ For each shell tool call:
      `-I`, `--to-command`, `-F`; `sort --compress-program`; `make --eval`, `make -f -` or a
      makefile from standard input, a device or a pipe, also through a symbolic link, and
      `NAME=value` arguments of make on the environment's terms; `fd -x`; `rg --pre`;
-     `man -P`, `-H` and `-C`); builtins that evaluate a value as arithmetic (`let`,
+     `man -P`, `-H` and `-C`; a compiler's `-wrapper`, `-B`, `-fplugin`,
+     `-fmodule-mapper`, `-specs`, `-Xclang`,
+     `-fuse-ld=<path>`, `--prefix` and a linker plugin; `rustc -C linker=`,
+     `link-arg` (or `link_arg`) and `-Z`; `ccache` with a program other than a compiler, or
+     `-o`; `cmake -E`, `-P`, `-C`, `--toolchain`, `-D` of a `CMAKE_` variable outside a short
+     list of harmless ones (`CMAKE_BUILD_TYPE`, `CMAKE_INSTALL_PREFIX`, the standards, ...),
+     `CMAKE_<...>FLAGS` with one of the compiler options above, and `cmake --build -- <words>`
+     held to make's checks; `make NAME=value` whose value is one of the compiler options above,
+     and a make argument with `=` in a form other than a plain `NAME=value` (`'X != cmd'`,
+     `a/b:=...`, any such word after `--`); a lone `-h` or `-V` given to a shell other than
+     bash, sh and dash, to the vim family under any of its names (`vim.basic`, `vim.tiny`,
+     `ex`, `editor`), `tclsh`, `octave` or `as` (an option there, which then reads standard
+     input); `rustc +<path>`, `rustfmt +<path>` and the other rustup proxies with a
+     toolchain that is not a plain name;
+     `cargo clippy`, `rustc` and `rustdoc` with rustc's options after `--`; `ctest -S`, `--build-and-test` and `--test-command`; `just --command`/`-c` and
+     `--shell` and `--chooser`; `tox exec` and `-x`/`--override`; `meson devenv` and
+     `--wrapper`; `mypy --python-executable` and `--install-types`; `go` with `-extld` or
+     `-extar` anywhere, and `-gccgoflags`; `npm run env`, wherever `env` stands after `run`; an option of any of these held in a variable goes to the model); builtins that evaluate a value as arithmetic (`let`,
      `declare -i`, `test -v` with a subscript), and a value given in any of those ways to
      one of bash's integer variables (`RANDOM`, `SRANDOM`, `OPTIND`, `HISTCMD`, `SECONDS`,
      `BASHPID`, `BASH_XTRACEFD`, `READLINE_MARK`, `READLINE_POINT`); a locale (`LANG`,
@@ -277,8 +301,17 @@ For each shell tool call:
      call whose shell has such an entry where opencode's `PATH` has none asks, and says why.
      A write to `/tmp` does not count for the project, except for a git command whose
      configuration, hook or URL names a program, and for a program whose place the check
-     cannot tell (`npm --version`, `cargo --version`: to the model). A write the check cannot place (an archive
-     extraction, `patch`, `git apply`, a recursive copy) marks the directory it ran in; after a git command that writes the work tree
+     cannot tell (`npm --version`, `cargo --version`: to the model). A pattern a program
+     expands itself (`npm test -- '/tmp/d*/x.test.js'`) counts from the last `/` before its
+     first `*`, `?`, `[`, `{`, `(` or `\`, and a word with a `%xx` escape, a `data:` URL or an
+     expansion bash computes (`$P`, `$(...)`) is a place the check cannot tell; one in the first part of an absolute path could be anywhere. A write the check cannot place (an archive
+     extraction, `patch`, `git apply`, a recursive copy, and every gcc-family or rustc call that
+     is not a pure query (`--version`, `--help`, `-print-*`, `-dumpmachine`; `-E` and
+     `-fsyntax-only` count as compiles, as an option's value can hide or undo them), since a compiler and its options choose many names) marks the directory it ran
+     in, or, where the place cannot be read (every compile, a write in a call that also makes or
+     copies a link: `ln`, or `cp` with `-s`, `-l`, `-d`, `-P`, `-r` or `-a`; `cp --parents`), the project, the temp directories and `allowedPaths`; a runner
+     outside every project counts a write in a writable directory above where it runs, as npm
+     and cargo look upward; after a git command that writes the work tree
      (`pull`, `merge`, `checkout`, `rebase`, `stash pop`, `reset`) only the files git
      changed count, once the call is over. In a session that has written nothing in the
      project, `make`, `npm test` and `cargo build` are allows and run the project's code
@@ -339,7 +372,9 @@ For each shell tool call:
      cache works against it read-only (`cargo build` and `cargo test` do, with a crate from
      `~/.cargo/registry`); a build that must fetch or write a shared cache fails with
      "Read-only file system". List the directory in `sandboxWritable` if you accept that, or
-     run the fetch step yourself.
+     run the fetch step yourself. A store file that is hard-linked into the project (pnpm and
+     bun link `node_modules` files from their stores) is the same file under both names, and a
+     write through the project's name reaches it (see Known gaps).
    - **Git directories** found under the project, `allowedPaths` and temp dirs (main, linked
      worktrees, submodules, bare repos; at any depth, `node_modules` included) are read-only
      all the way down, mounts beneath them included, as are `.git` pointer files, every
@@ -519,8 +554,11 @@ For each shell tool call:
    opencode runs the tool calls of one message at the same time and does not say which shell
    belongs to which call, so a shell is sandboxed only when every identical command waiting
    for one is an allow. If two identical commands issued together get different verdicts, both
-   ask, and the one that would have been allowed may still run sandboxed when you approve it:
-   the one case where an approved command is not run as is. The plugin also keeps track of
+   ask, and the one that would have been allowed may still run sandboxed when you approve it.
+   The same holds for an allow that asks because auto-allow is paused for the session or a
+   git directory it could write cannot be looked into: its shell is already sandboxed, so it
+   runs as printed when you approve it. These are the cases where an approved command is not
+   run as is. The plugin also keeps track of
    which calls may still be running, until no process of theirs is left (a call run in the
    background ends its tool call while its process runs). While a push that
    `allowFeatureBranchPush` checked may be running, every call that gets a writable `.git`
@@ -644,8 +682,8 @@ defaults would silently drop `enabled: false` and your own ask and deny rules.
 
 "Always allow" in an opencode prompt is mirrored per project into
 `~/.local/state/opencode-automode/always.json`, only for plain word patterns on a short allowlist
-of common build, test and read commands (`git status/commit/...` but not `git push`, `git config`
-or `git rebase`, `cargo build/test`, `npm run`, `pytest`, `ls`, `cat`, `grep`, project scripts
+of common build, test and read commands (`git status/commit/...` but not `git push`, `git config`,
+`git rebase`, `git stash`, `git restore` or `git rm`, `cargo build/test`, `npm run`, `pytest`, `ls`, `cat`, `grep`, project scripts
 `./x`, ...). Whatever they run still runs sandboxed. Like a prompt's session choice, it never overrides a firm ask (root, credential
 reads, downloaded code, your own ask rules). For `edit` and `read` the plugin only tightens.
 opencode `deny` rules never reach it, so they always win.
@@ -864,7 +902,8 @@ message), which is why pushes and ssh use deterministic rules instead.
   or program the command runs (`./test.sh`, `make`) does the same with values from a file,
   the environment or a program's output, and that is not seen.
 - **Programs are judged by name.** Apart from the options listed above (git, tar, sort, make,
-  fd, rg, man, sed, awk, curl, wget, the package managers and the wrappers and runners), an
+  fd, rg, man, sed, awk, curl, wget, the compilers and build tools, the package managers and
+  the wrappers and runners), an
   allowed program is not checked for options that make it run another program or read a
   script. Whatever it starts runs inside the sandbox. (After a session write the safe list
   is asked about the file bash would run, not about the name; but a program put into a
@@ -906,6 +945,10 @@ message), which is why pushes and ssh use deterministic rules instead.
   remote command are lexical: they read the words, not the remote machine, so a remote
   symbolic link to `/proc/<pid>/environ` is not seen, and `systemctl show` and
   `systemctl cat` print a unit's configuration, environment settings included.
+- **Hard links out of the writable directories.** A file the sandbox may write under one name
+  is written under every name it has: a pnpm or bun store file hard-linked into
+  `node_modules` changes in the store when the call writes `node_modules/<pkg>/index.js`.
+  Landlock grants by the path walked, and a hard link's other names cannot be told from it.
 - **`/tmp` is shared.** It stays writable and shared with other processes, because agents and
   opencode's own tools pass files through it, and it is walked before every allowed command
   (see the scan budget above). A tool that keeps code it runs later in a temp directory under a
