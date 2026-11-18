@@ -22,7 +22,9 @@ import {
   commitWrites,
   fileVerdict,
   isRootLike,
+  bare,
   makeScope,
+  psEnvironments,
   readVerdict,
   realish,
   within,
@@ -1801,6 +1803,9 @@ const psSortOk = (value: string) => value.split(",").every((k) => PS_FIELDS.has(
 // same word after -o, or the next); --sort takes sort keys; -p -u -U -C --pid --ppid select.
 // BSD words (no dash) are flags from a list, `o` taking a format; `e` (environment) is not one.
 function psOk(argv: string[]): boolean {
+  // (Round 43, Mythos: procps reads `-ex` and the like again as BSD words, where `e` prints
+  // environments: the rules' reading of ps decides that first.)
+  if (psEnvironments(argv.slice(1))) return false;
   const FLAGS = "eAfFlwHjTLMyZaxu";
   const SELECT = new Set(["-p", "-u", "-U", "-C", "--pid", "--ppid"]);
   for (let i = 1; i < argv.length; i++) {
@@ -3932,32 +3937,50 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       // writes `./.git`. Judged by where each lands.)
       // (Round 42, Mythos: `~+` is where it runs. Opus: a copy of a directory's contents, `src/.`,
       // rsync's `src/`, `-T`, brings the `.git` it holds to where the contents land.)
-      if (how === "last" && files.length > 1) {
-        const dest = herePlus(files.at(-1)!);
+      // (Round 43, Opus: also into a `-t`/`--target-directory` directory, and from the names a glob
+      // source expands to; Mythos: a `.git` at any depth of the source, gitIn.)
+      const tool = path.basename(word);
+      let tdir: string | undefined;
+      let tWord: string | undefined;
+      if (how === "last" && tool !== "rsync") {
+        for (let k = 0; k < args.length && args[k] !== "--"; k++) {
+          const a = args[k];
+          if (/^--targ/.test(a) && "--target-directory".startsWith(a.split("=")[0])) {
+            tdir = a.includes("=") ? a.slice(a.indexOf("=") + 1) : (tWord = args[k + 1]);
+          } else if (/^-[^-]/.test(a) && a[a.slice(1).search(/[Sgmot]/) + 1] === "t" && a.slice(1).search(/[Sgmot]/) >= 0) {
+            // (The letter before any other that takes a value: `-St` names the suffix `t`.)
+            const rest = a.slice(a.slice(1).search(/[Sgmot]/) + 2);
+            tdir = rest || (tWord = args[k + 1]);
+          }
+        }
+      }
+      const given = tdir !== undefined ? files.filter((f, k) => !(f === tWord && k === files.indexOf(tWord))) : files.slice(0, -1);
+      if (how === "last" && given.length && (tdir !== undefined || files.length > 1)) {
+        const dest = herePlus(tdir ?? files.at(-1)!);
         const dir = cwdOf(cmd);
-        const tool = path.basename(word);
-        const asFile = tool !== "rsync" && args.some((a) => a === "--no-target-directory" || /^-[a-zA-Z]*T/.test(a));
-        let into = !asFile && (dest.endsWith("/") || files.length > 2);
+        const asFile = tdir === undefined && tool !== "rsync" && args.some((a) => a === "--no-target-directory" || /^-[a-zA-Z]*T/.test(a));
+        let into = tdir !== undefined || (!asFile && (dest.endsWith("/") || files.length > 2));
         if (!into && !asFile && dir !== undefined) {
           try {
             into = fs.statSync(path.resolve(dir, tilde(dest))).isDirectory();
           } catch {}
         }
-        for (const written of files.slice(0, -1)) {
-          const src = herePlus(written);
-          const contents = asFile || /\/\.\/*$/.test(src) || (tool === "rsync" && src.endsWith("/"));
-          const landing = into && !contents ? `${dest.replace(/\/+$/, "")}/${path.basename(src.replace(/\/+$/, ""))}` : dest;
-          if (into && !contents) targets.push(landing);
-          // (The project's own root is no such source: its `.git` is the one already trusted; a
-          // nested clone or a directory elsewhere is.)
-          let holdsGit = false;
-          if (dir !== undefined) {
+        for (const written of given) {
+          const word0 = herePlus(written);
+          const names = dir !== undefined && /[*?[]/.test(word0) ? (expandNames(word0, dir) ?? [word0]) : [word0];
+          for (const src of names) {
+            const contents = asFile || /\/\.\/*$/.test(src) || (tool === "rsync" && src.endsWith("/"));
+            const landing = into && !contents ? `${dest.replace(/\/+$/, "")}/${path.basename(src.replace(/\/+$/, ""))}` : dest;
+            if (into && !contents) targets.push(landing);
+            // (The project's own root is no such source: its `.git` is the one already trusted; a
+            // nested clone or a directory elsewhere is.)
+            // (A link copies nothing: `ln` makes the one name only.)
+            if (dir === undefined || tool === "ln") continue;
             const from = path.resolve(dir, tilde(src));
-            try {
-              holdsGit = !!fs.lstatSync(path.join(from, ".git")) && !(roots ?? []).some((r) => physical(r) === physical(from));
-            } catch {}
+            if ((roots ?? []).some((r) => physical(r) === physical(from))) continue;
+            const found = gitIn(from);
+            if (found !== undefined) targets.push(`${landing.replace(/\/+$/, "")}/${found}`);
           }
-          if (holdsGit) targets.push(`${landing.replace(/\/+$/, "")}/.git`);
         }
       }
       if (how && !NAME_KEEPERS.has(path.basename(word))) {
@@ -5170,6 +5193,26 @@ function descriptorsReached(raw: string): string[] {
   }
   return DESCRIPTOR.test(cur) ? [cur] : [];
 }
+// Where a directory holds a `.git` at any depth (council project review 2, round 43, Mythos), as
+// a path below it; `.git` itself where the walk runs out of its budget before it could tell.
+function gitIn(dir: string, budget = { left: 4000 }, below = ""): string | undefined {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(path.join(dir, below), { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  for (const e of entries) {
+    if (--budget.left < 0) return ".git";
+    const rel = below ? `${below}/${e.name}` : e.name;
+    if (e.name === ".git") return rel;
+    if (e.isDirectory()) {
+      const found = gitIn(dir, budget, rel);
+      if (found !== undefined) return found;
+    }
+  }
+  return undefined;
+}
 // Whether a directory holds a symbolic link at any depth (council project review 2, round 22), or
 // is too large to tell within a small budget; a link to a place inside the directory counts too.
 function holdsLink(dir: string, budget = { left: 4000 }): boolean {
@@ -5822,3 +5865,6 @@ export function decideRead(guard: Guard, session: SessionState, cwd: string, tar
   const verdict = readVerdict("read", target, scopeFor(guard, session, cwd));
   return verdict ? fromRules(verdict) : undefined;
 }
+
+// (Round 43: see rules.ts `bare`.)
+bare(LS_REMOTE_OPTIONS, RESET_OPTIONS, GIT_STATE_BY, GIT_TODO, CREATE_OPTIONS, REMOTE, HOOKS_RUN, GIT_SHORT_REFUSED, GLOB_AFTER, GIT_WRITE, NEEDS_OUTSIDE, WRITER_OPERANDS, PARENT_MAKERS, HOOKS_OF, HOOK_OPTIONS);

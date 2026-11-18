@@ -82,7 +82,7 @@ const WRAPPABLE = new Set(["bash", "sh"]);
 // offered "a difference asks, or ends the wrapping of that shell"; the maintainer took the
 // second. Under dash nothing is allowed without a prompt, and the prompt says so.
 const REALLY: Record<string, string[]> = { bash: ["bash"], sh: ["bash"] };
-const wrappable = (shell: string) => (REALLY[path.basename(shell)] ?? []).includes(path.basename(realpath(shell)));
+const wrappable = (shell: string) => ((Object.hasOwn(REALLY, path.basename(shell)) ? REALLY[path.basename(shell)] : undefined) ?? []).includes(path.basename(realpath(shell)));
 
 // The state directory holds every command the agent ran: private to the user, and hidden from
 // sandboxed commands (see the plan's hidePaths).

@@ -16,7 +16,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { bashVerdict, compressorReading, fileVerdict, parse, readVerdict, rsyncReading, tarReading, within, type Matcher, type Scope, type Simple } from "./rules.ts";
+import { bare, bashVerdict, compressorReading, fileVerdict, parse, readVerdict, rsyncReading, tarReading, within, type Matcher, type Scope, type Simple } from "./rules.ts";
 import { gitArgs, gitEnv } from "./sandbox.ts";
 
 const HOME = os.homedir();
@@ -4374,10 +4374,10 @@ function programProblem(name: string, args: string[], cwd?: string, inProject?: 
     // Read by position (round 41, Mythos and Sol): an option's value is no option, and `--` ends
     // the options only where an option could stand.
     if (t.clusters.some((a) => /[IFML]/.test(a))) return ask("tar -I or -F runs a program, and -M or -L prompts for the next volume, where ! runs a shell on standard input");
-    // (Round 42, Opus: any word before `--` that could name a remote archive, not only those the
-    // reader takes for one, so this check does not share the rules' reading; `--force-local` as
-    // tar reads it.)
-    if ((t.archives.some((a) => /^[^/]*:/.test(a)) || (args.includes("--") ? args.slice(0, args.indexOf("--")) : args).some((a) => /^(-[a-zA-Z]*f)?[^-/][^/]*:/.test(a))) && !t.has("force-local")) return ask("tar with an archive on a remote host runs a remote shell");
+    // (Round 42, Opus: any word that could name a remote archive, not only those the reader takes
+    // for one, so this check does not lean on the reader's option values; a member the reader
+    // lists is no archive, round 43, Sol and Astra: `tar -tf a.tar notes:today`.)
+    if ((t.archives.some((a) => /^[^/]*:/.test(a)) || args.some((a) => /^(-[a-zA-Z]*f)?[^-/][^/]*:/.test(a) && !t.members.includes(a))) && !t.has("force-local")) return ask("tar with an archive on a remote host runs a remote shell");
   }
   if (name === "sort" && longOption(args, ["--compress-program"])) return ask("sort --compress-program runs a program");
   // Council project review 2 (Mythos): the compilers and build tools the rules allow by name, with
@@ -4884,8 +4884,8 @@ const TAR_OPTIONS: Getopt = {
   values: "gCTXfFLbHVIKN",
   long: Object.fromEntries([
     ...longs("flag", "catenate concatenate create delete diff compare append test-label list update extract get check-device incremental ignore-failed-read no-check-device no-seek seek sparse exclude-backups exclude-caches exclude-caches-all exclude-caches-under exclude-vcs exclude-vcs-ignores no-null no-recursion no-unquote no-verbatim-files-from null verbatim-files-from recursion unquote anchored ignore-case no-anchored no-ignore-case no-wildcards no-wildcards-match-slash wildcards wildcards-match-slash keep-directory-symlink keep-newer-files keep-old-files no-overwrite-dir overwrite overwrite-dir recursive-unlink remove-files skip-old-files unlink-first verify ignore-command-error no-ignore-command-error to-stdout clamp-mtime delay-directory-restore touch no-delay-directory-restore no-same-owner no-same-permissions numeric-owner preserve-permissions same-permissions same-owner preserve-order same-order acls no-acls no-selinux no-xattrs selinux xattrs force-local multi-volume read-full-records ignore-zeros old-archive portability posix auto-compress bzip2 xz lzip lzma lzop no-auto-compress zstd gzip gunzip ungzip compress uncompress hard-dereference dereference one-file-system absolute-names full-time check-links block-number show-defaults show-omitted-dirs show-snapshot-field-ranges show-transformed-names utc verbose interactive confirmation restrict usage version help"),
-    ...longs("value", "listed-incremental hole-detection level sparse-version add-file directory exclude exclude-ignore exclude-ignore-recursive exclude-tag exclude-tag-all exclude-tag-under files-from exclude-from to-command group group-map mode mtime owner owner-map sort xattrs-exclude xattrs-include file info-script new-volume-script tape-length rmt-command rsh-command volno-file blocking-factor record-size format label use-compress-program starting-file newer-mtime newer after-date suffix strip-components transform xform checkpoint-action index-file no-quote-chars quote-chars quoting-style warning pax-option"),
-    ...longs("optional", "occurrence one-top-level atime-preserve backup checkpoint totals"),
+    ...longs("value", "listed-incremental hole-detection level sparse-version add-file directory exclude exclude-ignore exclude-ignore-recursive exclude-tag exclude-tag-all exclude-tag-under files-from exclude-from to-command group group-map mode mtime owner owner-map sort xattrs-exclude xattrs-include file info-script new-volume-script tape-length rmt-command rsh-command volno-file blocking-factor record-size format label use-compress-program starting-file newer-mtime newer after-date suffix strip-components transform xform checkpoint-action index-file no-quote-chars quote-chars quoting-style warning pax-option program-name"),
+    ...longs("optional", "occurrence one-top-level atime-preserve backup checkpoint totals HANG"),
   ]),
 };
 // The options with which tar writes where its `-C` does not show: absolute member names, another
@@ -4895,16 +4895,19 @@ const TAR_ELSEWHERE = new Set(["-P", "--absolute-names", "--one-top-level", "--t
 // tar's words with an old-style bundle (`tar xfC a.tar sub`) turned into options, as tar does:
 // each letter of the first word is an option, and the letters that take a value take the words
 // after it in order.
+// (Round 43, Mythos: any first word without a dash, and a `-` in it ends the options as `--`
+// would, as rules.ts `tarReading` reads it: `tar cf- .git/config f` makes `.git/config`.)
 function tarWords(args: string[]): string[] {
   const first = args[0];
-  if (first === undefined || first.startsWith("-") || !/^[a-zA-Z]+$/.test(first)) return args;
+  if (first === undefined || first === "" || first.startsWith("-")) return args;
+  const dash = first.indexOf("-");
   const out: string[] = [];
   let k = 1;
-  for (const letter of first) {
+  for (const letter of dash < 0 ? first : first.slice(0, dash)) {
     out.push(`-${letter}`);
     if (TAR_OPTIONS.values!.includes(letter)) out.push(args[k++] ?? "");
   }
-  return [...out, ...args.slice(k)];
+  return [...out, ...(dash < 0 ? [] : ["--"]), ...args.slice(k)];
 }
 // B9-6: the archive tar writes when it makes one or changes one (`-c`, `-r`, `-u`, `-A`, `--create`,
 // `--append`, `--update`, `--catenate`, `--delete`, in any spelling): every `-f`/`--file` value but
@@ -5921,11 +5924,11 @@ function walk(command: string, starts: Places, depth: number, ctx: WalkContext):
     }
     const opens: Record<string, Frame["kind"]> = { "{": "{", if: "if", while: "loop", until: "loop", for: "loop", select: "loop", case: "case" };
     const closes: Record<string, Frame["kind"]> = { "}": "{", fi: "if", done: "loop", esac: "case" };
-    if (opens[w]) {
+    if (Object.hasOwn(opens, w)) {
       const g = open(opens[w], fnPending);
       fnPending = false;
       if (w === "case") g.pattern = false;
-    } else if (closes[w] && cur.argv.length === 0) close(closes[w]);
+    } else if (Object.hasOwn(closes, w) && cur.argv.length === 0) close(closes[w]);
     else if (fnPending && w !== "function") ctx.bail = true;
   };
   const pushWord = () => {
@@ -8367,3 +8370,6 @@ export function expansionProblem(command: string): GuardVerdict | undefined {
   }
   return undefined;
 }
+
+// (Round 43: see rules.ts `bare`.)
+bare(MAKE_OPTIONS, PATCH_OPTIONS, TAR_OPTIONS, QUOTED, GIT_KEYED_OPTIONS, GIT_MESSAGE_FLAGS, GIT_MESSAGE_SHORT, GIT_OPTIONS, GIT_VALUE_OPTIONS, INSTALLERS, GLOB_CLASSES, GLOB_CLASS_TESTS, DASH_DASH, GIT_DASH_DASH, RUNNERS, WRAPPER_SPECS, WRAPPER_OPERANDS, RUNNER_SPECS, PM_GLOBALS, COPY_OPTIONS, GIT_LIST_OPTIONS, LIST_OPTIONS, RUNNER_SELECTORS, KEYED, GIT_VALUES);

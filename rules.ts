@@ -2032,7 +2032,7 @@ const RSYNC_LONG_VALUED = new Set(`out-format log-format log-file log-file-forma
   password-file partial-dir temp-dir backup-dir suffix compare-dest copy-dest link-dest chmod chown usermap groupmap timeout contimeout
   bwlimit max-size min-size block-size port sockopts outbuf remote-option iconv checksum-choice cc compress-choice zc compress-level zl
   compress-threads zt skip-compress info debug modify-window max-delete max-alloc stop-after time-limit stop-at write-batch read-batch
-  only-write-batch protocol address rsync-path config dparam checksum-seed early-input copy-as confine-root`.split(/\s+/));
+  only-write-batch protocol address rsync-path config dparam checksum-seed early-input copy-as confine-root stderr`.split(/\s+/));
 export function rsyncReading(args: string[]) {
   const longs: [string, string | undefined][] = [];
   const letters: string[] = [];
@@ -2052,7 +2052,8 @@ export function rsyncReading(args: string[]) {
       for (let k = 1; k < a.length; k++) {
         letters.push(a[k]);
         if ("eTfBM@".includes(a[k])) {
-          shorts.push([a[k], k < a.length - 1 ? a.slice(k + 1) : args[++i]]);
+          // (Round 43, Opus and Mythos: popt drops a `=` before an attached value, `-T=dir`.)
+          shorts.push([a[k], k < a.length - 1 ? a.slice(k + 1).replace(/^=/, "") : args[++i]]);
           break;
         }
       }
@@ -2065,7 +2066,10 @@ export function rsyncReading(args: string[]) {
   const listOnly = has("list-only");
   // (Round 42, Mythos: `--read-batch` replays a recorded update into its one operand.)
   const batch = prefixed("read-batch");
-  return { longs, letters, shorts, operands, dryRun, listOnly, batch, daemon: prefixed("daemon"), copiesNothing: !batch && (dryRun || listOnly || operands.length < 2), values: (name: string) => longs.filter(([h]) => h === `--${name}`).map(([, v]) => v ?? "") };
+  // (Round 43, Mythos: `--server` writes what standard input sends into its operand, which is no
+  // source; Sol: a dry run of a batch writes nothing.)
+  const server = prefixed("server") || prefixed("sender");
+  return { longs, letters, shorts, operands, dryRun, listOnly, batch, server, daemon: prefixed("daemon"), copiesNothing: !server && (dryRun || listOnly || (!batch && operands.length < 2)), values: (name: string) => longs.filter(([h]) => h === `--${name}`).map(([, v]) => v ?? "") };
 }
 
 // tar's command line read by position (round 41): the old style (a first word of letters without
@@ -2073,12 +2077,13 @@ export function rsyncReading(args: string[]) {
 // options with their values, and `--` ending the options only where an option stands.
 // (Round 42, all four: GNU tar takes a long option by a prefix only where the prefix names one
 // option, and a whole name wins, `--list` over `--listed-incremental`; `--backup`, `--occurrence`,
-// `--checkpoint` and the like take a value only after `=`. The names are tar 1.35's `--help`.)
+// `--checkpoint` and the like take a value only after `=`. The names are tar 1.35's `--help`,
+// with the hidden `--program-name` (a value) and `--HANG` (round 43, Mythos).)
 const TAR_LONG_VALUED = `add-file after-date blocking-factor checkpoint-action directory exclude exclude-from exclude-ignore exclude-ignore-recursive
   exclude-tag exclude-tag-all exclude-tag-under file files-from format group group-map hole-detection index-file info-script label level
   listed-incremental mode mtime new-volume-script newer newer-mtime no-quote-chars owner owner-map pax-option quote-chars quoting-style
   record-size rmt-command rsh-command sort sparse-version starting-file strip-components suffix tape-length to-command transform
-  use-compress-program volno-file warning xattrs-exclude xattrs-include xform`.split(/\s+/);
+  use-compress-program volno-file warning xattrs-exclude xattrs-include xform program-name`.split(/\s+/);
 const TAR_LONG_FLAGS = `absolute-names acls anchored append atime-preserve auto-compress backup block-number bzip2 catenate check-device check-links
   checkpoint clamp-mtime compare compress concatenate confirmation create delay-directory-restore delete dereference diff exclude-backups
   exclude-caches exclude-caches-all exclude-caches-under exclude-vcs exclude-vcs-ignores extract force-local full-time get gunzip gzip
@@ -2089,7 +2094,7 @@ const TAR_LONG_FLAGS = `absolute-names acls anchored append atime-preserve auto-
   old-archive one-file-system one-top-level overwrite overwrite-dir portability posix preserve-order preserve-permissions read-full-records
   recursion recursive-unlink remove-files restrict same-order same-owner same-permissions seek selinux show-defaults show-omitted-dirs
   show-snapshot-field-ranges show-stored-names show-transformed-names skip-old-files sparse test-label to-stdout totals touch uncompress
-  ungzip unlink-first unquote update usage utc verbatim-files-from verbose verify version wildcards wildcards-match-slash xattrs xz zstd`.split(/\s+/);
+  ungzip unlink-first unquote update usage utc verbatim-files-from verbose verify version wildcards wildcards-match-slash xattrs xz zstd HANG`.split(/\s+/);
 const TAR_LONGS = [...TAR_LONG_VALUED, ...TAR_LONG_FLAGS];
 // The option a long word names, as getopt_long reads it: a whole name, else the one name it is a
 // prefix of. Undefined where it names none or several (tar stops with an error).
@@ -2111,12 +2116,19 @@ export function tarReading(args: string[]) {
     if (letter === "C" && value !== undefined) dirs.push(value);
   };
   let i = 0;
-  if (args[0] && /^[A-Za-z]+$/.test(args[0])) {
-    clusters.push(args[0]);
+  // (Round 43, Mythos: tar takes any first word without a dash as the old style, and a `-` in it
+  // ends the options as `--` would: `tar cIf- ./x.sh b.tar f`.)
+  let ended = false;
+  if (args[0] && !args[0].startsWith("-")) {
+    const dash = args[0].indexOf("-");
+    const letters = dash < 0 ? args[0] : args[0].slice(0, dash);
+    clusters.push(letters);
     i = 1;
-    for (const letter of args[0]) if (TAR_SHORT_VALUED.includes(letter)) takeShort(letter, args[i++]);
+    for (const letter of letters) if (TAR_SHORT_VALUED.includes(letter)) takeShort(letter, args[i++]);
+    ended = dash >= 0;
   }
-  for (; i < args.length; i++) {
+  if (ended) members.push(...args.slice(i));
+  else for (; i < args.length; i++) {
     const a = args[i];
     if (a === "--") {
       members.push(...args.slice(i + 1));
@@ -2149,33 +2161,45 @@ export function tarReading(args: string[]) {
 // word with one dash is a cluster of UNIX letters, one without a dash of BSD letters, and in both a
 // letter that takes a value takes the rest of the word or the next word; a long option takes the
 // next word where it takes a value. BSD `e` prints them, so does the field `environ` in a format
-// (`-o`, `-O`, `o`, `O`, `--format`, and in a sort key), the fields split at commas and blanks, and
-// what follows a `=` in one value its heading.
-const PS_UNIX_VALUED = "CGgoOpqstuUkN";
+// (`-o`, `-O`, `o`, `O`, `--format`; a sort key prints nothing), the fields split at commas and
+// blanks, and what follows a `=` in one value its heading.
+// (Round 43, Mythos: where the UNIX reading fails, a letter that is no UNIX option, `-ex`, or a
+// letter that takes a value with none left, `-e -t`, procps reads the dash words again as BSD
+// ones, and a UNIX `e` then prints environments. Opus: `-N` is a flag; `--format:` takes a value.)
+const PS_UNIX_VALUED = "CGgoOpqstuU";
+const PS_UNIX_FLAGS = "AacdefFHjLlMmNPTVwyZ";
 const PS_BSD_VALUED = "oOkpqtU";
-const PS_LONG_VALUED = /^--(format|sort|cols|columns|width|rows|lines|pid|ppid|tty|user|User|group|Group|sid|quick-pid|context)$/;
-function psEnvironments(args: string[]): boolean {
+const PS_LONG_VALUED = /^--(format|sort|cols|columns|width|rows|lines|pid|ppid|tty|user|User|group|Group|sid|quick-pid)$/;
+export function psEnvironments(args: string[]): boolean {
   const formats: string[] = [];
+  let unixE = false;
+  let again = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a.startsWith("--")) {
-      const eq = a.indexOf("=");
-      const head = eq < 0 ? a : a.slice(0, eq);
-      const value = eq >= 0 ? a.slice(eq + 1) : PS_LONG_VALUED.test(head) ? args[++i] : undefined;
-      if (/^--(format|sort)$/.test(head) && value !== undefined) formats.push(value);
+      const cut = a.search(/[=:]/);
+      const head = cut < 0 ? a : a.slice(0, cut);
+      const value = cut >= 0 ? a.slice(cut + 1) : PS_LONG_VALUED.test(head) ? args[++i] : undefined;
+      if (head === "--format" && value !== undefined) formats.push(value);
       continue;
     }
     const unix = a.startsWith("-");
     const valued = unix ? PS_UNIX_VALUED : PS_BSD_VALUED;
+    // Read again as BSD, a dash word's letters up to an `o` (which takes the rest) are flags.
+    if (unix && a.slice(1).split(/[oO]/)[0].includes("e")) unixE = true;
     for (let k = unix ? 1 : 0; k < a.length; k++) {
       if (!unix && a[k] === "e") return true;
       if (valued.includes(a[k])) {
         const value = k < a.length - 1 ? a.slice(k + 1) : args[++i];
-        if ("oOk".includes(a[k]) && value !== undefined) formats.push(value);
+        // A value the UNIX reading may refuse (`-uaxe` names the user `axe`) sends it to BSD.
+        if (unix && (value === undefined || (k < a.length - 1 && !"oO".includes(a[k])))) again = true;
+        if ("oO".includes(a[k]) && value !== undefined) formats.push(value);
         break;
       }
+      if (unix && !PS_UNIX_FLAGS.includes(a[k])) again = true;
     }
   }
+  if (unixE && again) return true;
   return formats.some((f) => {
     for (const field of f.split(/[\s,]+/)) {
       if (field.split(/[=:]/)[0].replace(/^[+-]/, "") === "environ") return true;
@@ -2188,19 +2212,35 @@ function psEnvironments(args: string[]): boolean {
 // gzip, xz, zstd and bzip2 read by position (round 42, Mythos and Sol): a letter that takes a value
 // ends its cluster (`-Sc` names the suffix `c`), with the rest of the word or the next word, and
 // zstd's `-T4`-like letters with the rest of the word only. A listing, a test or output to
-// standard output writes nothing in place (names matched whole); `-o` names the file written.
-const COMPRESSORS: Record<string, { family: string; valued: string; attached: string; long: RegExp; stdout?: true; decompress?: true }> = {
-  gzip: { family: "gzip", valued: "S", attached: "", long: /^--suffix$/ },
-  xz: { family: "xz", valued: "SFCTM", attached: "", long: /^--(suffix|format|check|threads|block-size|block-list|flush-timeout|memlimit(-compress|-decompress|-mt-decompress)?|filters[1-9]?)$/ },
-  zstd: { family: "zstd", valued: "Do", attached: "TBMbei", long: /^--(trace|filelist|output-dir-flat|output-dir-mirror)$/ },
-  bzip2: { family: "bzip2", valued: "", attached: "", long: /^$/ },
+// standard output writes nothing in place; `-o` names the file written.
+// (Round 43, Opus, Mythos, Sol, Astra: gzip and xz take a long option by any prefix that names one
+// (getopt_long: `--su` is `--suffix`, `--tes` is `--test`), bzip2 and zstd only whole; zstd's `-o`
+// takes the next word wherever it stands in a cluster (`-of FILE`), or what follows `=`; zstd
+// `--rm` removes its input after an `-o` too; the table is looked up by its own keys.)
+type CompressorTable = { family: string; valued: string; attached: string; longs: string[]; longValued: string[]; prefixes: boolean; stdout?: true; decompress?: true };
+const XZ_LONGS = `compress decompress uncompress test list keep force stdout to-stdout single-stream no-sparse no-sync suffix files files0 format check
+  ignore-check extreme fast best threads block-size block-list flush-timeout memlimit-compress memlimit-decompress memlimit-mt-decompress memlimit
+  no-adjust filters filters1 filters2 filters3 filters4 filters5 filters6 filters7 filters8 filters9 filters-help lzma1 lzma2 x86 arm arm64
+  armthumb powerpc ia64 sparc riscv delta quiet verbose no-warn robot info-memory help long-help version`.split(/\s+/);
+const COMPRESSORS: Record<string, CompressorTable> = {
+  gzip: { family: "gzip", valued: "Sb", attached: "", prefixes: true, longValued: ["suffix", "bits"], longs: "ascii to-stdout stdout decompress uncompress force help keep list license no-name name quiet silent synchronous recursive suffix test verbose version fast best lzw bits rsyncable".split(" ") },
+  xz: { family: "xz", valued: "SFCTM", attached: "", prefixes: true, longValued: ["suffix", "format", "check", "threads", "block-size", "block-list", "flush-timeout", "memlimit-compress", "memlimit-decompress", "memlimit-mt-decompress", "memlimit", "filters", ...[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `filters${n}`)], longs: XZ_LONGS },
+  zstd: { family: "zstd", valued: "D", attached: "TBMbei", prefixes: false, longValued: ["trace", "filelist", "output-dir-flat", "output-dir-mirror", "patch-from"], longs: [] },
+  bzip2: { family: "bzip2", valued: "", attached: "", prefixes: false, longValued: [], longs: [] },
 };
 for (const [alias, base, extra] of [["gunzip", "gzip", "d"], ["zcat", "gzip", "dc"], ["unxz", "xz", "d"], ["xzcat", "xz", "dc"], ["lzma", "xz", ""], ["unlzma", "xz", "d"], ["lzcat", "xz", "dc"], ["unzstd", "zstd", "d"], ["zstdcat", "zstd", "dc"], ["zstdmt", "zstd", ""], ["bunzip2", "bzip2", "d"], ["bzcat", "bzip2", "dc"]] as const) {
   COMPRESSORS[alias] = { ...COMPRESSORS[base], ...(extra.includes("d") ? { decompress: true } : {}), ...(extra.includes("c") ? { stdout: true } : {}) };
 }
 export function compressorReading(name: string, args: string[]) {
-  const table = COMPRESSORS[name];
+  const table = Object.hasOwn(COMPRESSORS, name) ? COMPRESSORS[name] : undefined;
   if (!table) return undefined;
+  // The option a long word names: whole, or (getopt_long) the one name it is a prefix of.
+  const resolve = (head: string) => {
+    const word = head.slice(2);
+    if (!table.prefixes || table.longs.includes(word)) return word;
+    const all = table.longs.filter((n) => n.startsWith(word));
+    return word && all.length === 1 ? all[0] : head;
+  };
   const letters: string[] = [];
   const longs: string[] = [];
   const operands: string[] = [];
@@ -2213,28 +2253,36 @@ export function compressorReading(name: string, args: string[]) {
     }
     if (a.startsWith("--")) {
       const eq = a.indexOf("=");
-      const head = eq < 0 ? a : a.slice(0, eq);
-      longs.push(head);
-      if (eq < 0 && table.long.test(head)) i++;
+      const name = resolve(eq < 0 ? a : a.slice(0, eq));
+      longs.push(name);
+      if (eq < 0 && table.longValued.includes(name)) i++;
     } else if (a.startsWith("-") && a.length > 1) {
       for (let k = 1; k < a.length; k++) {
         letters.push(a[k]);
+        if (table.family === "zstd" && a[k] === "o") {
+          if (a[k + 1] === "=") {
+            outputs.push(a.slice(k + 2));
+            break;
+          }
+          if (i + 1 < args.length) outputs.push(args[++i]);
+          continue;
+        }
         if (table.attached.includes(a[k])) break;
         if (table.valued.includes(a[k])) {
-          const value = k < a.length - 1 ? a.slice(k + 1) : args[++i];
-          if (table.family === "zstd" && a[k] === "o" && value !== undefined) outputs.push(value);
+          if (k === a.length - 1) i++;
           break;
         }
       }
     } else operands.push(a);
   }
   const long = (...names: string[]) => longs.some((h) => names.includes(h));
-  const stdout = !!table.stdout || letters.includes("c") || long("--stdout", "--to-stdout");
-  const test = letters.includes("t") || long("--test");
-  const list = letters.includes("l") || long("--list");
+  const stdout = !!table.stdout || letters.includes("c") || long("stdout", "to-stdout");
+  const test = letters.includes("t") || long("test");
+  const list = letters.includes("l") || long("list");
   // A decompression by any prefix getopt would take: the side that adds a write.
-  const decompress = !!table.decompress || letters.includes("d") || longs.some((h) => h.length > 2 && ("--decompress".startsWith(h) || "--uncompress".startsWith(h)));
-  return { operands, outputs, decompress, inPlace: !(stdout || test || list) && !outputs.length, family: table.family };
+  const decompress = !!table.decompress || letters.includes("d") || longs.some((h) => h.length > 0 && ("decompress".startsWith(h.replace(/^--/, "")) || "uncompress".startsWith(h.replace(/^--/, ""))));
+  const removes = long("rm");
+  return { operands, outputs, decompress, inPlace: !(stdout || test || list) && (!outputs.length || removes), family: table.family };
 }
 
 // A directory there now; false for anything else, a link loop included (round 40, Sol: ELOOP).
@@ -2837,6 +2885,7 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
     const r = rsyncReading(args);
     if (r.operands.some((a) => /^[^/]*:/.test(a))) return worst(verdict, ask("rsync copies to or from a remote host"));
     if (r.daemon) return worst(verdict, ask("rsync --daemon starts a server"));
+    if (r.server) return worst(verdict, classify("rsync --server writes what its standard input sends"));
     const outputs = [...["log-file", "write-batch", "only-write-batch", "backup-dir", "partial-dir", "temp-dir"].flatMap((n) => r.values(n)), ...r.shorts.filter(([l]) => l === "T").map(([, v]) => v ?? "")];
     if (outputs.some((f) => /(^|\/)\.git(\/|$)/.test(resolveWord(f, scope) ?? f))) return worst(verdict, ask("rsync writes a file in a .git directory"));
     if (outputs.length) {
@@ -2860,7 +2909,7 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   // Files written by an option (round 39, Mythos): held to the write test.
   // Long options by any prefix the tool takes (round 40, Mythos: `--cursor-fil=`).
   const optionWrites: Record<string, { short: RegExp; long: string[] }> = { journalctl: { short: /^$/, long: ["cursor-file"] }, zip: { short: /^-(O|b)$/, long: ["out", "temp-path"] }, docker: { short: /^$/, long: ["iidfile", "metadata-file"] } };
-  if (optionWrites[name]) {
+  if (Object.hasOwn(optionWrites, name)) {
     const table = optionWrites[name];
     const named = args.flatMap((a, k) => {
       const eq = a.indexOf("=");
@@ -3185,3 +3234,18 @@ export function readVerdict(tool: string, target: string, scope: Scope): Verdict
   const secret = secretIn(target.startsWith("@") ? target.slice(1) : target, scope, true);
   return secret ? criticalAsk(`${tool} of a credential file: ${target}`) : undefined;
 }
+
+// Tables looked up by a word of the command hold no inherited names (council project review 2,
+// round 43, Astra: `./constructor -V` found Object's `constructor` in a table): their prototypes,
+// and those of the plain objects they hold, are taken away once the module is loaded.
+export function bare(...tables: object[]): void {
+  const seen = new Set<object>();
+  const strip = (o: unknown) => {
+    if (o === null || typeof o !== "object" || seen.has(o) || Object.getPrototypeOf(o) !== Object.prototype) return;
+    seen.add(o);
+    Object.setPrototypeOf(o, null);
+    for (const v of Object.values(o)) strip(v);
+  };
+  for (const t of tables) strip(t);
+}
+bare(SUBCOMMANDS, DOCKER_GROUPS, ASK_BY_DEFAULT, ALWAYS_ASK, WRITERS, RUNNERS, LEAD_OPTIONS, RUNNER_OPTIONS, WRAPPER_OPTIONS, COMPRESSORS, DOWNLOAD_FILES);

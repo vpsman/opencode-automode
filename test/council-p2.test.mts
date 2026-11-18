@@ -1093,3 +1093,42 @@ test("round 42: rsync and tar options by their real tables, compressors by posit
   for (const c of ["\n\necho ${#BASH_EXECUTION_STRING}", "echo  hi; declare -p BASH_EXECUTION_STRING", '# heading\nprintf "%s\\n" "$LINE\\\nNO"', "# c\necho $((LINENO))", "# c\n(( n = LINENO ))", "# c\nf(){ caller; }; f"]) assert.ok("ask" in canonical(c), JSON.stringify(c));
   assert.ok(!("ask" in canonical("echo ok # $LINENO")));
 });
+
+// ---- round 43 ----
+
+test("round 43: tables hold no inherited names, tar's old style with a dash and hidden options, rsync --server and -T=, ps read again as BSD, compressor prefixes and zstd -o, .git in copies by -t, globs and depth", async () => {
+  // Astra: a command named like an Object property is judged, not thrown on.
+  fs.writeFileSync(path.join(repo, "constructor"), "#!/bin/sh\necho 1.0\n", { mode: 0o755 });
+  try {
+    for (const c of ["./constructor -V", "constructor", "__proto__ x", "toString"]) assert.notEqual(await effect(c), "allow", c);
+  } finally {
+    fs.rmSync(path.join(repo, "constructor"));
+  }
+  fs.mkdirSync(path.join(base, "ev", ".git"), { recursive: true });
+  fs.mkdirSync(path.join(base, "o2", "in", ".git"), { recursive: true });
+  fs.mkdirSync(path.join(repo, "dst"), { recursive: true });
+  const asks = [
+    // Mythos: tar's first word, a `-` in it, and its hidden options.
+    "tar cIf- ./x.sh b.tar f", "tar cFf- ./x.sh b.tar f", "tar cMf- b.tar f", "tar cf- .git/config f",
+    // Mythos: rsync --server writes from its input; Opus, Mythos: `-T=dir` is `dir`.
+    "rsync --server .git/hooks .", "rsync -a -T=/opt/x f g", "rsync -a -T=.git/x f g",
+    // Opus, Mythos: ps -N is a flag; procps reads dash words again as BSD ones.
+    "ps -N eww", "ps -ex", "ps -e -x", "ps -efx", "ps -auxe", "ps -uaxe", "ps -e -t", "ps -eH -x", "ps --format:environ",
+    // Opus, Mythos: gzip and xz take a long option by its prefix; zstd -o and --rm.
+    "gzip --suf -c .git/config", "gzip --su -c .git/config", "xz --suf -c .git/config", "zstd --rm .git/config -o x", "zstd -d -of .git/hooks/pre-commit p.zst",
+    // Opus, Mythos: a copy into -t, from a glob, or of a .git deeper down.
+    "cp -r -t dst ../ev", "cp -rt dst ../ev/.", "cp -r --target-directory=dst ../ev/.", "cp -r ../e[v] dst", "cp -r ../e?/. dst", "rsync -a ../e[v]/ dst", "cp -r ../o2 .", "rsync -a ../o2/ .",
+  ];
+  for (const c of asks) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["ps -ef", "ps -eLf", "ps -ef -u root", "ps -eo pid --sort environ", "tar tf- a.tar", "tar -tf a.tar notes:today", "cp -t dst f"]) assert.equal(await effect(c), "allow", c);
+  // Sol, Astra: a test by any prefix, and a dry run of a batch, write nothing.
+  for (const c of ["gzip -d --tes f.gz", "xz -d --tes f.xz", "rsync --dry-run --read-batch=batch dst/"]) {
+    const s = new SessionState(repo);
+    assert.equal(await effect(c, s), "allow", c);
+    assert.equal(await effect("npm test", s), "allow", `npm test after ${c}`);
+  }
+  // Mythos: an extraction past --program-name's value is a write.
+  const s = new SessionState(repo);
+  assert.equal(await effect("tar -xf a.tar --program-name -O", s), "allow");
+  assert.notEqual(await effect("npm test", s), "allow");
+});
