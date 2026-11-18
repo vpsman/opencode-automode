@@ -932,3 +932,34 @@ test("round 35: unittest names the project defines, compiler options from a stre
   assert.deepEqual(parse("echo x{y{1,2}").cmds[0].argv, ["echo", "x{y1", "x{y2"]);
   assert.equal(parse("echo {+1..3}").opaque, true);
 });
+
+// ---- round 36 ----
+
+test("round 36: unittest paths and names after --, option files by where they lead, install --strip-, cp -St, git log -pw, brace words per alternative", async () => {
+  const p = fs.realpathSync(fs.mkdtempSync(path.join(base, "r36-")));
+  try {
+    fs.mkdirSync(path.join(p, "tests"));
+    fs.writeFileSync(path.join(p, "tests", "__init__.py"), "");
+    fs.writeFileSync(path.join(p, "tests", "test_a.py"), "import unittest\n\nclass TestA(unittest.TestCase):\n    def test_one(self):\n        pass\n");
+    fs.mkdirSync(path.join(p, "code"));
+    fs.writeFileSync(path.join(p, "code", "interact.py"), "");
+    execFileSync("git", ["init", "-q", p]);
+    const at = async (c: string) => (await decideShell(guard, new SessionState(p), p, c)).effect;
+    // Opus, Mythos: a path is the dotted name unittest imports; a name after `--` is a name.
+    for (const c of ["echo x | python3 -m unittest code/interact.py", "python3 -m unittest -- -k code.interact", "python3 -m unittest -- --durations code.interact"]) assert.notEqual(await at(c), "allow", c);
+    for (const c of ["python3 -m unittest tests/test_a.py", "python3 -m unittest tests.test_a.TestA"]) assert.equal(await at(c), "allow", c);
+  } finally {
+    fs.rmSync(p, { recursive: true, force: true });
+  }
+  // Opus, Sol, Mythos: an option file by where its path leads.
+  for (const c of ["gcc @//dev/stdin g.c", "gcc @/./dev/stdin g.c", "gcc @/tmp/../dev/stdin g.c", "gcc @../../../../dev/stdin g.c", "rustc @//dev/stdin m.rs", "gcc -Wl,@//dev/stdin g.c"]) assert.notEqual(await effect(c), "allow", c);
+  assert.equal(await effect("gcc @flags.rsp g.c"), "allow");
+  // Opus, Sol: `--strip-` is a prefix getopt takes. Mythos: `-St` is suffix t; `-pw` prints a patch.
+  for (const c of ["install -s --strip-=/bin/sh f out/x", "cp -St .env out/x", "install -St .env out/i", "cp --suffix -t .env out/y", "git log -pw .env", "git log -pz .env", "gcc -include.env g.c", "gcc -Wl,@.env g.c", "python3 -m mypy --python-exec=./x ."]) assert.notEqual(await effect(c), "allow", c);
+  // Astra, Opus, Sol, Mythos: brace words as bash makes them.
+  assert.deepEqual(parse("printf %s start {,'x'}").cmds[0].argv, ["printf", "%s", "start", "x"]);
+  assert.deepEqual(parse("printf %s ''{,x}").cmds[0].argv, ["printf", "%s", "", "x"]);
+  assert.deepEqual(parse("echo {a}b,c}").cmds[0].argv, ["echo", "a}b", "c"]);
+  assert.equal(parse("echo {a..c..+1}").opaque, true);
+  assert.equal(parse("echo {Z..a}").opaque, true);
+});

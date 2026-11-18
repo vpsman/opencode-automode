@@ -451,7 +451,7 @@ function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope)
     // flags, round 35.)
     const patchLong = ["patch", "unified", "cc", "dd", "remerge-diff", "binary", "word-diff", "color-words", "function-context", "check", "patch-with-stat", "patch-with-raw"];
     const shows = (a: string) =>
-      /^(-[a-zA-Z]*[pumcW]|-U\d*|-L.*)$/.test(a) ||
+      /^(-[a-zA-Z0-9]*[pumcW][a-zA-Z0-9]*|-U\d*|-L.*)$/.test(a) ||
       (/^--diff-merges(=|$)/.test(a) && !/^--diff-merges=(off|none)$/.test(a)) ||
       patchLong.some((name) => longIs(a, name));
     if (["log", "shortlog", "rev-list", "whatchanged"].includes(sub ?? "") && !args.some(shows)) return undefined;
@@ -468,7 +468,20 @@ function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope)
     const attached = (a: string) => (/^-[a-zA-Z]*t./.test(a) && !a.startsWith("--")) || (/^--t[\w-]*=/.test(a) && "--target-directory".startsWith(a.split("=")[0]));
     const t = args.findIndex(separate);
     const target = t >= 0 || args.some(attached);
-    words = target ? operands(args.filter((_, k) => k !== t + 1 || t < 0)) : operands(args).slice(0, -1);
+    // (Round 36, Mythos: a `-t` can be another option's value, `-St` is suffix t; with any `-t` in
+    // sight every operand is read, the directory too.)
+    words = target ? operands(args) : operands(args).slice(0, -1);
+  }
+  // A compiler names the files it reads inside other words too: `-include.env`, `-imacros`,
+  // `-Wp,-include,.env`, `-Wl,@.env` (round 36, Mythos); its diagnostics print their lines.
+  if (/^(gcc|g\+\+|cc|c\+\+|clang|clang\+\+)(-\d+(\.\d+)*)?$/.test(name)) {
+    words = [
+      ...words,
+      ...args.flatMap((a) => [
+        ...(/^-(include|imacros)./.test(a) && !a.startsWith("--") ? [a.replace(/^-(include|imacros)/, "")] : []),
+        ...(/^-W[lap],/.test(a) ? a.split(",").slice(1).map((w) => w.replace(/^@/, "")) : []),
+      ]),
+    ];
   }
   // `--env-file .env` hands the file to a program and shows nothing.
   words = words.filter((w, i) => !/^--env-file(=|$)/.test(w) && words[i - 1] !== "--env-file");
@@ -591,6 +604,15 @@ interface ParseState {
 
 // Commands whose effect on later commands the rules follow; a function by one of these names is not modelled.
 const SHADOWS_STATE = new Set(["cd", "pushd", "popd", "command", "builtin", "exec", "eval", "source", ".", "set", "shopt", "unset", "export", "declare", "typeset", "local", "readonly", "read", "printf", "test", "[", "trap", "alias", "unalias", "hash", "enable", "type", "env", "ln", "mapfile", "readarray", "getopts", "wait"]);
+// Where an empty quote stood in a word, until brace expansion is done (see `add` in parseList).
+const EMPTY_QUOTE = "\uE000";
+const unmark = (w: string, m: string): [string, string] => {
+  if (!w.includes(EMPTY_QUOTE)) return [w, m];
+  let text = "";
+  let tags = "";
+  for (let k = 0; k < w.length; k++) if (w[k] !== EMPTY_QUOTE) (text += w[k]), (tags += m[k]);
+  return [text, tags];
+};
 const RESERVED = new Set(["if", "then", "elif", "else", "fi", "do", "done", "while", "until", "for", "in", "case", "esac", "select", "function", "time", "coproc", "!", "{", "}", "[[", "]]"]);
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/s;
 
@@ -624,22 +646,23 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
   const cases: ("pattern" | "body")[] = [];
   const heredocs: { delimiter: string; quoted: boolean; strip: boolean; owner: Simple }[] = [];
 
-  // Whether the word holds any quoting, an empty `''` included: then an empty word stays a word.
-  let quotedSeen = false;
+  // An empty quote (`''`, `""`) leaves EMPTY_QUOTE, tagged `Q`, where it stood: brace expansion
+  // keeps a word it makes empty only when that word holds a quote (`''{,x}`, not `{,'x'}`). The
+  // marks are taken out before the words are stored.
   const add = (text: string, tags: string) => {
-    word += text;
-    mask += tags;
+    word += text === "" ? EMPTY_QUOTE : text;
+    mask += text === "" ? "Q" : tags;
     hasWord = true;
-    if (text === "" || tags.includes("q")) quotedSeen = true;
   };
   // Before the program: only keywords so far.
   const commandPosition = () => cur.argv.every((w) => RESERVED.has(w) || ASSIGNMENT.test(w));
-  const place = (kind: RedirectKind, w: string, m: string, quotedWord = false) => {
+  const place = (kind: RedirectKind, w: string, m: string) => {
     if (kind === "" && commandPosition() && /[^u]/.test(m)) {
       // A quoted word is never a keyword, and a quoted name or `=` is no assignment: bash runs
       // `"x=/a"` and `\{` as programs.
-      const eq = w.indexOf("=");
-      if (RESERVED.has(w) || (ASSIGNMENT.test(w) && /[^u]/.test(m.slice(0, eq + 1)))) opaque();
+      const plain = unmark(w, m);
+      const eq = plain[0].indexOf("=");
+      if (RESERVED.has(plain[0]) || (ASSIGNMENT.test(plain[0]) && /[^u]/.test(plain[1].slice(0, eq + 1)))) opaque();
     }
     const words = expandBraces(w, m);
     if (!words) {
@@ -650,7 +673,7 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
     // A brace pattern in a word that also holds an expansion: the order of the two is not modelled.
     if (words.length > 1 && /[eE]/.test(m)) opaque();
     // bash drops a word the braces make empty, unless something in it was quoted (`{,x}` is `x`).
-    words2push(words.length > 1 && !quotedWord ? words.filter(([text]) => text !== "") : words, kind);
+    words2push((words.length > 1 ? words.filter(([text, tags]) => unmark(text, tags)[0] !== "" || /[qQ]/.test(tags)) : words).map(([text, tags]) => unmark(text, tags)), kind);
   };
   const words2push = (words: [string, string][], kind: RedirectKind) => {
     for (const [w, m] of words) {
@@ -680,11 +703,9 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
     const w = word;
     const m = mask;
     const kind = redirect;
-    const quotedWord = quotedSeen;
     word = "";
     mask = "";
     hasWord = false;
-    quotedSeen = false;
     redirect = "";
     // `esac` where a pattern or a command would start ends the innermost case.
     if (kind === "" && cases.length && cur.argv.length === 0 && w === "esac" && m === "uuuu") cases.pop();
@@ -692,9 +713,9 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
       // `>&2`, `<&0`, `>&-` copy or close a descriptor. Any other word is a file: `>& file` sends
       // both outputs there, and in `>&2#x` the word is `2#x`.
       if (/^(\d+-?|-)$/.test(w) && /^u+$/.test(m)) return;
-      return place(kind === "dupout" ? "out" : "in", w, m, quotedWord);
+      return place(kind === "dupout" ? "out" : "in", w, m);
     }
-    place(kind, w, m, quotedWord);
+    place(kind, w, m);
     // `case WORD in`: patterns follow.
     if (kind === "" && w === "in" && m === "uu" && cur.argv.length === 3 && cur.argv[0] === "case" && !cases.includes("pattern")) cases.push("pattern");
   };
@@ -792,7 +813,7 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
       i = end;
     } else if (c === '"') {
       hasWord = true;
-      quotedSeen = true;
+      const before = word.length;
       let j = i + 1;
       for (; j < s.length && s[j] !== '"'; j++) {
         const d = s[j];
@@ -810,6 +831,7 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
         else add(d, "q");
       }
       if (j >= s.length) return (opaque(), s.length);
+      if (word.length === before) add("", "");
       i = j;
     } else if (c === "$") {
       i = dollar(i, false);
@@ -1196,11 +1218,13 @@ function expandBraces(word: string, mask: string, budget = { n: 0 }): [string, s
       if (mask[k] !== "u") continue;
       if (word[k] === "{") depth++;
       else if (word[k] === "}") {
-        if (depth === 0) {
+        // (Round 36, Mythos: before a top-level comma, a `}` that does not end a sequence is
+        // text, `{a}b,c}` is `a}b c`.)
+        if (depth === 0 && (commas.length || /^[-+]?\w+\.\.[-+]?\w+(\.\.[-+]?\d+)?$/.test(word.slice(open + 1, k)) || !word.slice(k + 1).includes(","))) {
           close = k;
           break;
         }
-        depth--;
+        if (depth > 0) depth--;
       } else if (word[k] === "," && depth === 0) commas.push(k);
     }
     // An unmatched `{` is text; a later pair may still expand (`x{y{1,2}`).
@@ -1217,7 +1241,10 @@ function expandBraces(word: string, mask: string, budget = { n: 0 }): [string, s
     } else {
       const body = word.slice(open + 1, close);
       // (A `+` sign in a range, which bash also takes, is not modelled.)
-      if (/^[-+]?\d+\.\.[-+]?\d+(\.\.[-+]?\d+)?$/.test(body) && body.includes("+") && !/[^u]/.test(mask.slice(open, close + 1))) return undefined;
+      // (Round 36, Astra: nor a letter range with a `+` step, nor one that crosses the characters
+      // between Z and a, which bash quotes and removes.)
+      const ranged = /^([-+]?\d+|[A-Za-z])\.\.([-+]?\d+|[A-Za-z])(\.\.[-+]?\d+)?$/.exec(body);
+      if (ranged && !/[^u]/.test(mask.slice(open, close + 1)) && (body.includes("+") || (/^[A-Za-z]$/.test(ranged[1]) && /^[A-Za-z]$/.test(ranged[2]) && Math.min(ranged[1].charCodeAt(0), ranged[2].charCodeAt(0)) <= 90 && Math.max(ranged[1].charCodeAt(0), ranged[2].charCodeAt(0)) >= 97))) return undefined;
       const seq = /^(-?\d+|[A-Za-z])\.\.(-?\d+|[A-Za-z])(\.\.(-?\d+))?$/.exec(body);
       if (!seq || /[^u]/.test(mask.slice(open, close + 1))) continue;
       const numeric = /\d/.test(seq[1]) && /\d/.test(seq[2]);
@@ -1819,16 +1846,23 @@ function tarProblem(args: string[]): string | undefined {
 // project, read from where the command runs, or `discover` with its options.
 function unittestNamesOwn(args: string[], scope: Scope): boolean {
   if (args[0] === "discover") return true;
-  const names = args.filter((a, k) => !a.startsWith("-") && !/^(-k|--durations)$/.test(args[k - 1] ?? ""));
+  // Every word after `--` is a name (round 36, Mythos).
+  const dash = args.indexOf("--");
+  const head = dash < 0 ? args : args.slice(0, dash);
+  const names = [...head.filter((a, k) => !a.startsWith("-") && !/^(-k|--durations)$/.test(head[k - 1] ?? "")), ...(dash < 0 ? [] : args.slice(dash + 1))];
   if (!names.length) return true;
   if (!scope.cwd) return false;
   const cwd = scope.cwd;
-  return names.every((n) => {
+  return names.every((name) => {
+    let n = name;
     if (/[$`]/.test(n)) return false;
-    // A path to a test file of the project.
+    // A path to a test file: unittest turns it into the dotted name it imports (`code/interact.py`
+    // is `code.interact`, which a directory without __init__.py leaves to the standard module), so
+    // it is held to the same walk (round 36, Opus and Mythos).
     if (n.includes("/") || n.endsWith(".py")) {
       const p = resolveWord(n, scope);
-      return !!p && isLocal(p, scope) && !inTmp(p) && /\.py$/.test(p) && fs.existsSync(p);
+      if (!p || !isLocal(p, scope) || inTmp(p) || !/\.py$/.test(p) || !within(p, cwd, true)) return false;
+      n = path.relative(cwd, p).slice(0, -3).split(path.sep).join(".");
     }
     // A dotted name: packages (directories with __init__.py) down to a module file, then at most a
     // class and a method that the module's own text defines. (Round 35, all four: unittest walks
@@ -1846,8 +1880,12 @@ function unittestNamesOwn(args: string[], scope: Scope): boolean {
       if (!fs.existsSync(file)) return fs.existsSync(path.join(dir, parts[i], "__init__.py")) && i === parts.length - 1 && within(dir, cwd);
       const rest = parts.slice(i + 1);
       if (rest.length > 2) return false;
+      if (!rest.length) return isLocal(file, scope) && !inTmp(file);
+      // A regular file of a modest size only: a FIFO named like a module would hold the decision.
       let text = "";
       try {
+        const st = fs.statSync(file);
+        if (!st.isFile() || st.size > 4_000_000) return false;
         text = fs.readFileSync(file, "utf8");
       } catch {
         return false;
@@ -2502,7 +2540,8 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   }
   if ((name === "zip" && args.some((a) => a === "-TT" || longIs(a, "unzip-command"))) ) return worst(verdict, classify("zip -TT runs a program"));
   // (Round 35, Mythos: install -s runs the strip program on what it copied.)
-  if (name === "install" && args.some((a) => longIs(a, "strip-program") && a.split("=")[0].length >= 9)) return worst(verdict, classify("install --strip-program runs a program on the file it writes"));
+  // (Round 36: `--strip-` is already a prefix getopt takes.)
+  if (name === "install" && args.some((a) => a.split("=")[0].startsWith("--strip-") && longIs(a, "strip-program"))) return worst(verdict, classify("install --strip-program runs a program on the file it writes"));
   if (WRITERS[name]) return worst(verdict, writeTargets(name, args, scope, !!cmd.heredoc && !cmd.expands));
   if (name === "tar" || name === "zip" || name === "unzip" || name === "gzip" || name === "gunzip" || name === "xz" || name === "zstd") {
     const problem = name === "tar" ? tarProblem(args) : undefined;
@@ -2536,7 +2575,7 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   if (SUBCOMMANDS[name]) return worst(verdict, subcommand(name, args, scope));
   // (Round 35: whatever feeds its standard input, a group, a subshell, `exec <`, and in addopts.)
   if ((name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) && args.some((a) => /(^|[\s=])--(pdb|trace)/.test(a))) return worst(verdict, classify("pytest's debugger, which reads commands from standard input"));
-  if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "mypy" && args.some((a) => /^--(install-types|python-executable)/.test(a))) return worst(verdict, classify("mypy that installs packages or runs another interpreter"));
+  if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "mypy" && args.some((a) => (longIs(a, "install-types") || longIs(a, "python-executable")) && a.split("=")[0].length > 4)) return worst(verdict, classify("mypy that installs packages or runs another interpreter"));
   if (READ_ONLY.has(name) || DEV_TOOLS.has(name)) return verdict;
   // (Council project review 2, round 34, Mythos: unittest imports and calls any name it is given,
   // `python3 -m unittest code.interact` then runs standard input as Python; its names must be the

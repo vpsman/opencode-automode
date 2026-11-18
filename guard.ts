@@ -4229,7 +4229,11 @@ function buildToolProblem(name: string, args: string[]): string | undefined {
   // read from standard input, a descriptor, a device or a process substitution holds options the
   // call chose, `-wrapper` or `-C link-arg` included. For the linker or assembler too.)
   if (COMPILER.test(name) || /^(rustc|rustdoc|ccache|ld|ld\.\w+|as)$/.test(name)) {
-    const stream = (file: string) => file === "-" || /^\/(dev|proc)\//.test(file) || /[$`(<>]/.test(file);
+    // (Round 36, Opus, Sol, Mythos: by where the path leads, not its spelling: `//dev/stdin`,
+    // `/./dev/stdin`, `/tmp/../dev/stdin`, a link. A relative name is the project's own option
+    // file (the declined `gcc @file` class) unless it climbs with `..` towards a device.)
+    const stream = (file: string) =>
+      file === "-" || /[$`(<>]/.test(file) || (path.isAbsolute(file) ? codeFromDevice(file, undefined) !== undefined : /(^|\/)\.\.(\/|$)/.test(file) && /(^|\/)(dev|proc)(\/|$)/.test(file));
     for (let k = 0; k < args.length; k++) {
       const a = args[k];
       const files = [
