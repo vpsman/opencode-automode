@@ -1217,6 +1217,9 @@ function expandBraces(word: string, mask: string, budget = { n: 0 }): [string, s
   for (let open = 0; open < word.length; open++) {
     if (word[open] !== "{" || mask[open] !== "u") continue;
     if (word[open + 1] === "}" && mask[open + 1] === "u") {
+      // bash passes over `{}` only at the start of a word; elsewhere, with a comma in the word,
+      // what it makes is not modelled (round 38).
+      if (open > 0 && /,/.test(word.slice(open))) return undefined;
       open++;
       continue;
     }
@@ -1272,8 +1275,9 @@ function expandBraces(word: string, mask: string, budget = { n: 0 }): [string, s
       }
       expandEach = false;
     } else if (nested) {
-      // One alternative, with a comma further in: `{..{,}}` is `.. ..`.
-      alternatives = [[body, mask.slice(open + 1, close)]];
+      // A group with a comma only further in: bash's reading of it (`{..{,}}` is `.. ..`, but
+      // `{{a,b}}` is `{a} {b}`) is not modelled (round 38).
+      return undefined;
     } else continue;
     const pre: [string, string] = [word.slice(0, open), mask.slice(0, open)];
     const post = expandBraces(word.slice(close + 1), mask.slice(close + 1), budget);
@@ -1874,6 +1878,20 @@ const UNITTEST_LOADED = new Set(
 
 // The names `python3 -m unittest` is given (it imports and calls each): files or modules of the
 // project, read from where the command runs, or `discover` with its options.
+// `python3 -m venv DIR...` and `uv venv [DIR]`: each directory is written; with `--clear` it is
+// emptied first, as `rm -r` would.
+function venvTargets(args: string[], valued: string[], scope: Scope): Verdict {
+  const dirs = args.filter((a, k) => !a.startsWith("-") && !valued.includes(args[k - 1] ?? ""));
+  const clear = args.some((a) => longIs(a, "clear") && a.length > 3);
+  let verdict = ALLOW;
+  for (const d of dirs) {
+    const p = resolveWord(d, scope);
+    if (p && /(^|\/)\.git(\/|$)/.test(p)) verdict = worst(verdict, ask(`a virtual environment in a .git directory: ${d}`));
+    verdict = worst(verdict, clear ? rm(["-r", d], scope) : writeTargets("mkdir", [d], scope));
+  }
+  return verdict;
+}
+
 function unittestNamesOwn(args: string[], scope: Scope): boolean {
   if (args[0] === "discover") return true;
   // Every word after `--` is a name (round 36, Mythos).
@@ -2145,7 +2163,9 @@ function git(args: string[], scope: Scope): Verdict {
   if (sub === "stash") return words.includes("drop") || words.includes("clear") ? ask("git stash drop deletes stashed changes") : ALLOW;
   if (sub === "tag") return opt("delete", "d", "mFu") ? ask("git tag -d deletes a tag") : opt("force", "f", "mFu") ? ask("git tag -f replaces a tag, which keeps no reflog") : ALLOW;
   if (sub === "rebase" && (opt("interactive", "i", "xsX") || opt("exec", "x", "sX") || opt("edit-todo"))) return classify("git rebase that runs commands or an editor");
-  if (sub === "bisect" && words[0] === "run") return classify("git bisect run runs a command");
+  // (Round 38, Mythos: `git bisect view <words>` runs `git <words>`, or the program when it is tig
+  // or git-something; with options only it is git log.)
+  if (sub === "bisect" && (words[0] === "run" || (["view", "visualize"].includes(words[0] ?? "") && words.length > 1))) return classify(`git bisect ${words[0]} runs a command`);
   if (sub === "grep" && (opt("open-files-in-pager", "O", "eABCfm"))) return classify("git grep -O runs a pager program");
   if (sub === "reset" || sub === "clean" || sub === "restore") return ALLOW;
   if (sub === "config") return gitConfig(opts, rest, dir, scope);
@@ -2220,6 +2240,9 @@ function subcommand(tool: string, args: string[], scope?: Scope): Verdict {
   const table = SUBCOMMANDS[tool];
   const lead = LEAD_OPTIONS[tool];
   let sub = operands(args)[0];
+  // (Round 38, Mythos: systemctl and loginctl read their options anywhere; -H, -M and --root
+  // reach another host, machine or tree.)
+  if ((tool === "systemctl" || tool === "loginctl") && args.some((a) => /^-[a-zA-Z]*[HM]/.test(a) && !a.startsWith("--") || ["host", "machine", "root"].some((o) => longIs(a, o) && a.split("=")[0].length > 3))) return ask(`${tool} on another host, machine or root`);
   if (lead && args[0]?.startsWith("-")) {
     const k = leadingOptions(args, lead);
     const unknown = (why: string) => (ASK_BY_DEFAULT[tool] ? ask(`${tool} ${why}`) : classify(`${tool} ${why}`));
@@ -2340,7 +2363,7 @@ function find(args: string[], scope: Scope): Verdict {
     if (!isLocal(p, scope)) return outside(`find deletes or runs commands outside the working directory: ${r}`, p);
   }
   const exec = args.findIndex((a) => /^-(exec|execdir|ok|okdir)$/.test(a));
-  if (exec < 0) return classify("find -delete");
+  if (exec < 0) return classify("find -delete or a -fprint write");
   const end = args.findIndex((a, i) => i > exec && (a === ";" || a === "+"));
   // {} stands for a path under the search roots, which were checked above.
   const inner = args.slice(exec + 1, end < 0 ? undefined : end).map((a) => (a === "{}" ? "." : a));
@@ -2542,6 +2565,19 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   // (Round 35, Mythos: a colon before the first slash makes an operand remote for rsync, with an
   // empty host too (`:x`), and `-e` then runs locally.)
   if (name === "rsync" && operands(args).some((a) => /^[^/]*:/.test(a))) return worst(verdict, ask("rsync copies to or from a remote host"));
+  if (name === "rsync" && args.some((a) => longIs(a, "daemon") && a.length > 3)) return worst(verdict, ask("rsync --daemon starts a server"));
+  if (name === "rsync") {
+    // Files rsync writes besides its destination (round 38): held to the write test, as the README says.
+    const outputs = args.flatMap((a, k) => {
+      const m = /^--(log-file|write-batch|only-write-batch|backup-dir|partial-dir|temp-dir)(=(.*))?$/.exec(a);
+      return m ? [m[2] ? m[3] : (args[k + 1] ?? "")] : a === "-T" ? [args[k + 1] ?? ""] : [];
+    });
+    if (outputs.length) {
+      const w = writeTargets("tee", ["--", ...outputs], scope);
+      if (w.action !== "allow") return worst(verdict, { ...w, reason: w.reason.replace(/^tee/, "rsync") });
+    }
+  }
+  if (name === "nm" && args.some((a) => longIs(a, "plugin") && a.length > 4)) return worst(verdict, classify("nm --plugin loads a shared object"));
   if (name === "xargs") {
     const k = leadingOptions(args, { flags: "0oprtx", valued: "adEILnPs", long: ["null", "interactive", "no-run-if-empty", "verbose", "exit", "open-tty", "show-limits"], longValued: ["arg-file", "delimiter", "eof", "replace", "max-lines", "max-args", "max-procs", "max-chars", "process-slot-var"] });
     if (k < 0 || args.slice(0, k).some((a) => /^-[eil]/.test(a))) return worst(verdict, classify("xargs with options the rules do not model"));
@@ -2612,6 +2648,8 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   if (name === "npm" && operands(args)[0] === "config" && ["set", "delete", "edit"].includes(operands(args)[1])) {
     return worst(verdict, ask("npm config changes settings outside the project"));
   }
+  // (Round 38: build options that publish or reach out.)
+  if (name === "docker" && operands(args)[0] === "build" && args.some((a) => /^--(push|output|ssh|secret)(=|$)/.test(a) || /^-o/.test(a))) return worst(verdict, classify("docker build that publishes, exports or uses credentials"));
   if (name === "docker") {
     const [group, action] = operands(args);
     if (group === "compose" || group === "buildx") return worst(verdict, classify(`docker ${group}`));
@@ -2619,18 +2657,25 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
       return worst(verdict, DOCKER_GROUPS[group].split(" ").includes(action) ? ALLOW : classify(`docker ${group} ${action ?? ""}`.trim()));
     }
   }
+  if (name === "uv" && operands(args)[0] === "venv") {
+    const v = venvTargets(args.slice(args.indexOf("venv") + 1), ["--python", "-p", "--prompt", "--index-url", "--extra-index-url", "--seed"], scope);
+    if (v.action !== "allow") return worst(verdict, v);
+  }
   if (SUBCOMMANDS[name]) return worst(verdict, subcommand(name, args, scope));
   // (Round 35: whatever feeds its standard input, a group, a subshell, `exec <`, and in addopts.)
   // (Round 37, Mythos: `-o python_functions=interact` makes pytest call a function the call names.)
-  if ((name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) && args.some((a, k) => /^python_(functions|classes|files)=/.test(a) && /^(-o|--override-ini)$/.test(args[k - 1] ?? ""))) return worst(verdict, classify("pytest collecting functions the call names"));
+  if ((name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) && args.some((a) => /python_(functions|classes|files)=/.test(a))) return worst(verdict, classify("pytest collecting functions the call names"));
   if ((name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) && args.some((a) => /(^|[\s=])--(pdb|trace)/.test(a))) return worst(verdict, classify("pytest's debugger, which reads commands from standard input"));
   if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "mypy" && args.some((a) => (longIs(a, "install-types") || longIs(a, "python-executable")) && a.split("=")[0].length > 4)) return worst(verdict, classify("mypy that installs packages or runs another interpreter"));
   if (READ_ONLY.has(name) || DEV_TOOLS.has(name)) return verdict;
   // (Council project review 2, round 34, Mythos: unittest imports and calls any name it is given,
   // `python3 -m unittest code.interact` then runs standard input as Python; its names must be the
   // project's own files or modules. pytest's debugger, below, reads commands from standard input.)
-  // (Round 37, Mythos: `python3 -m pip` is pip, with pip's subcommand table.)
-  if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pip") return worst(verdict, subcommand("pip", args.slice(2), scope));
+  // (Round 37, Mythos: `python3 -m pip` is pip, with pip's subcommand table; round 38: a lone
+  // version or help query is one.)
+  if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pip") return args.length === 3 && /^(-V|--version|-h|--help)$/.test(args[2]) ? verdict : worst(verdict, subcommand("pip", args.slice(2), scope));
+  // (Round 38, Mythos: venv writes its directory, and --clear empties it first.)
+  if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "venv") return worst(verdict, venvTargets(args.slice(2), ["--prompt"], scope));
   if (/^python3?$/.test(name) && args[0] === "-m" && PY_MODULES.has(args[1]) && !cmd.heredoc && (args[1] !== "unittest" || unittestNamesOwn(args.slice(2), scope))) return verdict;
   // `node --test`: the test runner over the project's test files, as `npm test` runs it.
   if (name === "node" && args[0] === "--test" && !cmd.heredoc) {
@@ -2746,7 +2791,10 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
       if (["cd", "pushd", "popd"].includes(cmd.argv[0])) local.cwd = undefined;
     } else if (cmd.argv[0] === "cd" && local.cwd) {
       // `cd -` goes to $OLDPWD, which is not known.
-      const to = cmd.argv.length === 2 && cmd.argv[1] !== "-" ? resolveWord(cmd.argv[1], local) : cmd.argv.length === 1 ? HOME : undefined;
+      // `cd -L`, `cd -P` and `cd --` before one word go there too (round 38).
+      const cdArgs = cmd.argv.slice(1);
+      while (cdArgs.length > 1 && /^(-L|-P|--)$/.test(cdArgs[0])) cdArgs.shift();
+      const to = cdArgs.length === 1 && cdArgs[0] !== "-" ? resolveWord(cdArgs[0], local) : cdArgs.length === 0 ? HOME : undefined;
       const there = !!to && !!fs.statSync(to, { throwIfNoEntry: false })?.isDirectory();
       local.cwd = there || (to && cmd.next === "&&") ? to : undefined;
       failableCd = !there && local.cwd !== undefined;

@@ -989,7 +989,26 @@ test("round 37: option files where the command runs, declare's compound values, 
   const words = (w: string) => parse(`echo ${w}`).cmds[0].argv.slice(1);
   assert.deepEqual(words("{}x,y}"), ["{}x,y}"]);
   assert.deepEqual(words("{{a},b},c}"), ["{a},c}", "b,c}"]);
-  assert.deepEqual(words("{..{,}}"), ["..", ".."]);
-  assert.deepEqual(words("{1..{2,3}}"), ["1..2", "1..3"]);
+  // (Round 38: a group with a comma only further in is not modelled.)
+  assert.equal(parse("echo {..{,}}").opaque, true);
+  assert.equal(parse("echo {1..{2,3}}").opaque, true);
   assert.deepEqual(words("{x,{y,z}}w"), ["xw", "yw", "zw"]);
+});
+
+// ---- round 38 ----
+
+test("round 38: git bisect view's command, venv targets, systemctl -H anywhere, pytest -o spellings, rsync's outputs and daemon, brace quirks unmodelled", async () => {
+  // Mythos: `git bisect view <words>` runs `git <words>`.
+  assert.notEqual(await effect("git bisect view git -c alias.x=x x"), "allow");
+  assert.equal(await effect("git bisect view --stat"), "allow");
+  // Mythos: venv writes its directory; --clear empties it.
+  for (const c of ["python3 -m venv --clear .", "python3 -m venv --clear ~", "python3 -m venv .git/hooks", "uv venv --clear ."]) assert.notEqual(await effect(c), "allow", c);
+  assert.equal(await effect("python3 -m venv .venv"), "allow");
+  // Mythos: systemctl and loginctl read -H anywhere.
+  for (const c of ["systemctl status -H user@host", "systemctl is-active x --host=user@host", "loginctl list-sessions -H h", "systemctl status x -M foo"]) assert.notEqual(await effect(c), "allow", c);
+  // Opus, Mythos: every spelling of pytest's -o.
+  for (const c of ["pytest -opython_functions=interact x.py", "pytest --override-ini=python_functions=interact x.py", "rsync -a f g --log-file=../x", "rsync --daemon", "nm --plugin x.so f", "docker build --push ."]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["python3 -m pip --version", "cd -P . && ls"]) assert.equal(await effect(c), "allow", c);
+  // Astra, Sol, Mythos: bash's brace quirks are not modelled.
+  for (const w of ["{{{x,y}}}", "1{},}", "{{a,b}}", "a{},0}"]) assert.equal(parse(`echo ${w}`).opaque, true, w);
 });

@@ -681,7 +681,7 @@ defaults would silently drop `enabled: false` and your own ask and deny rules.
 | `sandboxShowPaths` | none | Credential locations to leave visible. |
 | `sandboxHidePaths` | none | More files or directories to hide from sandboxed commands. |
 | `sandboxKeepEnv` | none | Environment variables to pass through even though their name or value looks like a credential, and bash's own variables (`BASH_ENV`, `CDPATH`, `IFS`, ...) that are otherwise taken out of every shell. Naming `CDPATH` here makes the checks stop following a relative `cd`, and a call with a `cd` asks where a session's shell has another `CDPATH` than opencode's own. |
-| `log` | `true` | Log every decision, with the full command, to `~/.local/state/opencode-automode/decisions.jsonl` (mode 0600 in a 0700 directory, hidden from sandboxed commands). |
+| `log` | `true` | Log every decision, with the command (the first 4,000 characters, then its length), to `~/.local/state/opencode-automode/decisions.jsonl` (mode 0600 in a 0700 directory, hidden from sandboxed commands). |
 
 "Always allow" in an opencode prompt is mirrored per project into
 `~/.local/state/opencode-automode/always.json`, only for plain word patterns on a short allowlist

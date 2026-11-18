@@ -46,7 +46,7 @@ rules read it, or differently as printed than as written, is always one:
 Please report privately through GitHub: **Security → Report a vulnerability** on this
 repository. Include the command or setup that shows the problem, your Linux kernel version, and
 if you can the matching line from `~/.local/state/opencode-automode/decisions.jsonl` (it holds
-the full text of every command, so check it for anything private first).
+the text of every command, up to 4,000 characters, so check it for anything private first).
 
 Please don't open a public issue for a vulnerability until a fix is released. Reports are
 handled on a best-effort basis; there is no bounty.
