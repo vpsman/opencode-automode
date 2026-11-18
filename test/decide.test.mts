@@ -4547,8 +4547,9 @@ describe("r4 B3b 1: every input redirect is a file read, and one reader finds th
     "for f in a.txt .env; do wc -l < \"$f\"; done",
   ]);
   // A name known only at run time: held as `cat "$f"` is (the model's).
+  // (A variable the call sets to plain text is followed by the rules: a credential read, an ask.)
+  expectB3b("B3b-1", "ask", ["f=.env; cat < \"$f\""]);
   expectB3b("B3b-1", "classify", [
-    "f=.env; cat < \"$f\"",
     "cat < $(echo .env)",
     "cat < \"$f\"",
     "{ cat; } < \"$f\"",
@@ -4742,11 +4743,12 @@ describe("r4 B3c 1: the directory a command runs in, as bash goes there", () => 
   expectB3c("B3c-1", "ask", ["cd .aw? ; (cat zzz)", "cd .aw?; cd \"$d\"; ls"]);
   // A `cd` behind a keyword: the rules do not follow it (as before).
   expectB3c("B3c-1", "ask", ["for d in src sub; do cd \"$d\"; cat notes.txt; done"]);
+  // (The rules follow a variable the call sets to plain text: `cd .aws`, a credential place.)
+  expectB3c("B3c-1", "ask", ["d=.aws; cd \"$d\"; cat credentials"]);
   // A directory the check cannot follow is not the starting one.
   expectB3c("B3c-1", "classify", [
     "(cd \"$d\"; cat zzz)",
     "cd - && cat zzz",
-    "d=.aws; cd \"$d\"; cat credentials",
     "for d in src sub; do echo; cd \"$d\"; cat notes.txt; done",
     "cd \"$(echo .aws)\"; (cat zzz)",
     "set -P; cd cloud/..; cat zzz",
@@ -5484,8 +5486,11 @@ describe("r4 N3b-3: a word that begins with an expansion and holds a glob", () =
 
 describe("r4 N3b-4: an option that reads a list, hidden in a variable", () => {
   const OPTION = /(wc|du|file|grep|jq) .*: a word that can become an option once bash expands it, and (wc|du|file|grep|jq)'s options are checked by name/;
+  // (The rules follow a variable the call sets to plain text: the option, and the credential
+  // file it names, are read as written out.)
+  expectN3b("N3b-4", "env", "ask", ["x=--files0-from=.env; wc \"$x\"", "x=--files0-from=.env; wc $x"], /reads a credential file/);
+  expectN3b("N3b-4", "plain", "ask", ["x=--files0-from=.env; wc $x"], /reads a credential file/);
   expectN3b("N3b-4", "env", "classify", [
-    "x=--files0-from=.env; wc \"$x\"",
     "x=files0-from=.env; wc --\"$x\"",
     "du -a\"$x\" .",
     "grep -\"$x\" notes.txt",
@@ -5504,7 +5509,6 @@ describe("r4 N3b-4: an option that reads a list, hidden in a variable", () => {
   // (N3d-3: an unquoted expansion is also one bash splits and globs, judged as `*` is: where a
   // name begins with -, as in this tree, an ask; the check above holds them in a tree without.)
   const UNQUOTED = [
-    "x=--files0-from=.env; wc $x",
     "x=--files0-from=.env; du $x",
     "x=-f; file $x .env",
     "wc -l $(git ls-files '*.ts')",

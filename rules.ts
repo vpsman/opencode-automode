@@ -1,6 +1,8 @@
-// Vendored unchanged from pi-automode-classifier v0.4.1 (commit e61ea96), rules.ts.
+// Derived from rules.ts of pi-automode-classifier v0.4.1 (commit e61ea96),
 // https://github.com/deepu105/pi-automode-classifier — MIT, see LICENSE.pi-automode-classifier.
-// Do not edit here: re-vendor from upstream so diffs stay reviewable.
+// Maintained here since: its bugs are fixed in this file, each with a case in
+// test/rules.test.mts, and upstream releases are reviewed by hand against e61ea96 rather than
+// copied over it.
 
 // Deterministic rules for pi-automode-classifier. They run before the model and settle
 // most tool calls:
@@ -156,10 +158,17 @@ export interface Scope {
   // With the chat decider, running a file the session wrote or edited goes to it instead of being
   // allowed. Otherwise writing code to a file and running it would skip the decider.
   chatDecider?: boolean;
-  // Shell variables the command set to a known path before this point.
+  // Shell variables the command set to known literal text before this point.
   vars?: Map<string, string>;
   // Variables of a `for` loop over literal words, so they only ever hold one of those words.
   loopVars?: Set<string>;
+  // The words, globs included, that the variable of a `for` loop takes in turn.
+  loopValues?: Map<string, string[]>;
+  // Symbolic links the command being checked creates, to the path each leads to.
+  links?: Map<string, string>;
+  // True for a variable the command does not set anywhere: it holds what the environment the
+  // command starts with gives it (the environment of opencode, which runs it), or nothing.
+  unassigned?: (name: string) => boolean;
 }
 
 const expandHome = (p: string) => (p === "~" || p.startsWith("~/") ? HOME + p.slice(1) : p);
@@ -202,6 +211,10 @@ export function commitWrites(scope: Scope) {
 export interface Matcher {
   source: string;
   test(text: string): boolean;
+  // Also tested on the command with its program by name (`npm install` for `/usr/bin/npm
+  // install`), for deny, ask and classify. Set on compiled patterns; a matcher without it is
+  // tested on exactly the raw text, then the unwrapped one.
+  byName?: boolean;
 }
 export type UserRules = Record<Action, Matcher[]>;
 
@@ -216,7 +229,7 @@ export function compilePattern(pattern: string): Matcher {
     const body = (open ? words.slice(0, -2) : words).split("*").map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*");
     re = new RegExp(`^${body}${open ? "( .*)?" : ""}$`, "s");
   }
-  return { source: pattern, test: (text) => re.test(text) };
+  return { source: pattern, test: (text) => re.test(text), byName: true };
 }
 
 export function compileRules(rules: Partial<Record<Action, string[]>>): UserRules {
@@ -230,9 +243,13 @@ export function compileRules(rules: Partial<Record<Action, string[]>>): UserRule
 // behind `env` or a VAR=value assignment, which can change what runs.
 function userVerdict(argv: string[], rules: UserRules): Verdict | undefined {
   const raw = argv.join(" ");
-  const bare = unwrap(argv).join(" ");
+  const inner = unwrap(argv);
+  const bare = inner.join(" ");
+  // A program named by its path is also matched by its name: an ask rule for `npm install *`
+  // covers `/usr/bin/npm install`. (Not for allow rules, which match as written.)
+  const named = [...new Set([inner.length ? [path.basename(inner[0]), ...inner.slice(1)].join(" ") : "", argv.length ? [path.basename(argv[0]), ...argv.slice(1)].join(" ") : ""])].filter((t) => t !== "" && t !== raw && t !== bare);
   for (const action of ["deny", "ask", "classify"] as const) {
-    const hit = rules[action].find((m) => m.test(raw) || m.test(bare));
+    const hit = rules[action].find((m) => m.test(raw) || m.test(bare) || (!!m.byName && named.some((t) => m.test(t))));
     if (hit) return { action, reason: `your ${action} rule "${hit.source}"`, ...(action === "ask" && { firm: true }) };
   }
   return allowedBy(argv, rules.allow) ? ALLOW : undefined;
@@ -251,12 +268,57 @@ function resolveWord(word: string, scope: Scope): string | undefined {
   word = expandVars(word, scope);
   if (/[$`]/.test(word)) return undefined;
   if (word === "~" || word.startsWith("~/")) word = HOME + word.slice(1);
-  else if (word.startsWith("~")) return undefined;
+  else if (word === "~+" || word.startsWith("~+/")) {
+    if (!scope.cwd) return undefined;
+    word = scope.cwd + word.slice(2);
+  } else if (word.startsWith("~")) return undefined;
   if (!path.isAbsolute(word)) {
     if (!scope.cwd) return undefined;
     word = path.resolve(scope.cwd, word);
   }
+  const own = ownProcessPath(word, scope);
+  if (own !== false) return own;
   return realish(path.normalize(word));
+}
+
+// Paths that lead through the process that opens them: /proc/self is the shell running the
+// command, not this one, and /dev/stdout and /dev/fd/N are that shell's descriptors. They are read
+// by their text: /proc/self/cwd is the command's working directory, /proc/self/root is /, a
+// descriptor is a sink (kept as /dev/fd/N or /dev/stdout), and the rest of /proc/self is no
+// known path. False for any other path.
+function ownProcessPath(word: string, scope: Scope): string | undefined | false {
+  const m = /^\/(proc\/(self|thread-self)|dev)(\/.*)?$/.exec(word);
+  if (!m) return false;
+  const rest = m[3] ?? "";
+  if (m[1] === "dev") {
+    const sink = /^\/(stdin|stdout|stderr|fd\/\d+)$/.exec(rest);
+    if (sink) return `/dev${rest}`;
+    return /^\/(stdin|stdout|stderr|fd)(\/|$)/.test(rest) ? undefined : false;
+  }
+  // A `..` after a link is taken from the link's target, which is not known here.
+  if (/(^|\/)\.\.(\/|$)/.test(rest)) return undefined;
+  const cwd = /^\/cwd(\/.*)?$/.exec(rest);
+  if (cwd) return scope.cwd ? realish(path.join(scope.cwd, cwd[1] ?? "")) : undefined;
+  const root = /^\/root(\/.*)?$/.exec(rest);
+  if (root) return realish(path.normalize(root[1] || "/"));
+  const fd = /^\/fd\/(\d+)$/.exec(rest);
+  return fd ? `/dev/fd/${fd[1]}` : undefined;
+}
+
+// A path through a link this same command creates before it reads the path (`ln -s ~/.config/gh
+// g; cat g/hosts.yml`): the link is not there yet when the command is checked. (Writes through
+// such a link are held by the checks around the rules, which also know which programs act on
+// the link itself, as mv does.)
+function followLinks(p: string, scope: Scope): string {
+  for (let hops = 0; scope.links && hops < 40; hops++) {
+    const hit = [...scope.links].find(([link]) => within(p, link));
+    if (!hit) break;
+    const [link, target] = hit;
+    const next = realish(path.join(target, path.relative(link, p)));
+    if (next === p) break;
+    p = next;
+  }
+  return p;
 }
 
 const isGuarded = (p: string | undefined, scope: Scope) => !!p && scope.guarded.some((g) => within(p, g));
@@ -316,11 +378,10 @@ function runFile(word: string, args: string[], scope: Scope): Verdict | undefine
   const origin = originOf(p, scope);
   if (origin === "fetched") return criticalAsk(`runs a file downloaded in this session: ${word}`);
   if (isGuarded(p, scope) || !isLocal(p, scope) || OUTWARD_WORDS.test([path.basename(word), ...args].join(" "))) return undefined;
-  if (origin === "authored") {
-    if (!scope.chatDecider) return ALLOW;
-    // A file written by this same command is in the command itself.
-    return { ...classify(`runs ${word}, which this session wrote`), files: scope.pending.has(p) ? [] : [p] };
-  }
+  // A file the session wrote goes to the decider, whichever decider that is: otherwise writing code
+  // to a file and running it would skip every check. A file written by this same command is in the
+  // command itself.
+  if (origin === "authored") return { ...classify(`runs ${word}, which this session wrote`), files: scope.pending.has(p) ? [] : [p] };
   return origin === undefined && scope.project?.(p) ? ALLOW : undefined;
 }
 
@@ -359,7 +420,7 @@ function secretIn(word: string, scope: Scope, isPath = false): string | undefine
   for (const candidate of new Set([text, text.slice(text.lastIndexOf(":") + 1)])) {
     if (!candidate || candidate.startsWith("-")) continue;
     const p = resolveWord(candidate, scope);
-    if (isSecretPath(expandHome(candidate)) || (p && isSecretPath(p))) return candidate;
+    if (isSecretPath(expandHome(candidate)) || (p && (isSecretPath(p) || isSecretPath(followLinks(p, scope))))) return candidate;
   }
   return undefined;
 }
@@ -375,6 +436,11 @@ const PATTERN_FIRST = new Set(["grep", "egrep", "fgrep", "rg", "ag", "ack", "sed
 // The credential file a simple command would read, if any.
 function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope): string | undefined {
   if (NAMES_ONLY.has(name)) return undefined;
+  // git log and its kin name paths to filter commits by, and show their content only with a patch.
+  if (name === "git") {
+    const sub = operands(args)[0];
+    if (["log", "shortlog", "rev-list", "whatchanged"].includes(sub ?? "") && !args.some((a) => /^(-p|-u|--patch|--patch-with-\w+|-L.*|--full-diff|-[a-zA-Z]*[pu])$/.test(a))) return undefined;
+  }
   // An in-place edit shows nothing, and a destination is written, not read.
   if (name === "sed" && args.some((a) => /^(-i|--in-place)/.test(a) || /^-[a-zA-Z]*i/.test(a))) return undefined;
   let words = args;
@@ -383,8 +449,65 @@ function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope)
   // `--env-file .env` hands the file to a program and shows nothing.
   words = words.filter((w, i) => !/^--env-file(=|$)/.test(w) && words[i - 1] !== "--env-file");
   for (const word of [...words, ...(cmd.in ?? [])]) {
-    const secret = secretIn(word, scope);
+    const secret = secretIn(word, scope) ?? globSecret(word, scope);
     if (secret) return secret;
+  }
+  return undefined;
+}
+
+// A glob reads the files it matches: the credential file among them, if any. Undefined when the
+// word has no glob or matches nothing secret.
+function globSecret(word: string, scope: Scope): string | undefined {
+  const text = word.replace(/^[^=/]*=/, "").replace(/^@/, "");
+  if (!/[*?[]/.test(text) || /\s/.test(text)) return undefined;
+  const p = resolveWord(path.dirname(text), scope);
+  const base = path.basename(text);
+  // A glob in a directory part is not followed: any credential place it could reach counts.
+  if (/[*?[]/.test(path.dirname(text)) || !p) return SECRET_PLACES.some((place) => place.test(expandHome(text).replace(/[*?]/g, "x"))) ? text : undefined;
+  let re: RegExp;
+  try {
+    re = new RegExp(`^${base.replace(/[.+^${}()|\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".").replace(/\[!/g, "[^")}$`, "s");
+  } catch {
+    // A bracket bash would take literally: any name that differs only there could match.
+    re = new RegExp(`^${base.replace(/\[[^\]]*\]?/g, "\0").replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".").replace(/\0/g, ".*")}$`, "s");
+  }
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(p);
+  } catch {}
+  const hit = names.find((n) => re.test(n) && isSecretPath(path.join(p, n)));
+  return hit ? path.join(path.dirname(text), hit) : isSecretPath(path.join(p, base.replace(/[*?]/g, ""))) ? text : undefined;
+}
+
+// Whether a read-only program reads a file whose name the shell expands: a substitution, or a
+// variable the command does not set to a known value.
+// Programs that show the content of the files they are given.
+const FILE_READERS = new Set(`cat bat head tail less more wc rg grep egrep fgrep sort uniq cut jq yq column diff cmp comm nl tac rev fold paste join
+  sha256sum sha1sum md5sum b3sum xxd hexdump od strings nm zcat xzcat bzcat zstdcat`.split(/\s+/));
+// Whether a reader reads a file whose name the shell expands to something the rules do not know:
+// a substitution, or a variable the command does not set. A variable of a `for` loop over words
+// or globs stands for each of them, and each is checked as a file.
+function readsExpansion(name: string, args: string[], dyn: (k: number) => boolean, cmd: Simple, scope: Scope): string | undefined {
+  if (!FILE_READERS.has(name)) return undefined;
+  let words = args.filter((a, k) => !a.startsWith("-") && dyn(k));
+  if (PATTERN_FIRST.has(name)) words = words.filter((w) => w !== operands(args)[0]);
+  for (const w of [...words, ...(cmd.in ?? []).filter((w, k) => cmd.inDyn?.[k] ?? /[$`]/.test(w))]) {
+    const text = expandVars(w, scope);
+    const loop = /\$\{?([A-Za-z_]\w*)\}?/.exec(text);
+    const values = loop && scope.loopValues?.get(loop[1]);
+    if (values && text.replace(loop![0], "").search(/[$`]/) < 0) {
+      for (const v of values) {
+        const each = text.replace(loop![0], v);
+        const secret = secretIn(each, scope) ?? globSecret(each, scope);
+        if (secret) return `${name} reads a credential file: ${secret}`;
+      }
+      continue;
+    }
+    // Variables the command does not set hold what the environment gives them.
+    const fromEnv = text.replace(/\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)/g, (m, a, b) => (scope.unassigned?.(a ?? b) ? (process.env[a ?? b] ?? "") : m));
+    if (/[$`]/.test(fromEnv)) return `${name} reads a file named by an expansion`;
+    const secret = fromEnv && (secretIn(fromEnv, scope) ?? globSecret(fromEnv, scope));
+    if (secret) return `${name} reads a credential file: ${secret}`;
   }
   return undefined;
 }
@@ -406,6 +529,16 @@ export interface Simple {
   // Runs in a subshell: inside a command substitution, or as part of a pipeline or a background
   // job. A `cd` or an assignment there does not reach the commands that follow.
   subshell?: boolean;
+  // Per word of `in`: the same.
+  inDyn?: boolean[];
+  // Per word of argv: true when the shell expands something in it (a variable, a substitution,
+  // arithmetic) before the program sees it, so the text here is not the text that runs.
+  dyn?: boolean[];
+  // The operator that follows the command: `;`, a newline, `&&`, `||`, `|`, `&`, `(` or `)`.
+  next?: string;
+  // Inside a command substitution (or a heredoc body's): it runs while the command that holds it
+  // is expanded, and is listed before it.
+  nested?: boolean;
 }
 export interface Parsed {
   cmds: Simple[];
@@ -415,179 +548,693 @@ export interface Parsed {
   grouped: boolean;
 }
 
-function matchParen(s: string, open: number): number {
-  let depth = 0;
-  for (let i = open; i < s.length; i++) {
-    if (s[i] === "\\") i++;
-    else if (s[i] === "(") depth++;
-    else if (s[i] === ")" && --depth === 0) return i;
-  }
-  return -1;
+// The parser follows bash: quoting (`'...'`, `"..."`, `$'...'`, backslashes, line continuations),
+// substitutions (`$(...)`, backticks, `${...}`, arithmetic), heredocs, redirections and brace
+// expansion. What it does not model sets `opaque`, so the command is never allowed by rule.
+// Each character of a word carries a tag: `u` unquoted, `q` quoted, `e` the product of an expansion
+// (`E` inside double quotes). The tags decide what bash does next with the word: brace expansion
+// and `~` act on unquoted text only, a quoted word is never a keyword or an assignment, and only
+// an unquoted number before `>` is a file descriptor.
+type RedirectKind = "" | "out" | "append" | "in" | "dupout" | "dupin";
+interface ParseState {
+  depth: number;
+  result: Parsed;
+  // Variable names read by arithmetic, checked against the whole command once it is parsed.
+  arith: Set<string>;
 }
+
+// Commands whose effect on later commands the rules follow; a function by one of these names is not modelled.
+const SHADOWS_STATE = new Set(["cd", "pushd", "popd", "command", "builtin", "exec", "eval", "source", ".", "set", "shopt", "unset", "export", "declare", "typeset", "local", "readonly", "read", "printf", "test", "[", "trap", "alias", "unalias", "hash", "enable", "type", "env", "ln", "mapfile", "readarray", "getopts", "wait"]);
+const RESERVED = new Set(["if", "then", "elif", "else", "fi", "do", "done", "while", "until", "for", "in", "case", "esac", "select", "function", "time", "coproc", "!", "{", "}", "[[", "]]"]);
+const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/s;
 
 export function parse(command: string, depth = 0): Parsed {
   const result: Parsed = { cmds: [], opaque: depth > 4, grouped: false };
   if (result.opaque) return result;
-  const s = command;
-  let cur: Simple = { argv: [], out: [] };
-  let word = "";
-  let hasWord = false;
-  let redirect: "" | "out" | "append" | "in" = "";
-  // Heredocs opened on the current line. A body is data and is skipped, except that the shell
-  // runs the substitutions in a body whose delimiter is not quoted.
-  const heredocs: { delimiter: string; quoted: boolean; owner: Simple }[] = [];
+  const state: ParseState = { depth, result, arith: new Set() };
+  parseList(command, 0, false, false, state);
+  if (state.arith.size && !arithmeticSafe(command, state.arith)) result.opaque = true;
+  return result;
+}
 
-  const pushWord = () => {
-    if (hasWord) {
-      const expanded = word.replace(/\$\{HOME\}|\$HOME\b/g, HOME);
-      if (redirect === "out" || redirect === "append") cur.out.push(expanded);
-      else if (redirect === "") cur.argv.push(expanded);
-      else (cur.in ??= []).push(expanded);
-      if (redirect === "append") (cur.append ??= []).push(expanded);
-      redirect = "";
-    }
-    word = "";
-    hasWord = false;
-  };
-  const pushCmd = () => {
-    pushWord();
-    redirect = "";
-    if (cur.argv.length || cur.out.length) result.cmds.push(cur);
-    cur = { argv: [], out: [] };
-  };
-  // Parses a substitution body as extra commands.
-  const absorb = (inner: string) => {
-    const sub = parse(inner, depth + 1);
-    for (const c of sub.cmds) c.subshell = true;
-    result.cmds.push(...sub.cmds);
-    result.opaque ||= sub.opaque;
-  };
-  // The same, and leaves a placeholder in the word.
-  const nested = (inner: string) => {
-    absorb(inner);
-    word += "$()";
+// Parses commands from `start`. With `closer`, the list is the body of `$(` or `<(` and ends at
+// its `)`; returns the index of that `)`, or s.length when it is missing (the caller treats that
+// as unmodelled). `sub`: the commands run in a subshell.
+function parseList(s: string, start: number, closer: boolean, sub: boolean, st: ParseState): number {
+  const result = st.result;
+  const opaque = () => void (result.opaque = true);
+  const inner: ParseState = { ...st, depth: st.depth + 1 };
+  if (st.depth > 4) {
+    opaque();
+    return s.length;
+  }
+  let cur: Simple = { argv: [], out: [], dyn: [] };
+  let word = "";
+  let mask = "";
+  let hasWord = false;
+  let redirect: RedirectKind = "";
+  let parens = 0;
+  // Open case statements: reading a pattern (up to its `)`) or the commands of a branch.
+  const cases: ("pattern" | "body")[] = [];
+  const heredocs: { delimiter: string; quoted: boolean; strip: boolean; owner: Simple }[] = [];
+
+  const add = (text: string, tags: string) => {
+    word += text;
+    mask += tags;
     hasWord = true;
   };
-  // The substitutions the shell runs inside an unquoted heredoc body.
-  const heredocBody = (body: string, owner: Simple) => {
-    if (/[$`]/.test(body)) owner.expands = true;
-    for (let j = 0; j < body.length; j++) {
-      if (body[j] === "\\") j++;
-      else if (body[j] === "$" && body[j + 1] === "(") {
-        const end = matchParen(body, j + 1);
-        if (end < 0) return void (result.opaque = true);
-        absorb(body.slice(j + 2, end));
-        j = end;
-      } else if (body[j] === "`") {
-        const end = body.indexOf("`", j + 1);
-        if (end < 0) return void (result.opaque = true);
-        absorb(body.slice(j + 1, end));
-        j = end;
+  // Before the program: only keywords so far.
+  const commandPosition = () => cur.argv.every((w) => RESERVED.has(w) || ASSIGNMENT.test(w));
+  const place = (kind: RedirectKind, w: string, m: string) => {
+    if (kind === "" && commandPosition() && /[^u]/.test(m)) {
+      // A quoted word is never a keyword, and a quoted name or `=` is no assignment: bash runs
+      // `"x=/a"` and `\{` as programs.
+      const eq = w.indexOf("=");
+      if (RESERVED.has(w) || (ASSIGNMENT.test(w) && /[^u]/.test(m.slice(0, eq + 1)))) opaque();
+    }
+    const words = expandBraces(w, m);
+    if (!words) {
+      opaque();
+      words2push([[w, m]], kind);
+      return;
+    }
+    // A brace pattern in a word that also holds an expansion: the order of the two is not modelled.
+    if (words.length > 1 && /[eE]/.test(m)) opaque();
+    words2push(words, kind);
+  };
+  const words2push = (words: [string, string][], kind: RedirectKind) => {
+    for (const [w, m] of words) {
+      // $HOME as an expansion (not quoted text) is the home directory.
+      let text = "";
+      for (let k = 0; k < w.length; ) {
+        const home = /^(\$\{HOME\}|\$HOME(?![A-Za-z0-9_]))/.exec(w.slice(k));
+        if (home && /[eE]/.test(m[k])) {
+          text += HOME;
+          k += home[0].length;
+        } else text += w[k++];
       }
+      if (kind === "out" || kind === "append") cur.out.push(text);
+      else if (kind === "in") {
+        (cur.in ??= []).push(text);
+        (cur.inDyn ??= []).push(/[eE]/.test(m));
+      }
+      else {
+        cur.argv.push(text);
+        cur.dyn!.push(/[eE]/.test(m));
+      }
+      if (kind === "append") (cur.append ??= []).push(text);
     }
   };
+  const pushWord = () => {
+    if (!hasWord) return;
+    const w = word;
+    const m = mask;
+    const kind = redirect;
+    word = "";
+    mask = "";
+    hasWord = false;
+    redirect = "";
+    // `esac` where a pattern or a command would start ends the innermost case.
+    if (kind === "" && cases.length && cur.argv.length === 0 && w === "esac" && m === "uuuu") cases.pop();
+    if (kind === "dupout" || kind === "dupin") {
+      // `>&2`, `<&0`, `>&-` copy or close a descriptor. Any other word is a file: `>& file` sends
+      // both outputs there, and in `>&2#x` the word is `2#x`.
+      if (/^(\d+-?|-)$/.test(w) && /^u+$/.test(m)) return;
+      return place(kind === "dupout" ? "out" : "in", w, m);
+    }
+    place(kind, w, m);
+    // `case WORD in`: patterns follow.
+    if (kind === "" && w === "in" && m === "uu" && cur.argv.length === 3 && cur.argv[0] === "case" && !cases.includes("pattern")) cases.push("pattern");
+  };
+  const pushCmd = (op?: string) => {
+    pushWord();
+    if (redirect) {
+      opaque();
+      redirect = "";
+    }
+    if (cur.argv.length || cur.out.length) {
+      cur.next = op;
+      if (sub) cur.subshell = cur.nested = true;
+      result.cmds.push(cur);
+    }
+    cur = { argv: [], out: [], dyn: [] };
+  };
 
-  for (let i = 0; i < s.length; i++) {
+  // `$` at s[i]: an expansion or a plain dollar sign. Returns the index of its last character.
+  const dollar = (i: number, dq: boolean): number => {
+    const n = s[i + 1];
+    const tag = dq ? "E" : "e";
+    if (n === "(" && s[i + 2] === "(") {
+      const end = readArith(s, i + 3, "))", inner);
+      if (end < 0) return (opaque(), s.length);
+      add("$()", tag.repeat(3));
+      return end + 1;
+    }
+    if (n === "(") {
+      const end = parseList(s, i + 2, true, true, inner);
+      if (end >= s.length) return (opaque(), s.length);
+      add("$()", tag.repeat(3));
+      return end;
+    }
+    if (n === "[") {
+      const end = readArith(s, i + 2, "]", inner);
+      if (end < 0) return (opaque(), s.length);
+      add("$()", tag.repeat(3));
+      return end;
+    }
+    if (n === "{") {
+      const end = readParam(s, i + 2, inner);
+      if (end < 0) return (opaque(), s.length);
+      const text = s.slice(i, end + 1);
+      add(text, tag.repeat(text.length));
+      return end;
+    }
+    if (n === "'" && !dq) {
+      // ANSI-C quoting: a backslash escapes the next character, `\'` included.
+      let j = i + 2;
+      while (j < s.length && s[j] !== "'") j += s[j] === "\\" ? 2 : 1;
+      if (j >= s.length) return (opaque(), s.length);
+      const raw = s.slice(i + 2, j);
+      const text = ansiC(raw);
+      // Text spelled through numeric escapes (`\x63\x75\x72\x6c`) is hidden from a reader of the
+      // command: it counts as expanded, so it is never what decides an allow.
+      add(text, (/\\([0-7xuUc])/.test(raw) ? tag : "q").repeat(text.length));
+      return j;
+    }
+    // $"..." is a translated string, quoted as "..." is: the main loop reads it next.
+    if (n === '"' && !dq) return i;
+    const name = /^([A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])/.exec(s.slice(i + 1));
+    if (name) {
+      add("$" + name[1], tag.repeat(name[1].length + 1));
+      return i + name[1].length;
+    }
+    // A line continuation after `$` would join it to what follows: `$\⏎(`.
+    if (n === "\\" && s[i + 2] === "\n") opaque();
+    add("$", dq ? "q" : "u");
+    return i;
+  };
+  const backtick = (i: number, dq: boolean): number => {
+    const end = readBacktick(s, i, dq, inner);
+    if (end < 0) return (opaque(), s.length);
+    add("$()", (dq ? "E" : "e").repeat(3));
+    return end;
+  };
+
+  let i = start;
+  for (; i < s.length; i++) {
     const c = s[i];
     const next = s[i + 1];
     if (c === "\\") {
-      if (next !== "\n") {
-        word += next ?? "";
-        hasWord = true;
-      }
+      if (next === "\n") {
+        // A line continuation is removed before tokens form, so next to an operator it joins two
+        // into one (`&\⏎&`, `<\⏎<`): not modelled.
+        const before = s[i - 1] ?? "";
+        const after = s[i + 2] ?? "";
+        if ((before === "$" && /[^\s]/.test(after)) || (/[<>&|;(]/.test(before) && /[<>&|;(]/.test(after))) opaque();
+      } else if (next !== undefined) add(next, "q");
       i++;
     } else if (c === "'") {
       const end = s.indexOf("'", i + 1);
-      if (end < 0) return { ...result, opaque: true };
-      word += s.slice(i + 1, end);
-      hasWord = true;
+      if (end < 0) return (opaque(), s.length);
+      add(s.slice(i + 1, end), "q".repeat(end - i - 1));
       i = end;
     } else if (c === '"') {
       hasWord = true;
       let j = i + 1;
       for (; j < s.length && s[j] !== '"'; j++) {
-        if (s[j] === "\\" && j + 1 < s.length) word += s[++j];
-        else if (s[j] === "$" && s[j + 1] === "(") {
-          const end = matchParen(s, j + 1);
-          if (end < 0) return { ...result, opaque: true };
-          nested(s.slice(j + 2, end));
-          j = end;
-        } else if (s[j] === "`") {
-          const end = s.indexOf("`", j + 1);
-          if (end < 0) return { ...result, opaque: true };
-          nested(s.slice(j + 1, end));
-          j = end;
-        } else word += s[j];
+        const d = s[j];
+        if (d === "\\") {
+          const e = s[j + 1];
+          if (e === "\n") {
+            if (s[j - 1] === "$") opaque();
+            j++;
+          } else if (e !== undefined && '$`"\\'.includes(e)) {
+            add(e, "q");
+            j++;
+          } else add(d, "q");
+        } else if (d === "$") j = dollar(j, true);
+        else if (d === "`") j = backtick(j, true);
+        else add(d, "q");
       }
-      if (j >= s.length) return { ...result, opaque: true };
+      if (j >= s.length) return (opaque(), s.length);
       i = j;
+    } else if (c === "$") {
+      i = dollar(i, false);
     } else if (c === "`") {
-      const end = s.indexOf("`", i + 1);
-      if (end < 0) return { ...result, opaque: true };
-      nested(s.slice(i + 1, end));
+      i = backtick(i, false);
+    } else if ((c === "<" || c === ">") && next === "(") {
+      // Process substitution: the word is a path to a pipe (tagged `p`: no name the shell computes).
+      const end = parseList(s, i + 2, true, true, inner);
+      if (end >= s.length) return (opaque(), s.length);
+      add("$()", "ppp");
       i = end;
-    } else if ((c === "$" || c === "<" || c === ">") && next === "(") {
-      const end = matchParen(s, i + 1);
-      if (end < 0) return { ...result, opaque: true };
-      nested(s.slice(i + 2, end));
-      i = end;
-    } else if (c === "<") {
-      pushWord();
-      const heredoc = next === "<" && s[i + 2] !== "<" ? /^<<-?\s*(['"]?)([\w.-]+)\1/.exec(s.slice(i)) : null;
-      if (heredoc) {
-        heredocs.push({ delimiter: heredoc[2], quoted: heredoc[1] !== "", owner: cur });
-        cur.heredoc = true;
-        i += heredoc[0].length - 1;
-      } else {
-        // An input file or here-string is data: skip the word that follows.
-        if (next === "<") i += s[i + 2] === "<" ? 2 : 1;
-        redirect = "in";
-      }
-    } else if (c === ">" || (c === "&" && next === ">")) {
-      // A number right before `>` is a file descriptor, not an argument.
-      if (hasWord && /^\d+$/.test(word)) {
+    } else if (c === "<" || c === ">" || (c === "&" && next === ">")) {
+      // A number right before the operator, unquoted, is a file descriptor; so is `{name}`.
+      if (c !== "&" && hasWord && /^u+$/.test(mask) && (/^\d+$/.test(word) || /^\{[A-Za-z_][A-Za-z0-9_]*\}$/.test(word))) {
         word = "";
+        mask = "";
         hasWord = false;
       }
       pushWord();
-      if (c === "&") i++;
-      const append = s[i + 1] === ">";
-      if (append || s[i + 1] === "|") i++;
-      if (s[i + 1] === "&") {
-        // fd duplication such as 2>&1 has no file target.
-        i++;
-        while (/[\d-]/.test(s[i + 1] ?? "")) i++;
-      } else redirect = append ? "append" : "out";
+      if (redirect) opaque();
+      if (c === "<" && next === "<" && s[i + 2] !== "<") {
+        // A heredoc: the delimiter is the whole next word, quotes removed. Any quoting makes the
+        // body literal; `<<-` strips leading tabs.
+        let k = i + 2;
+        const strip = s[k] === "-";
+        if (strip) k++;
+        while (s[k] === " " || s[k] === "\t") k++;
+        let delimiter = "";
+        let quoted = false;
+        for (; k < s.length && !/[\s;&|()<>]/.test(s[k]); k++) {
+          const d = s[k];
+          if (d === "\\") {
+            if (s[k + 1] === "\n") opaque();
+            quoted = true;
+            delimiter += s[++k] ?? "";
+          } else if (d === "'" || d === '"') {
+            const e = s.indexOf(d, k + 1);
+            if (e < 0) return (opaque(), s.length);
+            quoted = true;
+            delimiter += s.slice(k + 1, e);
+            k = e;
+          } else if (d === "$" && (s[k + 1] === "'" || s[k + 1] === '"' || s[k + 1] === "(" || s[k + 1] === "{")) {
+            opaque();
+            delimiter += d;
+          } else if (d === "`") {
+            opaque();
+            delimiter += d;
+          } else delimiter += d;
+        }
+        if (!delimiter) opaque();
+        heredocs.push({ delimiter, quoted, strip, owner: cur });
+        cur.heredoc = true;
+        i = k - 1;
+        continue;
+      }
+      let k = i;
+      let kind: RedirectKind;
+      if (c === "&") {
+        k++;
+        kind = s[k + 1] === ">" ? (k++, "append") : "out";
+      } else if (c === "<") {
+        if (next === "<") {
+          // A here-string: the word is data.
+          k += 2;
+          kind = "in";
+        } else if (next === "&") {
+          k++;
+          kind = "dupin";
+        } else if (next === ">") {
+          // `<>` opens the file for reading and writing.
+          k++;
+          kind = "out";
+        } else kind = "in";
+      } else if (next === ">") {
+        k++;
+        kind = "append";
+      } else if (next === "|") {
+        k++;
+        kind = "out";
+      } else if (next === "&") {
+        k++;
+        kind = "dupout";
+      } else kind = "out";
+      redirect = kind;
+      i = k;
     } else if (c === " " || c === "\t") {
       pushWord();
-    } else if (c === "\n" || c === ";") {
-      pushCmd();
-      while (c === "\n" && heredocs.length) {
-        const doc = heredocs.shift()!;
-        const end = new RegExp(`^\\s*${doc.delimiter.replace(/[.\-]/g, "\\$&")}\\s*$`, "m").exec(s.slice(i + 1));
-        if (!doc.quoted) heredocBody(end ? s.slice(i + 1, i + 1 + end.index) : s.slice(i + 1), doc.owner);
-        i = end ? i + end.index + end[0].length : s.length;
+    } else if (c === "\n") {
+      pushCmd("\n");
+      if (heredocs.length) i = readBodies(i);
+    } else if (c === ";") {
+      pushCmd(";");
+      // `;;`, `;&` and `;;&` end a case branch: a pattern comes next.
+      if (next === ";" || next === "&") {
+        if (cases.length) cases[cases.length - 1] = "pattern";
+        else opaque();
       }
+      if (next === ";") i++;
+      if (s[i + 1] === "&") i++;
+    } else if (c === "&" && next === "&") {
+      pushCmd("&&");
+      i++;
+    } else if (c === "|" && next === "|") {
+      pushCmd("||");
+      i++;
     } else if (c === "&" || c === "|") {
       // `|`, `|&` and a single `&` fork: both sides of a pipe, and the background job.
-      const forks = next !== c;
-      if (forks) cur.subshell = true;
-      if (next === c || (c === "|" && next === "&")) i++;
-      pushCmd();
-      if (forks && c === "|") cur.subshell = true;
-    } else if (c === "(" || c === ")") {
+      cur.subshell = true;
+      if (c === "|" && next === "&") i++;
+      pushCmd(c);
+      if (c === "|") cur.subshell = true;
+    } else if (c === "(" && cases.at(-1) === "pattern" && !hasWord && cur.argv.length === 0) {
+      // A pattern may open with `(`.
+    } else if (c === ")" && cases.at(-1) === "pattern") {
+      // The end of a pattern; the branch's commands follow. (Its words stay listed as a command of
+      // their own, after the header's, as the checks around the rules read them.)
+      pushCmd(")");
+      cases[cases.length - 1] = "body";
+    } else if (c === "(") {
+      if (!hasWord && !redirect && commandPosition() && cur.argv.every((w) => RESERVED.has(w)) && next === "(") {
+        // An arithmetic command, `(( ... ))`.
+        const end = readArith(s, i + 2, "))", inner);
+        if (end < 0) return (opaque(), s.length);
+        i = end + 1;
+        continue;
+      }
+      // A function definition, `name()` or `name ()`: its body is read as commands where it stands.
+      // A function named like a command whose effect the rules follow (`cd`, `export`, `set`...)
+      // would stand in for it unseen, so that is not modelled.
+      const keyword = cur.argv[0] === "function" ? 1 : 0;
+      const fname = hasWord ? (/^u+$/.test(mask) && cur.argv.length === keyword ? word : "") : !redirect && cur.argv.length === 1 + keyword && !RESERVED.has(cur.argv[keyword]) && !cur.dyn![keyword] ? cur.argv[keyword] : "";
+      const close = /^[ \t]*\)/.exec(s.slice(i + 1));
+      if (fname && close && /^[A-Za-z_][\w.-]*$/.test(fname)) {
+        // A function in place of cd: where later commands run is not known (grouped, below).
+        if (SHADOWS_STATE.has(fname) && !["cd", "pushd", "popd"].includes(fname)) opaque();
+        // The name stays listed as a command of its own, as the checks around the rules expect.
+        result.grouped = true;
+        pushCmd("(");
+        i += close[0].length;
+        continue;
+      }
+      // A subshell group may start a command (after keywords). Extglob (`@(...)`) is not modelled;
+      // anything else here is a syntax error, or an array assignment, read as a group as before.
+      if (hasWord && /[@!+*?]$/.test(word) && mask.endsWith("u")) opaque();
       result.grouped = true;
-      pushCmd();
+      parens++;
+      pushCmd("(");
+    } else if (c === ")") {
+      if (parens > 0) {
+        parens--;
+        pushCmd(")");
+      } else if (closer) {
+        pushCmd(")");
+        if (heredocs.length) opaque();
+        return i;
+      } else {
+        opaque();
+        pushCmd(")");
+      }
     } else if (c === "#" && !hasWord) {
+      // A word that starts with `#` starts a comment, to the end of the line.
       const end = s.indexOf("\n", i);
       i = end < 0 ? s.length : end - 1;
     } else {
-      word += c;
-      hasWord = true;
+      add(c, "u");
     }
   }
-  pushCmd();
-  return result;
+  pushCmd(undefined);
+  if (parens > 0 || heredocs.length || cases.length) opaque();
+  return s.length;
+
+  // The bodies of the heredocs opened on the line that ends at `nl`. Returns the index just before
+  // the newline that ends the last delimiter line, so the main loop goes on from there.
+  function readBodies(nl: number): number {
+    let pos = nl + 1;
+    while (heredocs.length) {
+      const doc = heredocs.shift()!;
+      let body = "";
+      let found = false;
+      while (pos < s.length) {
+        let eol = s.indexOf("\n", pos);
+        if (eol < 0) eol = s.length;
+        let line = s.slice(pos, eol);
+        // In an unquoted body a backslash-newline joins the next line on before the delimiter is
+        // looked for: `EO\⏎F` ends the body.
+        while (!doc.quoted && /(^|[^\\])(\\\\)*\\$/.test(line) && eol < s.length) {
+          let e2 = s.indexOf("\n", eol + 1);
+          if (e2 < 0) e2 = s.length;
+          line = line.slice(0, -1) + s.slice(eol + 1, e2);
+          eol = e2;
+        }
+        // The delimiter line is the delimiter exactly; `<<-` strips leading tabs only.
+        if ((doc.strip ? line.replace(/^\t+/, "") : line) === doc.delimiter) {
+          found = true;
+          pos = eol;
+          break;
+        }
+        body += line + "\n";
+        pos = eol + 1;
+      }
+      // An unterminated heredoc: bash takes the rest as its body, with a warning.
+      if (!found) {
+        opaque();
+        pos = s.length;
+      }
+      if (!doc.quoted) {
+        if (/[$`]/.test(body)) doc.owner.expands = true;
+        scanExpansions(body, inner);
+      }
+    }
+    return pos - 1;
+  }
+}
+
+// An expansion that starts at s[j] with `$(`, `$((`, `${` or `$[`: parses what runs in it and
+// returns the index of its last character, or -1 when it does not end.
+function readDollar(s: string, j: number, st: ParseState): number {
+  const n = s[j + 1];
+  let end = -1;
+  if (n === "(" && s[j + 2] === "(") {
+    end = readArith(s, j + 3, "))", st);
+    if (end >= 0) end++;
+  } else if (n === "(") end = parseList(s, j + 2, true, true, st);
+  else if (n === "{") end = readParam(s, j + 2, st);
+  else if (n === "[") end = readArith(s, j + 2, "]", st);
+  return end >= s.length ? -1 : end;
+}
+
+// The substitutions in text the shell expands as it would inside double quotes, but where `"` is
+// plain text: an unquoted heredoc body.
+function scanExpansions(text: string, st: ParseState) {
+  for (let j = 0; j < text.length; j++) {
+    const c = text[j];
+    if (c === "\\") j++;
+    else if (c === "`") {
+      const end = readBacktick(text, j, false, st);
+      if (end < 0) return void (st.result.opaque = true);
+      j = end;
+    } else if (c === "$" && "({[".includes(text[j + 1] ?? " ")) {
+      const end = readDollar(text, j, st);
+      if (end < 0) return void (st.result.opaque = true);
+      j = end;
+    }
+  }
+}
+
+// A backtick substitution starting at s[i]: returns the index of the closing backtick, or -1. In
+// the body a backslash escapes `$`, a backtick and itself (and `"` inside double quotes).
+function readBacktick(s: string, i: number, dq: boolean, st: ParseState): number {
+  let body = "";
+  let j = i + 1;
+  for (; j < s.length && s[j] !== "`"; j++) {
+    if (s[j] === "\\") {
+      const e = s[j + 1];
+      if (e === "\n") j++;
+      else if (e !== undefined && ("$`\\".includes(e) || (dq && e === '"'))) {
+        body += e;
+        j++;
+      } else body += "\\";
+    } else body += s[j];
+  }
+  if (j >= s.length) return -1;
+  parseList(body, 0, false, true, st);
+  return j;
+}
+
+// `${...}` from just after the brace: returns the index of the closing `}`, or -1. Substitutions
+// inside are parsed; the forms that only pick or edit text are modelled, the rest is opaque.
+function readParam(s: string, start: number, st: ParseState): number {
+  let j = start;
+  for (; j < s.length && s[j] !== "}"; j++) {
+    const c = s[j];
+    if (c === "\\") {
+      if (s[j + 1] === "\n") st.result.opaque = true;
+      j++;
+    } else if (c === "'" || c === '"') {
+      // Quotes inside `${...}` follow rules of their own (in double quotes `'` may or may not
+      // quote, by operator): not modelled.
+      st.result.opaque = true;
+    } else if (c === "`") {
+      const end = readBacktick(s, j, false, st);
+      if (end < 0) return -1;
+      j = end;
+    } else if (c === "$" && "({[".includes(s[j + 1] ?? " ")) {
+      const end = readDollar(s, j, st);
+      if (end < 0) return -1;
+      j = end;
+    }
+  }
+  if (j >= s.length) return -1;
+  const m = /^(#?)([A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?$!-])(\[([^\]]*)\])?(.*)$/s.exec(s.slice(start, j));
+  const rest = m?.[5] ?? "";
+  // ${x}, ${#x}, ${x[i]}, ${x:-word}, ${x:=word}, ${x#pat}, ${x/a/b}, ${x^^}, ${x:i:n}. A subscript
+  // or an offset is arithmetic, read as such. Not modelled: ${!x} (indirection), `:=` on a
+  // variable bash reads or the environment holds, and ${x@P} and the other transformations, which
+  // can run what the value holds.
+  if (m?.[4] !== undefined && m[4] !== "@" && m[4] !== "*") checkArith(m[4], st);
+  const offsets = /^:(?![-=?+])(.*)$/s.exec(rest);
+  if (m && !m[1] && offsets) for (const part of offsets[1].split(":")) checkArith(part, st);
+  const assigns = /^:?=/.test(rest) && !!m && /^[A-Za-z_]/.test(m[2]);
+  const plain =
+    !!m &&
+    (rest === "" ||
+      (!m[1] && (!!offsets || /^:?[-?+]/.test(rest) || /^(##?|%%?|\/[/#%]?|\^\^?|,,?)/.test(rest) || (assigns && !BASH_READS.test(m[2]) && !Object.hasOwn(process.env, m[2])))));
+  if (!plain) st.result.opaque = true;
+  return j;
+}
+
+// An arithmetic expression from `start` to its closing `))` (or `]` for `$[`): returns the index of
+// the first closing character, or -1. Substitutions inside are parsed. The expression may hold
+// numbers, operators and variable names; the names are checked against the command as a whole.
+function readArith(s: string, start: number, close: "))" | "]", st: ParseState): number {
+  let depth = 0;
+  let text = "";
+  for (let j = start; j < s.length; j++) {
+    const c = s[j];
+    if (depth === 0 && ((close === "))" && c === ")") || (close === "]" && c === "]"))) {
+      if (close === "))" && s[j + 1] !== ")") return -1;
+      checkArith(text, st);
+      return j;
+    }
+    if (c === "(") depth++;
+    else if (c === ")") depth--;
+    if (c === "\\" && s[j + 1] === "\n") {
+      j++;
+      continue;
+    }
+    if (c === "$" && "({[".includes(s[j + 1] ?? " ")) {
+      const end = readDollar(s, j, st);
+      if (end < 0) return -1;
+      // ${name} reads the variable as the bare name does; anything else stands for a number.
+      const name = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(s.slice(j, end + 1));
+      text += name ? ` ${name[1]} ` : s[j + 1] === "{" ? " $? " : " 0 ";
+      j = end;
+      continue;
+    }
+    text += c;
+  }
+  return -1;
+}
+
+function checkArith(text: string, st: ParseState) {
+  const t = text
+    .replace(/\b\d+#\$([A-Za-z_][A-Za-z0-9_]*)/g, " $1 ")
+    .replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, " $1 ")
+    .replace(/\$[#?$!]/g, " 0 ")
+    .replace(/\b\d+#[A-Za-z0-9@_]+/g, " 0 ");
+  // Positional parameters, quotes, subscripts and anything else: not modelled.
+  if (/[^\w\s+\-*/%<>=!&|^~?:,();]/.test(t)) {
+    st.result.opaque = true;
+    return;
+  }
+  for (const token of t.match(/[A-Za-z0-9_]+/g) ?? []) if (/^[A-Za-z_]/.test(token)) st.arith.add(token);
+}
+
+// Arithmetic evaluates a variable's value as an expression again, subscripts included, so a value
+// such as `a[$(cmd)]` runs cmd. A name may be read in arithmetic only when the command gives it
+// no value but a plain number or expression: no `read`-style builtin, no quoted or substituted value.
+function arithmeticSafe(command: string, names: Set<string>): boolean {
+  if (/(^|[\s;&|(`])(read|mapfile|readarray|getopts|declare|typeset|local|readonly|export|let|eval|source|select|\.|printf[ \t]+-v)(?=[\s;&|)]|$)/.test(command)) return false;
+  for (const name of names) {
+    for (const m of command.matchAll(new RegExp(`(^|[^\\w$])${name}(\\[[^\\]]*\\])?\\+?=(?!=)`, "g"))) {
+      const value = /^[^\s;&|)]*/.exec(command.slice(m.index + m[0].length))![0];
+      if (!/^[\w+\-*/%.,]*$/.test(value) && !/^\$\(\([^$`'"[\]]*$/.test(value)) return false;
+    }
+    for (const m of command.matchAll(new RegExp(`(^|[\\s;&|(])for[ \\t]+${name}\\b([^;\\n]*)`, "g"))) {
+      const words = /^[ \t]+in[ \t]+(.*?)[ \t]*$/.exec(m[2]);
+      if (!words || !/^[\w\s+\-.]*$/.test(words[1])) return false;
+    }
+  }
+  return true;
+}
+
+// Bash's brace expansion over the unquoted braces of a word: `a{b,c}` is `ab ac`, `{1..3}` is
+// `1 2 3`. Quoted braces, `${`, and braces without a comma or a sequence stay as they are.
+// Undefined when the expansion would be too large to follow.
+function expandBraces(word: string, mask: string, budget = { n: 0 }): [string, string][] | undefined {
+  for (let open = 0; open < word.length; open++) {
+    if (word[open] !== "{" || mask[open] !== "u") continue;
+    let depth = 0;
+    const commas: number[] = [];
+    let close = -1;
+    for (let k = open + 1; k < word.length; k++) {
+      if (mask[k] !== "u") continue;
+      if (word[k] === "{") depth++;
+      else if (word[k] === "}") {
+        if (depth === 0) {
+          close = k;
+          break;
+        }
+        depth--;
+      } else if (word[k] === "," && depth === 0) commas.push(k);
+    }
+    if (close < 0) return [[word, mask]];
+    const pre = [word.slice(0, open), mask.slice(0, open)];
+    const post = [word.slice(close + 1), mask.slice(close + 1)];
+    let alternatives: [string, string][] = [];
+    if (commas.length) {
+      let from = open + 1;
+      for (const k of [...commas, close]) {
+        alternatives.push([word.slice(from, k), mask.slice(from, k)]);
+        from = k + 1;
+      }
+    } else {
+      const body = word.slice(open + 1, close);
+      const seq = /^(-?\d+|[A-Za-z])\.\.(-?\d+|[A-Za-z])(\.\.(-?\d+))?$/.exec(body);
+      if (!seq || /[^u]/.test(mask.slice(open, close + 1))) continue;
+      const numeric = /\d/.test(seq[1]) && /\d/.test(seq[2]);
+      if (!numeric && (/\d/.test(seq[1]) || /\d/.test(seq[2]))) continue;
+      const a = numeric ? Number(seq[1]) : seq[1].charCodeAt(0);
+      const b = numeric ? Number(seq[2]) : seq[2].charCodeAt(0);
+      const step = Math.abs(Number(seq[4] ?? 1)) || 1;
+      if (Math.abs(b - a) / step > 1000) return undefined;
+      const width = numeric && [seq[1], seq[2]].some((x) => /^-?0\d/.test(x)) ? Math.max(seq[1].length, seq[2].length) : 0;
+      for (let v = a; a <= b ? v <= b : v >= b; v += a <= b ? step : -step) {
+        const text = numeric ? String(v).padStart(width, "0") : String.fromCharCode(v);
+        alternatives.push([text, "u".repeat(text.length)]);
+      }
+    }
+    const out: [string, string][] = [];
+    for (const [w, m] of alternatives) {
+      if (++budget.n > 1000) return undefined;
+      const more = expandBraces(pre[0] + w + post[0], pre[1] + m + post[1], budget);
+      if (!more) return undefined;
+      out.push(...more);
+    }
+    return out;
+  }
+  return [[word, mask]];
+}
+
+// The text of `$'...'`: bash's backslash escapes. A NUL ends the string, as it does for bash.
+function ansiC(raw: string): string {
+  const simple: Record<string, string> = { a: "\x07", b: "\b", e: "\x1b", E: "\x1b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", "\\": "\\", "'": "'", '"': '"', "?": "?" };
+  let out = "";
+  for (let k = 0; k < raw.length; k++) {
+    if (raw[k] !== "\\" || k + 1 >= raw.length) {
+      out += raw[k];
+      continue;
+    }
+    const e = raw[++k];
+    let m: RegExpExecArray | null;
+    if (simple[e] !== undefined) out += simple[e];
+    else if ((m = /^[0-7]{1,3}/.exec(raw.slice(k)))) {
+      out += String.fromCharCode(parseInt(m[0], 8) & 0xff);
+      k += m[0].length - 1;
+    } else if (e === "x" && (m = /^[0-9a-fA-F]{1,2}/.exec(raw.slice(k + 1)))) {
+      out += String.fromCharCode(parseInt(m[0], 16));
+      k += m[0].length;
+    } else if ((e === "u" || e === "U") && (m = new RegExp(`^[0-9a-fA-F]{1,${e === "u" ? 4 : 8}}`).exec(raw.slice(k + 1)))) {
+      out += String.fromCodePoint(Math.min(parseInt(m[0], 16), 0x10ffff));
+      k += m[0].length;
+    } else if (e === "c" && k + 1 < raw.length) {
+      out += String.fromCharCode(raw.charCodeAt(++k) & 0x1f);
+    } else out += "\\" + e;
+  }
+  const nul = out.indexOf("\0");
+  return nul < 0 ? out : out.slice(0, nul);
 }
 
 // ---- command tables ----
@@ -698,10 +1345,9 @@ const FIRST_OPERAND_NOT_PATH = new Set(["chmod", "chown", "chgrp", "sed"]);
 const COPIERS = new Set(["cp", "mv", "ln", "install", "rsync"]);
 const CONTENT_WRITERS = new Set(["tee", "truncate", "shred", "patch"]);
 
-// Variables that load other code into the program they are set for. NODE_OPTIONS only with
-// an option that loads a file; it often just sets a heap size.
+// Variables that load other code into the program they are set for: the reason given when one is
+// set (NODE_OPTIONS that only tunes the runtime is allowed, see NODE_TUNING).
 const LOADS_CODE = /^(LD_PRELOAD|LD_AUDIT|DYLD_INSERT_LIBRARIES|BASH_ENV|ENV|NODE_OPTIONS|PERL5OPT|RUBYOPT)=(.*)$/s;
-const NODE_LOADS = /(^|\s)(-r|--require|--import|--loader|--experimental-loader)(=|\s|$)/;
 const WRAPPERS = new Set(["env", "nice", "ionice", "timeout", "time", "command", "builtin", "nohup", "setsid", "stdbuf", "exec", "chrt", "taskset"]);
 // Wrappers that run the same program with the same environment and PATH lookup.
 const SAME_PROGRAM_WRAPPERS = new Set(["timeout", "time", "nice", "ionice", "nohup", "setsid", "stdbuf"]);
@@ -713,6 +1359,31 @@ const PY_MODULES = new Set(["pytest", "unittest", "venv", "pip", "build", "ruff"
 // tool -> subcommand that runs the rest of the line as a command.
 const RUNNERS: Record<string, string> = { uv: "run", poetry: "run", pipenv: "run", pdm: "run", hatch: "run", pnpm: "exec", bundle: "exec" };
 
+// Directories whose programs are the tools their names say.
+const SYSTEM_BIN = new Set(["/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/local/bin", "/usr/local/sbin"]);
+
+// The options a tool takes before its subcommand. Another option there leaves the subcommand to
+// the decider: its value could be read as the subcommand (`systemctl -p status restart nginx`).
+// `dirs`: options that move the tool to another directory, which must be local.
+const LEAD_OPTIONS: Record<string, OptionTable & { dirs?: string[] }> = {
+  npm: { flags: "sqdgyv", long: ["silent", "quiet", "verbose", "workspaces", "include-workspace-root", "if-present", "no-color", "offline", "prefer-offline", "no-audit", "no-fund", "global", "yes"], valued: "w", longValued: ["prefix", "workspace", "loglevel"], dirs: ["--prefix"] },
+  pnpm: { flags: "srwv", long: ["silent", "recursive", "workspace-root", "if-present", "no-color", "offline", "prefer-offline", "parallel", "stream", "aggregate-output", "frozen-lockfile"], valued: "CF", longValued: ["dir", "filter", "loglevel", "reporter", "workspace-concurrency"], dirs: ["-C", "--dir"] },
+  yarn: { flags: "sv", long: ["silent", "verbose", "offline", "frozen-lockfile", "immutable"], longValued: ["cwd"], dirs: ["--cwd"] },
+  bun: { flags: "sv", long: ["silent"], longValued: ["cwd"], dirs: ["--cwd"] },
+  cargo: { flags: "qv", long: ["quiet", "verbose", "frozen", "locked", "offline"], valued: "Z", longValued: ["color"] },
+  uv: { flags: "qv", long: ["quiet", "verbose", "offline", "no-cache", "native-tls", "no-progress"], longValued: ["directory", "project", "color"], dirs: ["--directory", "--project"] },
+  pip: { flags: "qv", long: ["quiet", "verbose", "disable-pip-version-check", "no-cache-dir", "isolated", "no-input", "no-color"] },
+  pip3: { flags: "qv", long: ["quiet", "verbose", "disable-pip-version-check", "no-cache-dir", "isolated", "no-input", "no-color"] },
+  docker: { flags: "D", long: ["debug"], valued: "l", longValued: ["log-level"] },
+  systemctl: { flags: "qlar", long: ["user", "system", "no-pager", "quiet", "no-legend", "full", "all", "failed", "recursive", "no-ask-password", "plain"], valued: "tpPno", longValued: ["type", "property", "lines", "output", "state"] },
+  loginctl: { flags: "al", long: ["no-pager", "no-legend", "all", "full", "no-ask-password", "value"], valued: "pPno", longValued: ["property", "lines", "output"] },
+};
+// The options of a runner's run subcommand, before the command it runs.
+const RUNNER_OPTIONS: Record<string, OptionTable> = {
+  uv: { flags: "qvsm", long: ["no-sync", "frozen", "locked", "isolated", "no-project", "all-extras", "no-dev", "dev", "quiet", "verbose", "offline", "active", "no-cache", "no-env-file", "all-packages", "exact", "module", "script"], valued: "p", longValued: ["with", "with-editable", "with-requirements", "python", "project", "directory", "group", "only-group", "extra", "env-file", "package"] },
+  pnpm: { flags: "r", long: ["recursive", "parallel"] },
+};
+
 const operands = (args: string[]) => args.filter((a) => !a.startsWith("-"));
 // Drops a wrapper's leading options; `takesValue` matches the ones followed by a value.
 function afterFlags(args: string[], takesValue: RegExp): string[] {
@@ -722,6 +1393,431 @@ function afterFlags(args: string[], takesValue: RegExp): string[] {
 }
 const hasFlag = (args: string[], short: string, long?: string) =>
   args.some((a) => (long && a === long) || (/^-[a-zA-Z]+$/.test(a) && a.includes(short)));
+
+// ---- options ----
+
+// Reads leading options against a table: flags, options that take a value (the next word, after
+// `=`, or attached to a short letter), and clusters of short flags. Returns the index of the first
+// operand, or -1 when an option is not in the table.
+interface OptionTable {
+  // Short letters that are flags, and those that take a value.
+  flags?: string;
+  valued?: string;
+  // Long options (without the dashes) that are flags, and those that take a value.
+  long?: string[];
+  longValued?: string[];
+}
+function leadingOptions(args: string[], table: OptionTable, from = 0): number {
+  let i = from;
+  while (i < args.length && args[i].startsWith("-") && args[i] !== "-") {
+    const a = args[i];
+    if (a === "--") return i + 1;
+    if (a.startsWith("--")) {
+      const eq = a.indexOf("=");
+      const name = a.slice(2, eq < 0 ? undefined : eq);
+      if (table.longValued?.includes(name)) i += eq < 0 ? 2 : 1;
+      else if (eq < 0 && table.long?.includes(name)) i++;
+      else return -1;
+      continue;
+    }
+    let k = 1;
+    for (; k < a.length; k++) {
+      if (table.valued?.includes(a[k])) break;
+      if (!table.flags?.includes(a[k])) return -1;
+    }
+    // A valued letter takes the rest of the word, or the next word.
+    i += k < a.length && k === a.length - 1 ? 2 : 1;
+  }
+  return i;
+}
+
+// A long option as git and argp read it: the full name, or an unambiguous prefix of it (any prefix
+// here, which errs toward asking), with or without `=value`.
+const longIs = (arg: string, name: string) => {
+  const head = arg.split("=")[0];
+  return head.length > 2 && head.startsWith("--") && `--${name}`.startsWith(head);
+};
+// A short letter in a cluster such as `-fd`, read up to the first letter that takes a value.
+const shortIn = (arg: string, letter: string, valued = "") => {
+  if (!/^-[A-Za-z0-9]/.test(arg) || arg.startsWith("--")) return false;
+  for (let k = 1; k < arg.length; k++) {
+    if (arg[k] === letter) return true;
+    if (valued.includes(arg[k])) return false;
+  }
+  return false;
+};
+
+
+// ---- wrappers and variables ----
+
+// The options of each wrapper, so that an option's value is never read as the program
+// (`env -u X cmd`, `timeout -s KILL 5 cmd`). Options that change more than the environment, the
+// priority or the time limit (`env -S`, which splits a string into a command; `env -C`; `time -o`,
+// which writes a file) are not listed, and leave the command unmodelled. `operands`: what comes
+// between the options and the program (timeout's duration, chrt's priority, taskset's mask).
+const WRAPPER_OPTIONS: Record<string, OptionTable & { operand?: RegExp }> = {
+  env: { flags: "i0v", valued: "u", long: ["ignore-environment", "null", "debug"], longValued: ["unset"] },
+  nice: { valued: "n", longValued: ["adjustment"] },
+  ionice: { flags: "t", valued: "cn", long: ["ignore"], longValued: ["class", "classdata"] },
+  timeout: { flags: "v", valued: "sk", long: ["preserve-status", "foreground", "verbose"], longValued: ["signal", "kill-after"], operand: /^\d+(\.\d+)?[smhd]?$/ },
+  time: { flags: "pvq", valued: "f", long: ["portability", "verbose", "quiet"], longValued: ["format"] },
+  command: { flags: "p" },
+  builtin: {},
+  nohup: {},
+  setsid: { flags: "cfw", long: ["ctty", "fork", "wait"] },
+  stdbuf: { valued: "ioe", longValued: ["input", "output", "error"] },
+  exec: { flags: "cl", valued: "a" },
+  chrt: { flags: "abdfiorRv", valued: "TPD", long: ["all-tasks", "batch", "deadline", "fifo", "idle", "other", "rr", "reset-on-fork", "verbose"], longValued: ["sched-runtime", "sched-period", "sched-deadline"], operand: /^\d+$/ },
+  taskset: { flags: "ac", long: ["all-tasks", "cpu-list"], operand: /^[\da-fA-Fx,:-]+$/ },
+};
+// What unwrap returns for a wrapper it cannot read: the command is left to the decider.
+const UNMODELLED = "\0unmodelled";
+
+// Variables that change how a program formats, logs or labels its work, not what code runs or
+// where files go: a command may set, export or pass them on. Any other variable set in the
+// environment of a program goes to the decider: PATH, HOME, XDG_*, GIT_*, LD_*, BASH_ENV,
+// TAR_OPTIONS, MAKEFLAGS, NODE_OPTIONS with a loader and the like change what runs.
+const PLAIN_VARS = /^(_|CI|NODE_ENV|RUST_BACKTRACE|RUST_LOG|RUST_LOG_STYLE|CARGO_TERM_COLOR|CARGO_TERM_VERBOSE|CARGO_TERM_PROGRESS_WHEN|CARGO_INCREMENTAL|DEBUG|VERBOSE|FORCE_COLOR|NO_COLOR|CLICOLOR|CLICOLOR_FORCE|COLUMNS|LINES|TERM|COLORTERM|LANG|LANGUAGE|LC_[A-Z]+|TZ|PYTHONUNBUFFERED|PYTHONDONTWRITEBYTECODE|PYTHONIOENCODING|PYTHONHASHSEED|PYTHONUTF8|PYTHONFAULTHANDLER|PYTHONWARNINGS|GOOS|GOARCH|CGO_ENABLED|GO111MODULE|PORT|HOST|LOG_LEVEL|IFS|GIT_TERMINAL_PROMPT|GIT_AUTHOR_(NAME|EMAIL|DATE)|GIT_COMMITTER_(NAME|EMAIL|DATE)|TIMEFORMAT|SOURCE_DATE_EPOCH|HUSKY|NPM_CONFIG_LOGLEVEL|NPM_CONFIG_FUND|NPM_CONFIG_AUDIT|NPM_CONFIG_UPDATE_NOTIFIER)$/;
+// Variables that name a program: allowed only when they name one that does nothing with its input.
+const PROGRAM_VARS = /^(EDITOR|VISUAL|GIT_EDITOR|GIT_SEQUENCE_EDITOR|PAGER|GIT_PAGER|SYSTEMD_PAGER|BAT_PAGER|MANPAGER)$/;
+const QUIET_PROGRAMS = new Set(["cat", "true", ":", "less", "more", "tee"]);
+// NODE_OPTIONS that tune the runtime, without loading anything.
+const NODE_TUNING = /^(--max-old-space-size=\d+|--max-semi-space-size=\d+|--stack-size=\d+|--enable-source-maps|--no-warnings|--no-deprecation|--trace-warnings|--trace-deprecation|--trace-uncaught|--unhandled-rejections=[\w-]+|--experimental-vm-modules|--experimental-strip-types|--no-experimental-strip-types|--dns-result-order=[\w-]+|--max-http-header-size=\d+|--disable-warning=[\w-]+|--use-openssl-ca|--use-bundled-ca)$/;
+const COMPILERS = /^(cc|c\+\+|gcc|g\+\+|clang|clang\+\+|tcc)(-\d+(\.\d+)*)?$/;
+// Variables bash reads itself: where commands are found, how globs and words expand, what runs
+// before each command or at startup.
+const BASH_READS = /^(PATH|CDPATH|GLOBIGNORE|EXECIGNORE|GLOBSORT|BASHOPTS|SHELLOPTS|POSIXLY_CORRECT|PS4|PWD|OLDPWD|HOME|ENV|BASH_\w+|FUNCNEST|PROMPT_COMMAND|INPUTRC|HISTFILE|TMPDIR|LD_\w+)$/;
+
+// Why setting the variable `name` (to `value`, when known) is left to the decider, if it is.
+// `how`: "env" puts it in a program's environment (a prefix, `env`, `export`); "set" sets a shell
+// variable, which reaches a program only if it is already exported, as the upper-case names that
+// programs read usually are.
+function variableProblem(name: string, value: string | undefined, how: "env" | "set", scope: Scope): string | undefined {
+  if (name.includes("[")) return `sets ${name}, whose subscript is evaluated as arithmetic`;
+  if (PLAIN_VARS.test(name)) return undefined;
+  // A variable set on its own stays in the shell, unless it is already in the environment (then
+  // the programs after it see the new value) or bash itself reads it.
+  if (how === "set" && !BASH_READS.test(name) && !Object.hasOwn(process.env, name)) return undefined;
+  // A value that extends the variable's own (`PATH=src:$PATH`) adds only what it spells out.
+  const self = new RegExp(`(^|[:\\s])\\$\\{?${name}\\}?(?=$|[:\\s])`, "g");
+  if (value !== undefined && self.test(value)) value = value.replace(self, "$1").replace(/^[:\s]+|[:\s]+$/g, "");
+  if (value !== undefined && !/[$`]/.test(value)) {
+    if (PROGRAM_VARS.test(name) && QUIET_PROGRAMS.has(value)) return undefined;
+    if (name === "NODE_OPTIONS" && value.split(/\s+/).filter(Boolean).every((o) => NODE_TUNING.test(o))) return undefined;
+    if ((name === "CC" || name === "CXX") && COMPILERS.test(value)) return undefined;
+    if (name === "PYTHONPATH" && value.split(":").every((d) => d !== "" && isLocal(resolveWord(d, scope), scope))) return undefined;
+  }
+  const loads = LOADS_CODE.exec(`${name}=${value ?? ""}`);
+  return loads ? `sets ${name}, which loads other code into the program` : `sets ${name}, which can change what a program runs or where it writes`;
+}
+
+// The variables a simple command sets, with how: assignments before it and those `env` passes, the
+// operands of export/declare/local/readonly/typeset, and the names that read, printf -v, mapfile,
+// getopts, unset, for and select set.
+function variablesSet(cmd: Simple, argv: string[]): [string, string | undefined, "env" | "set"][] | string {
+  const out: [string, string | undefined, "env" | "set"][] = [];
+  const pair = (w: string): [string, string] => {
+    const eq = w.indexOf("=");
+    return [w.slice(0, eq).replace(/\+$/, ""), w.slice(eq + 1)];
+  };
+  const dropped = cmd.argv.slice(0, cmd.argv.length - argv.length);
+  const assignments = dropped.filter((w) => ASSIGNMENT.test(w));
+  // Assignments alone set shell variables; before a program (or through env) they are its environment.
+  const alone = argv.length === 0;
+  for (const w of assignments) out.push([...pair(w), alone ? "set" : "env"]);
+  // A loop header: `for NAME in ...`, `select NAME in ...`.
+  const head = cmd.argv.findIndex((w) => !RESERVED.has(w) || w === "for" || w === "select");
+  if (cmd.argv[head] === "for" || cmd.argv[head] === "select") {
+    const name = cmd.argv[head + 1];
+    if (name && name !== "((") out.push([name, undefined, "set"]);
+  }
+  const [program, ...args] = argv;
+  if (!program) return out;
+  const name = path.basename(program);
+  if (["export", "declare", "typeset", "local", "readonly"].includes(name)) {
+    const flags = args.filter((a) => /^[-+]/.test(a)).join("");
+    // -i evaluates every later assignment as arithmetic; -n makes a name stand for another variable.
+    if (/^-.*[in]/.test(flags) || /-[a-zA-Z]*[in]/.test(flags)) return `${name} -i or -n changes how later assignments are read`;
+    const how = name === "export" || /-[a-zA-Z]*x/.test(flags) ? "env" : "set";
+    for (const a of args.filter((x) => !/^[-+]/.test(x))) {
+      if (ASSIGNMENT.test(a)) out.push([...pair(a), how]);
+      else if (how === "env" && /^[A-Za-z_]\w*$/.test(a)) out.push([a, undefined, "env"]);
+      else if (a.includes("[")) out.push([a, undefined, "set"]);
+    }
+  } else if (name === "unset") {
+    // `unset -f` removes functions.
+    if (!args.some((a) => /^-[a-z]*f/.test(a))) for (const a of args.filter((x) => !x.startsWith("-"))) out.push([a, undefined, "set"]);
+  } else if (name === "read") {
+    const k = leadingOptions(args, { flags: "ers", valued: "adinNptu" });
+    if (k < 0) return "read with options the rules do not model";
+    const array = args.slice(0, k).find((a, j) => a === "-a" || (args[j - 1] !== "-a" && /^-[a-z]*a$/.test(a)));
+    for (const a of args.slice(k)) out.push([a, undefined, "set"]);
+    if (array) out.push([args[args.indexOf(array) + 1] ?? "", undefined, "set"]);
+  } else if (name === "printf") {
+    const v = args.findIndex((a) => a === "-v");
+    if (v >= 0) out.push([args[v + 1] ?? "", undefined, "set"]);
+    else if (args.some((a) => /^-v./.test(a))) out.push([args.find((a) => /^-v./.test(a))!.slice(2), undefined, "set"]);
+  } else if (name === "mapfile" || name === "readarray") {
+    if (args.some((a) => /^-[a-zA-Z]*C/.test(a))) return `${name} -C runs a callback`;
+    const k = leadingOptions(args, { flags: "t", valued: "dnOsucC" });
+    if (k < 0) return `${name} with options the rules do not model`;
+    out.push([args[k] ?? "MAPFILE", undefined, "set"]);
+  } else if (name === "getopts") {
+    out.push([operands(args)[1] ?? "", undefined, "set"]);
+  } else if (name === "wait") {
+    const p = args.indexOf("-p");
+    if (p >= 0) out.push([args[p + 1] ?? "", undefined, "set"]);
+  }
+  return out;
+}
+
+// `set` options that change what later words mean: allexport (-a) puts every later assignment in
+// the environment, keyword (-k) takes assignments anywhere on a line as environment.
+function setProblem(args: string[]): string | undefined {
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === "--" || a === "-") break;
+    if (/^[-+]o$/.test(a) && /^(allexport|keyword)$/.test(args[k + 1] ?? "")) return `set -o ${args[k + 1]} changes how later assignments are read`;
+    if (/^[-+][a-zA-Z]+$/.test(a) && /[ak]/.test(a.slice(1))) return "set -a or -k changes how later assignments are read";
+    if (!/^[-+]/.test(a)) break;
+  }
+  return undefined;
+}
+
+// ---- programs that take code or run programs through their options ----
+
+// A sed script that only prints, deletes and substitutes text. Not: `e` (and the `e` flag of `s`),
+// which runs a command; `w`, `W` (and the `w` flag), which write a file; `r`, `R`, which read one
+// into the output. Anything the reader below does not follow is left to the decider.
+function sedScriptSafe(script: string): boolean {
+  let i = 0;
+  const s = script;
+  const skipBlank = () => {
+    while (i < s.length && /[ \t]/.test(s[i])) i++;
+  };
+  // A regex delimited by `d`, from just after the opening delimiter; returns false if unterminated.
+  const delimited = (d: string): boolean => {
+    for (; i < s.length; i++) {
+      if (s[i] === "\\") i++;
+      else if (s[i] === d) return (i++, true);
+      else if (s[i] === "\n") return false;
+    }
+    return false;
+  };
+  const address = (): boolean => {
+    if (/\d/.test(s[i] ?? "")) {
+      while (/[\d~]/.test(s[i] ?? "")) i++;
+    } else if (s[i] === "$") i++;
+    else if (s[i] === "/") {
+      i++;
+      if (!delimited("/")) return false;
+      while (/[IM]/.test(s[i] ?? "")) i++;
+    } else if (s[i] === "\\") {
+      const d = s[i + 1];
+      if (!d || d === "\n" || d === "\\") return false;
+      i += 2;
+      if (!delimited(d)) return false;
+      while (/[IM]/.test(s[i] ?? "")) i++;
+    }
+    return true;
+  };
+  while (i < s.length) {
+    while (i < s.length && /[\s;]/.test(s[i])) i++;
+    if (i >= s.length) break;
+    if (s[i] === "#") {
+      while (i < s.length && s[i] !== "\n") i++;
+      continue;
+    }
+    if (!address()) return false;
+    skipBlank();
+    if (s[i] === ",") {
+      i++;
+      skipBlank();
+      if (s[i] === "+" || s[i] === "~") i++;
+      if (!address()) return false;
+      skipBlank();
+    }
+    if (s[i] === "!") {
+      i++;
+      skipBlank();
+    }
+    const c = s[i++];
+    if (c === undefined) return false;
+    if (c === "{" || c === "}") continue;
+    if ("pPdDnNgGhHxlzF=".includes(c)) {
+      // `l` and the quit commands may take a number.
+    } else if ("qQL".includes(c)) {
+      skipBlank();
+      while (/\d/.test(s[i] ?? "")) i++;
+    } else if (c === ":" || "btTv".includes(c)) {
+      while (i < s.length && !/[;\n]/.test(s[i])) {
+        if (c !== ":" && s[i] === "}") break;
+        i++;
+      }
+    } else if ("aic".includes(c)) {
+      // Text to the end of the line; a backslash at the end continues it.
+      for (; i < s.length && s[i] !== "\n"; i++) if (s[i] === "\\") i++;
+    } else if (c === "s" || c === "y") {
+      const d = s[i++];
+      if (!d || d === "\\" || d === "\n") return false;
+      if (!delimited(d) || !delimited(d)) return false;
+      if (c === "s") {
+        while (i < s.length && /[gpiImMe\dw]/.test(s[i])) {
+          if (s[i] === "e" || s[i] === "w") return false;
+          i++;
+        }
+      }
+    } else return false;
+    skipBlank();
+    if (i < s.length && !/[;\n}#]/.test(s[i])) return false;
+  }
+  return true;
+}
+
+function sed(args: string[], scope: Scope): Verdict {
+  const scripts: string[] = [];
+  let inPlace = false;
+  let sandbox = false;
+  let k = 0;
+  for (; k < args.length && args[k].startsWith("-") && args[k] !== "-"; k++) {
+    const a = args[k];
+    if (a === "--") {
+      k++;
+      break;
+    }
+    if (a.startsWith("--")) {
+      if (a === "--sandbox") sandbox = true;
+      else if (/^--(expression)$/.test(a)) scripts.push(args[++k] ?? "");
+      else if (/^--expression=/.test(a)) scripts.push(a.slice(13));
+      else if (/^--in-place(=|$)/.test(a)) inPlace = true;
+      else if (/^--line-length$/.test(a)) k++;
+      else if (!/^--(quiet|silent|regexp-extended|separate|unbuffered|null-data|posix|debug|follow-symlinks|binary|line-length=\d+)$/.test(a)) return classify(`sed ${a.split("=")[0]}: an option the rules do not model`);
+      continue;
+    }
+    let j = 1;
+    for (; j < a.length; j++) {
+      const ch = a[j];
+      if ("nErsuzb".includes(ch)) continue;
+      if (ch === "i") {
+        inPlace = true;
+        break;
+      }
+      if (ch === "e" || ch === "l") {
+        const value = j + 1 < a.length ? a.slice(j + 1) : args[++k];
+        if (ch === "e") scripts.push(value ?? "");
+        break;
+      }
+      return classify(`sed -${ch}: an option the rules do not model`);
+    }
+  }
+  const rest = args.slice(k);
+  if (!scripts.length) scripts.push(rest.shift() ?? "");
+  if (!sandbox && !scripts.every(sedScriptSafe)) return classify("sed script that runs commands or reads or writes other files");
+  return inPlace ? writeTargets("sed", ["script", ...rest.filter((a) => !a.startsWith("-"))], scope) : ALLOW;
+}
+
+// An awk program that only reads its input and prints. Not: system(), getline (from a command or
+// a file), a pipe (`|` that is not `||`), print or printf redirected to a file, and gawk's `@`
+// (indirect calls, @include, @load).
+const awkSafe = (program: string) => !/\bsystem\b|\bgetline\b|@|\|&|\bprintf?\b[^;{}\n]*[>|]|[>|]\s*"/.test(program.replace(/\|\|/g, " "));
+
+function awk(args: string[]): Verdict {
+  const programs: string[] = [];
+  let k = 0;
+  for (; k < args.length && args[k].startsWith("-") && args[k] !== "-"; k++) {
+    const a = args[k];
+    if (a === "--") {
+      k++;
+      break;
+    }
+    if (a === "-F" || a === "-v") k++;
+    else if (/^-[Fv]./.test(a) || /^--(field-separator|assign)=/.test(a)) continue;
+    else if (a === "-e" || a === "--source") programs.push(args[++k] ?? "");
+    else if (/^--source=/.test(a)) programs.push(a.slice(9));
+    else if (/^-e./.test(a)) programs.push(a.slice(2));
+    // -f, -i and -l load a program, a library or an extension; -o, -d and -p write files.
+    else return classify(`awk ${a}: an option that loads code or writes files`);
+  }
+  if (!programs.length) programs.push(args[k] ?? "");
+  return programs.every(awkSafe) ? ALLOW : classify("awk that runs commands or reads or writes other files");
+}
+
+// make reads its makefile and runs the recipes in it; what can change that from the command line:
+// --eval, a makefile from standard input or a descriptor, and variables set to text that is not a
+// plain word (`make CC='id;'`) or that make itself reads (SHELL, MAKEFLAGS).
+function make(args: string[], scope: Scope): Verdict {
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (longIs(a, "eval") || shortIn(a, "E", "fCIjlWo")) return classify("make --eval runs text as a makefile");
+    const file = /^(-f|--file|--makefile)$/.test(a) ? args[k + 1] : /^--(file|makefile)=/.test(a) ? a.slice(a.indexOf("=") + 1) : /^-f./.test(a) ? a.slice(2) : undefined;
+    if (file !== undefined && (file === "-" || (/^\/dev\/|^\/proc\//.test(file) && file !== "/dev/null") || /[$`]/.test(file))) return classify("make reads its makefile from a stream");
+    const dir = /^(-C|--directory)$/.test(a) ? args[k + 1] : /^--directory=/.test(a) ? a.slice(12) : /^-C./.test(a) ? a.slice(2) : undefined;
+    if (dir !== undefined && !isLocal(resolveWord(dir, scope), scope)) return classify("make in a directory outside the working directory");
+    const m = /^([A-Za-z_.][\w.]*)\+?[:?!]?=(.*)$/s.exec(a);
+    if (m && (/^(SHELL|\.SHELLFLAGS|MAKEFLAGS|MFLAGS|MAKE|MAKEFILES|MAKEFILE_LIST|\.RECIPEPREFIX)$/.test(m[1]) || !/^[\w.+,:=%@\/-]*$/.test(m[2]))) {
+      return classify(`make ${m[1]}=: a value the recipes may run`);
+    }
+  }
+  return ALLOW;
+}
+
+// tar options that run a program: a checkpoint action, a compressor, --to-command, the volume
+// scripts, a remote shell; and an archive named host:file, which tar opens through rsh.
+function tarProblem(args: string[]): string | undefined {
+  const running = ["checkpoint-action", "use-compress-program", "to-command", "info-script", "new-volume-script", "rsh-command", "rmt-command"];
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (running.some((name) => longIs(a, name))) return `tar ${a.split("=")[0]} runs a program`;
+    // Short clusters, and the old style where the first word is a cluster without its dash.
+    const cluster = /^-[A-Za-z]+$/.test(a) ? a.slice(1) : k === 0 && /^[A-Za-z]+$/.test(a) ? a : "";
+    if (/[IF]/.test(cluster)) return "tar -I or -F runs a program";
+    const archive = /^--file=/.test(a) ? a.slice(7) : a === "--file" || /f$/.test(cluster) ? args[k + 1] : /^-f./.test(a) && !a.startsWith("--") ? a.slice(2) : undefined;
+    if (archive !== undefined && /^[^/]*:/.test(archive) && !args.includes("--force-local")) return "tar on a remote archive runs a remote shell";
+  }
+  return undefined;
+}
+
+// ---- nested shells ----
+
+// Options of bash and sh that can come before -c without changing how the code is read.
+const SHELL_FLAGS = "euxvfhlETCPBHnp";
+const SHELL_SET_O = /^(errexit|nounset|pipefail|xtrace|verbose|noglob|noclobber|errtrace|functrace|noexec|hashall)$/;
+
+// `bash -c CODE`: CODE is parsed as a command line, for bash, sh and dash only (zsh and ksh read
+// it differently), when no option before it changes how it is read, and when the outer shell
+// does not expand anything in it. `bash SCRIPT`: the script runs.
+function shell(name: string, args: string[], dyn: (k: number) => boolean, cmd: Simple, scope: Scope, depth: number): Verdict {
+  let k = 0;
+  let code = false;
+  for (; k < args.length && /^[-+]/.test(args[k]) && args[k] !== "-" && args[k] !== "--"; k++) {
+    const a = args[k];
+    if (/^--(norc|noprofile|login|posix|noediting)$/.test(a)) continue;
+    if (/^[-+]o$/.test(a)) {
+      if (!SHELL_SET_O.test(args[++k] ?? "")) return classify(`${name} ${a} ${args[k] ?? ""}: an option that changes how the code is read`.trim());
+      continue;
+    }
+    for (const ch of a.slice(1)) {
+      if (ch === "c") code = true;
+      else if (ch === "o") {
+        if (!SHELL_SET_O.test(args[++k] ?? "")) return classify(`${name} -o ${args[k] ?? ""}: an option that changes how the code is read`.trim());
+      } else if (!SHELL_FLAGS.includes(ch)) return classify(`${name} -${ch}: an option the rules do not model`);
+    }
+  }
+  if (args[k] === "--" || args[k] === "-") k++;
+  // -n reads the code without running it.
+  if (args.slice(0, k).some((a) => /^-[a-zA-Z]*n/.test(a))) return ALLOW;
+  if (!code) {
+    const [script, ...rest] = args.slice(k);
+    return (script && !cmd.heredoc && runFile(script, rest, scope)) || classify(`runs a script with ${name}`);
+  }
+  if (name === "zsh" || name === "ksh") return classify(`${name} -c: code that ${name} reads differently from bash`);
+  if (dyn(k)) return classify(`${name} -c of code the outer shell expands first`);
+  const text = args[k] ?? "";
+  // dash reads these as bash does not: `&>` is a background job, `$'` a dollar sign.
+  if ((name === "sh" || name === "dash") && /\$['"]|&>|<<<|\|&|\[\[|\(\(|[<>]\(/.test(text)) return classify(`${name} -c with syntax that sh reads differently from bash`);
+  if (depth > 3) return classify(`${name} -c nested too deeply`);
+  return evaluateParsed(parse(text), scope, depth + 1);
+}
 
 // ---- rules for one simple command ----
 
@@ -741,6 +1837,16 @@ function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = 
       if (!isLocal(p, scope)) return outside(`${cmd} writes outside the working directory: ${t}`, p);
     }
   }
+  // A symbolic link this command makes is followed by the paths it uses after it.
+  if (cmd === "ln" && paths.length > 1 && args.some((a) => a === "--symbolic" || /^-[a-zA-Z]*s/.test(a))) {
+    for (const source of sources) {
+      const link = dest && intoDir ? path.join(dest, path.basename(source)) : dest;
+      const at = link ? path.dirname(link) : undefined;
+      const text = expandHome(expandVars(source, scope));
+      const target = at && !/[$`]/.test(text) ? realish(path.resolve(at, text)) : undefined;
+      if (link && target) (scope.links ??= new Map()).set(link, target);
+    }
+  }
   if (COPIERS.has(cmd) && paths.length > 1) {
     for (const source of sources) {
       const from = resolveWord(source, scope);
@@ -750,8 +1856,17 @@ function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = 
     }
   } else if (CONTENT_WRITERS.has(cmd)) {
     const literal = cmd === "tee" && literalInput;
-    // Appending literal text leaves the file's origin as it was.
-    if (!(literal && hasFlag(args, "a", "--append"))) for (const t of targets) note(resolveWord(t, scope), literal ? "authored" : "other", scope);
+    // Appending literal text to a file of the project makes it one the session wrote; any other
+    // origin stays as it was.
+    for (const t of targets) {
+      const p = resolveWord(t, scope);
+      if (literal && hasFlag(args, "a", "--append")) {
+        if (p && originOf(p, scope) === undefined) note(p, "authored", scope);
+      } else note(p, literal ? "authored" : "other", scope);
+    }
+  } else if (cmd === "sed") {
+    // An in-place edit leaves content the rules did not write.
+    for (const t of targets) note(resolveWord(t, scope), "other", scope);
   }
   return ALLOW;
 }
@@ -775,44 +1890,146 @@ function rm(args: string[], scope: Scope): Verdict {
   return verdict;
 }
 
+// git's own options before the subcommand. `-C`, `--git-dir` and `--work-tree` name a repository,
+// which must be local; `-c` sets configuration, which only the keys below may do here (core.pager,
+// alias.*, core.sshCommand and many more run programs). Any other option, `--exec-path=`,
+// `--config-env` and `--super-prefix` among them, leaves the subcommand to the decider.
+const GIT_FLAGS = /^(-p|--paginate|-P|--no-pager|--no-replace-objects|--bare|--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs|--no-optional-locks|--no-lazy-fetch|--no-advice)$/;
+// Configuration that changes how git shows or records things, never what it runs.
+const GIT_PLAIN_CONFIG = /^(user\.(name|email)|author\.(name|email)|committer\.(name|email)|color\.[\w.-]+|core\.(quotepath|autocrlf|safecrlf|filemode|ignorecase|abbrev|eol)|advice\.\w+|init\.defaultbranch|commit\.(gpgsign|verbose|status)|tag\.gpgsign|log\.[\w.-]+|format\.pretty|diff\.(noprefix|renames|algorithm|colormoved|context|indentheuristic|mnemonicprefix|relative|statgraphwidth|submodule|wserrorhighlight)|merge\.(conflictstyle|ff|log|stat|renames)|pull\.(rebase|ff)|rebase\.(autosquash|autostash|stat|updaterefs)|push\.(autosetupremote|default|followtags)|fetch\.(prune|prunetags|parallel)|status\.[\w.-]+|column\.[\w.-]+|i18n\.[\w.-]+|gc\.auto|branch\.autosetup\w*|help\.autocorrect|rerere\.enabled|blame\.[\w.-]+|grep\.(linenumber|patterntype|extendedregexp|column|fullname)|feature\.\w+|index\.\w+|pack\.\w+|checkout\.defaultremote)$/i;
+
 function git(args: string[], scope: Scope): Verdict {
-  // Skip global options to find the subcommand.
+  // Global options, read as git reads them; the directory git works in follows `-C`.
+  let dir: Scope = scope;
   let i = 0;
-  while (i < args.length && args[i].startsWith("-")) {
-    if (args[i] === "-C") {
-      if (!isLocal(resolveWord(args[i + 1] ?? "", scope), scope)) return classify("git on a repository outside the working directory");
-      i += 2;
-    } else i += args[i] === "-c" ? 2 : 1;
+  for (; i < args.length && args[i].startsWith("-"); i++) {
+    const a = args[i];
+    if (GIT_FLAGS.test(a)) continue;
+    if (a === "--version" || a === "--help" || a === "-h" || a === "-v" || /^--(html|man|info)-path$/.test(a) || /^--list-cmds=/.test(a)) return ALLOW;
+    if (a === "-C" || /^--(git-dir|work-tree)(=|$)/.test(a)) {
+      const value = a.includes("=") ? a.slice(a.indexOf("=") + 1) : args[++i];
+      const p = resolveWord(value ?? "", dir);
+      if (!isLocal(p, scope)) return classify("git on a repository outside the working directory");
+      if (a === "-C") dir = { ...dir, cwd: p };
+      continue;
+    }
+    if (a === "-c") {
+      const key = (args[++i] ?? "").split("=")[0];
+      if (!GIT_PLAIN_CONFIG.test(key)) return classify(`git -c ${key} sets configuration that can run programs`);
+      continue;
+    }
+    if (/^--namespace(=|$)/.test(a)) {
+      if (!a.includes("=")) i++;
+      continue;
+    }
+    if (/^--attr-source(=|$)/.test(a)) {
+      if (!a.includes("=")) i++;
+      continue;
+    }
+    return classify(`git ${a.split("=")[0]} is an option the rules do not model`);
   }
   const sub = args[i];
   const rest = args.slice(i + 1);
-  const has = (...flags: string[]) => rest.some((a) => flags.includes(a));
-  // A long flag, or its letter alone or in a cluster such as `-SW`.
-  const flag = (long: string, letter: string) => has(long) || rest.some((a) => new RegExp(`^-[a-zA-Z]*${letter}[a-zA-Z]*$`).test(a));
   if (!sub) return ALLOW;
-  if (sub === "reset" && has("--hard")) return ask("git reset --hard discards local changes");
-  if (sub === "clean" && rest.some((a) => /^-[a-zA-Z]*f/.test(a) || a === "--force")) return ask("git clean -f deletes untracked files");
-  if (sub === "checkout" && (has("--", ".") || has("-f", "--force"))) return ask("git checkout discards local changes");
-  // Only --staged alone keeps the working tree; --worktree with it still discards changes.
-  if (sub === "restore" && (!flag("--staged", "S") || flag("--worktree", "W"))) return ask("git restore discards local changes");
-  // Without --force git refuses to remove a worktree or submodule that has local changes.
-  if (sub === "worktree" && operands(rest)[0] === "remove" && flag("--force", "f")) return ask("git worktree remove --force deletes the worktree with its uncommitted changes");
-  if (sub === "submodule" && operands(rest)[0] === "deinit" && flag("--force", "f")) return ask("git submodule deinit --force deletes submodule working trees with their local changes");
-  if (sub === "branch") return has("-D") || (has("-d", "--delete") && has("-f", "--force")) ? ask("git branch -D deletes a branch") : ALLOW;
-  if (sub === "stash") return has("drop", "clear") ? ask("git stash drop deletes stashed changes") : ALLOW;
-  if (sub === "tag") return has("-d", "--delete") ? ask("git tag -d deletes a tag") : has("-f", "--force") ? ask("git tag -f replaces a tag, which keeps no reflog") : ALLOW;
-  if (sub === "reset" || sub === "clean" || sub === "checkout" || sub === "restore") return ALLOW;
-  if (sub === "config") {
-    if (has("--global", "--system")) return has("--get", "--get-all", "--list", "-l") ? ALLOW : ask("changes git config outside the repository");
+  // Options of the subcommand, up to `--`.
+  const end = rest.indexOf("--");
+  const opts = end < 0 ? rest : rest.slice(0, end);
+  // A long option (or an unambiguous prefix of it, as git accepts) or a letter in a short cluster
+  // read up to the first letter that takes a value.
+  const opt = (long: string | undefined, letter?: string, valued = "") =>
+    opts.some((a) => (long !== undefined && longIs(a, long)) || (letter !== undefined && shortIn(a, letter, valued)));
+  const words = operands(opts);
+  if (rest.some((a) => /^[\w+.-]+::/.test(a))) return classify(`git ${sub} through a remote helper, which runs a program`);
+  // Options that run a program: upload-pack and receive-pack for the transports, --exec for
+  // archive and rebase, --template hooks.
+  if (opt("upload-pack") || opt("receive-pack") || opt("template") || (sub === "clone" && opt(undefined, "u", "obcj")) || (["archive", "ls-remote"].includes(sub) && opt("exec"))) {
+    return classify(`git ${sub} with an option that runs a program`);
+  }
+  if (opt("config", sub === "clone" ? "c" : undefined, "obuj")) {
+    const values = opts.flatMap((a, k) => (longIs(a, "config") || a === "-c" ? [a.includes("=") ? a.slice(a.indexOf("=") + 1) : (opts[k + 1] ?? "")] : /^-c./.test(a) ? [a.slice(2)] : []));
+    if (!values.every((v) => GIT_PLAIN_CONFIG.test(v.split("=")[0]))) return classify(`git ${sub} sets configuration that can run programs`);
+  }
+  // Files git writes besides the work tree.
+  const outputs: string[] = [];
+  const valueOf = (long: string, letter?: string) =>
+    opts.flatMap((a, k) => (longIs(a, long) ? [a.includes("=") ? a.slice(a.indexOf("=") + 1) : (opts[k + 1] ?? "")] : letter && a === `-${letter}` ? [opts[k + 1] ?? ""] : letter && a.startsWith(`-${letter}`) && a.length > 2 && !a.startsWith("--") ? [a.slice(2)] : []));
+  if (["diff", "log", "show", "whatchanged", "range-diff", "format-patch", "diff-tree", "diff-files", "diff-index", "cherry"].includes(sub)) outputs.push(...valueOf("output"));
+  if (sub === "format-patch") outputs.push(...valueOf("output-directory", "o"));
+  if (sub === "archive") outputs.push(...valueOf("output", "o"));
+  if (sub === "bundle" && words[0] === "create" && words[1]) outputs.push(words[1]);
+  if (sub === "clone" && words.length > 1) outputs.push(words.at(-1)!);
+  if (sub === "init" && words[0]) outputs.push(words[0]);
+  if (sub === "worktree" && words[0] === "add" && words[1]) outputs.push(words[1]);
+  for (const o of outputs) {
+    const p = resolveWord(o, dir);
+    if (isGuarded(p, scope)) return guardAsk(`git ${sub} writes the auto-mode guard's own files`);
+    if (isPiFile(p, scope)) return piAsk(`git ${sub} writes Pi's own files: ${o}`);
+    if (!isLocal(p, scope)) return outside(`git ${sub} writes outside the working directory: ${o}`, p);
+  }
+  const force = opt("force", "f");
+  if (sub === "reset" && opt("hard")) return ask("git reset --hard discards local changes");
+  if (sub === "clean" && force) return ask("git clean -f deletes untracked files");
+  if (sub === "checkout") {
+    if (end >= 0 || words.includes(".") || force || opt(undefined, "B", "bB") || opt("patch", "p", "bB")) return ask("git checkout discards local changes");
+    // An operand that names a path checks out that path over local changes.
+    const named = opts.filter((a, k) => !a.startsWith("-") && !/^(-b|-B|--orphan)$/.test(opts[k - 1] ?? ""));
+    if (named.length && !dir.cwd) return classify("git checkout in a directory the rules cannot place");
+    if (named.some((w) => fs.existsSync(path.resolve(dir.cwd!, w)))) return ask("git checkout of a path discards local changes");
     return ALLOW;
   }
-  if (sub === "remote") return has("add", "set-url", "remove", "rm", "rename") ? ask("changes where git pushes and fetches") : ALLOW;
-  if (sub === "reflog") return has("expire", "delete") ? ask("deletes git recovery data") : ALLOW;
-  if (sub === "gc") return has("--prune=now", "--aggressive") ? ask("deletes git recovery data") : ALLOW;
+  if (sub === "switch") return force || opt("discard-changes") || opt("force-create", "C", "cC") ? ask("git switch discards local changes or resets a branch") : ALLOW;
+  // Only --staged alone keeps the working tree; --worktree with it still discards changes.
+  if (sub === "restore" && (!opt("staged", "S", "s") || opt("worktree", "W", "s"))) return ask("git restore discards local changes");
+  // Without --force git refuses to remove a worktree or submodule that has local changes.
+  if (sub === "worktree" && words[0] === "remove" && force) return ask("git worktree remove --force deletes the worktree with its uncommitted changes");
+  if (sub === "submodule" && words[0] === "deinit" && force) return ask("git submodule deinit --force deletes submodule working trees with their local changes");
+  if (sub === "submodule" && words[0] === "foreach") return classify("git submodule foreach runs a command");
+  if (sub === "branch") {
+    const deletes = opt("delete", "d", "ut");
+    return opt(undefined, "D", "ut") || opt(undefined, "M", "ut") || opt(undefined, "C", "ut") || force || (deletes && force) ? ask("git branch -D, -M, -C or -f deletes or replaces a branch") : ALLOW;
+  }
+  if (sub === "stash") return words.includes("drop") || words.includes("clear") ? ask("git stash drop deletes stashed changes") : ALLOW;
+  if (sub === "tag") return opt("delete", "d", "mFu") ? ask("git tag -d deletes a tag") : opt("force", "f", "mFu") ? ask("git tag -f replaces a tag, which keeps no reflog") : ALLOW;
+  if (sub === "rebase" && (opt("interactive", "i", "xsX") || opt("exec", "x", "sX") || opt("edit-todo"))) return classify("git rebase that runs commands or an editor");
+  if (sub === "bisect" && words[0] === "run") return classify("git bisect run runs a command");
+  if (sub === "grep" && (opt("open-files-in-pager", "O", "eABCfm"))) return classify("git grep -O runs a pager program");
+  if (sub === "reset" || sub === "clean" || sub === "restore") return ALLOW;
+  if (sub === "config") return gitConfig(opts, rest, dir, scope);
+  if (sub === "remote") return words.some((w) => ["add", "set-url", "remove", "rm", "rename"].includes(w)) ? ask("changes where git pushes and fetches") : ALLOW;
+  if (sub === "reflog") return words.includes("expire") || words.includes("delete") ? ask("deletes git recovery data") : ALLOW;
+  if (sub === "gc") return opt("prune") || opt("aggressive") ? ask("deletes git recovery data") : ALLOW;
   return subcommand("git", [sub, ...rest]);
 }
 
+// git config: reads are allowed; a write to the global or system file asks, and a write to the
+// repository's own may only set the keys that do not run programs.
+function gitConfig(opts: string[], rest: string[], dir: Scope, scope: Scope): Verdict {
+  const opt = (long: string, letter?: string) => opts.some((a) => longIs(a, long) || (letter !== undefined && shortIn(a, letter, "f")));
+  // Options that take a value, so their value is not an operand.
+  const valued = /^(--file|-f|--blob|--type|--default|--comment|--value)$/;
+  const words = opts.filter((a, k) => !a.startsWith("-") && !valued.test(opts[k - 1] ?? ""));
+  const [action] = words;
+  const newRead = action === "get" || action === "list";
+  const newWrite = ["set", "unset", "rename-section", "remove-section", "edit"].includes(action ?? "");
+  const reads = newRead || opt("get") || opt("get-all") || opt("get-regexp") || opt("get-urlmatch") || opt("get-color") || opt("get-colorbool") || opt("list", "l");
+  const writes = newWrite || opt("unset") || opt("unset-all") || opt("add") || opt("replace-all") || opt("rename-section") || opt("remove-section") || opt("edit", "e") || (!reads && words.length >= 2);
+  if (!writes) return ALLOW;
+  if (opt("global") || opt("system")) return ask("changes git config outside the repository");
+  const file = opts.flatMap((a, k) => (longIs(a, "file") ? [a.includes("=") ? a.slice(a.indexOf("=") + 1) : (opts[k + 1] ?? "")] : a === "-f" ? [opts[k + 1] ?? ""] : []));
+  for (const f of file) {
+    const p = resolveWord(f, dir);
+    if (!isLocal(p, scope)) return outside(`git config writes outside the working directory: ${f}`, p);
+  }
+  if (opt("edit", "e") || action === "edit") return classify("git config --edit runs an editor");
+  if (opt("rename-section") || opt("remove-section") || action === "rename-section" || action === "remove-section") return classify("git config changes a whole section");
+  const key = newWrite ? words[1] : words[0];
+  return key && GIT_PLAIN_CONFIG.test(key) ? ALLOW : classify(`git config ${key ?? ""} sets configuration that can run programs`.trim());
+}
+
+
 function gh(args: string[]): Verdict {
+  // An option before the group could take the group's place as its value.
+  if (args[0]?.startsWith("-")) return classify("gh with an option before its command");
   const [group, action] = operands(args);
   if (!group) return ALLOW;
   if (group === "api") {
@@ -845,9 +2062,25 @@ function llamastash(args: string[]): Verdict {
   return { ...classify(`llamastash ${sub}`), pattern: `llamastash ${sub} *` };
 }
 
-function subcommand(tool: string, args: string[]): Verdict {
+function subcommand(tool: string, args: string[], scope?: Scope): Verdict {
   const table = SUBCOMMANDS[tool];
-  const sub = operands(args)[0];
+  const lead = LEAD_OPTIONS[tool];
+  let sub = operands(args)[0];
+  if (lead && args[0]?.startsWith("-")) {
+    const k = leadingOptions(args, lead);
+    const unknown = (why: string) => (ASK_BY_DEFAULT[tool] ? ask(`${tool} ${why}`) : classify(`${tool} ${why}`));
+    if (k < 0) return unknown("with an option before its subcommand that the rules do not model");
+    for (let j = 0; j < k; j++) {
+      const a = args[j];
+      const flag = a.split("=")[0];
+      if (!lead.dirs?.includes(flag)) continue;
+      const value = a.includes("=") ? a.slice(a.indexOf("=") + 1) : args[j + 1];
+      if (!scope || !isLocal(resolveWord(value ?? "", scope), scope)) return unknown(`in a directory outside the working directory: ${value}`);
+    }
+    sub = args[k];
+  } else if (!lead && args[0]?.startsWith("-") && tool !== "git") {
+    return classify(`${tool} with an option before its subcommand`);
+  }
   if (!sub) return ALLOW;
   if (table.ask?.[sub]) return ask(table.ask[sub]);
   if (table.allow.split(/\s+/).includes(sub)) return ALLOW;
@@ -862,8 +2095,14 @@ function network(cmd: string, args: string[], scope: Scope): Verdict {
     const m = args.findIndex((a) => a === "-X" || a === "--request");
     const method = m >= 0 ? args[m + 1] : args.find((a) => /^-X\w+$/.test(a))?.slice(2);
     if (method && !/^(GET|HEAD|OPTIONS)$/i.test(method)) return ask(`curl -X ${method} changes remote data`);
+    // Headers, query parts and variables read from a file are sent with the request.
+    if (args.some((a, k) => (/^(-H|--header|--url-query|--variable)$/.test(args[k - 1] ?? "") && /(^|=)@/.test(a)) || /^-H@/.test(a))) return ask("curl sends a file's contents to a remote host");
+    // -K reads more options from a file, which can send data as the command line can.
+    if (args.some((a) => a === "-K" || a === "--config" || /^-[a-zA-Z]*K/.test(a))) return classify("curl reads its options from a file");
   } else if (args.some((a) => /^--(post|body|method)/.test(a))) {
     return ask("wget sends data to a remote host");
+  } else if (args.some((a) => /^(-e|--execute|--config)(=|$)/.test(a) || /^-[a-zA-Z]*e/.test(a))) {
+    return classify("wget runs wgetrc commands or reads its options from a file");
   }
   const curl = cmd === "curl";
   // A URL or header built from a variable or a substitution can carry local data out. The name
@@ -951,25 +2190,50 @@ function find(args: string[], scope: Scope): Verdict {
   const end = args.findIndex((a, i) => i > exec && (a === ";" || a === "+"));
   // {} stands for a path under the search roots, which were checked above.
   const inner = args.slice(exec + 1, end < 0 ? undefined : end).map((a) => (a === "{}" ? "." : a));
-  return worst(classify("find -exec"), simple({ argv: inner, out: [] }, scope, 1));
+  return worst(classify("find -exec"), simple({ argv: inner, out: [], dyn: inner.map((a) => /[$`]/.test(a)) }, scope, 1));
 }
 
 // Drops leading keywords, VAR=value assignments and wrappers such as `timeout 60` or `env`.
 // Empty when nothing is left to run. With `only`, drops just the keywords and those wrappers
 // (by exact name) and stops at an assignment.
+// Keywords count only before any assignment (`x= done` runs a program called `done`), and
+// assignments only before the program and as operands of `env` (`nice x=/a` runs `x=/a`). A loop
+// header gives the command after its `do`, if it is on the same line. A wrapper option the rules
+// do not know gives UNMODELLED.
 function unwrap(words: string[], only?: Set<string>): string[] {
   const argv = [...words];
-  const assignment = (word: string) => !only && /^[A-Za-z_][A-Za-z0-9_]*=/.test(word);
+  const assignment = (word: string) => !only && ASSIGNMENT.test(word);
+  let assigned = false;
+  let wrapped = false;
   for (;;) {
-    while (argv.length && (KEYWORDS.has(argv[0]) || assignment(argv[0]))) argv.shift();
-    if (!argv.length || NOOP_KEYWORDS.has(argv[0])) return [];
+    while (argv.length && ((!assigned && !wrapped && KEYWORDS.has(argv[0])) || (!wrapped && assignment(argv[0])))) assigned = assignment(argv.shift()!) || assigned;
+    if (!argv.length) return [];
+    if (!assigned && (argv[0] === "for" || argv[0] === "select")) {
+      const body = argv.indexOf("do");
+      return body < 0 ? [] : unwrap(argv.slice(body + 1), only);
+    }
+    // `done`, `fi`, `esac` and `in` close or continue a compound command; words after them are a
+    // syntax error to bash.
+    if (!assigned && NOOP_KEYWORDS.has(argv[0])) return argv.length === 1 || argv[0] === "in" ? [] : [UNMODELLED];
     const wrapper = only ? argv[0] : path.basename(argv[0]);
     if (!(only ?? WRAPPERS).has(wrapper)) return argv;
     argv.shift();
+    wrapped = true;
     // `command -v name` looks a command up and runs nothing.
     if (wrapper === "command" && /^-[vV]$/.test(argv[0] ?? "")) return [];
-    // Wrapper options and their values: flags, numbers, durations, VAR=value.
-    while (argv.length && (/^(-.*|\d+(\.\d+)?[smhd]?)$/.test(argv[0]) || assignment(argv[0]))) argv.shift();
+    const table = WRAPPER_OPTIONS[wrapper] ?? {};
+    // nice's old spelling of the adjustment, `nice -10`.
+    while (wrapper === "nice" && /^--?\d+$/.test(argv[0] ?? "")) argv.shift();
+    // env's `-` is -i.
+    if (wrapper === "env" && argv[0] === "-") argv.shift();
+    const k = leadingOptions(argv, table);
+    if (k < 0) return [UNMODELLED];
+    argv.splice(0, k);
+    if (table.operand) {
+      if (!table.operand.test(argv[0] ?? "")) return [UNMODELLED];
+      argv.shift();
+    }
+    if (wrapper === "env") while (argv.length && assignment(argv[0])) argv.shift();
   }
 }
 
@@ -994,8 +2258,10 @@ function redirects(cmd: Simple, scope: Scope): Verdict {
     if (isGuarded(p, scope)) verdict = worst(verdict, guardAsk("redirect overwrites the auto-mode guard's own files"));
     else if (isPiFile(p, scope)) verdict = worst(verdict, piAsk(`redirect writes Pi's own files: ${target}`));
     else if (!isLocal(p, scope)) verdict = worst(verdict, outside(`redirect writes outside the working directory: ${target}`, p));
-    // Appending literal text leaves the file's origin as it was.
+    // Appending literal text to a file of the project makes it one the session wrote; any other
+    // origin stays as it was.
     if (!(origin === "authored" && cmd.append?.includes(target))) note(p, origin, scope);
+    else if (p && originOf(p, scope) === undefined) note(p, "authored", scope);
   }
   return verdict;
 }
@@ -1023,14 +2289,23 @@ function simple(cmd: Simple, scope: Scope, depth = 0): Verdict {
 function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   let verdict = ALLOW;
   const argv = unwrap(cmd.argv);
-  const assigned = cmd.argv.slice(0, cmd.argv.length - argv.length);
-  if (["export", "declare", "typeset", "readonly"].includes(argv[0])) assigned.push(...argv.slice(1));
-  const loader = assigned.map((w) => LOADS_CODE.exec(w)).find((m) => m && (m[1] !== "NODE_OPTIONS" || NODE_LOADS.test(m[2])));
-  if (loader) verdict = classify(`sets ${loader[1]}, which loads other code into the program`);
+  if (argv[0] === UNMODELLED) return classify("shell syntax or a wrapper option the rules do not model");
+  // Variables set for the program or in the shell: those that can change what runs go to the decider.
+  const set = variablesSet(cmd, argv);
+  if (typeof set === "string") verdict = classify(set);
+  else {
+    const problem = set.map(([n, v, how]) => variableProblem(n, v, how, scope)).find(Boolean);
+    if (problem) verdict = classify(problem);
+  }
   if (!argv.length) return verdict;
 
   const name = path.basename(argv[0]);
   const args = argv.slice(1);
+  // The words of `argv` that the shell expands before the program sees them.
+  const offset = cmd.argv.length - argv.length;
+  const dyn = (k: number) => cmd.dyn?.[offset + 1 + k] ?? /[$`]/.test(args[k] ?? "");
+  // The same command with fewer words at the front, keeping what is known of each word.
+  const tail = (inner: string[], extra: boolean[] = []): Simple => ({ argv: [...inner, ...extra.map(() => "$()")], out: [], dyn: [...inner.map((_, k) => cmd.dyn?.[cmd.argv.length - inner.length + k] ?? /[$`]/.test(inner[k])), ...extra] });
 
   if (["case", "function", "select", "source", ".", "trap", "alias"].includes(name)) return worst(verdict, classify(`shell ${name}`));
   if (/^mkfs(\.|$)/.test(name) || name === "wipefs") return deny(`${name} formats a disk`);
@@ -1041,18 +2316,31 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   }
   const secret = credentialRead(name, args, cmd, scope);
   if (secret) verdict = worst(verdict, criticalAsk(`${name} reads a credential file: ${secret}`));
+  // A reader whose file is named by an expansion could be reading anything, a credential included.
+  else {
+    const unknown = readsExpansion(name, args, dyn, cmd, scope);
+    if (unknown) verdict = worst(verdict, unknown.includes("credential") ? criticalAsk(unknown) : classify(unknown));
+  }
   // Pi's package commands change its settings and what code every session loads.
   if (name === "pi" && ["install", "remove", "uninstall", "update", "config"].includes(args[0])) verdict = worst(verdict, piAsk(`pi ${args[0]} changes Pi's own setup`));
-  // A program in a temp directory, or one this session wrote or downloaded, is not the tool its
-  // name says: /tmp/file is not file(1).
+  // A program named by its path is the tool its name says only in a system directory or in the
+  // project (`.venv/bin/pip`, `node_modules/.bin/tsc`): /tmp/file is not file(1), /opt/x/ls not
+  // ls, and a file this session wrote or downloaded is what it holds. Elsewhere it must be a file
+  // the rules let run, and then the rules for its name apply as well.
   if (argv[0].includes("/")) {
+    const word = expandVars(argv[0], scope);
     const p = resolveWord(argv[0], scope);
-    if (p && (inTmp(p) || originOf(p, scope) !== undefined)) return worst(verdict, runFile(argv[0], args, scope) ?? classify(`runs ${argv[0]}`));
+    const absolute = path.isAbsolute(word) ? path.normalize(word) : p;
+    const known = !!p && originOf(p, scope) === undefined && ((!!absolute && SYSTEM_BIN.has(path.dirname(absolute))) || (isLocal(p, scope) && !inTmp(p)));
+    if (!known) {
+      const own = runFile(argv[0], args, scope) ?? classify(`runs ${argv[0]}`);
+      if (own.action !== "allow") return worst(verdict, own);
+    }
   }
 
   if (name === "sudo" || name === "doas") {
     const inner = afterFlags(args, /^-[ugCDhpRrTU]$/);
-    return worst(verdict, criticalAsk(`${name} runs as root`), inner.length ? simple({ argv: inner, out: [] }, scope, depth + 1) : ALLOW);
+    return worst(verdict, criticalAsk(`${name} runs as root`), inner.length ? simple(tail(inner), scope, depth + 1) : ALLOW);
   }
   if (ALWAYS_ASK[name]) return worst(verdict, (name === "su" || name === "pkexec" ? criticalAsk : ask)(`${name} ${ALWAYS_ASK[name]}`));
   // (opencode-automode: a lone `-h` or `-V` is an option of many programs, hashall to a shell,
@@ -1060,23 +2348,34 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   // read-only or as dev tools take it as help or a version here. `--help` and `--version` stay.)
   if (args.length === 1 && (/^--(version|help)$/.test(args[0]) || (/^-[Vh]$/.test(args[0]) && (READ_ONLY.has(name) || DEV_TOOLS.has(name))))) return verdict;
 
-  if (SHELLS.has(name)) {
-    if (args[0] === "-n") return verdict;
-    const c = args.findIndex((a) => /^-[a-zA-Z]*c$/.test(a));
-    if (c >= 0 && depth <= 3) return worst(verdict, evaluateParsed(parse(args[c + 1] ?? ""), scope, depth + 1));
-    const [script, ...rest] = afterFlags(args, /^[-+]o$/);
-    return worst(verdict, (c < 0 && script && !cmd.heredoc && runFile(script, rest, scope)) || classify(`runs a script with ${name}`));
+  if (SHELLS.has(name)) return worst(verdict, shell(name, args, dyn, cmd, scope, depth));
+  // eval runs its words joined, after the shell has expanded them: a variable in them is code
+  // the rules cannot see.
+  if (name === "eval") return worst(verdict, args.some((_, k) => dyn(k)) ? classify("eval of expanded text") : evaluateParsed(parse(args.join(" ")), scope, depth + 1));
+  if (name === "set") {
+    const problem = setProblem(args);
+    if (problem) return worst(verdict, classify(problem));
   }
-  if (name === "eval") return worst(verdict, evaluateParsed(parse(args.join(" ")), scope, depth + 1));
+  if (name === "shopt" && args.includes("extglob") && args.some((a) => /^-[a-z]*s/.test(a))) return worst(verdict, classify("shopt -s extglob changes how later lines are read"));
+  // test -v evaluates a subscript as arithmetic.
+  if ((name === "test" || name === "[") && args.some((a, k) => args[k - 1] === "-v" && a.includes("["))) return worst(verdict, classify("test -v of a subscript, evaluated as arithmetic"));
   // `uv run pytest` and similar: the rest of the line is the command.
-  if (RUNNERS[name] && operands(args)[0] === RUNNERS[name]) {
-    const inner = afterFlags(args.slice(args.indexOf(RUNNERS[name]) + 1), /^(--with|--python|-p|--project|--group|--extra|--env-file|--directory)$/);
-    return worst(verdict, inner.length ? simple({ argv: inner, out: [] }, scope, depth + 1) : ALLOW);
+  if (RUNNERS[name]) {
+    const lead = leadingOptions(args, LEAD_OPTIONS[name] ?? {});
+    if (lead >= 0 && args[lead] === RUNNERS[name]) {
+      const from = lead + 1;
+      const k = leadingOptions(args, RUNNER_OPTIONS[name] ?? {}, from);
+      if (k < 0) return worst(verdict, classify(`${name} ${RUNNERS[name]} with an option the rules do not model`));
+      const inner = args.slice(k);
+      return worst(verdict, inner.length ? simple(tail(inner), scope, depth + 1) : ALLOW);
+    }
   }
   if (name === "rsync" && operands(args).some((a) => /^[\w.@-]+:/.test(a))) return worst(verdict, ask("rsync copies to or from a remote host"));
   if (name === "xargs") {
-    const inner = afterFlags(args, /^-[InPLsdE]$/);
-    return worst(verdict, classify("xargs"), inner.length ? simple({ argv: [...inner, "$()"], out: [] }, scope, depth + 1) : ALLOW);
+    const k = leadingOptions(args, { flags: "0oprtx", valued: "adEILnPs", long: ["null", "interactive", "no-run-if-empty", "verbose", "exit", "open-tty", "show-limits"], longValued: ["arg-file", "delimiter", "eof", "replace", "max-lines", "max-args", "max-procs", "max-chars", "process-slot-var"] });
+    if (k < 0 || args.slice(0, k).some((a) => /^-[eil]/.test(a))) return worst(verdict, classify("xargs with options the rules do not model"));
+    const inner = args.slice(k);
+    return worst(verdict, classify("xargs"), inner.length ? simple(tail(inner, [true]), scope, depth + 1) : ALLOW);
   }
   if (name === "cd" || name === "pushd" || name === "popd") return verdict;
 
@@ -1095,10 +2394,31 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
       if (p && isRootLike(p)) return deny(`${name} -R on ${t} would change a home or system directory`);
     }
   }
-  if (name === "sed") return worst(verdict, args.some((a) => /^(-i|--in-place)/.test(a) || /^-[a-zA-Z]*i/.test(a)) ? writeTargets("sed", args, scope) : ALLOW);
-  if (name === "awk" || name === "gawk") return worst(verdict, args.some((a) => /system\s*\(|\|\s*"|>\s*"/.test(a)) ? classify("awk that runs commands or writes files") : ALLOW);
+  if (name === "sed") return worst(verdict, sed(args, scope));
+  if (name === "awk" || name === "gawk") return worst(verdict, awk(args));
+  if (name === "make") {
+    const problem = make(args, scope);
+    if (problem.action !== "allow") return worst(verdict, problem);
+  }
+  if (name === "sort") {
+    if (args.some((a) => longIs(a, "compress-program"))) return worst(verdict, classify("sort --compress-program runs a program"));
+  }
+  if (name === "rg" && args.some((a) => /^--(pre|hostname-bin)(=|$)/.test(a))) return worst(verdict, classify(`rg ${args.find((a) => /^--(pre|hostname-bin)/.test(a))!.split("=")[0]} runs a program`));
+  if ((name === "fd" || name === "fdfind") && args.some((a) => /^(-x|-X|--exec|--exec-batch)(=|$)/.test(a) || /^-[a-zA-Z]*[xX]$/.test(a))) return worst(verdict, classify("fd -x runs a command"));
+  // man-db: a pager, a config file (which names the formatters), a browser or a preprocessor
+  // is a program man runs; any option but these few is left to the decider.
+  if (name === "man" && args.some((a) => /^-[a-zA-Z]*[PCH]/.test(a) || ["pager", "config-file", "html", "browser", "preprocessor"].some((o) => longIs(a, o)))) return worst(verdict, classify("man with an option that can name a program"));
+  if (name === "file") {
+    const list = args.flatMap((a, k) => (a === "-f" || a === "--files-from" ? [args[k + 1] ?? ""] : /^--files-from=/.test(a) ? [a.slice(13)] : /^-f./.test(a) ? [a.slice(2)] : []));
+    const secret = list.map((f) => secretIn(f, scope)).find(Boolean);
+    if (secret) return worst(verdict, criticalAsk(`file -f prints the lines of a credential file: ${secret}`));
+    if (list.some((f) => /[$`]/.test(f))) return worst(verdict, classify("file -f of a list named by an expansion"));
+  }
+  if ((name === "zip" && args.some((a) => a === "-TT" || longIs(a, "unzip-command"))) ) return worst(verdict, classify("zip -TT runs a program"));
   if (WRITERS[name]) return worst(verdict, writeTargets(name, args, scope, !!cmd.heredoc && !cmd.expands));
   if (name === "tar" || name === "zip" || name === "unzip" || name === "gzip" || name === "gunzip" || name === "xz" || name === "zstd") {
+    const problem = name === "tar" ? tarProblem(args) : undefined;
+    if (problem) return worst(verdict, classify(problem));
     // Archives read and write paths given as operands and after -f / -C / -d.
     for (const a of args.filter((x) => !x.startsWith("-"))) {
       if (!isLocal(resolveWord(a, scope), scope)) return worst(verdict, classify(`${name} with a path outside the working directory`));
@@ -1125,9 +2445,16 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
       return worst(verdict, DOCKER_GROUPS[group].split(" ").includes(action) ? ALLOW : classify(`docker ${group} ${action ?? ""}`.trim()));
     }
   }
-  if (SUBCOMMANDS[name]) return worst(verdict, subcommand(name, args));
+  if (SUBCOMMANDS[name]) return worst(verdict, subcommand(name, args, scope));
   if (READ_ONLY.has(name) || DEV_TOOLS.has(name)) return verdict;
   if (/^python3?$/.test(name) && args[0] === "-m" && PY_MODULES.has(args[1]) && !cmd.heredoc) return verdict;
+  // `node --test`: the test runner over the project's test files, as `npm test` runs it.
+  if (name === "node" && args[0] === "--test" && !cmd.heredoc) {
+    const k = leadingOptions(args, { long: ["test", "test-only", "test-force-exit", "experimental-test-coverage", "experimental-strip-types", "no-warnings", "enable-source-maps"], longValued: ["test-name-pattern", "test-skip-pattern", "test-concurrency", "test-timeout", "disable-warning"] });
+    const reporters = args.filter((a) => /^--test-reporter(=|$)/.test(a));
+    const files = k < 0 ? [] : args.slice(k);
+    if (k >= 0 && reporters.length === 0 && files.every((f) => !/[$`]/.test(f) && runFile(f, [], scope)?.action === "allow")) return verdict;
+  }
   if (INTERPRETERS.has(name)) {
     // `python3 scripts/x.py`: the script is the first argument. Inline code (-c, -e, a heredoc) stays with the model.
     const script = !cmd.heredoc && args[0] && !args[0].startsWith("-") ? runFile(args[0], args.slice(1), scope) : undefined;
@@ -1193,7 +2520,7 @@ function assignments(argv: string[]): [string, string][] | undefined {
 function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
   let verdict: Verdict = parsed.opaque ? classify("shell syntax the rules do not model") : ALLOW;
   // Relative paths are only trusted while the working directory is known.
-  const local: Scope = { ...scope, vars: new Map(), loopVars: new Set() };
+  const local: Scope = { ...scope, vars: new Map(), loopVars: new Set(), loopValues: new Map(), links: new Map(scope.links ?? []) };
   const hasCd = parsed.cmds.some((c) => ["cd", "pushd", "popd"].includes(c.argv[0]));
   if (hasCd && parsed.grouped) local.cwd = undefined;
   // A variable is followed only when the command names it once, in the assignment, and at the
@@ -1201,12 +2528,32 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
   // nested shell does not see unexported variables, so it starts with none.
   const words = parsed.cmds.flatMap((c) => [...c.argv, ...c.out, ...(c.in ?? [])]).join(" ");
   const namedOnce = (name: string) => (words.match(new RegExp(`(^|[^$\\w{])${name}(?!\\w)`, "g")) ?? []).length === 1;
+  local.unassigned = (name: string) => !new RegExp(`(^|[^$\\w{])${name}(?!\\w)|\\$\\{${name}:?=`).test(words);
   const track = depth === 0 && !parsed.grouped;
   // The patterns of the parts that decide. A prompt offers one only when it covers them all.
   const patterns = new Set<string | undefined>(parsed.opaque ? [undefined] : []);
+  // After a `cd` that can fail (to a directory that is not there yet), the commands joined to it by
+  // `&&` run in that directory, and those after a `;`, `||` or `&` in either one.
+  // A `{ ...; }` group in that chain is part of it, whatever separates the commands inside.
+  let failableCd = false;
+  let braces = 0;
+  let previous: Simple | undefined;
   for (const cmd of parsed.cmds) {
+    if (!cmd.nested && failableCd && previous && ((!["&&", "|"].includes(previous.next ?? "") && braces === 0) || braces < 0)) {
+      local.cwd = undefined;
+      failableCd = false;
+    }
+    if (!cmd.nested) {
+      previous = cmd;
+      for (const w of cmd.argv) {
+        if (w === "{") braces++;
+        else if (!RESERVED.has(w)) break;
+      }
+      if (cmd.argv[0] === "}") braces--;
+    }
     const [kw, name, inKw, ...values] = cmd.argv;
     if (track && kw === "for" && inKw === "in" && values.every((w) => /^[\w./@:+-]+$/.test(w)) && namedOnce(name)) local.loopVars!.add(name);
+    if (track && kw === "for" && inKw === "in" && values.every((w, k) => /^[\w./@:+*?[\]-]+$/.test(w) && !cmd.dyn?.[3 + k]) && namedOnce(name)) (local.loopValues ??= new Map()).set(name, values);
     const part = simple(cmd, local, depth);
     if (part.action === "classify" || part.action === "ask") patterns.add(part.pattern);
     verdict = worst(verdict, part);
@@ -1214,20 +2561,30 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
     if (cmd.subshell) {
       if (["cd", "pushd", "popd"].includes(cmd.argv[0])) local.cwd = undefined;
     } else if (cmd.argv[0] === "cd" && local.cwd) {
-      local.cwd = cmd.argv.length === 2 ? resolveWord(cmd.argv[1], local) : cmd.argv.length === 1 ? HOME : undefined;
+      // `cd -` goes to $OLDPWD, which is not known.
+      const to = cmd.argv.length === 2 && cmd.argv[1] !== "-" ? resolveWord(cmd.argv[1], local) : cmd.argv.length === 1 ? HOME : undefined;
+      const there = !!to && !!fs.statSync(to, { throwIfNoEntry: false })?.isDirectory();
+      local.cwd = there || (to && cmd.next === "&&") ? to : undefined;
+      failableCd = !there && local.cwd !== undefined;
+      braces = 0;
     } else if (cmd.argv[0] === "pushd" || cmd.argv[0] === "popd") local.cwd = undefined;
     for (const [name, value] of (track && !cmd.subshell && assignments(cmd.argv)) || []) {
-      // A relative value is resolved where it is used, after any later `cd`, so only absolute
-      // ones are followed.
-      const p = /^(\/|~\/|~$)/.test(expandVars(value, local)) ? resolveWord(value, local) : undefined;
-      if (p && namedOnce(name)) local.vars!.set(name, p);
+      // The text is kept and resolved where it is used, after any later `cd`, as the shell does.
+      // Only one word of plain text is followed: no expansion, blank or glob. `~` at its start is
+      // expanded in an assignment.
+      const text = expandVars(value, local);
+      const i = cmd.argv.findIndex((w) => w.startsWith(`${name}=`));
+      if (namedOnce(name) && /^[\w./~@%+,:=-]*$/.test(text) && !cmd.dyn?.[i]) local.vars!.set(name, text.startsWith("~/") || text === "~" ? HOME + text.slice(1) : text);
     }
   }
   return verdict.pattern && patterns.size > 1 ? { ...verdict, pattern: undefined } : verdict;
 }
 
+// The fork bomb in any spelling: a function that pipes itself into itself in the background.
+const FORK_BOMB_SHAPE = /([\w:.-]+)\(\)\{\1\|\1&;?\};?\1/;
+
 export function bashVerdict(command: string, scope: Scope): Verdict {
-  if (FORK_BOMB.test(command)) return deny("fork bomb");
+  if (FORK_BOMB.test(command) || FORK_BOMB_SHAPE.test(command.replace(/\s+/g, ""))) return deny("fork bomb");
   const verdict = evaluateParsed(parse(command), scope, 0);
   if (verdict.action === "deny") return verdict;
   return forDecider(PIPE_TO_SHELL.test(command) ? worst(verdict, criticalAsk("downloads code and runs it")) : verdict, scope);
@@ -1238,10 +2595,10 @@ export function fileVerdict(tool: string, target: string, scope: Scope): Verdict
   const p = resolveWord(target.startsWith("@") ? target.slice(1) : target, scope);
   if (isGuarded(p, scope)) return guardAsk(`${tool} changes the auto-mode guard's own files`);
   if (isPiFile(p, scope)) return piAsk(`${tool} changes Pi's own files: ${target}`);
-  // The write tool replaces the whole file with the agent's text; an edit keeps the file's origin.
-  // For the chat decider an edit makes a file of no known origin one the session wrote, so a
-  // project script the agent changed goes to it when run.
-  if (tool === "write" || (scope.chatDecider && p && originOf(p, scope) === undefined)) note(p, "authored", scope);
+  // The write tool replaces the whole file with the agent's text; an edit keeps the file's origin,
+  // and makes a file of no known origin one the session wrote, so a project script the agent
+  // changed goes to the decider when run.
+  if (tool === "write" || (p && originOf(p, scope) === undefined)) note(p, "authored", scope);
   return isLocal(p, scope) ? ALLOW : forDecider(outside(`${tool} outside the working directory: ${target}`, p), scope);
 }
 

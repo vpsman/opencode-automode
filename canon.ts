@@ -1,10 +1,10 @@
 // The canonical run (round 4, finding 16). Four rounds each found a family of inputs that bash
 // runs differently from how the checks read them, because several hand-written readers (the
-// scanner, the strict tokenizer, the vendored parser) each had to agree with bash on every
+// scanner, the strict tokenizer, the rules' parser) each had to agree with bash on every
 // spelling bash accepts. This module removes the spellings instead.
 //
 // canonical() reads a command as bash's lexer does and prints it back in a spelling small enough
-// that bash and the vendored parser (rules.ts `parse`) cannot read it differently:
+// that bash and the rules' parser (rules.ts `parse`) cannot read it differently:
 //
 //   - A word is a run of pieces. Literal text is written bare when every character of it is
 //     plain (`[A-Za-z0-9_@%+=:,./-]`), and in single quotes otherwise; a single quote is `\'`
@@ -28,7 +28,7 @@
 // what the command does, in plain sight, and is caught by the round-trip test; it cannot make
 // bash run a command the checks did not see. Whatever cannot be printed asks.
 //
-// `judged` is the text the rules and guards read. It is `text`, except where the vendored parser
+// `judged` is the text the rules and guards read. It is `text`, except where the rules' parser
 // has no reading at all and the construct holds no command of its own: a validated `$((...))` is
 // `0`, an arithmetic command is `:`, `[[ ... ]]` is `test ...` with its operators as words, a
 // descriptor copy on the input side (`<&3`) is left out, and the text of a message of
