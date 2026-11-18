@@ -1235,3 +1235,19 @@ test("round 47: ps conflicts read again as BSD, gzip's suffixes in any case, rsy
   assert.equal(await effect("rsync -n --version --log-file=version.log f dst/", s), "allow");
   assert.notEqual(await effect("npm test", s), "allow");
 });
+
+// ---- round 48 ----
+
+test("round 48: sort read by position, ps -O given BSD keys, parsed ps flags only, zstd's .zstd, rsync's last log and help queries", async () => {
+  fs.mkdirSync(path.join(repo, "dst"), { recursive: true });
+  fs.mkdirSync(path.join(repo, "sub"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "sub", ".git.zstd"), "x");
+  // Opus: `--` as an option's value ends nothing; `-O p` sends procps to BSD; zstd's `.zstd`.
+  for (const c of ["sort --random-source -- --compress-program=sh -S 1K f", "sort -T -- --compress-program=sh f", "sort --compress-prog sh f", "ps -eT -O p", "ps -eTOp", "ps -Op -eT", "ps -eTO+p", "zstd -d sub/.git.zstd"]) assert.notEqual(await effect(c), "allow", c);
+  // Sol, Astra: values are no flags or options; help queries write no log.
+  for (const c of ["ps -eT -C -H -o pid,comm", "ps -eT -C --forest -o pid,comm", "sort -c -T --compress-program f", "sort -c --files0-from --compress-program", "rsync --info=help --log-file=.git/info.log", "rsync --debug=help --log-file=.git/debug.log", "ps -eT -O c", "ps -e -O tt"]) assert.equal(await effect(c), "allow", c);
+  // Sol: the last --log-file is the one rsync opens; an empty one opens none.
+  const s = new SessionState(repo);
+  assert.equal(await effect("rsync --version --log-file=unused.log --log-file= f dst/", s), "allow");
+  assert.equal(await effect("npm test", s), "allow");
+});

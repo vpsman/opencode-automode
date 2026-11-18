@@ -2096,9 +2096,14 @@ export function rsyncReading(args: string[]) {
   const server = prefixed("server") || prefixed("sender");
   // (Round 46, Sol: `--version`, `-V` and `--help` print and copy nothing.)
   // (Round 47, Sol: `--version` still opens its `--log-file`; `--help` opens nothing.)
-  const help = has("help");
+  // (Round 48, Astra: `--info=help` and `--debug=help` print their lists and exit too.)
+  const help = has("help") || longs.some(([h, v]) => (h === "--info" || h === "--debug") && v === "help");
   const prints = has("version") || help || letters.includes("V");
-  return { longs, letters, shorts, operands, dryRun, listOnly, batch, server, prints, help, daemon: prefixed("daemon"), copiesNothing: prints || (!server && (dryRun || listOnly || (!batch && operands.length < 2))), values: (name: string) => longs.filter(([h]) => h === `--${name}`).map(([, v]) => v ?? "") };
+  return { longs, letters, shorts, operands, dryRun, listOnly, batch, server, prints, help, daemon: prefixed("daemon"), copiesNothing: prints || (!server && (dryRun || listOnly || (!batch && operands.length < 2))), values: (name: string) => {
+      // (Round 48, Sol: the last `--log-file` is the one rsync opens, and an empty one none.)
+      const all = longs.filter(([h]) => h === `--${name}`).map(([, v]) => v ?? "");
+      return name === "log-file" ? all.slice(-1).filter((v) => v !== "") : all;
+    } };
 }
 
 // tar's command line read by position (round 41): the old style (a first word of letters without
@@ -2231,10 +2236,23 @@ function psValueTaken(letter: string, value: string, here: boolean): boolean {
   if (letter === "t") return items.every((n) => n === "-" || n === "?" || (here && /^[\w/]+$/.test(n) && (n.startsWith("/dev/") ? fs.existsSync(n) : ["", "tty", "pts/"].some((p) => fs.existsSync(`/dev/${p}${n}`)))));
   return false;
 }
+// The format fields procps-ng 4.0.4 knows made of letters only (`ps L`), and `environ`.
+const PS_LETTER_FIELDS = new Set(`environ ${`args atime blocked bsdstart bsdtime c caught cgname cgroup cgroupns class cls cmd comm command context cp cpuid
+  cputime cputimes cuc cuu drs dsiz egid egroup eip esp etime etimes euid euser exe f fgid fgroup flag flags fname fsgid
+  fsgroup fsuid fsuser fuid fuser gid group ignored intpri ipcns label lastcpu lim longtname lsession lstart luid lwp
+  lxc machine majflt minflt mntns netns ni nice nlwp numa oom oomadj opri ouid pagein pcpu pending pgid pgrp pid pidns
+  pmem policy ppid pri priority psr pss rbytes rchars rgid rgroup rops rss rssize rsz rtprio ruid ruser s sched seat
+  sess session sgid sgroup sid sig sigcatch sigignore sigmask size slice spid stackp start stat state stime suid supgid
+  supgrp suser svgid svgroup svuid svuser sz tgid thcount tid time timens times tname tpgid trs trss tsig tsiz tt tty
+  ucmd ucomm uid uname unit user userns uss util utsns uunit vsize vsz wbytes wcbytes wchan wchars wname wops zone`}`.split(/\s+/));
 export function psEnvironments(args: string[], here = true): boolean {
   const formats: string[] = [];
   let unixE = false;
   let again = false;
+  // The UNIX letters read as flags, not values (round 48, Sol and Astra: in `-C -H` the `-H` is a
+  // command's name).
+  let unixFlags = "";
+  let forest = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a.startsWith("--")) {
@@ -2242,6 +2260,7 @@ export function psEnvironments(args: string[], here = true): boolean {
       const head = cut < 0 ? a : a.slice(0, cut);
       const value = cut >= 0 ? a.slice(cut + 1) : PS_LONG_VALUED.test(head) ? args[++i] : undefined;
       if (head === "--format" && value !== undefined) formats.push(value);
+      if (head === "--forest") forest = true;
       continue;
     }
     const unix = a.startsWith("-");
@@ -2252,6 +2271,9 @@ export function psEnvironments(args: string[], here = true): boolean {
       if (!unix && a[k] === "e") return true;
       if (valued.includes(a[k])) {
         const value = k < a.length - 1 ? a.slice(k + 1) : args[++i];
+        // (Round 48, Opus: a UNIX `-O` given BSD sort keys, `-O p`, `-O +pt`, is refused by the
+        // format reader and read again as BSD: procps-ng 4.0.4.)
+        if (unix && a[k] === "O" && value !== undefined && /^([+-]?[A-Za-z])+$/.test(value) && (/[+-]/.test(value) || !PS_LETTER_FIELDS.has(value))) again = true;
         // A value the UNIX reading may refuse (`-uaxe` names the user `axe`) sends it to BSD; a
         // value it takes does not (round 44 and 45, Sol and Astra). A separate word that starts
         // with `-` is refused, and the BSD reading takes it (round 45, Opus: `ps -e -u -x`).
@@ -2262,15 +2284,14 @@ export function psEnvironments(args: string[], here = true): boolean {
         break;
       }
       if (unix && !PS_UNIX_FLAGS.includes(a[k])) again = true;
+      if (unix) unixFlags += a[k];
     }
   }
   // (Round 47, Opus: procps reads the words again as BSD ones when the UNIX reading fails after
   // parsing too: a thread display beside a forest, `-eTH`, `-eT --forest`; `-L` beside `-m`;
   // `-T` beside `-m` or `-L`.)
-  const unixLetters = args.filter((a) => /^-[^-]/.test(a)).map((a) => a.slice(1).split(new RegExp(`[${PS_UNIX_VALUED}]`))[0]).join("");
-  const forest = unixLetters.includes("H") || args.includes("--forest");
-  const threads = ["T", "L", "m"].filter((l) => unixLetters.includes(l));
-  if ((threads.length && forest) || threads.length > 1) again = true;
+  const threads = ["T", "L", "m"].filter((l) => unixFlags.includes(l));
+  if ((threads.length && (forest || unixFlags.includes("H"))) || threads.length > 1) again = true;
   if (unixE && again) return true;
   // (Round 44, Opus: read again as BSD, `-u` in `ps -xu -e` takes no value, so `-e` is BSD `e`.)
   if (again) {
@@ -2382,7 +2403,7 @@ export function compressorReading(name: string, args: string[]) {
   // Round 46, Opus: zstd also takes gzip, xz, lzma and lz4 files and strips their suffixes.)
   // (Round 47, Opus: gzip compares a suffix ignoring case, `.git.GZ`; zstd's `.t*` suffixes end
   // in `.tar`.)
-  const DEFAULT_SUFFIXES: Record<string, string[]> = { gzip: [".gz", "-gz", ".z", "-z", "_z", ".tgz", ".taz"], xz: [".xz", ".lzma", ".lz", ".txz", ".tlz"], zstd: [".zst", ".tzst", ".gz", ".tgz", ".xz", ".txz", ".lzma", ".lz4", ".tlz4"], bzip2: [".bz2", ".bz", ".tbz2", ".tbz"] };
+  const DEFAULT_SUFFIXES: Record<string, string[]> = { gzip: [".gz", "-gz", ".z", "-z", "_z", ".tgz", ".taz"], xz: [".xz", ".lzma", ".lz", ".txz", ".tlz"], zstd: [".zst", ".tzst", ".zstd", ".gz", ".tgz", ".xz", ".txz", ".lzma", ".lz4", ".tlz4"], bzip2: [".bz2", ".bz", ".tbz2", ".tbz"] };
   const fold = table.family === "gzip";
   const unnamed = letters.includes("N") && table.family === "gzip" ? "-N" : letters.includes("r") || long("recursive") ? "-r" : long("name") && table.family === "gzip" ? "--name" : undefined;
   const outputName = (input: string) => {
@@ -2421,6 +2442,36 @@ export function copiesNothing(name: string, args: string[]): boolean {
     } else if (a.startsWith("-") && a.length > 1) {
       for (let k = 1; k < a.length; k++) {
         if (table.short.includes(a[k])) {
+          if (k === a.length - 1) i++;
+          break;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+// Whether sort runs a compressor (round 48, Opus, Sol, Astra): its words read by position, as
+// getopt_long reads them, with the options that take a value (GNU sort 9.7); `--` ends the
+// options only where an option could stand (`sort --random-source -- --compress-program=sh`).
+const SORT_LONGS = `ignore-leading-blanks dictionary-order ignore-case general-numeric-sort ignore-nonprinting month-sort human-numeric-sort
+  numeric-sort random-sort random-source reverse sort version-sort batch-size check compress-program debug files0-from key merge output stable
+  buffer-size field-separator temporary-directory parallel unique zero-terminated help version`.split(/\s+/);
+const SORT_LONG_VALUED = ["random-source", "sort", "batch-size", "compress-program", "files0-from", "key", "output", "buffer-size", "field-separator", "temporary-directory", "parallel"];
+export function sortRunsCompressor(args: string[]): boolean {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") return false;
+    if (a.startsWith("--")) {
+      const eq = a.indexOf("=");
+      const word = (eq < 0 ? a : a.slice(0, eq)).slice(2);
+      const all = SORT_LONGS.filter((n) => n.startsWith(word));
+      const name = SORT_LONGS.includes(word) ? word : all.length === 1 ? all[0] : undefined;
+      if (name === "compress-program") return true;
+      if (name && eq < 0 && SORT_LONG_VALUED.includes(name)) i++;
+    } else if (a.startsWith("-") && a.length > 1) {
+      for (let k = 1; k < a.length; k++) {
+        if ("koStT".includes(a[k])) {
           if (k === a.length - 1) i++;
           break;
         }
@@ -3112,8 +3163,9 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
     if (problem.action !== "allow") return worst(verdict, problem);
   }
   if (name === "sort") {
-    // (Round 47, Sol: a word after `--` is a file, `sort -c -- --compress-program`.)
-    if ((args.includes("--") ? args.slice(0, args.indexOf("--")) : args).some((a) => longIs(a, "compress-program"))) return worst(verdict, classify("sort --compress-program runs a program"));
+    // (Round 47, Sol: a word after `--` is a file, `sort -c -- --compress-program`. Round 48: read
+    // by position, sortRunsCompressor.)
+    if (sortRunsCompressor(args)) return worst(verdict, classify("sort --compress-program runs a program"));
   }
   if (name === "rg" && args.some((a) => /^--(pre|hostname-bin)(=|$)/.test(a))) return worst(verdict, classify(`rg ${args.find((a) => /^--(pre|hostname-bin)/.test(a))!.split("=")[0]} runs a program`));
   if ((name === "fd" || name === "fdfind") && args.some((a) => /^(-x|-X|--exec|--exec-batch)(=|$)/.test(a) || /^-[a-zA-Z]*[xX]$/.test(a))) return worst(verdict, classify("fd -x runs a command"));

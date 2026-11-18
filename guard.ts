@@ -16,7 +16,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { bare, bashVerdict, compressorReading, copiesNothing, fileVerdict, parse, readVerdict, rsyncReading, tarReading, within, type Matcher, type Scope, type Simple } from "./rules.ts";
+import { bare, bashVerdict, compressorReading, copiesNothing, sortRunsCompressor, fileVerdict, parse, readVerdict, rsyncReading, tarReading, within, type Matcher, type Scope, type Simple } from "./rules.ts";
 import { gitArgs, gitEnv } from "./sandbox.ts";
 
 const HOME = os.homedir();
@@ -4379,7 +4379,7 @@ function programProblem(name: string, args: string[], cwd?: string, inProject?: 
     // lists is no archive, round 43, Sol and Astra: `tar -tf a.tar notes:today`.)
     if ((t.archives.some((a) => /^[^/]*:/.test(a)) || args.some((a) => /^(-[a-zA-Z]*f)?[^-/][^/]*:/.test(a) && !t.members.includes(a) && !t.optionValues.includes(a))) && !t.has("force-local")) return ask("tar with an archive on a remote host runs a remote shell");
   }
-  if (name === "sort" && longOption(args.includes("--") ? args.slice(0, args.indexOf("--")) : args, ["--compress-program"])) return ask("sort --compress-program runs a program");
+  if (name === "sort" && sortRunsCompressor(args)) return ask("sort --compress-program runs a program");
   // Council project review 2 (Mythos): the compilers and build tools the rules allow by name, with
   // the options and subcommands that run a program or command the call names or load a plugin. (A
   // file of more options, `gcc @args`, is a place the runner check cannot tell: runnerPlaces.)
@@ -5433,9 +5433,11 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       // (Round 46, Sol: a dry run or listing writes no backup, temp or partial files, as the rules
       // read it; a version or help query nothing.)
       const rs = name === "rsync" ? rsyncReading(args) : undefined;
+      // (Round 47, Sol: a version query still writes its log. Round 48, Sol: the last `--log-file`
+      // only, and an empty one none.)
+      if (rs && !rs.help) for (const f of rs.values("log-file")) place(f, false);
       if (rs && !rs.help) for (const o of getopt(args, COPY_OPTIONS.rsync).opts) {
-        // (Round 47, Sol: a version query still writes its log.)
-        if (o.name === "--log-file" || (!rs.prints && ["--write-batch", "--only-write-batch"].includes(o.name))) place(o.value, false);
+        if (!rs.prints && ["--write-batch", "--only-write-batch"].includes(o.name)) place(o.value, false);
         if (rs.prints) continue;
         if (["--backup-dir", "--temp-dir", "-T", "--partial-dir"].includes(o.name) && !(rs.dryRun || rs.listOnly)) place(o.value, true);
       }
