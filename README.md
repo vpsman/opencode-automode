@@ -149,8 +149,9 @@ For each shell tool call:
      and `/usr/local/bin/git`, where every option before the message is one that takes no
      value, not behind `xargs` or `find -exec`, and not in a command that defines a
      function; the message of `git stash push -m` is read like any other
-     word. A word named like a credential file is read as a file wherever it stands:
-     `git log -1 secrets.json` asks even when `secrets.json` is a branch.
+     word. A word named like a credential file is read as a file wherever it stands, except
+     where git only names it to filter commits: `git show HEAD:secrets.json`, `git diff` and
+     `git log -p secrets.json` ask, `git log -1 secrets.json` (no patch) does not.
    - **Per command**, also inside `sh -c`, `sudo`, `xargs`, with the program named by path
      (`/usr/bin/npm`), and behind every wrapper and runner the rules look through
      (`timeout 60`, `nice -n 5`, `uv run`, `poetry run`, `pipenv run`, `pdm run`,
@@ -240,7 +241,8 @@ For each shell tool call:
      (`cd $dir && ls`, `cd -`), or asks where the rules themselves would judge a relative
      path in the wrong directory (`if ...; then cd x; fi; cat f`). `~+`, and `$PWD` after a
      `cd`, are read as the directory the command runs in (`cd src && echo x > $PWD/out.txt`
-     writes `src/out.txt`; a write through `~+` after a `cd` asks); another form of `$PWD` after a `cd` (`${PWD%/*}`) and a path
+     writes `src/out.txt`, and so does `~+/out.txt`; a write through either into a protected
+     place asks); another form of `$PWD` after a `cd` (`${PWD%/*}`) and a path
      through `~-` go to the model, or ask where a write through them would leave the
      project.
    - **To the model instead of an allow**: running a file the session may have changed. A
@@ -338,7 +340,8 @@ For each shell tool call:
      leaves as it is and the rules read as your home directory (`ls ~'/x'`; quoted text
      that merely holds a `~`, as in `grep '~' f`, goes too); `make NAME=value` whose value
      is not a plain word; `read` into a name that is not plain lower case (`read X`);
-     `node --test`, `node -e` and `python3 -c`; and other variables set for a command
+     `node -e` and `python3 -c` (`node --test` over the project's own test files is an allow,
+     as `npm test` is, and goes to the model once the session has written files); and other variables set for a command
      (`FOO=1 ls`, `export FOO=1`; a variable set on a line of its own stays in the shell
      and is not asked about, unless opencode's own environment already exports it: then it
      reaches the programs that follow and is judged as `export` would be).
@@ -669,7 +672,7 @@ defaults would silently drop `enabled: false` and your own ask and deny rules.
 | `classifier` | the unix socket above, `askAbove` 0.2, `timeoutMs` 5000 | Kev server (`endpoint`: `unix:/path` or an http URL), threshold (above 0, at most 1) and reply timeout. |
 | `rules` | empty | Your own `allow`/`ask`/`deny`/`classify` patterns: a glob over one simple command (`*` any text, trailing ` *` optional) or `re:` + regex. A pattern sees the command's words, not where it redirects: an ask rule for a file does not match `echo x > file`. `deny`/`ask`/`classify` patterns also match a program named by its path (`/usr/bin/npm install` for `npm install *`); `allow` patterns match only as written. Rules in the plugin's options are added to the file's. |
 | `allowedPaths` | none | Extra directories counted as the project (writable, writes there allowed). Absolute or `~/...`. |
-| `sshHosts` | none | `ssh` to these targets runs when it is the whole tool call, in plain words, and the remote command only uses read-only programs with options from a per-program allowlist (`cat`, `df`, `journalctl`, `systemctl status`, `ip addr`, ...), with no variables, substitutions or redirects except to `/dev/null` (no recursive `grep`, `rg` only to list files, no `printf -v` or `test -v`: they print or run more than the words say; `ps` only with field names and sort keys from a list, so no `environ` and no BSD `e`; `journalctl`/`systemctl` `-o` only with an output format's name; no raw reads of `/dev` or `/proc` apart from a short list of `/proc` files such as `meminfo` and `<pid>/status`, and no `..` in an absolute path), and ssh itself only uses harmless options (`-q`, `-T`, `-p`, `-l`, `-o BatchMode/ConnectTimeout/...`). A target matches as listed: `lab` covers `ssh lab ...` only; list `admin@lab` to allow that user. |
+| `sshHosts` | none | `ssh` to these targets runs when it is the whole tool call (a plain `cd` before it aside), in plain words, and the remote command only uses read-only programs with options from a per-program allowlist (`cat`, `df`, `journalctl`, `systemctl status`, `ip addr`, ...), with no variables, substitutions or redirects except to `/dev/null` (no recursive `grep`, `rg` only to list files, no `printf -v` or `test -v`: they print or run more than the words say; `ps` only with field names and sort keys from a list, so no `environ` and no BSD `e`; `journalctl`/`systemctl` `-o` only with an output format's name; no raw reads of `/dev` or `/proc` apart from a short list of `/proc` files such as `meminfo` and `<pid>/status`, and no `..` in an absolute path), and ssh itself only uses harmless options (`-q`, `-T`, `-p`, `-l`, `-o BatchMode/ConnectTimeout/...`). A target matches as listed: `lab` covers `ssh lab ...` only; list `admin@lab` to allow that user. |
 | `sshReadOnlySudo` | `false` | On `sshHosts`: also allow `sudo [-n] <read-only command>`. |
 | `allowFeatureBranchPush` | `false` | `git push` runs when it is the whole tool call, in plain words, from the top of one of the project's checkouts. The plugin asks git itself what the push would do (`git push --dry-run --porcelain`, hooks off) and allows it when every URL git would connect to belongs to a remote the session started with, unchanged since (all of its URLs), and every ref goes from a branch to a non-protected branch (not `main`/`master`/`release*`/`develop`/... nor the default branch the remote reports) without force or delete. So git's own precedence decides (`branch.*.pushRemote`, `remote.pushDefault`, `remote.*.push`, `push.default`), in any config scope; a push that would only fail (no upstream) asks. The repository's own config must hold only keys from a list of harmless ones (no `pushurl`, `mirror`, `insteadOf`, `sshCommand`, `askPass`, hooks, helpers, ...; `push.followTags` and `remote.*.mirror` ask in any scope), and no `pre-push` hook may exist. Every push URL of every remote, after git's own rewriting, must be an `https://`, `ssh://` or `[user@]host:path` URL: a local path, `file://` or a transport helper asks without a dry run, since for those git would run code from that repository (or a program) before you are asked. The default branch is asked of each URL the push goes to (`ls-remote`), not of the fetch URL. The plugin's own git runs with no controlling terminal, and ssh in batch mode unless your git config names an ssh command, so nothing prompts on opencode's terminal. A user in an ssh URL (`git@host:o/r.git`) is fine. A push that recurses into submodules, force, deletes, tags and `--no-verify` ask. The dry run and the `ls-remote` cost extra round trips to the remote. |
 | `sandbox` | `true` | Off: auto-allowed commands run unsandboxed (still as their printed text), and `gh`, `docker` and the bus clients are not asked about for the sandbox's sake. `tar -x`, `unzip` (but its listing options), `patch`, `git apply` and `git am` then ask: what they write is named inside the file, and no command line shows it. Not recommended. |

@@ -120,8 +120,10 @@ export function within(p: string, dir: string, strict = false): boolean {
   return rel !== ".." && !rel.startsWith(".." + path.sep) && !path.isAbsolute(rel);
 }
 
-const TMP_DIRS = [...new Set(["/tmp", "/var/tmp", os.tmpdir()].map(realish))];
-const DEV_SINKS = /^\/dev\/(null|zero|stdout|stderr|tty|fd\/\d+)$/;
+// (/dev/shm is shared memory: a temp directory, as the README and guard.ts count it.)
+const TMP_DIRS = [...new Set(["/tmp", "/var/tmp", "/dev/shm", os.tmpdir()].map(realish))];
+// (/dev/full takes no write: every write to it fails, which is what a test of a write error wants.)
+const DEV_SINKS = /^\/dev\/(null|zero|full|stdout|stderr|tty|fd\/\d+)$/;
 // (opencode-automode: a sink is told by the path as written, absolute and without `..`, not by
 // resolving it in this process, whose own descriptors are not the command's: `/dev/stderr` led to
 // a terminal here and to a pipe there. A word that resolves to /dev/null through links is a sink
@@ -1189,7 +1191,8 @@ function expandBraces(word: string, mask: string, budget = { n: 0 }): [string, s
       const a = numeric ? Number(seq[1]) : seq[1].charCodeAt(0);
       const b = numeric ? Number(seq[2]) : seq[2].charCodeAt(0);
       const step = Math.abs(Number(seq[4] ?? 1)) || 1;
-      if (Math.abs(b - a) / step > 1000) return undefined;
+      // (Round 33, Astra: past 2^53 adding the step changes nothing, and the loop would not end.)
+      if (![a, b, step].every(Number.isSafeInteger) || Math.abs(b - a) / step > 1000) return undefined;
       const width = numeric && [seq[1], seq[2]].some((x) => /^-?0\d/.test(x)) ? Math.max(seq[1].length, seq[2].length) : 0;
       for (let v = a; a <= b ? v <= b : v >= b; v += a <= b ? step : -step) {
         const text = numeric ? String(v).padStart(width, "0") : String.fromCharCode(v);
@@ -2254,7 +2257,7 @@ function redirects(cmd: Simple, scope: Scope): Verdict {
   for (const target of cmd.out) {
     const p = resolveWord(target, scope);
     if (devSink(target, p)) continue;
-    if (p && /^\/dev\//.test(p)) return deny(`writes to the device ${target}`);
+    if (p && /^\/dev\//.test(p) && !inTmp(p)) return deny(`writes to the device ${target}`);
     if (isGuarded(p, scope)) verdict = worst(verdict, guardAsk("redirect overwrites the auto-mode guard's own files"));
     else if (isPiFile(p, scope)) verdict = worst(verdict, piAsk(`redirect writes Pi's own files: ${target}`));
     else if (!isLocal(p, scope)) verdict = worst(verdict, outside(`redirect writes outside the working directory: ${target}`, p));
@@ -2385,7 +2388,7 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
     const of = args.find((a) => a.startsWith("of="))?.slice(3);
     if (of === undefined) return worst(verdict, classify("dd"));
     const p = resolveWord(of, scope);
-    if (p && /^\/dev\//.test(p) && !DEV_SINKS.test(p)) return deny(`dd writes to the device ${of}`);
+    if (p && /^\/dev\//.test(p) && !DEV_SINKS.test(p) && !inTmp(p)) return deny(`dd writes to the device ${of}`);
     if (isPiFile(p, scope)) return worst(verdict, piAsk(`dd writes Pi's own files: ${of}`));
     return worst(verdict, isLocal(p, scope) ? classify("dd") : outside(`dd writes outside the working directory: ${of}`, p));
   }

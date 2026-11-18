@@ -294,8 +294,9 @@ const SETUP: Record<string, (dir: string) => void> = {
     write(path.join(dir, "vendor/stale/.git"), "gitdir: ../../.git/modules/gone\n");
     fs.mkdirSync(path.join(dir, "testdata/x/.git"), { recursive: true });
   },
-  // `git log -1 secrets.json` itself asks, before and after this round: the rules read a word
-  // named like a credential file as a file. What must work is git reading the ref.
+  // (`git log -1 secrets.json` itself is a rule allow since rules.ts became the project's own:
+  // without a patch, git log only filters commits by the name.) What must work is git reading
+  // the ref.
   "git branch --list | grep -c secrets": (dir) => void git(dir, "branch", "secrets.json"),
   // Round 4, group B.
   "./scripts/build.sh": projectScript,

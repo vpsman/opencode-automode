@@ -1468,6 +1468,10 @@ class Printer {
         else if (parts.length === 1 && (p.text === "{" || p.text === "}")) add(p.text);
         else {
           // Unquoted text: what bash acts on stays bare, the rest is literal.
+          // (Council project review 2, round 33, Astra: a `~` after `=` or `:` is expanded by bash up
+          // to the end of its prefix, and a quote printed inside that prefix changes where the prefix
+          // ends: `x=~#=~` expands its last `~`, `x=~'#'=~` does not. Such a word asks.)
+          if (/[=:]~/.test(p.text) && [...p.text].some((ch) => !PLAIN.test(ch) && !ACTIVE.includes(ch))) ask("a `~` after `=` or `:` beside text the printer would quote, which changes where bash ends the tilde's prefix");
           let text = "";
           const flush = () => {
             if (text) add(quote(text));

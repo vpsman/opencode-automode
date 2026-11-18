@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 import { DEFAULT_ASK, decideShell, mirrorable, SessionState, takeMoment, type Guard } from "../decide.ts";
 import { canonical } from "../canon.ts";
 SessionState.moment = takeMoment;
-import { compileRules } from "../rules.ts";
+import { compileRules, parse } from "../rules.ts";
 import { DEFAULT_CLASSIFIER } from "../kev.ts";
 
 assert.ok(process.env.GIT_CONFIG_GLOBAL?.startsWith(os.homedir()), "run through test/run.mjs, which supplies a throwaway $HOME");
@@ -842,4 +842,36 @@ test("round 32: unzip -l - --l extracts; npm version past an option's value; rul
   }
   for (const c of ["echo hi > /dev/stderr", "echo hi > /dev/stdout", "npm test 2>/dev/null", "cp f /dev/null", "ls -h", "git --version", "node --version"]) assert.equal(await effect(c), "allow", c);
   for (const c of ["echo x | zsh -h", "echo x | mytool -V"]) assert.notEqual(await effect(c), "allow", c);
+});
+
+// ---- round 33 ----
+
+test("round 33: a quote inside a tilde's prefix, npm field words, Tcl's --help, /dev/full and /dev/shm, brace ranges past 2^53, whole-number timeouts", async () => {
+  // Astra: the printer cannot quote text inside a `~` prefix after `=` or `:` without changing it.
+  assert.ok("ask" in canonical("echo x=~#=~"), "x=~#=~ asks");
+  assert.equal(canonical("PATH=~/bin:~/x ls").text, "PATH=~/bin:~/x ls");
+  // Sol: `version` as a field word of npm view or info is no write.
+  for (const reader of ["npm view sample version description", "npm view sample description version", "npm info x version"]) {
+    const s = new SessionState(repo);
+    assert.equal(await effect(reader, s), "allow", reader);
+    assert.equal(await effect("npm test", s), "allow", `npm test after ${reader}`);
+  }
+  for (const writer of ["npm version patch", "pnpm -w version 1.2.3"]) {
+    const s = new SessionState(repo);
+    const wrote = await effect(writer, s);
+    assert.ok(wrote !== "allow" || (await effect("npm test", s)) !== "allow", writer);
+  }
+  // Opus: Tcl's shells and erl take --help as an argument for the script on standard input.
+  for (const c of ["echo x | tclsh --help", "tclsh8.6 --version", "erl --version"]) assert.notEqual(await effect(c), "allow", c);
+  // Mythos: /dev/full and /dev/shm are writable, as the README says.
+  for (const c of ["echo x > /dev/full", "echo x > /dev/shm/cp2-r33"]) assert.equal(await effect(c), "allow", c);
+  // Astra: a range whose ends are past 2^53 is not followed (it used not to end).
+  assert.equal(parse("echo {9007199254740992..9007199254740992}").opaque, true);
+  // Astra, Sol: a timeout that is not a whole number fails to ask, before any request.
+  const { scoreCommand } = await import("../kev.ts");
+  const scored = await scoreCommand({ ...DEFAULT_CLASSIFIER, timeoutMs: 100.5 }, { tool: "bash", cwd: repo, command: "ls" });
+  assert.ok("error" in scored);
+  const { loadConfig } = await import("../config.ts");
+  assert.match(loadConfig(path.join(base, "no-such-config.json"), { classifier: { timeoutMs: 100.5 } }).problem ?? "", /timeoutMs/);
+  assert.equal(loadConfig(path.join(base, "no-such-config.json"), { classifier: { timeoutMs: 5000 } }).problem, undefined);
 });

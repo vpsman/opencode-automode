@@ -65,7 +65,7 @@ export async function scoreCommand(
 ): Promise<Scored> {
   const started = Date.now();
   const failed = (error: string): Scored => ({ error, ms: Date.now() - started });
-  if (!Number.isFinite(config.timeoutMs) || config.timeoutMs <= 0) return failed("classifier.timeoutMs is not a positive number");
+  if (!Number.isInteger(config.timeoutMs) || config.timeoutMs <= 0) return failed("classifier.timeoutMs is not a positive whole number");
   const timeout = AbortSignal.timeout(config.timeoutMs);
   const abort = signal ? AbortSignal.any([signal, timeout]) : timeout;
   const body = JSON.stringify({

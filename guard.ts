@@ -390,6 +390,9 @@ function shellProblem(cmds: Simple[]): string | undefined {
       // `-h` or `-V`, taken for help or a version. For these that word is an option, and they go
       // on to run their standard input (`rbash -h` is hashall, `ex -V` is verbose).
       if (at.has(i) && rest.length === 1 && /^-[hV]$/.test(rest[0]) && STDIN_RUNNERS.has(name)) return `${name} ${rest[0]}: an option of ${name}, which then runs what its standard input holds`;
+      // (Round 33, Opus: Tcl's shells and erl take any first word that begins with `-` as an
+      // argument for the script, `--help` and `--version` included, and then run standard input.)
+      if (at.has(i) && rest.length === 1 && /^--(help|version)$/.test(rest[0]) && /^(tclsh|wish|expect|expectk|jimsh|erl)[\d.]*$/.test(name)) return `${name} ${rest[0]}: an argument for ${name}'s script, which then runs what its standard input holds`;
       if (BASH_LIKE.has(name)) {
         const found = optionsProblem(rest, true);
         if (found === "-O") return `${name} -O, which changes how the shell reads its code`;
@@ -5100,10 +5103,32 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
   if (["npm", "pnpm", "yarn"].includes(name)) {
     // (Round 32, all four: wherever the word stands, as an option's value may come first; yarn's
     // bare `version` prompts for the new one.)
-    const words = args.filter((a) => !a.startsWith("-"));
-    const v = words.indexOf("version");
-    const k = words.indexOf("pkg");
-    if ((v >= 0 && (words.length > v + 1 || name === "yarn" || args.some((a) => /^--(major|minor|patch|pre\w*|new-version)/.test(a)))) || (k >= 0 && ["set", "delete", "fix"].includes(words[k + 1] ?? ""))) return `${name} ${v >= 0 ? "version" : "pkg"} rewrites package.json`;
+    // (Round 33, Sol: only where the subcommand stands. `npm view x version` names a field. The
+    // subcommand is the first word after the options; a known option that takes a value skips it,
+    // and after an option this check does not know either word may be the subcommand.)
+    const valued = /^(--loglevel|--prefix|-w|--workspace|--registry|--userconfig|--globalconfig|--cache|--tag|--otp|--access|-C|--dir|-F|--filter|--cwd|--reporter|--color|--workspace-concurrency)$/;
+    const known = /^(-[sqdgyvr]+|--(silent|quiet|verbose|workspaces|include-workspace-root|if-present|no-color|offline|prefer-offline|global|yes|recursive|workspace-root|frozen-lockfile|immutable|json|parseable|long|no-git-tag-version|git-tag-version|allow-same-version|force)|--[\w-]+=.*)$/;
+    const at: number[] = [];
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (a === "--") {
+        at.push(i + 1);
+        break;
+      }
+      if (!a.startsWith("-")) {
+        at.push(i);
+        break;
+      }
+      // (pnpm's -w is a flag, the workspace root; npm's takes a workspace.)
+      if (name === "pnpm" && a === "-w") continue;
+      if (valued.test(a)) i++;
+      else if (!known.test(a)) at.push(i + 1, i + 2);
+    }
+    const subs = at.map((i) => args[i]).filter((w): w is string => w !== undefined && !w.startsWith("-"));
+    const rest = (sub: string) => args.slice(args.indexOf(sub) + 1).filter((a) => !a.startsWith("-"));
+    const version = subs.find((w) => w === "version");
+    const pkg = subs.find((w) => w === "pkg");
+    if ((version && (rest(version).length > 0 || name === "yarn" || args.some((a) => /^--(major|minor|patch|pre\w*|new-version)/.test(a)))) || (pkg && ["set", "delete", "fix"].includes(rest(pkg)[0] ?? ""))) return `${name} ${version ? "version" : "pkg"} rewrites package.json`;
   }
   if (name === "ccache" && args.length && COMPILER.test(args[0])) return unnamedWrite(args[0], args.slice(1), filesOnly);
   if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|unlz4)$/.test(name) || (/^(gzip|xz|zstd|bzip2|lzop|lz4|lzip|brotli)$/.test(name) && args.some((a) => /^-[a-zA-Z0-9]*d[a-zA-Z0-9]*$/.test(a) || (a.length > 2 && ("--decompress".startsWith(a) || "--uncompress".startsWith(a))))) || (name === "lzop" && args.some((a) => /^-[a-zA-Z0-9]*x/.test(a)))) return `${name} -d writes files next to its input`;
