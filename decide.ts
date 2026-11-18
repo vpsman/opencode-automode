@@ -3927,7 +3927,12 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
     const targets = [...cmd.out, ...extra.filter((w) => w.cmd === cmd).map((w) => w.word)];
     // Round 4, N3: the targets that make a file (see NAME_KEEPERS), with the operands after `--`.
     const made = extra.filter((w) => w.cmd === cmd && !NAME_KEEPERS.has(w.by ?? "")).map((w) => w.word);
+    // (Round 51, Sol: after a program that only prints its help, a later word is a command only
+    // where the parser places one: in `cp --help -S cp -- --literal` the second `cp` is a value.)
+    const placed = programs(cmd.argv);
+    const quiet = placed.filter((p) => printsOnly(path.basename(cmd.argv[p]), cmd.argv.slice(p + 1)) || copiesNothing(path.basename(cmd.argv[p]), cmd.argv.slice(p + 1)));
     cmd.argv.forEach((word, at) => {
+      if (!placed.includes(at) && quiet.some((p) => p < at)) return;
       const how = Object.hasOwn(WRITER_OPERANDS, path.basename(word)) ? WRITER_OPERANDS[path.basename(word)] : undefined;
       const args = cmd.argv.slice(at + 1);
       // (Round 50, Sol: a copy that copies nothing names no destination and makes no file.)

@@ -441,6 +441,16 @@ const PATTERN_FIRST = new Set(["grep", "egrep", "fgrep", "rg", "ag", "ack", "sed
 // The credential file a simple command would read, if any.
 function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope): string | undefined {
   if (NAMES_ONLY.has(name)) return undefined;
+  // (Round 51, Sol and Astra: a call that only prints its help or version reads no file.)
+  if (printsOnly(name, args)) return undefined;
+  // (Round 51, Sol: sort's files are its operands and its option values, read by position.)
+  if (name === "sort") {
+    for (const w of sortReading(args).reads) {
+      const secret = secretIn(w, scope, false, true);
+      if (secret) return secret;
+    }
+    return undefined;
+  }
   // git log and its kin name paths to filter commits by, and show their content only with a patch.
   if (name === "git") {
     // (Round 35, Sol: the subcommand past git's own options, `-C dir` and `-c key=value`.)
@@ -2422,7 +2432,7 @@ export function compressorReading(name: string, args: string[]) {
     }
     return undefined;
   };
-  return { operands, outputs: reads ? [] : outputs, decompress, reads, inPlace: !(stdout || reads) && (!outputs.length || removes), family: table.family, unnamed, outputName };
+  return { operands, outputs: reads ? [] : outputs, decompress, reads, prints, inPlace: !(stdout || reads) && (!outputs.length || removes), family: table.family, unnamed, outputName };
 }
 
 // A copy that copies nothing (round 45, Sol and Opus): an rsync dry run, listing or single
@@ -2471,21 +2481,31 @@ const SORT_LONG_VALUED = ["random-source", "sort", "batch-size", "compress-progr
 // guard's write record: `sort --random-source -- -o .git/config f` writes `.git/config`.)
 // (Round 50, Opus: `-y` takes a value too, an attached one, GNU sort's `-bcCdfghik:mMno:rRsS:t:T:uVy::z`; Sol,
 // Astra: `--help`/`--version` as options print and write nothing.)
-export function sortReading(args: string[]): { compressor: boolean; outputs: string[]; prints: boolean } {
+// (Round 51, Sol: the files it reads, operands and `--files0-from`/`--random-source` values; a long
+// option sort does not know or cannot tell apart, `--ver`, stops it before it does anything.)
+export function sortReading(args: string[]): { compressor: boolean; outputs: string[]; prints: boolean; reads: string[]; lists: string[] } {
   let compressor = false;
   let prints = false;
   const outputs: string[] = [];
+  const reads: string[] = [];
+  const lists: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === "--") break;
+    if (a === "--") {
+      reads.push(...args.slice(i + 1));
+      break;
+    }
     if (a.startsWith("--")) {
       const eq = a.indexOf("=");
       const word = (eq < 0 ? a : a.slice(0, eq)).slice(2);
       const all = SORT_LONGS.filter((n) => n.startsWith(word));
       const name = SORT_LONGS.includes(word) ? word : all.length === 1 ? all[0] : undefined;
       const value = name && SORT_LONG_VALUED.includes(name) ? (eq >= 0 ? a.slice(eq + 1) : args[++i]) : undefined;
+      if (!name) prints = true;
       if (name === "compress-program") compressor = true;
       if (name === "output" && value !== undefined) outputs.push(value);
+      if ((name === "files0-from" || name === "random-source") && value !== undefined) reads.push(value);
+      if (name === "files0-from" && value !== undefined) lists.push(value);
       if (name === "help" || name === "version") prints = true;
     } else if (a.startsWith("-") && a.length > 1) {
       for (let k = 1; k < a.length; k++) {
@@ -2498,9 +2518,9 @@ export function sortReading(args: string[]): { compressor: boolean; outputs: str
           break;
         }
       }
-    }
+    } else reads.push(a);
   }
-  return prints ? { compressor: false, outputs: [], prints } : { compressor, outputs, prints };
+  return prints ? { compressor: false, outputs: [], prints, reads: [], lists: [] } : { compressor, outputs, prints, reads, lists };
 }
 export const sortRunsCompressor = (args: string[]) => sortReading(args).compressor;
 
@@ -2512,17 +2532,33 @@ export function printsOnly(name: string, args: string[]): boolean {
   if (name === "sort") return sortReading(args).prints;
   if (name === "tar" || name === "gtar") {
     const t = tarReading(args);
-    return t.has("help") || t.has("usage") || t.has("version") || t.clusters.some((c) => c.includes("?"));
+    // (Round 51, Astra and Sol: `--show-defaults` and `--show-snapshot-field-ranges` print too.)
+    return ["help", "usage", "version", "show-defaults", "show-snapshot-field-ranges"].some((n) => t.has(n)) || t.clusters.some((c) => c.includes("?"));
   }
   if (name === "ps") {
+    // (Round 51, Sol and Astra: read as psEnvironments reads the words: `-N` is a flag, `-opcpu`
+    // holds its value; `--help:all` as `--help=all`.)
     for (let i = 0; i < args.length; i++) {
       const a = args[i];
-      if (/^--(help|version|info)(=|$)/.test(a) || a === "-V" || a === "V") return true;
-      if (/^--(format|sort|cols|columns|width|rows|lines|pid|ppid|tty|user|User|group|Group|sid|quick-pid)$/.test(a)) i++;
-      else if (/^-?[A-Za-z]*[CGgoOpqstuUkN]$/.test(a)) i++;
+      if (/^--(help|version|info)([=:]|$)/.test(a)) return true;
+      if (a.startsWith("--")) {
+        if (PS_LONG_VALUED.test(a)) i++;
+        continue;
+      }
+      const unix = a.startsWith("-");
+      if (a === "-V" || a === "V") return true;
+      const valued = unix ? PS_UNIX_VALUED : PS_BSD_VALUED;
+      for (let k = unix ? 1 : 0; k < a.length; k++) {
+        if (valued.includes(a[k])) {
+          if (k === a.length - 1) i++;
+          break;
+        }
+      }
     }
     return false;
   }
+  const z = compressorReading(name, args);
+  if (z) return z.prints;
   if (["cp", "mv", "ln", "install"].includes(name)) return copiesNothing(name, args);
   if (name === "rsync") return rsyncReading(args).help;
   // (The compressors' queries are read by compressorReading, as writing nothing.)
@@ -3131,7 +3167,7 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
     const r = rsyncReading(args);
     if (r.operands.some((a) => /^[^/]*:/.test(a))) return worst(verdict, ask("rsync copies to or from a remote host"));
     if (r.daemon && !r.prints) return worst(verdict, ask("rsync --daemon starts a server"));
-    if (r.server) return worst(verdict, classify("rsync --server writes what its standard input sends"));
+    if (r.server && !r.prints) return worst(verdict, classify("rsync --server writes what its standard input sends"));
     // (Round 44, Opus: what `-M`/`--remote-option` hands the receiving side, which for a local
     // copy is this machine, is read as rsync's own words: `-M--log-file=../x`.)
     const remote = rsyncReading([...r.shorts.filter(([l]) => l === "M").map(([, v]) => v ?? ""), ...r.values("remote-option")]);

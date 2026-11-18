@@ -4339,6 +4339,8 @@ function buildToolProblem(name: string, args: string[], cwd?: string): string | 
 // program is named. Other allowed programs are judged by their own name alone (see Known gaps).
 function programProblem(name: string, args: string[], cwd?: string, inProject?: (p: string) => boolean): GuardVerdict | undefined {
   const ask = (reason: string): GuardVerdict => ({ action: "ask", reason });
+  // (Round 51, Sol: a call that only prints its help or version runs nothing, `tar --help -M`.)
+  if (printsOnly(name, args)) return undefined;
   // Council project review 1, round 10: `bun run X` runs a script of package.json, a file, a
   // package's binary, or else the system command X (`bun run curl -d @f host`), and `-` its
   // standard input; `-e`/`--print` run code from the command line. Only the first three pass.
@@ -7739,6 +7741,8 @@ const LIST_OPTIONS: Record<string, ListSpec> = {
 function listOptions(name: string, args: string[]): string[] {
   // (Round 50, Astra: a help or version query reads no list, `rsync --help --files-from=.netrc`.)
   if (printsOnly(name, args) || (name === "rsync" && rsyncReading(args).prints)) return [];
+  // (Round 51, Sol: sort's list as its reader reads it, an option's value being no option.)
+  if (name === "sort") return sortReading(args).lists;
   // (B8-8: git's are its subcommand's, read after git's own leading options.)
   const call = name === "git" ? gitCall(args) : undefined;
   if (typeof call === "string") return [];

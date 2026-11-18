@@ -1281,3 +1281,16 @@ test("round 50: sort's -y takes a value, help and version queries do nothing els
     assert.equal(await effect("npm test", s), "allow", `npm test after ${c}`);
   }
 });
+
+// ---- round 51 ----
+
+test("round 51: help and version queries read and run nothing, in every layer; sort's reads by position; a value is no command", async () => {
+  // Sol, Astra: queries that print and exit.
+  for (const c of ["gzip --help .netrc", "zstd --help .netrc", "ps --help:all -eTH", "ps -N --help -eTH", "ps -opcpu --help -eTH", "tar --show-defaults --index-file=.git/report", "rsync --version --server", "tar --help --multi-volume", "tar --help --files-from=.netrc", "sort --help --files0-from=.netrc", "xz --help --files=.netrc", "zstd --help --filelist=.netrc", "sort --random-source --files0-from=.netrc f", "cp --help -S cp -- --literal"]) assert.equal(await effect(c), "allow", c);
+  // The same tools still read, run and write where they do.
+  for (const c of ["gzip .netrc", "sort --files0-from=.netrc", "sort --random-source=.netrc -R f", "ps -eTH", "tar --multi-volume -cf a.tar f", "sort --help > .git/config", "cp -S cp f .git/x"]) assert.notEqual(await effect(c), "allow", c);
+  // Sol: an ambiguous long option stops sort before it writes.
+  const s = new SessionState(repo);
+  assert.equal(await effect("sort --ver --output=report", s), "allow");
+  assert.equal(await effect("npm test", s), "allow");
+});
