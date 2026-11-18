@@ -3910,6 +3910,8 @@ function optionNamedPath(cmds: Simple[], dirsOf: (cmd: Simple) => string[] | und
 // word. The landed path is walked as the kernel walks it (a link to `.git` counts), and read from
 // the project's top down where it lies in the project (a project kept under a directory of such
 // a name is not written "into" it by every write).
+// `~+` is the directory the command runs in (round 42, Mythos).
+const herePlus = (word: string) => (word === "~+" ? "." : word.startsWith("~+/") ? `.${word.slice(2)}` : word);
 function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined, dirsOf?: (cmd: Simple) => string[] | undefined, roots?: string[]): string | undefined {
   // Also every place the guard's own list of writes names (`cp -t`, `sort -o`, git's `--output`).
   const extra = writesOf(cmds).writes;
@@ -3928,16 +3930,35 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       else if (how) targets.push(...(how === "last" ? files.slice(-1) : files));
       // (Round 41, Opus: a copy into a directory writes each source's name there: `cp -r ev/.git .`
       // writes `./.git`. Judged by where each lands.)
+      // (Round 42, Mythos: `~+` is where it runs. Opus: a copy of a directory's contents, `src/.`,
+      // rsync's `src/`, `-T`, brings the `.git` it holds to where the contents land.)
       if (how === "last" && files.length > 1) {
-        const dest = files.at(-1)!;
+        const dest = herePlus(files.at(-1)!);
         const dir = cwdOf(cmd);
-        let into = dest.endsWith("/") || files.length > 2;
-        if (!into && dir !== undefined) {
+        const tool = path.basename(word);
+        const asFile = tool !== "rsync" && args.some((a) => a === "--no-target-directory" || /^-[a-zA-Z]*T/.test(a));
+        let into = !asFile && (dest.endsWith("/") || files.length > 2);
+        if (!into && !asFile && dir !== undefined) {
           try {
             into = fs.statSync(path.resolve(dir, tilde(dest))).isDirectory();
           } catch {}
         }
-        if (into) targets.push(...files.slice(0, -1).map((src) => `${dest.replace(/\/+$/, "")}/${path.basename(src.replace(/\/+$/, ""))}`));
+        for (const written of files.slice(0, -1)) {
+          const src = herePlus(written);
+          const contents = asFile || /\/\.\/*$/.test(src) || (tool === "rsync" && src.endsWith("/"));
+          const landing = into && !contents ? `${dest.replace(/\/+$/, "")}/${path.basename(src.replace(/\/+$/, ""))}` : dest;
+          if (into && !contents) targets.push(landing);
+          // (The project's own root is no such source: its `.git` is the one already trusted; a
+          // nested clone or a directory elsewhere is.)
+          let holdsGit = false;
+          if (dir !== undefined) {
+            const from = path.resolve(dir, tilde(src));
+            try {
+              holdsGit = !!fs.lstatSync(path.join(from, ".git")) && !(roots ?? []).some((r) => physical(r) === physical(from));
+            } catch {}
+          }
+          if (holdsGit) targets.push(`${landing.replace(/\/+$/, "")}/.git`);
+        }
       }
       if (how && !NAME_KEEPERS.has(path.basename(word))) {
         const end = args.indexOf("--");
@@ -3961,7 +3982,7 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       const name = protectedNameIn(target, PROTECTED_NAMES, cwdOf(cmd));
       if (name === ".git") return `writes ${target}: a path inside or named .git, where git finds hooks and config`;
       if (name) return `writes ${target}, which opencode or a git hook loads and runs`;
-      const t = tilde(target);
+      const t = tilde(herePlus(target));
       if (/[$`*?[\]{}]/.test(target) || /^~[^/]/.test(t) || /^&/.test(target) || roots === undefined) continue;
       for (const dir of path.isAbsolute(t) ? ["/"] : (dirsOf?.(cmd) ?? [])) {
         const full = path.isAbsolute(t) ? t : `${dir}/${t}`;

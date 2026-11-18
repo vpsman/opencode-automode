@@ -45,7 +45,11 @@ For each shell tool call:
    `|`, and `-p` or `--` after `time` and a redirect; a descriptor copy (`<&N`) on `cd`,
    `pushd` or `popd`, or on a compound command in a call that changes directory; control
    characters other than tab and newline, U+2028 and U+2029, and a non-ASCII space outside
-   quotes; a command line that starts with `-` or `+`. For a nested shell or `eval`: code
+   quotes; a command line that starts with `-` or `+`; and, where printing changes the text,
+   a command that names `LINENO`, `BASH_LINENO`, `BASH_COMMAND`, `BASH_EXECUTION_STRING`,
+   `$_`, `caller` or an indirect `${!...}`, quoted or not (`eval`, `trap` and `PS4` read
+   quoted text as code), since it would see the printed text (`set -v` echoes the printed
+   text, which is what runs). For a nested shell or `eval`: code
    built from a variable, a substitution or a glob; a nested shell or an `eval` in a command
    that defines a function, and code for `eval` that defines one; a program named like a
    shell at a path the checks do not know, with `-c` (`/tmp/bash -c ...`); code that

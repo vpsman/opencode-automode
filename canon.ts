@@ -2016,6 +2016,7 @@ function print(command: string, depth: number, where?: string): Printed & { defi
   }
 }
 
+const SELF_READING = /\b(LINENO|BASH_COMMAND|BASH_EXECUTION_STRING|BASH_LINENO|caller)\b|\$\{?[#!]?_\b|\$\{!/;
 export function canonical(command: string): Canonical {
   try {
     if (CONTROL.test(command)) return { ask: "a control character (a carriage return, an escape or the like) or a Unicode line separator" };
@@ -2033,7 +2034,12 @@ export function canonical(command: string): Canonical {
     // A command that reads its own text or place (`$LINENO`, `$BASH_COMMAND`,
     // `$BASH_EXECUTION_STRING`, `$BASH_LINENO`, `$_`) sees the printed text, not the written one
     // (council project review 2, round 41, Astra; declined in rounds 30 and 39, closed here).
-    if (text !== command && /\$\{?(LINENO|BASH_COMMAND|BASH_EXECUTION_STRING|BASH_LINENO|_)\b/.test(command)) return { ask: "a command that reads its own text or line number, which printing it would change" };
+    // (Round 42, all four: read in the printed text, where line continuations are joined and
+    // comments gone, and by name, as arithmetic, `${#…}`, `declare -p` and a later `eval` read it,
+    // with `caller` and an indirect `${!…}`. A name in single quotes counts too: `eval`, `trap` and
+    // `PS4` read quoted text as code. `set -v` echoes the printed text, which is what runs: kept,
+    // as the maintainer's D-fixes allow `set -vx; ls`.)
+    if (text !== command && SELF_READING.test(text)) return { ask: "a command that reads its own text or line number, which printing it would change" };
     return { text, judged, bashOnly, inputs, judgedInputs, arithLed, literals, ...(folds ? { folded: true } : {}) };
   } catch (e) {
     if (e instanceof Ask) return { ask: e.message };

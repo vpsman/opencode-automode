@@ -16,7 +16,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { bashVerdict, fileVerdict, parse, readVerdict, rsyncReading, tarReading, within, type Matcher, type Scope, type Simple } from "./rules.ts";
+import { bashVerdict, compressorReading, fileVerdict, parse, readVerdict, rsyncReading, tarReading, within, type Matcher, type Scope, type Simple } from "./rules.ts";
 import { gitArgs, gitEnv } from "./sandbox.ts";
 
 const HOME = os.homedir();
@@ -4363,16 +4363,21 @@ function programProblem(name: string, args: string[], cwd?: string, inProject?: 
     }
   }
   if (name === "tar" || name === "gtar" || name === "bsdtar") {
-    const option = longOption(args, ["--checkpoint-action", "--use-compress-program", "--to-command", "--info-script", "--new-volume-script", "--rsh-command", "--rmt-command", "--multi-volume", "--tape-length"]);
-    if (option) return ask(`tar ${option.split("=")[0]} runs a program, or prompts for the next volume, where \`!\` runs a shell on standard input`);
+    // Long options as tar reads them (round 42, all four: a whole name wins over a prefix,
+    // `--checkpoint=1` is no `--checkpoint-action`; an option's value is no option).
+    const t = tarReading(args);
+    const option = ["checkpoint-action", "use-compress-program", "to-command", "info-script", "new-volume-script", "rsh-command", "rmt-command", "multi-volume", "tape-length"].find((n) => t.has(n));
+    if (option) return ask(`tar --${option} runs a program, or prompts for the next volume, where \`!\` runs a shell on standard input`);
     // Bundled short options, with or without the dash (`tar cIf`): -I and -F name a program; -M
     // and -L make tar prompt for the next volume, where `!` runs a shell on standard input
     // (council project review 2, round 28, Mythos).
     // Read by position (round 41, Mythos and Sol): an option's value is no option, and `--` ends
     // the options only where an option could stand.
-    const bundles = tarReading(args).clusters;
-    if (bundles.some((a) => /[IFML]/.test(a))) return ask("tar -I or -F runs a program, and -M or -L prompts for the next volume, where ! runs a shell on standard input");
-    if (tarReading(args).archives.some((a) => /^[^/]*:/.test(a)) && !args.includes("--force-local")) return ask("tar with an archive on a remote host runs a remote shell");
+    if (t.clusters.some((a) => /[IFML]/.test(a))) return ask("tar -I or -F runs a program, and -M or -L prompts for the next volume, where ! runs a shell on standard input");
+    // (Round 42, Opus: any word before `--` that could name a remote archive, not only those the
+    // reader takes for one, so this check does not share the rules' reading; `--force-local` as
+    // tar reads it.)
+    if ((t.archives.some((a) => /^[^/]*:/.test(a)) || (args.includes("--") ? args.slice(0, args.indexOf("--")) : args).some((a) => /^(-[a-zA-Z]*f)?[^-/][^/]*:/.test(a))) && !t.has("force-local")) return ask("tar with an archive on a remote host runs a remote shell");
   }
   if (name === "sort" && longOption(args, ["--compress-program"])) return ask("sort --compress-program runs a program");
   // Council project review 2 (Mythos): the compilers and build tools the rules allow by name, with
@@ -5106,8 +5111,10 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
   // A name the URL or the server chooses (round 4, finding 17, second pass).
   if (name === "curl" || name === "wget") return fetcherWrites(name, args).chosen[0]?.why;
   if (name === "tar" || name === "gtar" || name === "bsdtar") {
-    const first = args[0] ?? "";
-    if (longOption(args, ["--extract", "--get"]) || args.some((a) => /^-[a-zA-Z]*x/.test(a) && !a.startsWith("--")) || /^[a-zA-Z]*x/.test(first)) return `${name} -x writes the files the archive names`;
+    // Read by position (round 42, Sol: `tar -tf a.tar --exclude -x` lists; `-xO` writes to
+    // standard output only).
+    const t = tarReading(args);
+    if ((t.has("extract") || t.has("get") || t.letter("x")) && !(t.has("to-stdout") || t.letter("O"))) return `${name} -x writes the files the archive names`;
   }
   if ((name === "unzip" && unzipWords(args).writes) || name === "7z" || name === "cpio" || name === "rar" || name === "unrar") return `${name} writes the files the archive names`;
   // (Council project review 1, round 4: `-d` anywhere in a cluster, `gzip -dk`; and the other
@@ -5162,7 +5169,12 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
     if ((version && (rest(version).length > 0 || name === "yarn" || args.some((a) => /^--(major|minor|patch|pre\w*|new-version)/.test(a)))) || (pkg && ["set", "delete", "fix"].includes(rest(pkg)[0] ?? ""))) return `${name} ${version ? "version" : "pkg"} rewrites package.json`;
   }
   if (name === "ccache" && args.length && COMPILER.test(args[0])) return unnamedWrite(args[0], args.slice(1), filesOnly);
-  if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|unlz4)$/.test(name) || (/^(gzip|xz|zstd|bzip2|lzop|lz4|lzip|brotli)$/.test(name) && args.some((a) => /^-[a-zA-Z0-9]*d[a-zA-Z0-9]*$/.test(a) || (a.length > 2 && ("--decompress".startsWith(a) || "--uncompress".startsWith(a))))) || (name === "lzop" && args.some((a) => /^-[a-zA-Z0-9]*x/.test(a)))) return `${name} -d writes files next to its input`;
+  // (Round 42, Sol: gzip, xz, zstd and bzip2 read by position; a listing, a test or output to
+  // standard output writes nothing; the other compressors as before.)
+  const z = compressorReading(name, args);
+  if (z) {
+    if (z.decompress && (z.inPlace || z.outputs.length)) return `${name} -d writes files next to its input`;
+  } else if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|unlz4)$/.test(name) || (/^(gzip|xz|zstd|bzip2|lzop|lz4|lzip|brotli)$/.test(name) && args.some((a) => /^-[a-zA-Z0-9]*d[a-zA-Z0-9]*$/.test(a) || (a.length > 2 && ("--decompress".startsWith(a) || "--uncompress".startsWith(a))))) || (name === "lzop" && args.some((a) => /^-[a-zA-Z0-9]*x/.test(a)))) return `${name} -d writes files next to its input`;
   if (name === "patch") {
     const got = getopt(args, PATCH_OPTIONS);
     if (got.unknown || !got.opts.some((o) => ["--dry-run", "-o", "--output"].includes(o.name))) return "patch writes the files the diff names";

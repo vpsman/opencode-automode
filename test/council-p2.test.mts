@@ -1065,3 +1065,31 @@ test("round 41: rsync and tar read by position, a copy into a directory by the s
   assert.ok("ask" in canonical('printf "%s\\n" "$BASH_COMMAND"'));
   assert.ok("ask" in canonical('# heading\nprintf "%s\\n" "$LINENO"'));
 });
+
+// ---- round 42 ----
+
+test("round 42: rsync and tar options by their real tables, compressors by position, a directory's contents copied with its .git, ~+, ps by position, self-reading by name", async () => {
+  // Opus, Mythos: a flag the readers took for an option with a value hid the next word.
+  const tars = ["tar --backup -I ./x.sh -cf a.tar f", "tar --occurrence -I ./x.sh -xf a.tar", "tar --backup -F ./x.sh -cf a.tar f", "tar --backup -L 1 -cf a.tar f", "tar -c --backup -f h:a.tar f", "tar --list -I ./x.sh -f a.tar", "tar --list -M -f a.tar", "tar --list -f host:a.tar", "tar -cf a.tar --remove-files --backup .git", "tar -tf host:x --xattrs-include --force-local"];
+  const rsyncs = ["rsync -e ./x.sh --munge-links x:y z", "rsync --munge-links --remove-source-files ../out/victim g", "rsync --munge-links --daemon", "rsync f --checksum host:dst", "rsync --backup host:/etc/passwd d/", "rsync --partial f ~/.bashrc", "rsync -a --backup --remove-source-files ~/docs/ d/", "rsync --partial --daemon", "rsync --read-batch=b ~/", "rsync --log-format -n f ~/.bashrc"];
+  // Mythos: a compressor's option value is no listing, test or stdout letter.
+  const zips = ["gzip -Sc .git/HEAD", "gzip -dSc .git/hooks/pre-commitc", "xz -Flzma .git/HEAD", "xz -Ccrc32 .git/HEAD", "zstd -Ddict .git/HEAD", "zstd -o .git/x f"];
+  // Opus, Mythos: a directory's contents bring the .git they hold; `~+` is where it runs.
+  fs.mkdirSync(path.join(base, "ev", ".git"), { recursive: true });
+  const copies = ["cp -r ../ev/. .", "cp -rT ../ev .", "cp -r --no-target-directory ../ev .", "rsync -a ../ev/ .", "cp -r ../ev/.git ~+", "cp -r ../ev/.git ~+/."];
+  const pss = ["ps -oenviron", "ps -eoenviron", "ps -e -opid,environ", "ps -Oenviron", "ps -o 'pid environ'", "ps g e", "ps --forest e", "ps --headers e", "ps -o environ:60", "ps opid,environ"];
+  for (const c of [...tars, ...rsyncs, ...zips, ...copies, ...pss]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["ps axoetime", "ps t e", "tar --checkpoint=1 -tf a.tar", "tar -tfFILM", "tar -tf a.tar --exclude --to-command", "tar --force-loc -tf tag:archive", "tar -tf a.tar -- a:b", "cp f ~+/g"]) assert.equal(await effect(c), "allow", c);
+  // Sol: reads that write nothing leave no write in the session's record.
+  for (const c of ["tar -tf a.tar --exclude -x", "tar -xOf a.tar f", "gzip -dc f.gz", "gunzip -t f.gz", "xz -dc f.xz", "zcat f.gz"]) {
+    const s = new SessionState(repo);
+    assert.equal(await effect(c, s), "allow", c);
+    assert.equal(await effect("npm test", s), "allow", `npm test after ${c}`);
+  }
+  const s = new SessionState(repo);
+  assert.equal(await effect("gzip -d f.gz", s), "allow");
+  assert.notEqual(await effect("npm test", s), "allow");
+  // All four: the self-reading names in the printed text, by name.
+  for (const c of ["\n\necho ${#BASH_EXECUTION_STRING}", "echo  hi; declare -p BASH_EXECUTION_STRING", '# heading\nprintf "%s\\n" "$LINE\\\nNO"', "# c\necho $((LINENO))", "# c\n(( n = LINENO ))", "# c\nf(){ caller; }; f"]) assert.ok("ask" in canonical(c), JSON.stringify(c));
+  assert.ok(!("ask" in canonical("echo ok # $LINENO")));
+});
