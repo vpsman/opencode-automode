@@ -1017,7 +1017,7 @@ test("round 38: git bisect view's command, venv targets, systemctl -H anywhere, 
 
 test("round 39: operands after --, option-named write places outside, deletions by rsync and tar, \\😀 printed whole", async () => {
   // Opus: every word after `--` is an operand, `-/../.git` included.
-  for (const c of ["mkdir - && rm -rf -- -/../.git", "mkdir - && echo x | tee -a -- -/../.git/config", "tee -- -/../../outside.txt < f", "python3 -m venv --clear -- -/../.git"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["mkdir - && rm -rf -- -/../.git", "mkdir - && echo x | tee -a -- -/../.git/config", `tee -- -/${"../".repeat(repo.split("/").length)}opt/cp2-r39 < f`, "python3 -m venv --clear -- -/../.git"]) assert.notEqual(await effect(c), "allow", c);
   // Mythos: places the guard reads right are held to the outside test.
   for (const c of ["cp f ~/.bashrc -S bak", "install f ~/.local/bin/x -m 755", "tar -xf a.tar -C../out", "tar -xf a.tar --directory=../out", "find . -name f -fprint0 ~/.bashrc", "rsync -aT../out f g", "chmod --reference=f ~/.bashrc"]) assert.notEqual(await effect(c), "allow", c);
   // Mythos: deletions held to rm's test.
@@ -1026,4 +1026,21 @@ test("round 39: operands after --, option-named write places outside, deletions 
   // Astra: a backslash quotes the whole code point.
   const p = canonical("echo \\😀");
   assert.ok(!("ask" in p) && p.text === "echo '😀'", JSON.stringify(p));
+});
+
+// ---- round 40 ----
+
+test("round 40: -- in every reader, chmod modes and --ref, option writes by prefix, tar --remove-files lists, ps e, \"$*$@\", rsync dry runs", async () => {
+  const up = "../".repeat(repo.split("/").length);
+  // Opus: every reader takes the words after `--` as files.
+  for (const c of ["mkdir - && cat -- -/../.env", "mkdir - && rm -- -/../.git/config", "gzip .git/config", "mkdir - && gzip -- -/../.git/config", `mkdir - && tar -cf a.tar --remove-files -- -/${up}opt/x`, `mkdir - && sed -i -- s/a/b/ -/${up}opt/x`, `python3 -m venv --clear -- -/${up}opt/x`]) assert.notEqual(await effect(c), "allow", c);
+  // Mythos: a mode that looks like an option, --reference by prefix, option writes by prefix.
+  for (const c of ["chmod -w ~/.bashrc", "chmod -R -rwx ~/Documents", "chmod --ref=f ~/.bashrc", "journalctl --cursor-fil=/opt/x -n1", "tar -c --remove-files -f a.tar --dir=/home Documents", "tar --remove-files -cf a.tar -T list.txt", "ps axeww", "ps -eo pid,environ"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["chmod --reference /bin/true f", "chmod -R a-w sub", "ps aux", "ps -C sleep", "python3 -m compileall -q -d /usr/src/demo f", "tar -tf a.tar -- -F", "rsync -ani --delete ./d/ ./e/", "rsync -ani --out-format --log-file f g"]) assert.equal(await effect(c), "allow", c);
+  // Sol: an rsync dry run records no write.
+  const s = new SessionState(repo);
+  assert.equal(await effect("rsync -ani f g", s), "allow");
+  assert.equal(await effect("npm test", s), "allow");
+  // Astra: "$@" beside other text in a word asks rather than being printed in parts.
+  assert.ok("ask" in canonical('printf "<%s>" "$*$@" END'));
 });

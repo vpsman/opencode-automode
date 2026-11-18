@@ -3920,7 +3920,9 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
     cmd.argv.forEach((word, at) => {
       const how = Object.hasOwn(WRITER_OPERANDS, path.basename(word)) ? WRITER_OPERANDS[path.basename(word)] : undefined;
       const args = cmd.argv.slice(at + 1);
-      const files = args.filter((a) => !a.startsWith("-"));
+      // Every word after `--` is a file, one that begins with `-` too (round 40, Opus).
+      const dashes = args.indexOf("--");
+      const files = [...(dashes < 0 ? args : args.slice(0, dashes)).filter((a) => !a.startsWith("-")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
       if (path.basename(word) === "sed" && !args.some((a) => /^(-[a-zA-Z]*i|--in-place)/.test(a))) return;
       if (path.basename(word) === "dd") targets.push(...args.filter((a) => a.startsWith("of=")).map((a) => a.slice(3)));
       else if (how) targets.push(...(how === "last" ? files.slice(-1) : files));
@@ -5404,12 +5406,19 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
     if (/^\/dev\/(null|zero|full|stdout|stderr|tty|fd\/\d+)$/.test(tilde(w.word))) continue;
     const p = resolve(w.word, w.cmd);
     if (!p || (!path.isAbsolute(tilde(w.word)) && where.cwd.get(w.cmd) === undefined)) continue;
-    let at = p;
+    // A directory is judged by the names that land in it: each source's base name, or, with none,
+    // a name nothing in it has (round 40, Sol: an unrelated link already there is not the write).
+    let at = [p];
     try {
-      if (w.dir || w.word.endsWith("/") || fs.statSync(p).isDirectory()) at = path.join(p, "x");
+      if (w.dir || w.word.endsWith("/") || fs.statSync(p).isDirectory()) at = (w.sources?.length ? w.sources.map((s) => path.basename(s)) : [".automode-placed-check"]).map((n) => path.join(p, n));
     } catch {}
-    const v = fileVerdict("edit", at, { ...scope, pending: new Map(scope.pending) });
-    if (v.action !== "allow") placedIssue = v.reason.replace(/^edit /, `${path.basename(w.cmd.argv[0] ?? "")} writes `);
+    for (const q of at) {
+      const v = fileVerdict("edit", q, { ...scope, pending: new Map(scope.pending) });
+      if (v.action !== "allow") {
+        placedIssue = v.reason.replace(/^edit /, `${path.basename(w.cmd.argv[0] ?? "")} writes `);
+        break;
+      }
+    }
   }
   const cwdOf = (c: Simple) => where.cwd.get(c);
   // Directories where this call writes files the check cannot list (round 4, finding 4, signed

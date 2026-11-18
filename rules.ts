@@ -416,11 +416,12 @@ function isSecretPath(p: string): boolean {
 
 // The credential file a shell word names, if any. Handles `--file=path`, curl's `@file` and
 // git's `rev:path`. In a command, words with spaces and URLs are text, not paths.
-function secretIn(word: string, scope: Scope, isPath = false): string | undefined {
+function secretIn(word: string, scope: Scope, isPath = false, operand = false): string | undefined {
   if (!isPath && (/\s/.test(word) || /^[a-z][a-z0-9+.-]*:\/\//i.test(word))) return undefined;
-  const text = word.replace(/^[^=/]*=/, "").replace(/^@/, "");
+  // An operand (after `--`) is a path whatever it starts with (round 40, Opus: `cat -- -/../.env`).
+  const text = operand ? word : word.replace(/^[^=/]*=/, "").replace(/^@/, "");
   for (const candidate of new Set([text, text.slice(text.lastIndexOf(":") + 1)])) {
-    if (!candidate || candidate.startsWith("-")) continue;
+    if (!candidate || (candidate.startsWith("-") && !operand)) continue;
     const p = resolveWord(candidate, scope);
     if (isSecretPath(expandHome(candidate)) || (p && (isSecretPath(p) || isSecretPath(followLinks(p, scope))))) return candidate;
   }
@@ -487,6 +488,12 @@ function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope)
   words = words.filter((w, i) => !/^--env-file(=|$)/.test(w) && words[i - 1] !== "--env-file");
   for (const word of [...words, ...(cmd.in ?? [])]) {
     const secret = secretIn(word, scope) ?? globSecret(word, scope);
+    if (secret) return secret;
+  }
+  // Every word after `--` is a file, one that begins with `-` too.
+  const dashes = args.indexOf("--");
+  if (dashes >= 0) for (const word of args.slice(dashes + 1)) {
+    const secret = secretIn(word, scope, false, true);
     if (secret) return secret;
   }
   return undefined;
@@ -1774,10 +1781,12 @@ function sed(args: string[], scope: Scope): Verdict {
   let inPlace = false;
   let sandbox = false;
   let k = 0;
+  let dashed = false;
   for (; k < args.length && args[k].startsWith("-") && args[k] !== "-"; k++) {
     const a = args[k];
     if (a === "--") {
       k++;
+      dashed = true;
       break;
     }
     if (a.startsWith("--")) {
@@ -1808,7 +1817,8 @@ function sed(args: string[], scope: Scope): Verdict {
   const rest = args.slice(k);
   if (!scripts.length) scripts.push(rest.shift() ?? "");
   if (!sandbox && !scripts.every(sedScriptSafe)) return classify("sed script that runs commands or reads or writes other files");
-  return inPlace ? writeTargets("sed", ["script", ...rest.filter((a) => !a.startsWith("-"))], scope) : ALLOW;
+  // After a `--` every word is a file (round 40, Opus).
+  return inPlace ? writeTargets("sed", ["script", "--", ...(dashed ? rest : operands(rest))], scope) : ALLOW;
 }
 
 // An awk program that only reads its input and prints. Not: system(), getline (from a command or
@@ -1862,6 +1872,8 @@ function tarProblem(args: string[]): string | undefined {
   const running = ["checkpoint-action", "use-compress-program", "to-command", "info-script", "new-volume-script", "rsh-command", "rmt-command"];
   for (let k = 0; k < args.length; k++) {
     const a = args[k];
+    // After `--`, words are members (round 40, Sol: `tar -tf a.tar -- -F`).
+    if (a === "--") break;
     if (running.some((name) => longIs(a, name))) return `tar ${a.split("=")[0]} runs a program`;
     // Short clusters, and the old style where the first word is a cluster without its dash.
     const cluster = /^-[A-Za-z]+$/.test(a) ? a.slice(1) : k === 0 && /^[A-Za-z]+$/.test(a) ? a : "";
@@ -1887,7 +1899,7 @@ const UNITTEST_LOADED = new Set(
 // --remove-files) may delete: outside the project and in a .git directory, as rm -r would; the
 // project's own files are left to the decider as before (the maintainer's d-fixes D5 decisions).
 function deletion(target: string, scope: Scope): Verdict {
-  const v = rm(["-r", target], scope);
+  const v = rm(["-r", "--", target], scope);
   if (v.action === "ask" && /deletes the whole project/.test(v.reason)) {
     const p = resolveWord(target, scope);
     return p && /(^|\/)\.git(\/|$)/.test(p) ? v : ALLOW;
@@ -1900,12 +1912,12 @@ function deletion(target: string, scope: Scope): Verdict {
 function venvTargets(args: string[], valued: string[], scope: Scope): Verdict {
   const dashes = args.indexOf("--");
   const dirs = [...(dashes < 0 ? args : args.slice(0, dashes)).filter((a, k) => !a.startsWith("-") && !valued.includes(args[k - 1] ?? "")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
-  const clear = args.some((a) => (longIs(a, "clear") && a.length > 3) || a === "-c");
+  const clear = (dashes < 0 ? args : args.slice(0, dashes)).some((a) => (longIs(a, "clear") && a.length > 3) || a === "-c");
   let verdict = ALLOW;
   for (const d of dirs) {
     const p = resolveWord(d, scope);
     if (p && /(^|\/)\.git(\/|$)/.test(p)) verdict = worst(verdict, ask(`a virtual environment in a .git directory: ${d}`));
-    verdict = worst(verdict, clear ? rm(["-r", d], scope) : writeTargets("mkdir", [d], scope));
+    verdict = worst(verdict, clear ? rm(["-r", "--", d], scope) : writeTargets("mkdir", ["--", d], scope));
   }
   return verdict;
 }
@@ -2009,14 +2021,29 @@ function shell(name: string, args: string[], dyn: (k: number) => boolean, cmd: S
   return evaluateParsed(parse(text), scope, depth + 1);
 }
 
+// A directory there now; false for anything else, a link loop included (round 40, Sol: ELOOP).
+const isDirectory = (p: string) => {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+};
+
 // ---- rules for one simple command ----
 
 function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = false): Verdict {
   // (Round 39, Mythos: with `--reference=FILE` chmod/chown/chgrp take no mode or owner operand.)
-  const paths = FIRST_OPERAND_NOT_PATH.has(cmd) && !args.some((a) => /^--reference(=|$)/.test(a)) ? operands(args).slice(1) : operands(args);
+  // (Round 40: a mode can look like an option, `chmod -w f`, and `--reference` is matched by any
+  // prefix; its value, as a separate word, is the file read, not a target.)
+  const head = args.indexOf("--") < 0 ? args : args.slice(0, args.indexOf("--"));
+  const reference = head.findIndex((a) => longIs(a, "reference") && a.split("=")[0].length >= 4);
+  const modeAsOption = cmd === "chmod" && head.some((a) => /^-[rwxXstugoa+=,-]+$/.test(a) && /[rwxXst]/.test(a));
+  const words = reference >= 0 && !head[reference].includes("=") ? args.filter((_, k) => k !== reference + 1) : args;
+  const paths = FIRST_OPERAND_NOT_PATH.has(cmd) && reference < 0 && !modeAsOption ? operands(words).slice(1) : operands(words);
   const sources = paths.slice(0, -1);
   const dest = paths.length > 1 ? resolveWord(paths.at(-1)!, scope) : undefined;
-  const intoDir = COPIERS.has(cmd) && paths.length > 1 && (sources.length > 1 || paths.at(-1)!.endsWith("/") || (!!dest && fs.statSync(dest, { throwIfNoEntry: false })?.isDirectory()));
+  const intoDir = COPIERS.has(cmd) && paths.length > 1 && (sources.length > 1 || paths.at(-1)!.endsWith("/") || (!!dest && isDirectory(dest)));
   const targets = WRITERS[cmd] === "last" ? paths.slice(-1) : paths;
   for (const t of targets) {
     // Copied into a directory, the files land inside it: `cp a.rs /tmp` writes /tmp/a.rs.
@@ -2591,7 +2618,15 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   if (name === "rsync" && rsyncOperands.some((a) => /^[^/]*:/.test(a))) return worst(verdict, ask("rsync copies to or from a remote host"));
   // (Round 39, Mythos: --remove-source-files deletes its sources, and --delete what is in the
   // destination and not in the source: held to rm's test.)
-  if (name === "rsync" && rsyncOperands.length > 1) {
+  // A dry run (`-n`, `--dry-run`) deletes nothing (round 40, Sol).
+  const dryRun = name === "rsync" && args.some((a) => longIs(a, "dry-run") || (/^-[a-zA-Z]+$/.test(a) && a.includes("n")));
+  if (name === "rsync" && dryRun) {
+    // (A dry run writes only its log, checked above.)
+    if (args.some((a) => /^--(log-file|write-batch|only-write-batch)/.test(a))) {
+      // fall through to the log check below
+    } else return verdict;
+  }
+  if (name === "rsync" && rsyncOperands.length > 1 && !dryRun) {
     const removes = args.some((a) => /^--remove-(source|sent)-files$/.test(a));
     const deletes = args.some((a) => /^--(delete|del)(-\w+)?$/.test(a));
     let gone = ALLOW;
@@ -2602,22 +2637,33 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   if (name === "rsync" && args.some((a) => longIs(a, "daemon") && a.length > 3)) return worst(verdict, ask("rsync --daemon starts a server"));
   if (name === "rsync") {
     // Files rsync writes besides its destination (round 38): held to the write test, as the README says.
-    const outputs = args.flatMap((a, k) => {
+    // By position: a word that is another option's value is no option (round 40, Sol:
+    // `--out-format --log-file`).
+    const outputs: string[] = [];
+    for (let k = 0; k < args.length; k++) {
+      const a = args[k];
+      if (a === "--") break;
       const m = /^--(log-file|write-batch|only-write-batch|backup-dir|partial-dir|temp-dir)(=(.*))?$/.exec(a);
-      return m ? [m[2] ? m[3] : (args[k + 1] ?? "")] : a === "-T" ? [args[k + 1] ?? ""] : [];
-    });
+      if (m) outputs.push(m[2] ? m[3] : (args[++k] ?? ""));
+      else if (a === "-T") outputs.push(args[++k] ?? "");
+      else if (rsyncValued.test(a)) k++;
+    }
     if (outputs.length) {
       const w = writeTargets("tee", ["--", ...outputs], scope);
       if (w.action !== "allow") return worst(verdict, { ...w, reason: w.reason.replace(/^tee/, "rsync") });
     }
   }
   // Files written by an option (round 39, Mythos): held to the write test.
-  const optionWrites: Record<string, RegExp> = { journalctl: /^--cursor-file$/, zip: /^(-O|--out|-b|--temp-path)$/, docker: /^--(iidfile|metadata-file)$/ };
+  // Long options by any prefix the tool takes (round 40, Mythos: `--cursor-fil=`).
+  const optionWrites: Record<string, { short: RegExp; long: string[] }> = { journalctl: { short: /^$/, long: ["cursor-file"] }, zip: { short: /^-(O|b)$/, long: ["out", "temp-path"] }, docker: { short: /^$/, long: ["iidfile", "metadata-file"] } };
   if (optionWrites[name]) {
+    const table = optionWrites[name];
     const named = args.flatMap((a, k) => {
       const eq = a.indexOf("=");
-      if (eq > 0 && optionWrites[name].test(a.slice(0, eq))) return [a.slice(eq + 1)];
-      if (optionWrites[name].test(a)) return [args[k + 1] ?? ""];
+      const head = eq > 0 ? a.slice(0, eq) : a;
+      const isLong = head.startsWith("--") && head.length >= 4 && table.long.some((o) => longIs(head, o));
+      if (eq > 0 && isLong) return [a.slice(eq + 1)];
+      if (isLong || table.short.test(a)) return [args[k + 1] ?? ""];
       const attached = name === "zip" ? /^-(O|b)(.+)$/.exec(a) : null;
       return attached ? [attached[2]] : [];
     });
@@ -2627,6 +2673,10 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
       if (w.action !== "allow") return worst(verdict, { ...w, reason: w.reason.replace(/^tee/, name) });
     }
   }
+  // (Round 40, Mythos: ps prints other processes' environments with BSD `e` or `environ`.)
+  if (name === "ps" && args.some((a, k) => (/^[aAcefhjlmrsSTuvwxXZ]+$/.test(a) && a.includes("e") && !/^-[a-zA-Z]*[CpuUgGtoOqs]$|^--\w+$/.test(args[k - 1] ?? "")) || /environ/.test(a))) return worst(verdict, ask("ps that prints other processes' environments"));
+  // (setfacl --restore takes its paths from a file.)
+  if (name === "setfacl" && args.some((a) => longIs(a, "restore") && a.split("=")[0].length >= 4)) return worst(verdict, classify("setfacl --restore changes the files a list names"));
   if (name === "nm" && args.some((a) => longIs(a, "plugin") && a.split("=")[0].length >= 4)) return worst(verdict, classify("nm --plugin loads a shared object"));
   if (name === "xargs") {
     const k = leadingOptions(args, { flags: "0oprtx", valued: "adEILnPs", long: ["null", "interactive", "no-run-if-empty", "verbose", "exit", "open-tty", "show-limits"], longValued: ["arg-file", "delimiter", "eof", "replace", "max-lines", "max-args", "max-procs", "max-chars", "process-slot-var"] });
@@ -2680,7 +2730,13 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
     // (Round 39, Mythos: --remove-files deletes the members after archiving them: held to rm's test,
     // and unread under a -C/--directory.)
     if (name === "tar" && args.some((a) => longIs(a, "remove-files") && a.length > 4)) {
-      if (args.some((a, k) => /^(-C|--directory)/.test(a) || /^-[a-zA-Z]*C/.test(a) || (k === 0 && /^[a-zA-Z]*C/.test(a)))) return worst(verdict, classify("tar --remove-files under another directory"));
+      // (Round 40, Mythos: `--dir=` and the other prefixes of --directory, members from a list,
+      // and `--add-file=` are read too.)
+      if (args.some((a, k) => (longIs(a, "directory") && a.split("=")[0].length >= 4) || /^-[a-zA-Z]*[CT]/.test(a) || (k === 0 && /^[a-zA-Z]*[CT]/.test(a)) || longIs(a, "files-from"))) return worst(verdict, classify("tar --remove-files under another directory or from a list"));
+      for (const a of args) if (/^--add-file=/.test(a)) {
+        const gone = deletion(a.slice(11), scope);
+        if (gone.action !== "allow") return worst(verdict, gone);
+      }
       const members = operands(args).filter((a, k, all) => !/f$/.test(args[args.indexOf(a) - 1] ?? "") && !(k === 0 && /^[a-zA-Z]+$/.test(a) && !args[0].startsWith("-") && a === args[0]));
       let gone = ALLOW;
       for (const m of members) gone = worst(gone, deletion(m, scope));
@@ -2689,7 +2745,10 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
     const problem = name === "tar" ? tarProblem(args) : undefined;
     if (problem) return worst(verdict, classify(problem));
     // Archives read and write paths given as operands and after -f / -C / -d.
-    for (const a of args.filter((x) => !x.startsWith("-"))) {
+    // A compressor replaces its input with the compressed file beside it: one in a .git directory
+    // is a write there (round 40, Opus: `gzip -- -/../.git/config`).
+    if (/^(gzip|gunzip|xz|zstd)$/.test(name) && operands(args).some((a) => /(^|\/)\.git(\/|$)/.test(resolveWord(a, scope) ?? a))) return worst(verdict, ask(`${name} writes in a .git directory`));
+    for (const a of operands(args)) {
       if (!isLocal(resolveWord(a, scope), scope)) return worst(verdict, classify(`${name} with a path outside the working directory`));
     }
     return verdict;
@@ -2725,15 +2784,24 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   // (Round 37, Mythos: `-o python_functions=interact` makes pytest call a function the call names.)
   // (Round 39: pytest empties --basetemp before it uses it: held to rm's test.)
   if (name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) {
-    const base = args.flatMap((a, k) => (/^--basetemp=/.test(a) ? [a.slice(11)] : a === "--basetemp" ? [args[k + 1] ?? ""] : []));
+    // (Also inside `-o addopts=...`, round 40, Mythos.)
+    const base = args.flatMap((a, k) => [...(a === "--basetemp" ? [args[k + 1] ?? ""] : []), ...[...a.matchAll(/(?:^|[\s=])--basetemp[=\s]+([^\s'"]+)/g)].map((m) => m[1])]);
     for (const b of base) {
-      const gone = rm(["-r", b], scope);
+      const gone = rm(["-r", "--", b], scope);
       if (gone.action !== "allow") return worst(verdict, gone);
     }
   }
   if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "compileall") {
-    const out = operands(args.slice(2)).map((d) => writeTargets("mkdir", [d], scope)).find((v) => v.action !== "allow");
-    if (out) return worst(verdict, out);
+    // (Round 40, Astra: -d, -s, -p, -x, -i, -r, -j, -o and -e take a value, which names no
+    // output; Mythos: a .git target asks.)
+    const rest = args.slice(2);
+    const dirs = operands(rest.filter((a, k) => !/^-[dspxirjoe]$/.test(rest[k - 1] ?? "")));
+    for (const d of dirs) {
+      const p = resolveWord(d, scope);
+      if (p && /(^|\/)\.git(\/|$)/.test(p)) return worst(verdict, ask(`compileall writes in a .git directory: ${d}`));
+      const out = writeTargets("mkdir", ["--", d], scope);
+      if (out.action !== "allow") return worst(verdict, out);
+    }
   }
   if ((name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) && args.some((a) => /python_(functions|classes|files)=/.test(a))) return worst(verdict, classify("pytest collecting functions the call names"));
   if ((name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) && args.some((a) => /(^|[\s=])--(pdb|trace)/.test(a))) return worst(verdict, classify("pytest's debugger, which reads commands from standard input"));

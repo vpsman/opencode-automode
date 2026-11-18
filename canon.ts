@@ -1466,6 +1466,11 @@ class Printer {
     // (An assignment's own `name=` is no text of the value: `i=$((i+1))` is as before.)
     const filled = parts.filter((q, n) => !(q.kind === "lit" && (q.text === "" || (n === 0 && !q.quoted && /^[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=$/.test(q.text)))));
     if (filled.length > 1 && filled.some((q) => q.kind === "arith")) ask("a word that holds arithmetic and other text, whose value the rules cannot read (they read 0 in its place)");
+    // (Council project review 2, round 40, Astra: `"$@"` and `"${a[@]}"` beside anything else in a
+    // word make words by bash's own rules (`"$*$@"` with no parameters is no word at all); printed
+    // as separate quoted parts they make other ones.)
+    const atList = (q: Part) => (q.kind === "var" && q.quoted && q.name === "@") || (q.kind === "param" && q.quoted && (q.head === "@" || /\[@\]$/.test(q.head)));
+    if (filled.some(atList) && parts.filter((q) => !(q.kind === "lit" && q.text === "")).length > 1) ask('a word that joins "$@" with other text, whose words bash makes by its own rules');
     parts.forEach((p, n) => {
       if (p.kind === "arith" && parts.slice(0, n).every((q) => q.kind === "lit" && q.text === "")) this.arithLed = true;
       if (p.kind === "lit") {

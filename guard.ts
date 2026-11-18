@@ -4368,7 +4368,9 @@ function programProblem(name: string, args: string[], cwd?: string, inProject?: 
     // Bundled short options, with or without the dash (`tar cIf`): -I and -F name a program; -M
     // and -L make tar prompt for the next volume, where `!` runs a shell on standard input
     // (council project review 2, round 28, Mythos).
-    const bundles = args.filter((a, i) => (/^-[a-zA-Z]+/.test(a) && !a.startsWith("--")) || (i === 0 && /^[a-zA-Z]+$/.test(a)));
+    // Options end at `--`; the words after it are members (round 40, Sol: `tar -tf a.tar -- -F`).
+    const head = args.indexOf("--") < 0 ? args : args.slice(0, args.indexOf("--"));
+    const bundles = head.filter((a, i) => (/^-[a-zA-Z]+/.test(a) && !a.startsWith("--")) || (i === 0 && /^[a-zA-Z]+$/.test(a)));
     if (bundles.some((a) => /[IFML]/.test(a))) return ask("tar -I or -F runs a program, and -M or -L prompts for the next volume, where ! runs a shell on standard input");
     if (args.some((a) => !a.startsWith("-") && /^[\w.@-]+:/.test(a)) && !args.includes("--force-local")) return ask("tar with an archive on a remote host runs a remote shell");
   }
@@ -5165,7 +5167,8 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
     const got = getopt(args, PATCH_OPTIONS);
     if (got.unknown || !got.opts.some((o) => ["--dry-run", "-o", "--output"].includes(o.name))) return "patch writes the files the diff names";
   }
-  if (name === "rsync") return "rsync writes the files it copies";
+  // (A dry run writes nothing but a log the rules hold, round 40, Sol.)
+  if (name === "rsync" && !args.some((a) => (a.length > 3 && "--dry-run".startsWith(a)) || (/^-[a-zA-Z]+$/.test(a) && a.includes("n")))) return "rsync writes the files it copies";
   // Read by the tool's own options (round 4, finding 4, second pass: `--recur`, `--arc`).
   if (["cp", "mv", "install"].includes(name)) {
     const words = copyWords(name, args);
@@ -5310,6 +5313,8 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       if (name === "tee" || name === "truncate") files.forEach((f) => add(f, true));
       else if (name === "sed" && args.some((a) => /^(-[a-zA-Z]*i|--in-place)/.test(a))) files.slice(args.some((a) => /^(-[a-zA-Z]*e$|--expression)/.test(a)) ? 0 : 1).forEach((f) => add(f, true));
       else if ((name === "perl" || name === "ruby") && args.some((a) => /^-[a-zA-Z]*i/.test(a))) files.slice(args.some((a) => /^-[a-zA-Z]*e$/.test(a)) ? 1 : 0).forEach((f) => add(f, false));
+      // An rsync dry run copies nothing (round 40, Sol).
+      else if (name === "rsync" && args.some((a) => (a.length > 3 && "--dry-run".startsWith(a)) || (/^-[a-zA-Z]+$/.test(a) && a.includes("n")))) continue;
       else if (["cp", "mv", "ln", "install", "rsync"].includes(name)) {
         // `-t DIR` / `--target-directory=DIR`: every operand is a source (the rules read the last
         // one as the destination and never look at DIR).
@@ -7101,7 +7106,8 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
     if (ASSIGN.test(word)) continue;
     const name = path.basename(word);
     const args = cmd.argv.slice(at + 1);
-    const files = args.filter((a) => !a.startsWith("-"));
+    const dashes = args.indexOf("--");
+    const files = [...(dashes < 0 ? args : args.slice(0, dashes)).filter((a) => !a.startsWith("-")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
 
     // B7-5: an option that reads a file of names, patterns or code is a read of that file, in
     // every place the command may run (listOptions).

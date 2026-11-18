@@ -788,7 +788,9 @@ describe("the canonical printer: bash and the rules' parser make the same words 
     const snapshot = (command: string, n: number, tag: string) => {
       const work = path.join(dir, `files-${tag}-${n}`);
       fs.mkdirSync(work);
-      spawnSync("/bin/bash", ["-c", command], { cwd: work, encoding: "utf8", env: { PATH: `${dir}:/usr/bin:/bin`, HOME: "/home/nobody", x: "abc", LC_ALL: "C" } });
+      const r = spawnSync("/bin/bash", ["-c", command], { cwd: work, encoding: "utf8", env: { PATH: `${dir}:/usr/bin:/bin`, HOME: "/home/nobody", x: "abc", LC_ALL: "C" } });
+      // A shell that cannot start leaves two empty snapshots, which would compare as equal (round 40, Sol).
+      if (r.error) throw new Error(`/bin/bash could not be run for ${JSON.stringify(command)}: ${r.error.message}`);
       return JSON.stringify(fs.readdirSync(work).sort().map((name) => [name, fs.readFileSync(path.join(work, name), "utf8")]));
     };
     const bad: string[] = [];
