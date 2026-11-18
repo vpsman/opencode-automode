@@ -1219,3 +1219,19 @@ test("round 46: copies read by position before --help, zstd's other suffixes, gl
   assert.equal(await effect("rsync -ani --partial-dir=scratch f dst/", d), "allow");
   assert.equal(await effect("npm test", d), "allow");
 });
+
+// ---- round 47 ----
+
+test("round 47: ps conflicts read again as BSD, gzip's suffixes in any case, rsync --version's log, xz's queries, sort's --, ps terminals", async () => {
+  fs.mkdirSync(path.join(repo, "dst"), { recursive: true });
+  fs.mkdirSync(path.join(repo, "sub"), { recursive: true });
+  for (const n of [".git.GZ", ".git_Z", ".git-GZ"]) fs.writeFileSync(path.join(repo, "sub", n), "x");
+  // Opus: a thread display beside a forest fails the UNIX reading after parsing; gzip folds case.
+  for (const c of ["ps -eTH", "ps -e -T -H -o pid,args", "ps -eT --forest", "ps -eLm", "gunzip sub/.git.GZ", "gzip -d sub/.git_Z", "gunzip sub/.git-GZ", "rsync -n --version --log-file=.git/x f dst/"]) assert.notEqual(await effect(c), "allow", c);
+  // Sol, Astra: queries and spellings that write nothing and print no environment.
+  for (const c of ["ps -e -t - -o pid,comm", "ps -e -t/dev/tty -o pid,comm", "xz --info-memory .git/fixture", "xz --filters-help .git/fixture", "rsync -n --help --log-file=.git/fixtures/help.log f dst/", "sort -c -- --compress-program", "ps -eH", "ps -eT", "ps -eLf"]) assert.equal(await effect(c), "allow", c);
+  // Sol: rsync --version still writes its log, which the record keeps.
+  const s = new SessionState(repo);
+  assert.equal(await effect("rsync -n --version --log-file=version.log f dst/", s), "allow");
+  assert.notEqual(await effect("npm test", s), "allow");
+});

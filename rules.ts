@@ -2095,8 +2095,10 @@ export function rsyncReading(args: string[]) {
   // source; Sol: a dry run of a batch writes nothing.)
   const server = prefixed("server") || prefixed("sender");
   // (Round 46, Sol: `--version`, `-V` and `--help` print and copy nothing.)
-  const prints = has("version") || has("help") || letters.includes("V");
-  return { longs, letters, shorts, operands, dryRun, listOnly, batch, server, prints, daemon: prefixed("daemon"), copiesNothing: prints || (!server && (dryRun || listOnly || (!batch && operands.length < 2))), values: (name: string) => longs.filter(([h]) => h === `--${name}`).map(([, v]) => v ?? "") };
+  // (Round 47, Sol: `--version` still opens its `--log-file`; `--help` opens nothing.)
+  const help = has("help");
+  const prints = has("version") || help || letters.includes("V");
+  return { longs, letters, shorts, operands, dryRun, listOnly, batch, server, prints, help, daemon: prefixed("daemon"), copiesNothing: prints || (!server && (dryRun || listOnly || (!batch && operands.length < 2))), values: (name: string) => longs.filter(([h]) => h === `--${name}`).map(([, v]) => v ?? "") };
 }
 
 // tar's command line read by position (round 41): the old style (a first word of letters without
@@ -2225,7 +2227,8 @@ function psValueTaken(letter: string, value: string, here: boolean): boolean {
   if (!items.length || items.some((n) => n === "")) return false;
   if ("pqs".includes(letter)) return items.every((n) => /^\+?\d+$/.test(n));
   if ("uUgG".includes(letter)) return items.every((n) => /^\+?\d+$/.test(n) || (here && namesHere().has(n)));
-  if (letter === "t") return items.every((n) => n === "-" || n === "?" || (here && /^[\w/]+$/.test(n) && ["", "tty", "pts/"].some((p) => fs.existsSync(`/dev/${p}${n}`))));
+  // (Round 47, Astra: an absolute path to a terminal, `-t/dev/tty`.)
+  if (letter === "t") return items.every((n) => n === "-" || n === "?" || (here && /^[\w/]+$/.test(n) && (n.startsWith("/dev/") ? fs.existsSync(n) : ["", "tty", "pts/"].some((p) => fs.existsSync(`/dev/${p}${n}`)))));
   return false;
 }
 export function psEnvironments(args: string[], here = true): boolean {
@@ -2253,13 +2256,21 @@ export function psEnvironments(args: string[], here = true): boolean {
         // value it takes does not (round 44 and 45, Sol and Astra). A separate word that starts
         // with `-` is refused, and the BSD reading takes it (round 45, Opus: `ps -e -u -x`).
         // (`-C` takes any word as a command's name, `-C -x` too, round 46, Astra.)
-        if (unix && (value === undefined || (k < a.length - 1 ? !psValueTaken(a[k], value, here) : value.startsWith("-") && !"oOC".includes(a[k])))) again = true;
+        // (Round 47, Sol and Astra: `-t -` names no terminal, as `-t-` does.)
+        if (unix && (value === undefined || (k < a.length - 1 ? !psValueTaken(a[k], value, here) : value.startsWith("-") && !"oOC".includes(a[k]) && !(a[k] === "t" && value === "-")))) again = true;
         if ("oO".includes(a[k]) && value !== undefined) formats.push(value);
         break;
       }
       if (unix && !PS_UNIX_FLAGS.includes(a[k])) again = true;
     }
   }
+  // (Round 47, Opus: procps reads the words again as BSD ones when the UNIX reading fails after
+  // parsing too: a thread display beside a forest, `-eTH`, `-eT --forest`; `-L` beside `-m`;
+  // `-T` beside `-m` or `-L`.)
+  const unixLetters = args.filter((a) => /^-[^-]/.test(a)).map((a) => a.slice(1).split(new RegExp(`[${PS_UNIX_VALUED}]`))[0]).join("");
+  const forest = unixLetters.includes("H") || args.includes("--forest");
+  const threads = ["T", "L", "m"].filter((l) => unixLetters.includes(l));
+  if ((threads.length && forest) || threads.length > 1) again = true;
   if (unixE && again) return true;
   // (Round 44, Opus: read again as BSD, `-u` in `ps -xu -e` takes no value, so `-e` is BSD `e`.)
   if (again) {
@@ -2358,7 +2369,8 @@ export function compressorReading(name: string, args: string[]) {
   const stdout = !!table.stdout || letters.includes("c") || long("stdout", "to-stdout");
   const test = letters.includes("t") || long("test");
   // (Round 46, Sol: a version, help or licence query prints and writes nothing.)
-  const prints = letters.some((l) => "VhH".includes(l) || (l === "L" && table.family !== "xz")) || long("version", "help", "long-help", "license");
+  // (Round 47, Astra and Sol: xz's `--info-memory` and `--filters-help` print too.)
+  const prints = letters.some((l) => "VhH".includes(l) || (l === "L" && table.family !== "xz")) || long("version", "help", "long-help", "license", "info-memory", "filters-help");
   const list = letters.includes("l") || long("list") || prints;
   // A decompression by any prefix getopt would take: the side that adds a write.
   const decompress = !!table.decompress || letters.includes("d") || longs.some((h) => h.length > 0 && ("decompress".startsWith(h.replace(/^--/, "")) || "uncompress".startsWith(h.replace(/^--/, ""))));
@@ -2368,10 +2380,16 @@ export function compressorReading(name: string, args: string[]) {
   // (Round 45, Opus: what a decompression names its output: the input less its suffix, `-S`'s
   // first; gzip's `-N` takes the name the archive holds, and `-r` the files a directory holds.
   // Round 46, Opus: zstd also takes gzip, xz, lzma and lz4 files and strips their suffixes.)
-  const DEFAULT_SUFFIXES: Record<string, string[]> = { gzip: [".gz", "-gz", ".z", "-z", "_z", ".Z"], xz: [".xz", ".lzma", ".lz"], zstd: [".zst", ".tzst", ".gz", ".tgz", ".xz", ".txz", ".lzma", ".tlz", ".lz4", ".tlz4"], bzip2: [".bz2", ".bz"] };
+  // (Round 47, Opus: gzip compares a suffix ignoring case, `.git.GZ`; zstd's `.t*` suffixes end
+  // in `.tar`.)
+  const DEFAULT_SUFFIXES: Record<string, string[]> = { gzip: [".gz", "-gz", ".z", "-z", "_z", ".tgz", ".taz"], xz: [".xz", ".lzma", ".lz", ".txz", ".tlz"], zstd: [".zst", ".tzst", ".gz", ".tgz", ".xz", ".txz", ".lzma", ".lz4", ".tlz4"], bzip2: [".bz2", ".bz", ".tbz2", ".tbz"] };
+  const fold = table.family === "gzip";
   const unnamed = letters.includes("N") && table.family === "gzip" ? "-N" : letters.includes("r") || long("recursive") ? "-r" : long("name") && table.family === "gzip" ? "--name" : undefined;
   const outputName = (input: string) => {
-    for (const s of [...suffixes, ...(DEFAULT_SUFFIXES[table.family] ?? [])]) if (s && input.length > s.length && input.endsWith(s)) return input.slice(0, -s.length);
+    for (const s of [...suffixes, ...(DEFAULT_SUFFIXES[table.family] ?? [])]) {
+      const ends = fold ? input.toLowerCase().endsWith(s.toLowerCase()) : input.endsWith(s);
+      if (s && input.length > s.length && ends) return input.slice(0, -s.length) + (/^\.t[a-z0-9]+$/i.test(s) && !suffixes.includes(s) ? ".tar" : "");
+    }
     return undefined;
   };
   return { operands, outputs: reads ? [] : outputs, decompress, reads, inPlace: !(stdout || reads) && (!outputs.length || removes), family: table.family, unnamed, outputName };
@@ -3017,7 +3035,7 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
     // copy is this machine, is read as rsync's own words: `-M--log-file=../x`.)
     const remote = rsyncReading([...r.shorts.filter(([l]) => l === "M").map(([, v]) => v ?? ""), ...r.values("remote-option")]);
     // (Round 45, Sol: a dry run writes its log and batch, but no backup, partial or temp files.)
-    const places = (x: ReturnType<typeof rsyncReading>) => [...["log-file", "write-batch", "only-write-batch", ...(r.dryRun || r.listOnly ? [] : ["backup-dir", "partial-dir", "temp-dir"])].flatMap((n) => x.values(n)), ...(r.dryRun || r.listOnly ? [] : x.shorts.filter(([l]) => l === "T").map(([, v]) => v ?? ""))];
+    const places = (x: ReturnType<typeof rsyncReading>) => (r.help ? [] : r.prints ? x.values("log-file") : [...["log-file", "write-batch", "only-write-batch", ...(r.dryRun || r.listOnly ? [] : ["backup-dir", "partial-dir", "temp-dir"])].flatMap((n) => x.values(n)), ...(r.dryRun || r.listOnly ? [] : x.shorts.filter(([l]) => l === "T").map(([, v]) => v ?? ""))]);
     const outputs = [...places(r), ...places(remote)];
     if (outputs.some((f) => /(^|\/)\.git(\/|$)/.test(resolveWord(f, scope) ?? f))) return worst(verdict, ask("rsync writes a file in a .git directory"));
     if (outputs.length) {
@@ -3094,7 +3112,8 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
     if (problem.action !== "allow") return worst(verdict, problem);
   }
   if (name === "sort") {
-    if (args.some((a) => longIs(a, "compress-program"))) return worst(verdict, classify("sort --compress-program runs a program"));
+    // (Round 47, Sol: a word after `--` is a file, `sort -c -- --compress-program`.)
+    if ((args.includes("--") ? args.slice(0, args.indexOf("--")) : args).some((a) => longIs(a, "compress-program"))) return worst(verdict, classify("sort --compress-program runs a program"));
   }
   if (name === "rg" && args.some((a) => /^--(pre|hostname-bin)(=|$)/.test(a))) return worst(verdict, classify(`rg ${args.find((a) => /^--(pre|hostname-bin)/.test(a))!.split("=")[0]} runs a program`));
   if ((name === "fd" || name === "fdfind") && args.some((a) => /^(-x|-X|--exec|--exec-batch)(=|$)/.test(a) || /^-[a-zA-Z]*[xX]$/.test(a))) return worst(verdict, classify("fd -x runs a command"));
