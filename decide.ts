@@ -25,6 +25,7 @@ import {
   bare,
   makeScope,
   psEnvironments,
+  findActions,
   copiesNothing,
   printsOnly,
   readVerdict,
@@ -3918,6 +3919,14 @@ function optionNamedPath(cmds: Simple[], dirsOf: (cmd: Simple) => string[] | und
 // word. The landed path is walked as the kernel walks it (a link to `.git` counts), and read from
 // the project's top down where it lies in the project (a project kept under a directory of such
 // a name is not written "into" it by every write).
+// Whether the word at `i` (an `-exec`-like word) is an action of a `find` (round 56), as rules.ts
+// `findActions` reads find's words.
+function findAction(argv: string[], i: number): boolean {
+  let p = i - 1;
+  while (p >= 0 && path.basename(argv[p]) !== "find") p--;
+  return p >= 0 && findActions(argv.slice(p + 1)).at.includes(i - p - 1);
+}
+
 // File tools that run no program their words name (rounds 52 and 54): behind one, a word named
 // like a writer is an operand. An allowlist: the programs that may run one are open-ended.
 const PLAIN_TOOLS = new Set(
@@ -3937,7 +3946,10 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
     const made = extra.filter((w) => w.cmd === cmd && !NAME_KEEPERS.has(w.by ?? "")).map((w) => w.word);
     // (Round 51, Sol: after a program that only prints its help, a later word is a command only
     // where the parser places one: in `cp --help -S cp -- --literal` the second `cp` is a value.)
-    const placed = programs(cmd.argv);
+    // (Round 56, Astra: a word after `-exec` is a command only where the `-exec` is find's action,
+    // not an operand of another program, `rg --files -- -exec cp .git/x`, nor a predicate's
+    // value, `find . -name -exec -o -name cp`.)
+    const placed = programs(cmd.argv).filter((p) => !(p > 0 && /^-(exec|execdir|ok|okdir)$/.test(cmd.argv[p - 1]) && !findAction(cmd.argv, p - 1)));
     const quiet = placed.filter((p) => printsOnly(path.basename(cmd.argv[p]), cmd.argv.slice(p + 1)) || copiesNothing(path.basename(cmd.argv[p]), cmd.argv.slice(p + 1)));
     cmd.argv.forEach((word, at) => {
       if (!placed.includes(at) && quiet.some((p) => p < at)) return;
@@ -3954,7 +3966,9 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       if (!placed.includes(at) && owner !== undefined && path.basename(cmd.argv[owner]) === "git") {
         let sub = owner + 1;
         while (sub < at && cmd.argv[sub].startsWith("-")) sub += /^(-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--config-env)$/.test(cmd.argv[sub]) ? 2 : 1;
-        if (sub < at) return;
+        // Behind git, only its subcommand's own place can name a writer (round 56, Sol: a global
+        // option's value, `git -C nested/cp ls-files`, is none).
+        if (at !== sub) return;
       }
       const how = Object.hasOwn(WRITER_OPERANDS, path.basename(word)) ? WRITER_OPERANDS[path.basename(word)] : undefined;
       // (Round 54, Opus: inside `find -exec`, the command's words end at the `;` or `{} +` that

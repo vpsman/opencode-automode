@@ -455,7 +455,8 @@ function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope)
   if (printsOnly(name, args)) return undefined;
   // (Round 51, Sol: sort's files are its operands and its option values, read by position.)
   if (name === "sort") {
-    for (const w of sortReading(args).reads) {
+    const posix = cmd.argv.find((w) => /^_POSIX2_VERSION=/.test(w));
+    for (const w of sortReading(args, posix !== undefined ? Number(posix.slice(16)) >= 200112 : undefined).reads) {
       const secret = secretIn(w, scope, false, true);
       if (secret) return secret;
     }
@@ -2081,7 +2082,9 @@ const RSYNC_LONG_VALUED = new Set(`out-format log-format log-file log-file-forma
 // (Round 55, Astra: rsync opens `--include-from`/`--exclude-from` files and the files of `merge`
 // and `.` filter rules as it reads each option, before a later `--help` or any `--version`
 // prints; `dir-merge`, `:` and `--files-from` open nothing then: tried, rsync 3.5.0.)
-const RSYNC_EAGER_RULE = /^(merge|\.)(,[-+a-zA-Z]*)?[ _](.+)$/;
+// (Round 56, Opus: a short `.` rule takes its modifiers without a comma, `.-`, `.e`, and `merge,`
+// takes `/` among them; any modifiers are matched, which only over-asks on ones rsync refuses.)
+const RSYNC_EAGER_RULE = /^(?:merge(?:,[^ _]*)?|\.[^ _]*)[ _](.+)$/;
 export function rsyncReading(args: string[]) {
   const longs: [string, string | undefined][] = [];
   const letters: string[] = [];
@@ -2093,7 +2096,7 @@ export function rsyncReading(args: string[]) {
     if (value === undefined) return;
     if (name === "include-from" || name === "exclude-from") order.push({ opens: value });
     const rule = name === "filter" ? RSYNC_EAGER_RULE.exec(value) : null;
-    if (rule) order.push({ opens: rule[3] });
+    if (rule) order.push({ opens: rule[1] });
   };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -2526,7 +2529,9 @@ const SORT_LONG_VALUED = ["random-source", "sort", "batch-size", "compress-progr
 // Astra: `--help`/`--version` as options print and write nothing.)
 // (Round 51, Sol: the files it reads, operands and `--files0-from`/`--random-source` values; a long
 // option sort does not know or cannot tell apart, `--ver`, stops it before it does anything.)
-export function sortReading(args: string[]): { compressor: boolean; outputs: string[]; prints: boolean; reads: string[]; lists: string[] } {
+// (Round 56, Sol: with `_POSIX2_VERSION` 200112 or later, sort takes no `+POS` key: the word is a
+// file.)
+export function sortReading(args: string[], posix2 = Number(process.env._POSIX2_VERSION ?? 0) >= 200112): { compressor: boolean; outputs: string[]; prints: boolean; reads: string[]; lists: string[] } {
   let compressor = false;
   let prints = false;
   const outputs: string[] = [];
@@ -2557,7 +2562,7 @@ export function sortReading(args: string[]): { compressor: boolean; outputs: str
       if (name === "random-sort" || (name === "sort" && value !== undefined && "random".startsWith(value) && value !== "")) random = true;
       if (name === "key" && value !== undefined) keys.push(value);
       if (name === "help" || name === "version") prints = true;
-    } else if (/^\+\d+(\.\d+)?[bdfgiMhnRrV]*$/.test(a)) {
+    } else if (!posix2 && /^\+\d+(\.\d+)?[bdfgiMhnRrV]*$/.test(a)) {
       // (Round 54, Sol and Astra: the old key syntax, `+POS1 [-POS2]`, with its modifiers at
       // either end, `sort -R +0n -1`.)
       let key = a.slice(1);
@@ -3015,17 +3020,42 @@ function optionValues(args: string[], valued: string, long: string[]): [string, 
   return out;
 }
 
+// find's words read as find reads them (round 56, Astra): its options and paths, then
+// predicates, some of which take one or two values (`-name -exec` names a pattern), and actions,
+// whose command runs to its `;` or `{} +`. `at` holds the place of each action word.
+const FIND_ONE = new Set(
+  `-name -iname -path -ipath -wholename -iwholename -regex -iregex -regextype -type -xtype -user -group -perm -size -mtime -mmin -atime -amin -ctime
+   -cmin -newer -anewer -cnewer -samefile -inum -links -maxdepth -mindepth -fprint -fprint0 -fls -printf -lname -ilname -uid -gid -used -context
+   -files0-from -fstype`.split(/\s+/),
+);
+export function findActions(args: string[]): { at: number[]; names: string[] } {
+  const at: number[] = [];
+  let k = 0;
+  while (k < args.length && /^-[HLP]$|^-D$|^-O\d*$/.test(args[k])) k += args[k] === "-D" ? 2 : 1;
+  while (k < args.length && !/^[-(!),]/.test(args[k])) k++;
+  for (; k < args.length; k++) {
+    const w = args[k];
+    if (/^-(delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$/.test(w)) at.push(k);
+    if (/^-(exec|execdir|ok|okdir)$/.test(w)) {
+      while (k + 1 < args.length && !(args[k + 1] === ";" || (args[k + 1] === "+" && args[k] === "{}"))) k++;
+      k++;
+    } else if (w === "-fprintf" || /^-newer[aBcmt][aBcmt]$/.test(w)) k += w === "-fprintf" ? 2 : 1;
+    else if (FIND_ONE.has(w)) k++;
+  }
+  return { at, names: at.map((i) => args[i]) };
+}
+
 function find(args: string[], scope: Scope): Verdict {
   const firstOption = args.findIndex((a) => /^(-|\(|!)/.test(a));
   const roots = firstOption < 0 ? args : args.slice(0, firstOption);
-  const acts = args.some((a) => /^-(delete|exec|execdir|ok|okdir|fprint|fprintf|fls)$/.test(a));
-  if (!acts) return ALLOW;
+  const actions = findActions(args);
+  if (!actions.at.length) return ALLOW;
   for (const r of roots.length ? roots : ["."]) {
     const p = resolveWord(r, scope);
     if (isPiFile(p, scope)) return piAsk(`find deletes or runs commands in Pi's own files: ${r}`);
     if (!isLocal(p, scope)) return outside(`find deletes or runs commands outside the working directory: ${r}`, p);
   }
-  const exec = args.findIndex((a) => /^-(exec|execdir|ok|okdir)$/.test(a));
+  const exec = actions.at.find((i) => /^-(exec|execdir|ok|okdir)$/.test(args[i])) ?? -1;
   if (exec < 0) return classify("find -delete or a -fprint write");
   const end = args.findIndex((a, i) => i > exec && (a === ";" || a === "+"));
   // {} stands for a path under the search roots, which were checked above.

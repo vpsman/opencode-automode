@@ -1339,3 +1339,17 @@ test("round 55: rsync opens filter files as it reads each option, before a later
   for (const c of ["git ls-files --others cp .git/report", "find . -name cp -o -path ./.git/report -print", "sort +0xR --random-source=.netrc rows"]) assert.equal(await effect(c), "allow", c);
   for (const c of ["git -C . mv f ./--zz", "find . -exec cp f .git/x \\;", "sort -R +0 --random-source=.netrc rows"]) assert.notEqual(await effect(c), "allow", c);
 });
+
+// ---- round 56 ----
+
+test("round 56: find's actions read in place, rsync's short filter rules with modifiers, git's option values, sort under _POSIX2_VERSION", async () => {
+  // Astra: a literal -exec is no action outside find's action place.
+  for (const c of ["rg --files -- -exec cp .git/report", "git ls-files --others -- -exec cp .git/report", "find . -name -exec -o -name cp -o -path ./.git/report", "git -C nested/cp ls-files --others -- f .git/report"]) assert.equal(await effect(c), "allow", c);
+  for (const c of ["find . -name x -exec cp f .git/x \;", "find . -type f -exec true \; -exec cp f .git/x \;", "find . -newermt 2020 -exec cp f .git/x \;", "git -C . mv f ./--zz"]) assert.notEqual(await effect(c), "allow", c);
+  // Opus: `.-`, `.e`, `merge,/` open their file before a query exits.
+  for (const c of ["rsync --version --filter='.- .netrc'", "rsync -f'.- .netrc' --version", "rsync --version --filter='merge,/- .netrc'", "rsync --filter='.- .netrc' --help", "rsync --filter='merge,/ .netrc' --info=help"]) assert.notEqual(await effect(c), "allow", c);
+  // Sol: under _POSIX2_VERSION=200112, `+0R` is a file: the call goes to the model for the
+  // variable, not to a credential ask.
+  const d = await decideShell(guard, new SessionState(repo), repo, "_POSIX2_VERSION=200112 sort +0R --random-source=.netrc rows");
+  assert.doesNotMatch(d.reason, /credential/);
+});
