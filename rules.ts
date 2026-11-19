@@ -439,6 +439,14 @@ const NAMES_ONLY = new Set(
 const PATTERN_FIRST = new Set(["grep", "egrep", "fgrep", "rg", "ag", "ack", "sed", "awk", "gawk", "jq", "yq"]);
 
 // The credential file a simple command would read, if any.
+// Whether an `env` cluster holds `-i` before a letter that takes a value (`-u`, `-C`, `-S`).
+function envClusterClears(word: string): boolean {
+  for (const letter of word.slice(1)) {
+    if (letter === "i") return true;
+    if ("uCS".includes(letter)) return false;
+  }
+  return false;
+}
 function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope): string | undefined {
   if (NAMES_ONLY.has(name)) return undefined;
   // (Round 51, Sol and Astra: a call that only prints its help or version reads no file. Round 54,
@@ -462,8 +470,10 @@ function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope)
     for (let k = 0; k < cmd.argv.length; k++) {
       const w = cmd.argv[k];
       if (/^_POSIX2_VERSION=/.test(w)) posix = w;
-      // (Round 59, Opus: in a cluster too, `env -vi`; and any prefix of the long name.)
-      else if (/^-[a-zA-Z0-9]*i[a-zA-Z0-9]*$/.test(w) || (w.length > 3 && "--ignore-environment".startsWith(w)) || w === "-") posix = "_POSIX2_VERSION=0";
+      // (Round 59, Opus: in a cluster too, `env -vi`; and any prefix of the long name. Round 60, Sol
+      // and Astra: read letter by letter, a letter that takes a value ending the cluster: in
+      // `env -ui` and `env -uquiet` the `i` is `-u`'s.)
+      else if ((/^-[^-]/.test(w) && envClusterClears(w)) || (w.length > 3 && "--ignore-environment".startsWith(w)) || w === "-") posix = "_POSIX2_VERSION=0";
       else if ((w === "-u" || w === "--unset") && cmd.argv[k + 1] === "_POSIX2_VERSION") (posix = "_POSIX2_VERSION=0"), k++;
       else if (w === "-u_POSIX2_VERSION" || w === "--unset=_POSIX2_VERSION") posix = "_POSIX2_VERSION=0";
       else if (!(w === "env" || /^[A-Za-z_]\w*=/.test(w))) break;
@@ -3084,7 +3094,8 @@ export function findActions(args: string[]): { at: number[]; names: string[]; fi
       break;
     }
     if (w === "-files0-from") files0 = true;
-    if (/^-(delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$/.test(w)) at.push(k);
+    // (Round 60, Sol: an output action to a device sink, `-fprint0 /dev/stdout`, writes no file.)
+    if (/^-(delete|exec|execdir|ok|okdir)$/.test(w) || (/^-(fprint|fprint0|fprintf|fls)$/.test(w) && !DEV_SINKS.test(args[k + 1] ?? ""))) at.push(k);
     if (/^-(exec|execdir|ok|okdir)$/.test(w)) {
       while (k + 1 < args.length && !(args[k + 1] === ";" || (args[k + 1] === "+" && args[k] === "{}"))) k++;
       k++;
@@ -3116,12 +3127,18 @@ function find(args: string[], scope: Scope): Verdict {
     // (Round 57, Opus: a start point in a .git directory, where git finds hooks and config.)
     if (/(^|\/)\.git(\/|$)/.test(p ?? r)) return ask(`find deletes or runs commands in a .git directory: ${r}`);
   }
-  const exec = actions.at.find((i) => /^-(exec|execdir|ok|okdir)$/.test(args[i])) ?? -1;
-  if (exec < 0) return classify("find -delete or a -fprint write");
-  const end = args.findIndex((a, i) => i > exec && (a === ";" || a === "+"));
-  // {} stands for a path under the search roots, which were checked above.
-  const inner = args.slice(exec + 1, end < 0 ? undefined : end).map((a) => (a === "{}" ? "." : a));
-  return worst(classify("find -exec"), simple({ argv: inner, out: [], dyn: inner.map((a) => /[$`]/.test(a)) }, scope, 1));
+  // (Round 60, Opus: every action find runs, not only the first, each ending where find ends it:
+  // at `;`, or at `+` straight after `{}`; `find . -exec true \; -exec rm -rf ~ \;`.)
+  const execs = actions.at.filter((i) => /^-(exec|execdir|ok|okdir)$/.test(args[i]));
+  if (!execs.length) return classify("find -delete or a -fprint write");
+  let verdict = classify("find -exec");
+  for (const exec of execs) {
+    const end = args.findIndex((a, i) => i > exec && (a === ";" || (a === "+" && args[i - 1] === "{}")));
+    // {} stands for a path under the search roots, which were checked above.
+    const inner = args.slice(exec + 1, end < 0 ? undefined : args[end] === "+" ? end - 1 : end).map((a) => (a === "{}" ? "." : a));
+    verdict = worst(verdict, simple({ argv: inner, out: [], dyn: inner.map((a) => /[$`]/.test(a)) }, scope, 1));
+  }
+  return verdict;
 }
 
 // Drops leading keywords, VAR=value assignments and wrappers such as `timeout 60` or `env`.

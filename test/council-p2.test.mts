@@ -1438,3 +1438,23 @@ test("round 59: find's help and version start nothing, -D's help in its list, st
   assert.equal(await effect("find . -name -exec -print", s), "allow");
   assert.notEqual(await effect("find . -name x -exec ls {} +", s), "allow");
 });
+
+// ---- round 60 ----
+
+test("round 60: every find action is judged, the guard skips only behind a find that prints, env's clusters read in order, find's outputs to device sinks", async () => {
+  // Opus: an action behind `-exec true \;`, a `+` that ends no action, a sibling `--help`.
+  for (const c of ["find . -exec true \\; -exec npm publish \\;", "find . -exec true \\; -exec ssh host.invalid uptime \\;", "find . -exec true {} + -exec cat ~/.ssh/id_ed25519 \\;", "find . -maxdepth 0 -exec xargs -E + npm publish {} +", "find . -exec sort --help \\; -exec gcc -wrapper /tmp/x t.c \\;", "find . -exec find --help \\; -exec gcc -wrapper /tmp/x t.c \\;"]) assert.notEqual(await effect(c), "allow", c);
+  assert.equal(await effect("find . -exec true \\; -exec rm -rf ~ \\;"), "deny");
+  // Sol: find's output to standard output is no file.
+  for (const c of ["find . -maxdepth 0 -fprint0 /dev/stdout", "find . -fprint0 /dev/stdout -help"]) assert.equal(await effect(c), "allow", c);
+  // Sol, Astra: `-u` takes the rest of its word, so `env -ui` clears nothing.
+  const old = process.env._POSIX2_VERSION;
+  try {
+    process.env._POSIX2_VERSION = "200112";
+    for (const c of ["env -ui sort +0R --random-source=.netrc rows", "env -uquiet sort +0R --random-source=.netrc rows"]) assert.equal(await effect(c), "allow", c);
+    assert.notEqual(await effect("env -vi sort +0R --random-source=.netrc rows"), "allow");
+  } finally {
+    if (old === undefined) delete process.env._POSIX2_VERSION;
+    else process.env._POSIX2_VERSION = old;
+  }
+});

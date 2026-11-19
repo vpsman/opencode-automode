@@ -7167,7 +7167,9 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
     const args = cmd.argv.slice(at + 1);
     // (Round 59, Astra and Sol: a program behind a call that only prints its help or version is
     // never started: `find --version -exec env --version \;`.)
-    if (programs(cmd.argv).some((p) => p < at && printsOnly(path.basename(cmd.argv[p]), cmd.argv.slice(p + 1)))) continue;
+    // (Round 60, Opus: only behind a find that only prints and is no `-exec`'s own command; a
+    // sibling `-exec sort --help \;` or `-exec find --help \;` owns no later `-exec`.)
+    if (programs(cmd.argv).some((p) => p < at && path.basename(cmd.argv[p]) === "find" && !(p > 0 && /^-(exec|execdir|ok|okdir)$/.test(cmd.argv[p - 1])) && printsOnly("find", cmd.argv.slice(p + 1)))) continue;
     const dashes = args.indexOf("--");
     const files = [...(dashes < 0 ? args : args.slice(0, dashes)).filter((a) => !a.startsWith("-")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
 
