@@ -1398,10 +1398,43 @@ test("round 58: sort's old keys stay keys after a pair, env -i clears _POSIX2_VE
   for (const c of ["find -D help . -exec printf x {} +", "find -help . -exec printf x {} +", "find . -name -files0-from -print"]) assert.equal(await effect(c), "allow", c);
   const d = await decideShell(guard, new SessionState(repo), repo, "find . -name -files0-from -exec ls -d {} +");
   assert.doesNotMatch(d.reason, /start points read from a file/);
-  // Opus: nested finds are read in linear time.
-  const n = 24;
-  const deep = "find . " + "-exec find ".repeat(n) + "-exec cp f .git/x " + "\\; ".repeat(n + 1);
-  const started = Date.now();
-  assert.notEqual(await effect(deep), "allow");
-  assert.ok(Date.now() - started < 5000, `${Date.now() - started} ms`);
+  // Opus: nested finds are read in time that grows slowly with the depth (round 59, Sol: two
+  // depths compared; the words are not one valid find, which is no matter to the reading).
+  const time = async (n: number) => {
+    const deep = "find . " + "-exec find ".repeat(n) + "-exec cp f .git/x " + "\\; ".repeat(n + 1);
+    const started = Date.now();
+    assert.notEqual(await effect(deep), "allow");
+    return Date.now() - started;
+  };
+  await time(4);
+  const shallow = await time(12);
+  const deeper = await time(24);
+  assert.ok(deeper < 5000 && deeper < 20 * Math.max(shallow, 25), `${shallow} ms at 12, ${deeper} ms at 24`);
+});
+
+// ---- round 59 ----
+
+test("round 59: find's help and version start nothing, -D's help in its list, start points named ) and ,, find's -exec pattern after a write", async () => {
+  // Astra, Sol: the guard reads no command a find that only prints would run.
+  for (const c of ["find -D tree,help . -exec ls {} +", "find --version -exec env --version \\;", "find . -maxdepth 0 -help -exec env --unrecognized {} +", "find ')' ',' -maxdepth 0 -print"]) assert.equal(await effect(c), "allow", c);
+  for (const c of ["find ')' ~ -delete", "find . -exec env --unrecognized {} +", "find . -exec cp f .git/x \\;"]) assert.notEqual(await effect(c), "allow", c);
+  // Opus: find opens an output file as it reads it, before a later help word prints.
+  for (const c of ["find . -fprint .git/config -help", "find . -fprint ../outside -help", "find . -fls .git/config --help", "find . -fprintf .git/config x -help", "find , ~ -name '*.bak' -delete"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["find . -help -fprint o", "find -D help . -fprint .git/config"]) assert.equal(await effect(c), "allow", c);
+  // Opus: sort takes `+POS` keys again from _POSIX2_VERSION 200809; `env -vi` clears it.
+  const old = process.env._POSIX2_VERSION;
+  try {
+    process.env._POSIX2_VERSION = "200809";
+    assert.notEqual(await effect("sort +0R --random-source=.netrc rows"), "allow");
+    process.env._POSIX2_VERSION = "200112";
+    assert.notEqual(await effect("env -vi sort +0R --random-source=.netrc rows"), "allow");
+  } finally {
+    if (old === undefined) delete process.env._POSIX2_VERSION;
+    else process.env._POSIX2_VERSION = old;
+  }
+  // Sol: after a session write, `-name -exec` is a pattern, no program.
+  const s = new SessionState(repo);
+  assert.equal(await effect("printf x > noted.txt", s), "allow");
+  assert.equal(await effect("find . -name -exec -print", s), "allow");
+  assert.notEqual(await effect("find . -name x -exec ls {} +", s), "allow");
 });

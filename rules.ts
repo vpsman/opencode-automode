@@ -462,12 +462,13 @@ function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope)
     for (let k = 0; k < cmd.argv.length; k++) {
       const w = cmd.argv[k];
       if (/^_POSIX2_VERSION=/.test(w)) posix = w;
-      else if (w === "-i" || w === "--ignore-environment" || w === "-") posix = "_POSIX2_VERSION=0";
+      // (Round 59, Opus: in a cluster too, `env -vi`; and any prefix of the long name.)
+      else if (/^-[a-zA-Z0-9]*i[a-zA-Z0-9]*$/.test(w) || (w.length > 3 && "--ignore-environment".startsWith(w)) || w === "-") posix = "_POSIX2_VERSION=0";
       else if ((w === "-u" || w === "--unset") && cmd.argv[k + 1] === "_POSIX2_VERSION") (posix = "_POSIX2_VERSION=0"), k++;
       else if (w === "-u_POSIX2_VERSION" || w === "--unset=_POSIX2_VERSION") posix = "_POSIX2_VERSION=0";
       else if (!(w === "env" || /^[A-Za-z_]\w*=/.test(w))) break;
     }
-    for (const w of sortReading(args, posix !== undefined ? Number(posix.slice(16)) >= 200112 : undefined).reads) {
+    for (const w of sortReading(args, posix !== undefined ? posix2Strict(Number(posix.slice(16))) : undefined).reads) {
       const secret = secretIn(w, scope, false, true);
       if (secret) return secret;
     }
@@ -2542,7 +2543,9 @@ const SORT_LONG_VALUED = ["random-source", "sort", "batch-size", "compress-progr
 // option sort does not know or cannot tell apart, `--ver`, stops it before it does anything.)
 // (Round 56, Sol: with `_POSIX2_VERSION` 200112 or later, sort takes no `+POS` key: the word is a
 // file.)
-export function sortReading(args: string[], posix2 = Number(process.env._POSIX2_VERSION ?? 0) >= 200112): { compressor: boolean; outputs: string[]; prints: boolean; reads: string[]; lists: string[] } {
+// (Round 59, Opus: only for 200112 <= v < 200809; GNU sort takes `+POS` keys again from 200809.)
+export const posix2Strict = (v: number) => v >= 200112 && v < 200809;
+export function sortReading(args: string[], posix2 = posix2Strict(Number(process.env._POSIX2_VERSION ?? 0))): { compressor: boolean; outputs: string[]; prints: boolean; reads: string[]; lists: string[] } {
   let compressor = false;
   let prints = false;
   const outputs: string[] = [];
@@ -2647,6 +2650,12 @@ export function printsOnly(name: string, args: string[]): boolean {
   const z = compressorReading(name, args);
   if (z) return z.prints;
   if (["cp", "mv", "ln", "install"].includes(name)) return copiesNothing(name, args);
+  // (Round 59, Astra and Sol: find's `-help`, `-version` and `-D help`; Opus: with no output file
+  // opened before it.)
+  if (name === "find") {
+    const f = findActions(args);
+    return f.prints && f.at.length === 0;
+  }
   // (Round 53, Sol: a version query reads nothing; it writes its log, which rsync's own checks read.)
   if (name === "rsync") {
     const r = rsyncReading(args);
@@ -3047,22 +3056,33 @@ const FIND_ONE = new Set(
 // (Round 58, Opus: as find's `looks_like_expression` tells, a word is an expression only if it is a
 // `-` followed by more, or exactly `(`, `!`, `)` or `,`: a lone `-` or `!x` is a start point.)
 export const findExpression = (w: string) => /^-./.test(w) || /^[(!),]$/.test(w);
+// (Round 59, Astra: where a start point may stand, `)` and `,` are files: find takes them for an
+// expression only after one has begun.)
+export const findStartExpression = (w: string) => /^-./.test(w) || w === "(" || w === "!";
 export function findActions(args: string[]): { at: number[]; names: string[]; files0: boolean; prints: boolean } {
   const at: number[] = [];
   let files0 = false;
   let prints = false;
   let k = 0;
   while (k < args.length && /^-[HLP]$|^-D$|^-O\d*$/.test(args[k])) {
-    if (args[k] === "-D" && args[k + 1] === "help") prints = true;
+    // (Round 59, Astra and Sol: `help` anywhere in -D's comma list.)
+    if (args[k] === "-D" && (args[k + 1] ?? "").split(",").includes("help")) prints = true;
     k += args[k] === "-D" ? 2 : 1;
   }
+  // `-D help` prints before find reads its expression (round 59, Opus: it opens no output).
+  if (prints) return { at: [], names: [], files0: false, prints };
   if (args[k] === "--") k++;
-  while (k < args.length && !findExpression(args[k])) k++;
+  while (k < args.length && !findStartExpression(args[k])) k++;
   for (; k < args.length; k++) {
     const w = args[k];
     // (Round 58, Sol: `-help` and `-version` print and run no action; Astra and Sol:
-    // `-files0-from` as find reads it, not a `-name` pattern.)
-    if (/^--?(help|version)$/.test(w)) prints = true;
+    // `-files0-from` as find reads it, not a `-name` pattern. Round 59, Opus: find opens each
+    // output file as it reads it, so those named before the help word are written; the reading
+    // stops there.)
+    if (/^--?(help|version)$/.test(w)) {
+      prints = true;
+      break;
+    }
     if (w === "-files0-from") files0 = true;
     if (/^-(delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$/.test(w)) at.push(k);
     if (/^-(exec|execdir|ok|okdir)$/.test(w)) {
@@ -3071,7 +3091,9 @@ export function findActions(args: string[]): { at: number[]; names: string[]; fi
     } else if (w === "-fprintf" || /^-newer[aBcmt][aBcmt]$/.test(w)) k += w === "-fprintf" ? 2 : 1;
     else if (FIND_ONE.has(w)) k++;
   }
-  return prints ? { at: [], names: [], files0: false, prints } : { at, names: at.map((i) => args[i]), files0, prints };
+  // A query keeps the output actions read before it; it runs and deletes nothing.
+  const kept = prints ? at.filter((i) => /^-(fprint|fprint0|fprintf|fls)$/.test(args[i])) : at;
+  return { at: kept, names: kept.map((i) => args[i]), files0: prints ? false : files0, prints };
 }
 
 function find(args: string[], scope: Scope): Verdict {
@@ -3081,7 +3103,7 @@ function find(args: string[], scope: Scope): Verdict {
   while (lead < args.length && /^-[HLP]$|^-D$|^-O\d*$/.test(args[lead])) lead += args[lead] === "-D" ? 2 : 1;
   if (args[lead] === "--") lead++;
   const rest = args.slice(lead);
-  const firstOption = rest.findIndex(findExpression);
+  const firstOption = rest.findIndex(findStartExpression);
   const roots = firstOption < 0 ? rest : rest.slice(0, firstOption);
   const actions = findActions(args);
   if (!actions.at.length) return ALLOW;

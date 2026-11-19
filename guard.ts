@@ -3569,9 +3569,13 @@ function faithful(argv: string[], start: number, out: number[], seen = new Set<n
       continue;
     }
     if (name === "find") {
+      // (Round 59, Astra and Sol: a find that only prints its help or version starts no command.)
+      if (printsOnly("find", argv.slice(i + 1))) return { main: i };
       let problem: string | undefined;
+      // (Round 59, Sol: the actions find reads as actions, `-name -exec` being a pattern.)
+      const actions = new Set(findActions(argv.slice(i + 1)).at.map((k) => i + 1 + k));
       for (let j = i + 1; j < argv.length; j++) {
-        if (!/^-(exec|execdir|ok|okdir)$/.test(argv[j]) || seen.has(j + 1)) continue;
+        if (!/^-(exec|execdir|ok|okdir)$/.test(argv[j]) || !actions.has(j) || seen.has(j + 1)) continue;
         seen.add(j + 1);
         problem ??= faithful(argv, j + 1, out, seen).problem;
       }
@@ -3597,8 +3601,16 @@ function traverse(argv: string[]): Traversal {
   // (kept as the loop goes: asking it of the whole prefix at each word made a command of 40,000
   // words take seconds).
   let wrappersOnly = true;
+  // (Round 59, Sol: a word after an `-exec` that the find before it reads as a predicate's value,
+    // `find . -name -exec -print`, is no program; an `-exec` behind any other program is still
+    // taken for one, which can only ask more.)
+  const valueOfFind = (k: number) => {
+    let p = k - 1;
+    while (p >= 0 && !(path.basename(argv[p]) === "find" && (p === 0 || at.has(p)))) p--;
+    return p >= 0 && !findActions(argv.slice(p + 1)).at.includes(k - p - 1);
+  };
   for (let i = 0; i < argv.length; i++) {
-    if (i === 0 || /^-(exec|execdir|ok|okdir)$/.test(argv[i - 1])) at.add(i);
+    if (i === 0 || (/^-(exec|execdir|ok|okdir)$/.test(argv[i - 1]) && !valueOfFind(i - 1))) at.add(i);
     else if (wrappersOnly && !WRAPPER_WORD.test(argv[i])) at.add(i);
     wrappersOnly &&= WRAPPER_NAMES.has(path.basename(argv[i])) || WRAPPER_WORD.test(argv[i]) || ASSIGN.test(argv[i]);
   }
@@ -7153,6 +7165,9 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
     if (ASSIGN.test(word)) continue;
     const name = path.basename(word);
     const args = cmd.argv.slice(at + 1);
+    // (Round 59, Astra and Sol: a program behind a call that only prints its help or version is
+    // never started: `find --version -exec env --version \;`.)
+    if (programs(cmd.argv).some((p) => p < at && printsOnly(path.basename(cmd.argv[p]), cmd.argv.slice(p + 1)))) continue;
     const dashes = args.indexOf("--");
     const files = [...(dashes < 0 ? args : args.slice(0, dashes)).filter((a) => !a.startsWith("-")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
 
@@ -7635,7 +7650,8 @@ function safeAfterWrite(name: string, args: string[], cmd: Simple, ctx: ArgvCont
   if (name === "jq") return !args.some((w) => /^(-[a-zA-Z]*[fL]|--from-file|--library-path)/.test(w) || /\b(import|include)\b/.test(w));
   // zip's `-T`/`-TT` runs a command on the archive.
   if (name === "zip") return !args.some((w) => /^-[a-zA-Z0-9]*T/.test(w) || /^--(test|unzip-command)/.test(w));
-  if (name === "find") return !args.some((w) => /^-(exec|execdir|ok|okdir)$/.test(w));
+  // (Round 59, Sol: find's actions where find reads them, `-name -exec` is a pattern.)
+  if (name === "find") return !findActions(args).names.some((w) => /^-(exec|execdir|ok|okdir)$/.test(w));
   if (name !== "git") return false;
   const call = gitCall(args);
   if (typeof call === "string") return false;
