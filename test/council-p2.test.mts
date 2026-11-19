@@ -1317,7 +1317,7 @@ test("round 53: ps reads on after -D's attached value, sort's random keys, a wri
 
 test("round 54: plain tools by allowlist again, find -exec's words end at its terminator, sort's old keys, rsync's version opens its filter files", async () => {
   // Opus: a wrapper the rules do not know keeps the .git write check; find -exec's `;` is no word.
-  for (const c of ["eatmydata cp f .git/hooks/pre-commit", "eatmydata tee .git/hooks/pre-commit", "eatmydata cp f opencode.json", "find . -maxdepth 0 -exec cp f .git/hooks/pre-commit \;", "find . -exec cp f .git/x ';' -print"]) {
+  for (const c of ["eatmydata cp f .git/hooks/pre-commit", "eatmydata tee .git/hooks/pre-commit", "eatmydata cp f opencode.json", "find . -maxdepth 0 -exec cp f .git/hooks/pre-commit \\;", "find . -exec cp f .git/x ';' -print"]) {
     const d = await decideShell(guard, new SessionState(repo), repo, c);
     assert.equal(d.effect, "ask", c);
     assert.match(d.reason, /writes (\.git|opencode)/, c);
@@ -1326,4 +1326,16 @@ test("round 54: plain tools by allowlist again, find -exec's words end at its te
   for (const c of ["rsync --include-from=.netrc --version", "rsync --version --exclude-from=.netrc", "sort -R +0 -1 --random-source=.netrc rows"]) assert.notEqual(await effect(c), "allow", c);
   // Sol, Astra: an old key's own ordering; git pathspecs and readers' operands named cp.
   for (const c of ["sort -R +0n -1 --random-source=.netrc rows", "sort -R +0n --random-source=.netrc rows", "git ls-files --others -- cp .git/report", "od -- cp .git/report", "rsync --help --include-from=.netrc"]) assert.equal(await effect(c), "allow", c);
+});
+
+// ---- round 55 ----
+
+test("round 55: rsync opens filter files as it reads each option, before a later help or any version; rg's operands", async () => {
+  // Astra: exactly the files rsync opens before a query exits (tried, rsync 3.5.0).
+  for (const c of ["rsync --version --exclude-from=.netrc", "rsync --version --filter='merge .netrc'", "rsync --version -f '. .netrc'", "rsync --exclude-from=.netrc --help", "rsync --exclude-from=.netrc --info=help", "rsync --include-from=.netrc --help", "rsync --filter='merge .netrc' --info=help", "rsync -f 'merge .netrc' --help"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["rsync --version --files-from=.netrc", "rsync --version --filter='dir-merge .netrc'", "rsync --help --exclude-from=.netrc", "rsync --info=help --exclude-from=.netrc", "rg --files -- cp .git/report"]) assert.equal(await effect(c), "allow", c);
+  // Sol: git's pathspecs after its subcommand, find's predicate values, a `+` word sort takes
+  // for a file (`+0xR`); git's own subcommand and find's -exec command are still read.
+  for (const c of ["git ls-files --others cp .git/report", "find . -name cp -o -path ./.git/report -print", "sort +0xR --random-source=.netrc rows"]) assert.equal(await effect(c), "allow", c);
+  for (const c of ["git -C . mv f ./--zz", "find . -exec cp f .git/x \\;", "sort -R +0 --random-source=.netrc rows"]) assert.notEqual(await effect(c), "allow", c);
 });

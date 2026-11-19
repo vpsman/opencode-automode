@@ -444,11 +444,10 @@ function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope)
   // (Round 51, Sol and Astra: a call that only prints its help or version reads no file. Round 54,
   // Sol: rsync opens its filter and list files before it prints its version, so those are read
   // there; its help exits first.)
-  if (name === "rsync" && rsyncReading(args).prints && !rsyncReading(args).help) {
-    const r = rsyncReading(args);
-    const lists = [...["include-from", "exclude-from", "files-from", "filter"].flatMap((n) => r.values(n)), ...r.shorts.filter(([l]) => l === "f").map(([, v]) => v ?? "")];
-    for (const v of lists) {
-      const secret = secretIn(v.replace(/^(merge|dir-merge|\.|:)[,_ ]?\s*/, ""), scope, false, true) ?? secretIn(v, scope);
+  // (Round 55, Astra: exactly the files rsync opens before the query exits.)
+  if (name === "rsync" && rsyncReading(args).prints) {
+    for (const v of rsyncReading(args).opensBeforeExit) {
+      const secret = secretIn(v, scope, false, true);
       if (secret) return secret;
     }
     return undefined;
@@ -2079,11 +2078,23 @@ const RSYNC_LONG_VALUED = new Set(`out-format log-format log-file log-file-forma
   bwlimit max-size min-size block-size port sockopts outbuf remote-option iconv checksum-choice cc compress-choice zc compress-level zl
   compress-threads zt skip-compress info debug modify-window max-delete max-alloc stop-after time-limit stop-at write-batch read-batch
   only-write-batch protocol address rsync-path config dparam checksum-seed early-input copy-as confine-root stderr`.split(/\s+/));
+// (Round 55, Astra: rsync opens `--include-from`/`--exclude-from` files and the files of `merge`
+// and `.` filter rules as it reads each option, before a later `--help` or any `--version`
+// prints; `dir-merge`, `:` and `--files-from` open nothing then: tried, rsync 3.5.0.)
+const RSYNC_EAGER_RULE = /^(merge|\.)(,[-+a-zA-Z]*)?[ _](.+)$/;
 export function rsyncReading(args: string[]) {
   const longs: [string, string | undefined][] = [];
   const letters: string[] = [];
   const shorts: [string, string | undefined][] = [];
   const operands: string[] = [];
+  // The files opened while the options are read, in order, with each help word's place.
+  const order: { opens?: string; help?: true }[] = [];
+  const eager = (name: string, value: string | undefined) => {
+    if (value === undefined) return;
+    if (name === "include-from" || name === "exclude-from") order.push({ opens: value });
+    const rule = name === "filter" ? RSYNC_EAGER_RULE.exec(value) : null;
+    if (rule) order.push({ opens: rule[3] });
+  };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--") {
@@ -2093,13 +2104,18 @@ export function rsyncReading(args: string[]) {
     if (a.startsWith("--")) {
       const eq = a.indexOf("=");
       const head = eq < 0 ? a : a.slice(0, eq);
-      longs.push([head, eq >= 0 ? a.slice(eq + 1) : RSYNC_LONG_VALUED.has(head.slice(2)) ? args[++i] : undefined]);
+      const value = eq >= 0 ? a.slice(eq + 1) : RSYNC_LONG_VALUED.has(head.slice(2)) ? args[++i] : undefined;
+      longs.push([head, value]);
+      eager(head.slice(2), value);
+      if (head === "--help" || ((head === "--info" || head === "--debug") && (value ?? "").split(",").some((t) => /^help\d*$/i.test(t)))) order.push({ help: true });
     } else if (a.startsWith("-") && a.length > 1) {
       for (let k = 1; k < a.length; k++) {
         letters.push(a[k]);
         if ("eTfBM@".includes(a[k])) {
           // (Round 43, Opus and Mythos: popt drops a `=` before an attached value, `-T=dir`.)
-          shorts.push([a[k], k < a.length - 1 ? a.slice(k + 1).replace(/^=/, "") : args[++i]]);
+          const value = k < a.length - 1 ? a.slice(k + 1).replace(/^=/, "") : args[++i];
+          shorts.push([a[k], value]);
+          if (a[k] === "f") eager("filter", value);
           break;
         }
       }
@@ -2126,7 +2142,11 @@ export function rsyncReading(args: string[]) {
   const firstLog = longs.findIndex(([h, v]) => h === "--log-file" && v !== "");
   const help = firstHelp >= 0 && (firstLog < 0 || firstHelp < firstLog);
   const prints = has("version") || firstHelp >= 0 || letters.includes("V");
-  return { longs, letters, shorts, operands, dryRun, listOnly, batch, server, prints, help, daemon: prefixed("daemon"), copiesNothing: prints || (!server && (dryRun || listOnly || (!batch && operands.length < 2))), values: (name: string) => {
+  // The files opened before a help or version query exits: those before the first help word, or
+  // all of them for a version query.
+  const helpAt = order.findIndex((e) => e.help);
+  const opensBeforeExit = (helpAt >= 0 ? order.slice(0, helpAt) : order).flatMap((e) => (e.opens !== undefined ? [e.opens] : []));
+  return { longs, letters, shorts, operands, dryRun, listOnly, batch, server, prints, help, opensBeforeExit, daemon: prefixed("daemon"), copiesNothing: prints || (!server && (dryRun || listOnly || (!batch && operands.length < 2))), values: (name: string) => {
       // (Round 48, Sol: the last `--log-file` is the one rsync opens, and an empty one none.)
       // A help word stops the reading where it stands: a log named after it is never opened.
       const all = (firstHelp >= 0 ? longs.slice(0, firstHelp) : longs).filter(([h]) => h === `--${name}`).map(([, v]) => v ?? "");
@@ -2537,11 +2557,12 @@ export function sortReading(args: string[]): { compressor: boolean; outputs: str
       if (name === "random-sort" || (name === "sort" && value !== undefined && "random".startsWith(value) && value !== "")) random = true;
       if (name === "key" && value !== undefined) keys.push(value);
       if (name === "help" || name === "version") prints = true;
-    } else if (/^\+\d+(\.\d+)?[a-zA-Z]*$/.test(a)) {
+    } else if (/^\+\d+(\.\d+)?[bdfgiMhnRrV]*$/.test(a)) {
       // (Round 54, Sol and Astra: the old key syntax, `+POS1 [-POS2]`, with its modifiers at
       // either end, `sort -R +0n -1`.)
       let key = a.slice(1);
-      if (/^-\d+(\.\d+)?[a-zA-Z]*$/.test(args[i + 1] ?? "")) key += `,${args[++i].slice(1)}`;
+      // (Round 55, Sol: only with modifiers sort takes; `+0xR` is a file.)
+      if (/^-\d+(\.\d+)?[bdfgiMhnRrV]*$/.test(args[i + 1] ?? "")) key += `,${args[++i].slice(1)}`;
       keys.push(key);
     } else if (a.startsWith("-") && a.length > 1) {
       for (let k = 1; k < a.length; k++) {
@@ -2608,9 +2629,8 @@ export function printsOnly(name: string, args: string[]): boolean {
   // (Round 53, Sol: a version query reads nothing; it writes its log, which rsync's own checks read.)
   if (name === "rsync") {
     const r = rsyncReading(args);
-    // (Round 54, Sol: a version query with a filter or list file opens it.)
-    const lists = ["include-from", "exclude-from", "files-from", "filter"].some((n) => r.values(n).length) || r.shorts.some(([l]) => l === "f");
-    return r.help || (r.prints && !r.values("log-file").length && !lists);
+    // (Round 54 and 55: a query that opens a filter file first does read it.)
+    return r.prints && !r.opensBeforeExit.length && (r.help || !r.values("log-file").length);
   }
   // (The compressors' queries are read by compressorReading, as writing nothing.)
   return false;

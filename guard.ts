@@ -7740,8 +7740,9 @@ const LIST_OPTIONS: Record<string, ListSpec> = {
 };
 function listOptions(name: string, args: string[]): string[] {
   // (Round 50, Astra: a help or version query reads no list, `rsync --help --files-from=.netrc`.)
-  // (Round 54, Sol: rsync's version query still opens its list files; its help does not.)
-  if (printsOnly(name, args) || (name === "rsync" && rsyncReading(args).help)) return [];
+  // (Round 54 and 55: a query opens only the filter files read before it exits.)
+  if (printsOnly(name, args)) return [];
+  if (name === "rsync" && rsyncReading(args).prints) return rsyncReading(args).opensBeforeExit;
   // (Round 51, Sol: sort's list as its reader reads it, an option's value being no option.)
   if (name === "sort") return sortReading(args).lists;
   // (B8-8: git's are its subcommand's, read after git's own leading options.)

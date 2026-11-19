@@ -3924,7 +3924,7 @@ const PLAIN_TOOLS = new Set(
   `sort cat head tail wc grep egrep fgrep ls cut tr uniq diff cmp comm nl tac rev fold paste join column stat file du basename dirname readlink
    realpath echo printf jq yq tree bat seq cp mv ln install rsync tee truncate touch mkdir rmdir chmod chown chgrp setfacl shred unlink rm od
    xxd hexdump strings sha1sum sha224sum sha256sum sha384sum sha512sum md5sum b2sum b3sum cksum sum base32 base64 iconv expand unexpand fmt pr
-   split csplit shuf numfmt tsort look zcat xzcat bzcat zstdcat gzip gunzip xz unxz zstd unzstd bzip2 bunzip2 lzma tar zip unzip`.split(/\s+/),
+   split csplit shuf numfmt tsort look rg ag ack find zcat xzcat bzcat zstdcat gzip gunzip xz unxz zstd unzstd bzip2 bunzip2 lzma tar zip unzip`.split(/\s+/),
 );
 // `~+` is the directory the command runs in (round 42, Mythos).
 const herePlus = (word: string) => (word === "~+" ? "." : word.startsWith("~+/") ? `.${word.slice(2)}` : word);
@@ -3949,7 +3949,13 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       if (!placed.includes(at) && owner !== undefined && PLAIN_TOOLS.has(path.basename(cmd.argv[owner]))) return;
       // (git's own subcommand is a writer's name, `git mv f ./--zz`; its pathspecs after `--` are
       // operands, `git ls-files -- cp .git/x`.)
-      if (!placed.includes(at) && owner !== undefined && path.basename(cmd.argv[owner]) === "git" && cmd.argv.slice(owner + 1, at).includes("--")) return;
+      // (Round 55, Sol: every word after the subcommand is a pathspec or an option's value,
+      // `git ls-files --others cp .git/x`.)
+      if (!placed.includes(at) && owner !== undefined && path.basename(cmd.argv[owner]) === "git") {
+        let sub = owner + 1;
+        while (sub < at && cmd.argv[sub].startsWith("-")) sub += /^(-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--config-env)$/.test(cmd.argv[sub]) ? 2 : 1;
+        if (sub < at) return;
+      }
       const how = Object.hasOwn(WRITER_OPERANDS, path.basename(word)) ? WRITER_OPERANDS[path.basename(word)] : undefined;
       // (Round 54, Opus: inside `find -exec`, the command's words end at the `;` or `{} +` that
       // closes it: `find . -exec cp f .git/x \;` writes `.git/x`, not `;/x`.)
