@@ -455,7 +455,13 @@ function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope)
   if (printsOnly(name, args)) return undefined;
   // (Round 51, Sol: sort's files are its operands and its option values, read by position.)
   if (name === "sort") {
-    const posix = cmd.argv.find((w) => /^_POSIX2_VERSION=/.test(w));
+    // (Round 57, Sol: the assignments before the program, or behind `env`, the last one winning;
+    // an operand of that shape is a file.)
+    let posix: string | undefined;
+    for (const w of cmd.argv) {
+      if (/^_POSIX2_VERSION=/.test(w)) posix = w;
+      else if (!(w === "env" || /^[A-Za-z_]\w*=/.test(w))) break;
+    }
     for (const w of sortReading(args, posix !== undefined ? Number(posix.slice(16)) >= 200112 : undefined).reads) {
       const secret = secretIn(w, scope, false, true);
       if (secret) return secret;
@@ -2562,7 +2568,9 @@ export function sortReading(args: string[], posix2 = Number(process.env._POSIX2_
       if (name === "random-sort" || (name === "sort" && value !== undefined && "random".startsWith(value) && value !== "")) random = true;
       if (name === "key" && value !== undefined) keys.push(value);
       if (name === "help" || name === "version") prints = true;
-    } else if (!posix2 && /^\+\d+(\.\d+)?[bdfgiMhnRrV]*$/.test(a)) {
+    // (Round 57, Astra: under _POSIX2_VERSION 200112 or later, GNU sort still takes `+POS` for a key
+    // where a `-POS` follows it, unless POSIXLY_CORRECT is set.)
+    } else if (/^\+\d+(\.\d+)?[bdfgiMhnRrV]*$/.test(a) && (!posix2 || (/^-\d/.test(args[i + 1] ?? "") && process.env.POSIXLY_CORRECT === undefined))) {
       // (Round 54, Sol and Astra: the old key syntax, `+POS1 [-POS2]`, with its modifiers at
       // either end, `sort -R +0n -1`.)
       let key = a.slice(1);
@@ -3046,14 +3054,24 @@ export function findActions(args: string[]): { at: number[]; names: string[] } {
 }
 
 function find(args: string[], scope: Scope): Verdict {
-  const firstOption = args.findIndex((a) => /^(-|\(|!)/.test(a));
-  const roots = firstOption < 0 ? args : args.slice(0, firstOption);
+  // (Round 57, Opus: the start points come after find's own leading options, `-H -L -P -D x -O<n>`,
+  // and `--`: `find -L ~ -delete` starts at `~`.)
+  let lead = 0;
+  while (lead < args.length && /^-[HLP]$|^-D$|^-O\d*$/.test(args[lead])) lead += args[lead] === "-D" ? 2 : 1;
+  if (args[lead] === "--") lead++;
+  const rest = args.slice(lead);
+  const firstOption = rest.findIndex((a) => /^(-|\(|!)/.test(a));
+  const roots = firstOption < 0 ? rest : rest.slice(0, firstOption);
   const actions = findActions(args);
   if (!actions.at.length) return ALLOW;
+  // Start points read from a file are places the rules cannot tell.
+  if (args.some((a) => a === "-files0-from")) return ask("find deletes or runs commands at start points read from a file");
   for (const r of roots.length ? roots : ["."]) {
     const p = resolveWord(r, scope);
     if (isPiFile(p, scope)) return piAsk(`find deletes or runs commands in Pi's own files: ${r}`);
     if (!isLocal(p, scope)) return outside(`find deletes or runs commands outside the working directory: ${r}`, p);
+    // (Round 57, Opus: a start point in a .git directory, where git finds hooks and config.)
+    if (/(^|\/)\.git(\/|$)/.test(p ?? r)) return ask(`find deletes or runs commands in a .git directory: ${r}`);
   }
   const exec = actions.at.find((i) => /^-(exec|execdir|ok|okdir)$/.test(args[i])) ?? -1;
   if (exec < 0) return classify("find -delete or a -fprint write");

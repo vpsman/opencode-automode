@@ -1345,11 +1345,35 @@ test("round 55: rsync opens filter files as it reads each option, before a later
 test("round 56: find's actions read in place, rsync's short filter rules with modifiers, git's option values, sort under _POSIX2_VERSION", async () => {
   // Astra: a literal -exec is no action outside find's action place.
   for (const c of ["rg --files -- -exec cp .git/report", "git ls-files --others -- -exec cp .git/report", "find . -name -exec -o -name cp -o -path ./.git/report", "git -C nested/cp ls-files --others -- f .git/report"]) assert.equal(await effect(c), "allow", c);
-  for (const c of ["find . -name x -exec cp f .git/x \;", "find . -type f -exec true \; -exec cp f .git/x \;", "find . -newermt 2020 -exec cp f .git/x \;", "git -C . mv f ./--zz"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["find . -name x -exec cp f .git/x \\;", "find . -type f -exec true \\; -exec cp f .git/x \\;", "find . -newermt 2020 -exec cp f .git/x \\;", "git -C . mv f ./--zz"]) assert.notEqual(await effect(c), "allow", c);
   // Opus: `.-`, `.e`, `merge,/` open their file before a query exits.
   for (const c of ["rsync --version --filter='.- .netrc'", "rsync -f'.- .netrc' --version", "rsync --version --filter='merge,/- .netrc'", "rsync --filter='.- .netrc' --help", "rsync --filter='merge,/ .netrc' --info=help"]) assert.notEqual(await effect(c), "allow", c);
   // Sol: under _POSIX2_VERSION=200112, `+0R` is a file: the call goes to the model for the
   // variable, not to a credential ask.
   const d = await decideShell(guard, new SessionState(repo), repo, "_POSIX2_VERSION=200112 sort +0R --random-source=.netrc rows");
   assert.doesNotMatch(d.reason, /credential/);
+});
+
+// ---- round 57 ----
+
+test("round 57: find is the program a command runs, its outputs where it reads them, sort's paired old keys", async () => {
+  // Astra: a pathspec named find owns no action; -name takes -fprint0 as its pattern.
+  for (const c of ["git ls-files -- find -exec cp .git/report", "find . -name -fprint0 -print", "sort -R +0n -1 --random-source=.netrc rows"]) assert.equal(await effect(c), "allow", c);
+  // Sol: a find placed only after a non-action -exec owns none; an operand shaped like an
+  // assignment sets nothing.
+  assert.equal(await effect("rg --files -- -exec find -exec cp .git/report"), "allow");
+  process.env._POSIX2_VERSION = "200112";
+  try {
+    assert.equal(await effect("sort +0R --random-source=.netrc _POSIX2_VERSION=199209 rows"), "allow");
+  } finally {
+    delete process.env._POSIX2_VERSION;
+  }
+  // Opus: find's start points come after its leading options; a .git start point asks.
+  for (const c of ["find -L ~ -name '*.bak' -delete", "find -P .. -name x -delete", "find -H ~/.ssh -type f -exec cat {} +", "find -O3 /etc -exec cat {} +", "find -files0-from list -delete", "find .git/hooks -delete", "find .git -name config -exec rm {} +"]) {
+    const d = await decideShell(guard, new SessionState(repo), repo, c);
+    assert.equal(d.effect, "ask", c);
+    assert.match(d.reason, /outside the working directory|start points read from a file|in a \.git directory/, c);
+  }
+  assert.equal(await effect("find -L src -name '*.ts'"), "allow");
+  for (const c of ["find . -fprint0 .git/x", "find . -name x -fprint .git/x", "find . -exec cp f .git/x \\;"]) assert.notEqual(await effect(c), "allow", c);
 });

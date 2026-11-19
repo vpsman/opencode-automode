@@ -3922,8 +3922,13 @@ function optionNamedPath(cmds: Simple[], dirsOf: (cmd: Simple) => string[] | und
 // Whether the word at `i` (an `-exec`-like word) is an action of a `find` (round 56), as rules.ts
 // `findActions` reads find's words.
 function findAction(argv: string[], i: number): boolean {
+  // (Round 57, Astra and Sol: the find a command runs, not a word named find, `git ls-files --
+  // find -exec`; one placed only after an `-exec` is a find only where that `-exec` is an action,
+  // `rg --files -- -exec find -exec cp .git/x`.)
+  const at = programs(argv);
+  const runs = (p: number): boolean => at.includes(p) && !(p > 0 && /^-(exec|execdir|ok|okdir)$/.test(argv[p - 1]) && !findAction(argv, p - 1));
   let p = i - 1;
-  while (p >= 0 && path.basename(argv[p]) !== "find") p--;
+  while (p >= 0 && !(path.basename(argv[p]) === "find" && runs(p))) p--;
   return p >= 0 && findActions(argv.slice(p + 1)).at.includes(i - p - 1);
 }
 

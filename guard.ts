@@ -16,7 +16,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { bare, bashVerdict, compressorReading, copiesNothing, printsOnly, sortReading, sortRunsCompressor, fileVerdict, parse, readVerdict, rsyncReading, tarReading, within, type Matcher, type Scope, type Simple } from "./rules.ts";
+import { bare, bashVerdict, compressorReading, copiesNothing, findActions, printsOnly, sortReading, sortRunsCompressor, fileVerdict, parse, readVerdict, rsyncReading, tarReading, within, type Matcher, type Scope, type Simple } from "./rules.ts";
 import { gitArgs, gitEnv } from "./sandbox.ts";
 
 const HOME = os.homedir();
@@ -5427,7 +5427,8 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       const compressed = compressorWrites(name, args);
       compressed.files.forEach((f) => add(f, false));
       compressed.dirs.forEach((d) => add(d, false, { dir: true }));
-      if (name === "find") args.forEach((a, k) => void (/^-(fprint0?|fprintf|fls)$/.test(a) && place(args[k + 1], false)));
+      // (Round 57, Astra: find's output actions where find reads them, `-name -fprint0` is a pattern.)
+      if (name === "find") for (const k of findActions(args).at) if (/^-(fprint0?|fprintf|fls)$/.test(args[k])) place(args[k + 1], false);
       // (Round 46, Sol: a dry run or listing writes no backup, temp or partial files, as the rules
       // read it; a version or help query nothing.)
       const rs = name === "rsync" ? rsyncReading(args) : undefined;
