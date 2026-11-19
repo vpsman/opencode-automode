@@ -3921,15 +3921,24 @@ function optionNamedPath(cmds: Simple[], dirsOf: (cmd: Simple) => string[] | und
 // a name is not written "into" it by every write).
 // Whether the word at `i` (an `-exec`-like word) is an action of a `find` (round 56), as rules.ts
 // `findActions` reads find's words.
+// (Round 57, Astra and Sol: the find a command runs, not a word named find, `git ls-files --
+// find -exec`; one placed only after an `-exec` is a find only where that `-exec` is an action,
+// `rg --files -- -exec find -exec cp .git/x`. Round 58, Opus: remembered per word, as the
+// recursion was exponential in nested finds; and any running find before it may own it, not
+// only the nearest, whose own command may have ended.)
+const findActionMemo = new WeakMap<string[], Map<number, boolean>>();
 function findAction(argv: string[], i: number): boolean {
-  // (Round 57, Astra and Sol: the find a command runs, not a word named find, `git ls-files --
-  // find -exec`; one placed only after an `-exec` is a find only where that `-exec` is an action,
-  // `rg --files -- -exec find -exec cp .git/x`.)
+  let memo = findActionMemo.get(argv);
+  if (!memo) findActionMemo.set(argv, (memo = new Map()));
+  const known = memo.get(i);
+  if (known !== undefined) return known;
+  memo.set(i, false);
   const at = programs(argv);
   const runs = (p: number): boolean => at.includes(p) && !(p > 0 && /^-(exec|execdir|ok|okdir)$/.test(argv[p - 1]) && !findAction(argv, p - 1));
-  let p = i - 1;
-  while (p >= 0 && !(path.basename(argv[p]) === "find" && runs(p))) p--;
-  return p >= 0 && findActions(argv.slice(p + 1)).at.includes(i - p - 1);
+  let result = false;
+  for (let p = i - 1; p >= 0 && !result; p--) if (path.basename(argv[p]) === "find" && runs(p) && findActions(argv.slice(p + 1)).at.includes(i - p - 1)) result = true;
+  memo.set(i, result);
+  return result;
 }
 
 // File tools that run no program their words name (rounds 52 and 54): behind one, a word named

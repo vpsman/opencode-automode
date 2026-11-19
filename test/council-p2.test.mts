@@ -1377,3 +1377,31 @@ test("round 57: find is the program a command runs, its outputs where it reads t
   assert.equal(await effect("find -L src -name '*.ts'"), "allow");
   for (const c of ["find . -fprint0 .git/x", "find . -name x -fprint .git/x", "find . -exec cp f .git/x \\;"]) assert.notEqual(await effect(c), "allow", c);
 });
+
+// ---- round 58 ----
+
+test("round 58: sort's old keys stay keys after a pair, env -i clears _POSIX2_VERSION, find's start points and help, nested finds in linear time", async () => {
+  const old = process.env._POSIX2_VERSION;
+  process.env._POSIX2_VERSION = "200112";
+  try {
+    // Opus: after `+0 -1`, `+0R` is a key; `env -i` gives sort no _POSIX2_VERSION.
+    for (const c of ["sort +0 -1 +0R --random-source=.netrc rows", "env -i sort +0R --random-source=.netrc rows"]) assert.notEqual(await effect(c), "allow", c);
+    // Sol, Astra: a pair's own ordering, with the variable set (POSIXLY_CORRECT never reaches sort).
+    for (const c of ["sort -R +0n -1 --random-source=.netrc rows", "sort +0n -1 --random-source=.netrc -R rows"]) assert.equal(await effect(c), "allow", c);
+  } finally {
+    if (old === undefined) delete process.env._POSIX2_VERSION;
+    else process.env._POSIX2_VERSION = old;
+  }
+  // Opus: a lone `-` or `!x` is a start point; Sol: find's help runs no action; Astra, Sol:
+  // `-name -files0-from` is a pattern.
+  for (const c of ["find - ~ -name '*.bak' -delete", "find '!x' ~ -delete", "find . -exec find -fprintf \\; -exec cp f .git/x \\;"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["find -D help . -exec printf x {} +", "find -help . -exec printf x {} +", "find . -name -files0-from -print"]) assert.equal(await effect(c), "allow", c);
+  const d = await decideShell(guard, new SessionState(repo), repo, "find . -name -files0-from -exec ls -d {} +");
+  assert.doesNotMatch(d.reason, /start points read from a file/);
+  // Opus: nested finds are read in linear time.
+  const n = 24;
+  const deep = "find . " + "-exec find ".repeat(n) + "-exec cp f .git/x " + "\\; ".repeat(n + 1);
+  const started = Date.now();
+  assert.notEqual(await effect(deep), "allow");
+  assert.ok(Date.now() - started < 5000, `${Date.now() - started} ms`);
+});

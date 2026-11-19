@@ -457,9 +457,14 @@ function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope)
   if (name === "sort") {
     // (Round 57, Sol: the assignments before the program, or behind `env`, the last one winning;
     // an operand of that shape is a file.)
+    // (Round 58, Opus: `env -i` and `env -u _POSIX2_VERSION` clear it for sort.)
     let posix: string | undefined;
-    for (const w of cmd.argv) {
+    for (let k = 0; k < cmd.argv.length; k++) {
+      const w = cmd.argv[k];
       if (/^_POSIX2_VERSION=/.test(w)) posix = w;
+      else if (w === "-i" || w === "--ignore-environment" || w === "-") posix = "_POSIX2_VERSION=0";
+      else if ((w === "-u" || w === "--unset") && cmd.argv[k + 1] === "_POSIX2_VERSION") (posix = "_POSIX2_VERSION=0"), k++;
+      else if (w === "-u_POSIX2_VERSION" || w === "--unset=_POSIX2_VERSION") posix = "_POSIX2_VERSION=0";
       else if (!(w === "env" || /^[A-Za-z_]\w*=/.test(w))) break;
     }
     for (const w of sortReading(args, posix !== undefined ? Number(posix.slice(16)) >= 200112 : undefined).reads) {
@@ -2545,6 +2550,7 @@ export function sortReading(args: string[], posix2 = Number(process.env._POSIX2_
   const lists: string[] = [];
   let source: string | undefined;
   let random = false;
+  let traditional = false;
   const keys: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -2569,8 +2575,10 @@ export function sortReading(args: string[], posix2 = Number(process.env._POSIX2_
       if (name === "key" && value !== undefined) keys.push(value);
       if (name === "help" || name === "version") prints = true;
     // (Round 57, Astra: under _POSIX2_VERSION 200112 or later, GNU sort still takes `+POS` for a key
-    // where a `-POS` follows it, unless POSIXLY_CORRECT is set.)
-    } else if (/^\+\d+(\.\d+)?[bdfgiMhnRrV]*$/.test(a) && (!posix2 || (/^-\d/.test(args[i + 1] ?? "") && process.env.POSIXLY_CORRECT === undefined))) {
+    // where a `-POS` follows it. Round 58, Opus: and once it has, every later `+POS` is a key too.
+    // POSIXLY_CORRECT is not read: the sandbox gives commands none, Astra and Sol.)
+    } else if (/^\+\d+(\.\d+)?[bdfgiMhnRrV]*$/.test(a) && (!posix2 || traditional || /^-\d/.test(args[i + 1] ?? ""))) {
+      traditional = true;
       // (Round 54, Sol and Astra: the old key syntax, `+POS1 [-POS2]`, with its modifiers at
       // either end, `sort -R +0n -1`.)
       let key = a.slice(1);
@@ -3036,13 +3044,26 @@ const FIND_ONE = new Set(
    -cmin -newer -anewer -cnewer -samefile -inum -links -maxdepth -mindepth -fprint -fprint0 -fls -printf -lname -ilname -uid -gid -used -context
    -files0-from -fstype`.split(/\s+/),
 );
-export function findActions(args: string[]): { at: number[]; names: string[] } {
+// (Round 58, Opus: as find's `looks_like_expression` tells, a word is an expression only if it is a
+// `-` followed by more, or exactly `(`, `!`, `)` or `,`: a lone `-` or `!x` is a start point.)
+export const findExpression = (w: string) => /^-./.test(w) || /^[(!),]$/.test(w);
+export function findActions(args: string[]): { at: number[]; names: string[]; files0: boolean; prints: boolean } {
   const at: number[] = [];
+  let files0 = false;
+  let prints = false;
   let k = 0;
-  while (k < args.length && /^-[HLP]$|^-D$|^-O\d*$/.test(args[k])) k += args[k] === "-D" ? 2 : 1;
-  while (k < args.length && !/^[-(!),]/.test(args[k])) k++;
+  while (k < args.length && /^-[HLP]$|^-D$|^-O\d*$/.test(args[k])) {
+    if (args[k] === "-D" && args[k + 1] === "help") prints = true;
+    k += args[k] === "-D" ? 2 : 1;
+  }
+  if (args[k] === "--") k++;
+  while (k < args.length && !findExpression(args[k])) k++;
   for (; k < args.length; k++) {
     const w = args[k];
+    // (Round 58, Sol: `-help` and `-version` print and run no action; Astra and Sol:
+    // `-files0-from` as find reads it, not a `-name` pattern.)
+    if (/^--?(help|version)$/.test(w)) prints = true;
+    if (w === "-files0-from") files0 = true;
     if (/^-(delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$/.test(w)) at.push(k);
     if (/^-(exec|execdir|ok|okdir)$/.test(w)) {
       while (k + 1 < args.length && !(args[k + 1] === ";" || (args[k + 1] === "+" && args[k] === "{}"))) k++;
@@ -3050,7 +3071,7 @@ export function findActions(args: string[]): { at: number[]; names: string[] } {
     } else if (w === "-fprintf" || /^-newer[aBcmt][aBcmt]$/.test(w)) k += w === "-fprintf" ? 2 : 1;
     else if (FIND_ONE.has(w)) k++;
   }
-  return { at, names: at.map((i) => args[i]) };
+  return prints ? { at: [], names: [], files0: false, prints } : { at, names: at.map((i) => args[i]), files0, prints };
 }
 
 function find(args: string[], scope: Scope): Verdict {
@@ -3060,12 +3081,12 @@ function find(args: string[], scope: Scope): Verdict {
   while (lead < args.length && /^-[HLP]$|^-D$|^-O\d*$/.test(args[lead])) lead += args[lead] === "-D" ? 2 : 1;
   if (args[lead] === "--") lead++;
   const rest = args.slice(lead);
-  const firstOption = rest.findIndex((a) => /^(-|\(|!)/.test(a));
+  const firstOption = rest.findIndex(findExpression);
   const roots = firstOption < 0 ? rest : rest.slice(0, firstOption);
   const actions = findActions(args);
   if (!actions.at.length) return ALLOW;
   // Start points read from a file are places the rules cannot tell.
-  if (args.some((a) => a === "-files0-from")) return ask("find deletes or runs commands at start points read from a file");
+  if (actions.files0) return ask("find deletes or runs commands at start points read from a file");
   for (const r of roots.length ? roots : ["."]) {
     const p = resolveWord(r, scope);
     if (isPiFile(p, scope)) return piAsk(`find deletes or runs commands in Pi's own files: ${r}`);

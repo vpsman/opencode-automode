@@ -3526,7 +3526,9 @@ const RUNS_NOTHING = RULES_NOOP;
 // The programs bash and the wrapped programs really run, from argv[start] on: every wrapper,
 // runner and program position (pushed to `out`). Returns a reason when the reading is unknown,
 // and the index of the main program (the first that is neither a wrapper nor a runner).
-function faithful(argv: string[], start: number, out: number[]): { main: number; problem?: string } {
+// (Council project review 2, round 58, Opus: each `-exec` start is read once in a call, as a
+// find's words were read again for every find inside it, exponential in nested finds.)
+function faithful(argv: string[], start: number, out: number[], seen = new Set<number>()): { main: number; problem?: string } {
   let i = start;
   let assignments = true;
   let keywords = true;
@@ -3568,7 +3570,11 @@ function faithful(argv: string[], start: number, out: number[]): { main: number;
     }
     if (name === "find") {
       let problem: string | undefined;
-      for (let j = i + 1; j < argv.length; j++) if (/^-(exec|execdir|ok|okdir)$/.test(argv[j])) problem ??= faithful(argv, j + 1, out).problem;
+      for (let j = i + 1; j < argv.length; j++) {
+        if (!/^-(exec|execdir|ok|okdir)$/.test(argv[j]) || seen.has(j + 1)) continue;
+        seen.add(j + 1);
+        problem ??= faithful(argv, j + 1, out, seen).problem;
+      }
       return { main: i, problem };
     }
     return { main: i };
