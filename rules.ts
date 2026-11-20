@@ -2838,6 +2838,15 @@ function psPlain(args: string[]): boolean {
   return true;
 }
 // Undefined when the call is spelled plainly; otherwise why it asks.
+// cloc counts lines, but some options write files (`--out`, `--report-file`, `--strip-comments`,
+// `--sql`, `--write-lang-def`) or run a program (`--vcs=<command>`): only its listing options are
+// read (project review 3, round 2, Mythos: `cloc --out=package.json .` was allowed unrecorded).
+const CLOC_PLAIN: Plain = {
+  short: "",
+  shortValued: "",
+  flags: "by-file by-file-by-lang json yaml csv md xml quiet hide-rate fullpath follow-links skip-uniqueness no-autogen".split(" "),
+  valued: "exclude-dir exclude-ext exclude-lang include-lang include-ext match-f not-match-f match-d not-match-d timeout processes".split(" "),
+};
 export function unreadSpelling(name: string, args: string[]): string | undefined {
   if (args.length === 1 && /^--(help|version)$/.test(args[0])) return undefined;
   const plain =
@@ -2847,6 +2856,7 @@ export function unreadSpelling(name: string, args: string[]): string | undefined
     : name === "sort" ? optionsPlain(args, SORT_PLAIN)
     : name === "ps" ? psPlain(args)
     : Object.hasOwn(COMPRESSORS, name) ? optionsPlain(args, COMPRESSOR_PLAIN)
+    : name === "cloc" ? optionsPlain(args, CLOC_PLAIN)
     : true;
   return plain ? undefined : `${name} with an option or spelling the rules do not read`;
 }

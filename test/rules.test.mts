@@ -195,6 +195,12 @@ const CASES: [string, string, Want, Record<string, string[]>?][] = [
   ["x for loop over a credential glob", "for f in .e*; do cat \"$f\"; done", "not-allow"],
   ["ok git -c user.name", "git -c user.name=x commit -m y", "allow"],
   ["ok git config user.email", "git config user.email x@y", "allow"],
+  // Project review 3, round 2 (Mythos): cloc's options that write files or run a program.
+  ["p3r2 cloc --out", "cloc --out=package.json .", "not-allow"],
+  ["p3r2 cloc --report-file", "cloc --report-file r.txt .", "not-allow"],
+  ["p3r2 cloc --strip-comments", "cloc --strip-comments=nc f", "not-allow"],
+  ["p3r2 cloc --vcs", "cloc --vcs='sh -c id' .", "not-allow"],
+  ["ok cloc", "cloc --by-file --json --exclude-dir=node_modules,dist src", "allow"],
   ["ok sed print", "sed -n '1,5p' f", "allow"],
   ["ok sed -i substitute", "sed -i 's/a/b/g' src/x.ts", "allow"],
   ["ok awk print", "awk '{print $1}' f", "allow"],

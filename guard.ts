@@ -5335,6 +5335,55 @@ export interface Unlisted {
 // after, and the status, show. `apply` and the commands that make another work tree or rewrite
 // the index by hand keep the directory mark.
 export const WORKTREE_GIT = new Set(["am", "checkout", "switch", "restore", "reset", "stash", "merge", "pull", "rebase", "cherry-pick", "revert", "mv", "bisect"]);
+// The second name a writer gives a file, which its command line fixes (project review 3, round 2,
+// Mythos): the backup `sed -i<suffix>`, `cp`/`mv`/`ln`/`install -S` and `patch -z`/`-B`/`-Y` make
+// beside a target (`sed -it p sub/.gi` makes `sub/.git`), and what a compressor writes in place:
+// the input less its suffix, or the input it replaces (`gunzip AGENTS.md.gz`, `gzip AGENTS.md`).
+// Held to the protected-name test like every target (decide.ts, writeProblem); not added to the
+// session's write record, where a compressor's copy is no write of content (README).
+export function secondNames(cmd: Simple, writes: Write[], expand: (word: string) => string[] | undefined): string[] {
+  const out: string[] = [];
+  for (const at of programs(cmd.argv)) {
+    const name = path.basename(cmd.argv[at]);
+    const args = cmd.argv.slice(at + 1);
+    if (printsOnly(name, args)) continue;
+    const mine = writes.filter((w) => w.cmd === cmd && w.by === name);
+    if (name === "sed") {
+      for (const a of args) {
+        const suffix = /^-[a-zA-Z]*i(.+)$/s.exec(a)?.[1] ?? /^--i[a-z-]*=(.+)$/s.exec(a)?.[1];
+        if (suffix !== undefined) for (const w of mine) out.push(w.word + suffix);
+      }
+    } else if (Object.hasOwn(COPY_OPTIONS, name)) {
+      const suffixes = getopt(args, COPY_OPTIONS[name]).opts.filter((o) => o.name === "-S" || o.name === "--suffix").map((o) => o.value ?? "");
+      for (const s of suffixes) {
+        for (const w of mine) {
+          // A destination may be a directory: the backup is then of the file each source lands on.
+          if (!w.dir) out.push(w.word + s);
+          for (const src of w.sources ?? []) out.push(`${w.word.replace(/\/+$/, "")}/${path.basename(src.replace(/\/+$/, ""))}${s}`);
+        }
+      }
+    } else if (name === "patch") {
+      const opts = getopt(args, PATCH_OPTIONS).opts;
+      const of = (...names: string[]) => opts.filter((o) => names.includes(o.name)).map((o) => o.value ?? "");
+      for (const w of mine) {
+        for (const s of of("-z", "--suffix")) out.push(w.word + s);
+        for (const p of of("-B", "--prefix")) out.push(p + w.word);
+        for (const p of of("-Y", "--basename-prefix")) out.push(path.join(path.dirname(w.word), p + path.basename(w.word)));
+      }
+    } else {
+      const z = compressorReading(name, args);
+      if (!z || !z.inPlace || z.reads) continue;
+      for (const operand of z.operands) {
+        for (const n of /[*?[]/.test(operand) ? (expand(operand) ?? [operand]) : [operand]) {
+          const made = z.decompress ? z.outputName(n) : n;
+          if (made !== undefined) out.push(made);
+        }
+      }
+    }
+  }
+  return out;
+}
+
 export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Simple) => boolean): { writes: Write[]; unknown?: string; unlisted: Unlisted[] } {
   const writes: Write[] = [];
   const unlisted: Unlisted[] = [];

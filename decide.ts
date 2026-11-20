@@ -44,7 +44,7 @@ import { TEMP_CODE_CACHES, findGitEntries, gitArgs, Scan, gitEnv, gitReadsElsewh
 import { canonical, type Printed } from "./canon.ts";
 import { PathWalkError, PWD_LEAD, fetchDestination, functionNames, pathFinds, pathHas, procRelative, runsItsWords, tempDirs, unseenWriter } from "./guard.ts";
 import { bentEnv, bentPath, gitOnlyReads, runsAnyProgram, runsProjectCode } from "./guard.ts";
-import { abbreviates, allCommands, arithmeticAssignments, braceWords, expandNames, expandWord, gitMessageWords, EDITOR_ASSIGNMENT, editorCommand, programs, withoutGlobals, alsoByName, argvGuards, dangerousName, envAssignmentsOk, expansionProblem, gitCall, gitProblem, inputReads, landing, linkedReads, literalTargets, located, physical, placedReads, present, cdTo, type Place, type Places, observer, protectedNameIn, runtimeReads, single, stricter, strict, strictCommands, textGuards, tilde, tildeMismatch, unmodelled, writesOf, writtenBy, type Single, type StrictCommand, getopt, GIT_OPTIONS, lastOf, type Getopt, unreadableGlob, withoutExpansions } from "./guard.ts";
+import { abbreviates, allCommands, arithmeticAssignments, braceWords, expandNames, secondNames, expandWord, gitMessageWords, EDITOR_ASSIGNMENT, editorCommand, programs, withoutGlobals, alsoByName, argvGuards, dangerousName, envAssignmentsOk, expansionProblem, gitCall, gitProblem, inputReads, landing, linkedReads, literalTargets, located, physical, placedReads, present, cdTo, type Place, type Places, observer, protectedNameIn, runtimeReads, single, stricter, strict, strictCommands, textGuards, tilde, tildeMismatch, unmodelled, writesOf, writtenBy, type Single, type StrictCommand, getopt, GIT_OPTIONS, lastOf, type Getopt, unreadableGlob, withoutExpansions } from "./guard.ts";
 
 export type Effect = "allow" | "ask" | "deny";
 
@@ -3955,7 +3955,15 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
   // Also every place the guard's own list of writes names (`cp -t`, `sort -o`, git's `--output`).
   const extra = writesOf(cmds).writes;
   for (const cmd of cmds) {
-    const targets = [...cmd.out, ...extra.filter((w) => w.cmd === cmd).map((w) => w.word)];
+    // (Project review 3, round 2, Mythos: with the second names a writer gives, a backup or a
+    // compressor's output.)
+    const expand = (word: string) => {
+      const dirs = dirsOf?.(cmd);
+      if (!dirs?.length) return undefined;
+      const all = dirs.map((dir) => expandNames(word, dir));
+      return all.some((n) => n === undefined) ? undefined : all.flatMap((n) => n!.map((name) => path.normalize(name)));
+    };
+    const targets = [...cmd.out, ...extra.filter((w) => w.cmd === cmd).map((w) => w.word), ...secondNames(cmd, extra, expand)];
     // Round 4, N3: the targets that make a file (see NAME_KEEPERS), with the operands after `--`.
     const made = extra.filter((w) => w.cmd === cmd && !NAME_KEEPERS.has(w.by ?? "")).map((w) => w.word);
     // (Round 51, Sol: after a program that only prints its help, a later word is a command only
