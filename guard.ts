@@ -2318,6 +2318,13 @@ export function globMatcher(segment: string): (name: string) => GlobAnswer {
 // (`cwd`; unknown, it is held to the pattern too). As bash does, `*`, `?` and `[...]` match a
 // leading dot only when the pattern starts with one.
 const ORDINARY_NAMES = ["x", ".x", "x.md", "x.json", "x.jsonc", "x.yml", "x.yaml", "x.toml", "x.txt", "README.md", "x.sh"];
+// Whether a name's segment is a glob that can match an ordinary file's name, as bash matches it
+// (a leading `.` only by a leading `.`).
+export const ordinaryGlob = (segment: string) => {
+  if (!/[*?[]/.test(segment)) return false;
+  const glob = globMatcher(segment);
+  return ORDINARY_NAMES.some((n) => glob(n).match && (segment.startsWith(".") || !n.startsWith(".")));
+};
 export function protectedNameIn(target: string, names: string[], cwd?: string): string | undefined {
   const alternatives = braceWords(target) ?? [target.replace(/\{[^{}]*\}/g, "*")];
   for (const alt of alternatives) {
@@ -5423,6 +5430,17 @@ export function secondNames(cmd: Simple, writes: Write[], expand: (word: string)
         // resolved from the call's own variables or asked about, rules.ts commandRead; any
         // other compressor is a command the rules do not know, which goes to the model.)
         if (/[$`]/.test(operand)) continue;
+        // (Project review 3, closing round, Opus: a glob is also held as written, for a file the
+        // call itself makes before it runs, which no listing at decision time finds:
+        // `gzip -c f > opencode.json.gz; gunzip opencode.json.g?`. The pattern, what the
+        // decompression makes of it, and a decompression's pattern less a last ending that holds
+        // the glob (`.g?`, `.*`); each only where its name cannot be an ordinary file's, so that
+        // `gunzip *.gz` is held to the names on disk alone.)
+        if (glob(operand)) {
+          const stem = operand.replace(/\.[^./]*[*?[][^./]*$/, "");
+          const held = z.decompress ? [operand, z.outputName(operand), stem !== operand ? stem : undefined] : [operand];
+          for (const p of held) if (p !== undefined && !ordinaryGlob(path.basename(p))) out.push(p);
+        }
         for (const n of glob(operand) ? (expand(operand) ?? [operand]) : [operand]) {
           // Round 3, Mythos: a name without a known suffix is one gzip completes (`gunzip
           // AGENTS.md` reads `AGENTS.md.gz`) and writes as given.
