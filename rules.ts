@@ -178,6 +178,9 @@ export interface Scope {
   // True for a variable the command does not set anywhere: it holds what the environment the
   // command starts with gives it (the environment of opencode, which runs it), or nothing.
   unassigned?: (name: string) => boolean;
+  // The variables the call assigns where the text the rules are given no longer shows it: by
+  // arithmetic, which the caller's printer takes out (decide.ts; project review 3, round 5).
+  reassigned?: Set<string>;
 }
 
 const expandHome = (p: string) => (p === "~" || p.startsWith("~/") ? HOME + p.slice(1) : p);
@@ -666,6 +669,9 @@ export interface Simple {
   dyn?: boolean[];
   // The operator that follows the command: `;`, a newline, `&&`, `||`, `|`, `&`, `(` or `)`.
   next?: string;
+  // `&&` or `||` where that joins the command to one that is not listed: an arithmetic command,
+  // a redirect with no command (`< f && x=1`), a subshell's `)`.
+  after?: "&&" | "||";
   // Its standard input is a pipe from the command before it.
   piped?: boolean;
   // Inside a command substitution (or a heredoc body's): it runs while the command that holds it
@@ -679,7 +685,8 @@ export interface Parsed {
   // Parenthesised subshells: `cd` tracking is unreliable.
   grouped: boolean;
   // The variables a `${name=word}` or `${name:=word}` of the command may assign, wherever it
-  // stands: a word, a heredoc's body, another expansion; `${name[0]:=word}` too.
+  // stands: a word, a heredoc's body, another expansion; `${name[0]:=word}` too. And those its
+  // arithmetic assigns (`$((name=1))`, `((name++))`, a subscript, an offset).
   assigns?: Set<string>;
 }
 
@@ -741,6 +748,8 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
   // Open case statements: reading a pattern (up to its `)`) or the commands of a branch.
   const cases: ("pattern" | "body")[] = [];
   const heredocs: { delimiter: string; quoted: boolean; strip: boolean; owner: Simple }[] = [];
+  // An `&&` or `||` that followed nothing listed, for the command after it (Simple.after).
+  let unlisted: "&&" | "||" | undefined;
 
   // An empty quote (`''`, `""`) leaves EMPTY_QUOTE, tagged `Q`, where it stood: brace expansion
   // keeps a word it makes empty only when that word holds a quote (`''{,x}`, not `{,'x'}`). The
@@ -823,9 +832,11 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
     }
     if (cur.argv.length || cur.out.length) {
       cur.next = op;
+      if (unlisted) cur.after = unlisted;
+      unlisted = undefined;
       if (sub) cur.subshell = cur.nested = true;
       result.cmds.push(cur);
-    }
+    } else if (op === "&&" || op === "||") unlisted = op;
     cur = { argv: [], out: [], dyn: [] };
   };
 
@@ -1276,6 +1287,10 @@ function checkArith(text: string, st: ParseState) {
     .replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, " $1 ")
     .replace(/\$[#?$!]/g, " 0 ")
     .replace(/\b\d+#[A-Za-z0-9@_]+/g, " 0 ");
+  // (Project review 3, round 5, Mythos: a name arithmetic assigns, by `=`, a compound assignment,
+  // `++` or `--` on either side, is assigned again, and the words keep none of the arithmetic's
+  // text: after `x=foo; : $((x=5))`, `$x` is `5`. Kept with the names a `${x:=word}` assigns.)
+  for (const m of t.matchAll(/([A-Za-z_]\w*)\s*(?:=(?!=)|(?:[-+*/%&^|]|<<|>>)=|\+\+|--)|(?:\+\+|--)\s*([A-Za-z_]\w*)/g)) (st.result.assigns ??= new Set()).add(m[1] ?? m[2]);
   // Positional parameters, quotes, subscripts and anything else: not modelled.
   if (/[^\w\s+\-*/%<>=!&|^~?:,();]/.test(t)) {
     st.result.opaque = true;
@@ -1757,6 +1772,8 @@ function variablesSet(cmd: Simple, argv: string[]): [string, string | undefined,
   } else if (name === "getopts") {
     out.push([operands(args)[1] ?? "", undefined, "set"]);
   } else if (name === "wait") {
+    // (Project review 3, round 5, Mythos: `-p` among other letters, or with its name on it.)
+    if (args.some((a) => /^-[a-zA-Z]*p./.test(a) || /^-[a-zA-Z]+p$/.test(a))) return "wait -p in a spelling the rules do not model";
     const p = args.indexOf("-p");
     if (p >= 0) out.push([args[p + 1] ?? "", undefined, "set"]);
   }
@@ -3852,6 +3869,12 @@ const PIPE_TO_SHELL = /\b(curl|wget)\b[^|;&\n]*\|\s*(sudo\s+)?(env\s+)?(ba|z|da|
 // The variables bash sets or computes by itself (bash 5.2, "Bash Variables"): what one expands to
 // is not the text a command assigned to it.
 const BASH_SETS = /^(_|BASH\w*|COMP_\w+|COMPREPLY|COPROC|DIRSTACK|EPOCH\w+|E?UID|FUNCNAME|GROUPS|HISTCMD|LINENO|LINES|COLUMNS|MAPFILE|OLDPWD|OPT(ARG|IND|ERR)|PIPESTATUS|PPID|PWD|RANDOM|READLINE_\w+|REPLY|SECONDS|SHELLOPTS|SHLVL|SRANDOM)$/;
+// The builtins that set a variable they are given the name of.
+const SETS_NAMES = /(^|[^\w.-])(printf|read|wait|mapfile|readarray|getopts|compgen|unset|let|declare|typeset|local|export|readonly)(?![\w.-])/;
+// The reserved words a compound command opens and closes with, and those another may follow.
+const OPENS = new Set(["{", "if", "while", "until", "for", "select"]);
+const CLOSES = new Set(["}", "fi", "done"]);
+const LEADS = new Set(["{", "if", "while", "until", "then", "else", "elif", "do", "!", "time", "}", "fi", "done"]);
 // `NAME=value` words of a command that only sets variables (or exports them).
 function assignments(argv: string[]): [string, string][] | undefined {
   const words = argv[0] === "export" ? argv.slice(1) : argv;
@@ -3873,7 +3896,13 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
   // the count of bare names does not see: after `x=; : "${x:=.md}"`, `AGENTS$x` is `AGENTS.md`.
   // Read where the parser reads every expansion, a heredoc's body and `${x[0]:=.md}` included,
   // and by the text of the words, which is what an `eval` runs.)
-  const defaulted = (name: string) => !!parsed.assigns?.has(name) || new RegExp(`\\$\\{${name}(\\[[^\\]]*\\])?:?=`).test(words);
+  // (Round 5, Mythos: arithmetic that assigns is another, kept by the parser with these. And a
+  // builtin takes the name it sets on its option's letter, where the count of bare names passes
+  // it by: `x=foo; printf -vx ''` and `wait -px` leave `$x` empty. In a command that names such a
+  // builtin, a word of options that ends in the name names it.)
+  const setters = parsed.cmds.map((c) => c.argv.join(" ")).filter((text) => SETS_NAMES.test(text)).join(" ");
+  const attached = (name: string) => new RegExp(`(^|[^\\w$])-[A-Za-z]*${name}(?!\\w)`).test(setters);
+  const defaulted = (name: string) => !!parsed.assigns?.has(name) || !!scope.reassigned?.has(name) || new RegExp(`\\$\\{${name}(\\[[^\\]]*\\])?:?=`).test(words) || attached(name);
   const namedOnce = (name: string) => !defaulted(name) && (words.match(new RegExp(`(^|[^$\\w{])${name}(?!\\w)`, "g")) ?? []).length === 1;
   local.unassigned = (name: string) => !defaulted(name) && !new RegExp(`(^|[^$\\w{])${name}(?!\\w)`).test(words);
   const track = depth === 0 && !parsed.grouped;
@@ -3885,12 +3914,29 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
   let failableCd = false;
   let braces = 0;
   let previous: Simple | undefined;
+  // (Project review 3, round 5, Mythos: an assignment is followed as one that ran only where
+  // every run of the call reaches it: `false && x=foo; echo hi > .git$x/hooks/pre-commit` writes
+  // in `.git`, and so does the second command of a branch, a loop or a group, `if false; then :;
+  // x=foo; fi`. `listed`: an `&&` or an `||` stands before the command in its list. `inside`:
+  // the compound commands open around it, counted by the reserved words that lead each command;
+  // a `case`, a `function` or a `coproc`, whose ends the count does not read, leaves it open
+  // for the rest of the call.)
+  let listed = false;
+  let inside = 0;
   for (const cmd of parsed.cmds) {
     if (!cmd.nested && failableCd && previous && ((!["&&", "|"].includes(previous.next ?? "") && braces === 0) || braces < 0)) {
       local.cwd = undefined;
       failableCd = false;
     }
     if (!cmd.nested) {
+      if (previous?.next === "&&" || previous?.next === "||" || cmd.after) listed = true;
+      else if (previous?.next !== "|") listed = false;
+      for (const w of cmd.argv) {
+        if (OPENS.has(w)) inside++;
+        else if (CLOSES.has(w)) inside--;
+        else if (["case", "function", "coproc"].includes(w)) inside = Infinity;
+        if (!LEADS.has(w)) break;
+      }
       previous = cmd;
       for (const w of cmd.argv) {
         if (w === "{") braces++;
@@ -3918,7 +3964,7 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
       failableCd = !there && local.cwd !== undefined;
       braces = 0;
     } else if (cmd.argv[0] === "pushd" || cmd.argv[0] === "popd") local.cwd = undefined;
-    for (const [name, value] of (track && !cmd.subshell && assignments(cmd.argv)) || []) {
+    for (const [name, value] of (track && !listed && inside === 0 && !cmd.subshell && assignments(cmd.argv)) || []) {
       // The text is kept and resolved where it is used, after any later `cd`, as the shell does.
       // Only one word of plain text is followed: no expansion, blank or glob. `~` at its start is
       // expanded in an assignment.

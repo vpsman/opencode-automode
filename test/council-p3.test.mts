@@ -230,3 +230,89 @@ test("round 4 (Mythos): an expansion that assigns, and a place an option names w
     "cp -r a b",
   ]) assert.equal(await decide(command), "allow", command);
 });
+
+test("round 5 (Mythos): an assignment or a cd the call may not reach, a name on its option's letter, arithmetic that assigns", async () => {
+  // The redirect after a `cd` the call may not reach asks by where it lands without the `cd`.
+  const d = await decideShell(guard, new SessionState(repo), repo, "true || cd sub; echo hi > ../o.txt");
+  assert.match(d.reason, /redirect writes outside the working directory: \.\.\/o\.txt \(where it runs: /);
+  for (const command of [
+    // Behind `&&` or `||` the assignment may not run: `$x` is then empty, and bash writes
+    // `.git/hooks/pre-commit`, `AGENTS.md`, and removes `/home`.
+    "false && x=foo; echo hi > .git$x/hooks/pre-commit",
+    "true || x=foo; echo hi > AGENTS.md$x",
+    "false && x=foo; rm -rf $x/home",
+    "false && true && x=foo; echo hi > AGENTS.md$x",
+    "false && x=foo && true; echo hi > AGENTS.md$x",
+    "{ false && x=foo; }; echo hi > AGENTS.md$x",
+    "false &&\nx=foo\necho hi > AGENTS.md$x",
+    "mkdir -p b && x=b; echo hi > $x/f",
+    // The same inside a branch, a loop or a group, wherever the assignment stands in it.
+    "if false; then :; x=foo; fi; echo hi > AGENTS.md$x",
+    "if false; then\nx=foo\nfi\necho hi > AGENTS.md$x",
+    "if true; then :; else\nx=foo\nfi; echo hi > AGENTS.md$x",
+    "while false; do\nx=foo\ndone; echo hi > AGENTS.md$x",
+    "for y in; do :; x=foo; done; echo hi > AGENTS.md$x",
+    "for fi in a; do\nx=foo\ndone; echo hi > AGENTS.md$x",
+    "false && { :; x=foo; }; echo hi > AGENTS.md$x",
+    "false || {\nx=foo\n}; echo hi > .git$x/hooks/pre-commit",
+    // Behind a command the rules do not list: arithmetic, a redirect with no command.
+    "((0)) && x=foo; echo hi > AGENTS.md$x",
+    "< nope && x=foo; echo hi > AGENTS.md$x",
+    // A `cd` the call may not reach: the redirect is written from where the call starts, and
+    // is judged in each place the command may run in.
+    "true || cd sub; echo hi > ../o.txt",
+    "false && cd sub; echo hi > ../o.txt",
+    "true || cd sub && echo hi > ../o.txt",
+    "true && false || cd sub && echo hi > ../o.txt",
+    "false && { :; cd sub; }; echo hi > ../o.txt",
+    "((0)) && cd sub; echo hi > ../o.txt",
+    "< nope && cd sub; echo hi > ../o.txt",
+    "true || cd sub; > ../o.txt",
+    "true || cd sub; echo hi >> ../o.txt",
+    "true || cd sub; echo hi 2> ../o.txt",
+    "true || cd sub; echo hi > ../sub/o.txt",
+    "x=..; true || cd sub; echo hi > $x/o.txt",
+    // The name a builtin sets, on its option's letter.
+    "x=foo; printf -vx %s ''; echo hi > AGENTS.md$x",
+    "x=foo; printf -vx ''; echo hi > AGENTS.md$x",
+    "x=foo; command printf -vx ''; echo hi > AGENTS.md$x",
+    'x=foo; "printf" -vx \'\'; echo hi > AGENTS.md$x',
+    "x=foo; printf -v{x,} ''; echo hi > AGENTS.md$x",
+    "x=foo; wait -px; echo hi > AGENTS.md$x",
+    "x=foo; wait -fpx; echo hi > AGENTS.md$x",
+    "x=foo; wait -npx; echo hi > AGENTS.md$x",
+    // Arithmetic that assigns: `$x` is a number afterwards.
+    "x=foo; : $((x=5)); echo hi > AGENTS$x",
+    "x=foo; ((x=1)); echo hi > AGENTS.md$x",
+    "x=foo; (( y = x = 0 )); echo hi > AGENTS.md$x",
+    "x=5; ((x+=1)); echo hi > f$x.txt",
+    "x=5; : $((--x)); echo hi > f$x.txt",
+    "x=foo; : <<E\n$((x=5))\nE\necho hi > AGENTS.md$x",
+    'x=foo; : "${y:-$((x=5))}"; echo hi > AGENTS.md$x',
+  ]) assert.equal(await decide(command), "ask", command);
+  for (const command of [
+    "x=out; echo hi > $x.txt",
+    "x=b && echo hi > $x/f",
+    "x=out; true && echo hi > $x.txt",
+    "x=out; if true; then echo hi > $x.txt; fi",
+    "if true; then :; fi; x=out; echo hi > $x.txt",
+    "x=foo && false; echo hi > notes$x",
+    "printf -v x %s out; echo hi > out.txt",
+    "x=out; printf -v y %s out; echo hi > $x.txt",
+    "x=out; wait -p y; echo hi > $x.txt",
+    "x=3; echo $((x+1)) > out.txt",
+    "n=1; echo $((n*2)) > $n.txt",
+    "x=5; ((y=x+1)); echo hi > f$x.txt",
+    "x=5; : $((x<=1)); echo hi > f$x.txt",
+    "i=0; i=$((i+1)); echo $i",
+    "cd sub && echo hi > out.txt",
+    "cd sub || exit 1; echo hi > out.txt",
+    "mkdir -p build && cd build && echo hi > out.txt",
+    "test -d sub && cd sub; ls",
+    "true || cd sub; echo hi > o.txt",
+    "test -d sub && cd sub; echo hi > out.txt",
+    "true || cd sub; echo hi > /dev/null",
+    "cd sub && echo hi > ../o.txt",
+    "OUT=out; cd sub && echo hi > $OUT.txt",
+  ]) assert.equal(await decide(command), "allow", command);
+});

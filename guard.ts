@@ -6539,7 +6539,11 @@ function placeAll(command: string, starts: Places, depth: number, out: Located, 
 // that names the directory by another name may be what the program writes (`cp -t/proc/self/cwd`,
 // `sort -o /proc/self/cwd/x`, `echo x > /proc/self/cwd/x` after a `cd .git/hooks`): which word a
 // program writes is its own table, so each such word is held to it, where it lands.
-export function placedReads(where: Located, scope: Scope, judgeAt: (dir: string, words: string[]) => { action: string; reason: string }, landed?: (file: string) => string | undefined): GuardVerdict | undefined {
+// (Project review 3, round 5, Mythos: and a redirect's target is judged with the command in each
+// place, as its words are: after `true || cd sub`, `echo hi > ../o.txt` writes above the project.
+// A target that holds an expansion is judged so only where the command may run in more than one
+// place: in one, the rules read it there with the call's variables, `cd sub && ls > $OUT.txt`.)
+export function placedReads(where: Located, scope: Scope, judgeAt: (dir: string, words: string[], out?: string[]) => { action: string; reason: string }, landed?: (file: string) => string | undefined): GuardVerdict | undefined {
   let verdict: GuardVerdict | undefined;
   const add = (action: "ask" | "classify", reason: string) => void (verdict = stricter(verdict, { action, reason }));
   if (where.moves) {
@@ -6627,15 +6631,17 @@ export function placedReads(where: Located, scope: Scope, judgeAt: (dir: string,
         break;
       }
     }
-    if (!own.length && !named.length) continue;
+    const redirected = where.moves ? cmd.out : [];
+    if (!own.length && !named.length && !redirected.length) continue;
     if (!places) {
       if (named.length) add("classify", `${named[0].word} names the directory a command runs in, which the check cannot tell`);
       continue;
     }
     if (!where.moves && !named.length) continue;
     const distinct = new Map(places.map((p) => [`${p.real}\0${p.logical}\0${p.alt ?? ""}`, p]));
+    const outs = redirected.filter((w) => distinct.size > 1 || !/[$`]/.test(w));
     for (const p of distinct.values()) {
-      const v = own.length ? judgeAt(p.real, own.map((w) => rewrite(w, p))) : undefined;
+      const v = own.length || outs.length ? judgeAt(p.real, own.length ? own.map((w) => rewrite(w, p)) : [":"], outs.map((w) => rewrite(w, p))) : undefined;
       if (v && (v.action === "ask" || v.action === "deny")) add("ask", `${v.reason} (where it runs: ${p.real})`);
       // Each such word as the file it names there, read or written, as the kernel walks it.
       for (const n of named) {

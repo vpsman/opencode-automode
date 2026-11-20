@@ -86,7 +86,11 @@ For each shell tool call:
      built from a variable the call sets to literal text is held to the same test as the rules
      read it (`x=opencode; echo '{}' > $x.json`); a variable bash gives a value of its own
      (`REPLY`, `FUNCNAME`, `DIRSTACK`, ...) is not followed, nor is one that a `${x:=word}` or
-     `${x=word}` anywhere in the call may assign again, and a compressor's operand the
+     `${x=word}`, arithmetic (`$((x=5))`, `((x++))`) or a builtin given the name on its
+     option's letter (`printf -vx`, `wait -px`) anywhere in the call may assign again, nor
+     one whose assignment not every run of the call reaches: behind `&&` or `||`, or inside a
+     branch, a loop or a group (`false && x=foo; echo hi > .git$x/hooks/pre-commit`,
+     `if ...; then :; x=foo; fi`); and a compressor's operand the
      rules cannot resolve asks. A place an option names (`unzip -d`, `tar -C`, rsync's
      `--log-file`, ...) is tested as a glob where it holds one (`tar -C sub/.gi?`) and, where
      it holds a variable, by the text beside it (`unzip -d .git/$x`) and by what the call's
@@ -269,7 +273,11 @@ For each shell tool call:
      followed by its text, as bash follows it (`cd sub/link && cd ..` is `sub`). A call
      with any other `cd`, a `pushd` or a `popd` goes to the model whole
      (`cd $dir && ls`, `cd -`), or asks where the rules themselves would judge a relative
-     path in the wrong directory (`if ...; then cd x; fi; cat f`). `~+`, and `$PWD` after a
+     path in the wrong directory (`if ...; then cd x; fi; cat f`). A command that
+     follows a `cd` not every run of the call reaches is judged in each directory it may run
+     in, its words and the files it redirects its output to
+     (`true || cd sub; echo hi > ../o.txt` asks: without the `cd` that is a file above the
+     project). `~+`, and `$PWD` after a
      `cd`, are read as the directory the command runs in (`cd src && echo x > $PWD/out.txt`
      writes `src/out.txt`, and so does `~+/out.txt`; a write through either into a protected
      place asks); another form of `$PWD` after a `cd` (`${PWD%/*}`) and a path

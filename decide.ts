@@ -5487,6 +5487,10 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   // The same rules without the observer, for each command judged again where it runs (B3c).
   const rulesAt: UserRules = { ...rules, deny: rules.deny.filter((m) => m !== watch.matcher) };
   const scope = scopeFor(guard, session, cwd, rules);
+  // (Project review 3, round 5, Mythos: a name arithmetic assigns is one the rules do not follow
+  // from its assignment, `x=foo; : $((x=5)); echo hi > AGENTS$x`: the judged text holds no
+  // arithmetic, so they are told.)
+  scope.reassigned = arithmeticSets;
   const verdict = bashVerdict(text, scope);
   if (verdict.action === "deny") return fromRules(verdict);
   const cwdKnown = !/(^|[\s;&|(])(cd|pushd|popd)(\s|$)/.test(text);
@@ -5778,7 +5782,8 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   // its words as the parser has them: plain ones bare (so that the allows above, which compare
   // texts, read them as before), others quoted.
   const shellWord = (w: string) => (/^[A-Za-z0-9_@%+=:,.\/-]+$/.test(w) ? w : `'${w.replace(/'/g, "'\\''")}'`);
-  const judgeAt = (dir: string, words: string[]) => bashVerdict(words.map(shellWord).join(" "), scopeFor(guard, session, dir, rulesAt));
+  // (Project review 3, round 5, Mythos: with the files it redirects its output to, when given.)
+  const judgeAt = (dir: string, words: string[], out: string[] = []) => bashVerdict([...words.map(shellWord), ...out.map((w) => `> ${shellWord(w)}`)].join(" "), scopeFor(guard, session, dir, rulesAt));
   // B8-4: a protected place a word names by the directory's other name (`/proc/self/cwd`, `~+`),
   // where it lands: read from the project's top down, as writeProblem reads a landed write.
   const landedProtected = (file: string): string | undefined => {
