@@ -5506,11 +5506,16 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       // unzip's `-d` when they extract, find's `-fprint0` (the rules ask on `-fprint`, `-fprintf`
       // and `-fls`), rsync's log, batch, backup, temp and partial places. Each is held to the write
       // check for that place (`tar -xf a.tar -C .git/hooks`).
-      // (A place known only when the command runs is the unnamed write's: the project is marked.)
       // Held to the check of protected places alone (decide.ts, writeProblem), which reads every
       // write listed here where it lands: what the rules say of the program's place outside the
       // project stands (`tar -xf a.tar -C /tmp` is the model's, as before).
-      const place = (word: string | undefined, dir: boolean) => void (word !== undefined && plainWord(word) && add(word, true, dir ? { dir: true } : {}));
+      // (Project review 3, round 4, Mythos: a value bash expands is listed as it is written, not
+      // dropped, so that check reads it as it reads every other target: a glob by the names it
+      // can match, `unzip -d pkg/.husk?`, `tar -C sub/.gi?`, and a word built at run time by the
+      // text it shows, `unzip -d .git/$x`. Where such a word leads stays the rules' to say, with
+      // the call's own variables, `x=git; unzip -d sub/.$x` (rules.ts, commandRead), or the
+      // model's, `tar -C "$d"`; the unnamed write marks the project.)
+      const place = (word: string | undefined, dir: boolean) => void add(word, true, dir ? { dir: true } : {});
       if (blind && (name === "tar" || name === "gtar" || name === "bsdtar")) {
         const opts = getopt(tarWords(args), TAR_OPTIONS).opts;
         for (const o of opts) if (o.name === "-C" || o.name === "--directory") place(o.value, true);

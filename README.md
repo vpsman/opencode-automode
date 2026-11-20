@@ -85,8 +85,13 @@ For each shell tool call:
      word built at run time. A path
      built from a variable the call sets to literal text is held to the same test as the rules
      read it (`x=opencode; echo '{}' > $x.json`); a variable bash gives a value of its own
-     (`REPLY`, `FUNCNAME`, `DIRSTACK`, ...) is not followed, and a compressor's operand the
-     rules cannot resolve asks.
+     (`REPLY`, `FUNCNAME`, `DIRSTACK`, ...) is not followed, nor is one that a `${x:=word}` or
+     `${x=word}` anywhere in the call may assign again, and a compressor's operand the
+     rules cannot resolve asks. A place an option names (`unzip -d`, `tar -C`, rsync's
+     `--log-file`, ...) is tested as a glob where it holds one (`tar -C sub/.gi?`) and, where
+     it holds a variable, by the text beside it (`unzip -d .git/$x`) and by what the call's
+     own variables make it (`x=git; unzip -d sub/.$x`); an `unzip` option word with a
+     variable in it (`-d$x`) goes to the model.
      Plus this plugin's additions (`DEFAULT_ASK` in `decide.ts`, and `guard.ts`): tokens on a
      `curl` line, hunting for credential files, git's own `-c` overrides outside a short
      list, `GIT_*`/`SSH_*`/`LD_*` environment however it is set (`NAME=`, `export`,

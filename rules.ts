@@ -678,6 +678,9 @@ export interface Parsed {
   opaque: boolean;
   // Parenthesised subshells: `cd` tracking is unreliable.
   grouped: boolean;
+  // The variables a `${name=word}` or `${name:=word}` of the command may assign, wherever it
+  // stands: a word, a heredoc's body, another expansion; `${name[0]:=word}` too.
+  assigns?: Set<string>;
 }
 
 // The parser follows bash: quoting (`'...'`, `"..."`, `$'...'`, backslashes, line continuations),
@@ -1225,6 +1228,7 @@ function readParam(s: string, start: number, st: ParseState): number {
   const offsets = /^:(?![-=?+])(.*)$/s.exec(rest);
   if (m && !m[1] && offsets) for (const part of offsets[1].split(":")) checkArith(part, st);
   const assigns = /^:?=/.test(rest) && !!m && /^[A-Za-z_]/.test(m[2]);
+  if (assigns) (st.result.assigns ??= new Set()).add(m![2]);
   const plain =
     !!m &&
     (rest === "" ||
@@ -3700,6 +3704,20 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
         }
       }
     }
+    // (Project review 3, round 4, Mythos: the directory an extraction writes in, `tar -C` and
+    // `unzip -d`, where the word holds an expansion: read with the call's own variables and held
+    // to the protected names, `x=git; unzip -o a.zip -d sub/.$x`. A plain word or a glob is read
+    // where the whole command is checked (guard.ts, writesOf). unzip's options are not read
+    // here, so every operand of it is held to the test, and an option word that holds an
+    // expansion, `-d$x`, is not followed, nor is a word the call's variables make an option,
+    // `x=-d; unzip -o a.zip $x sub/.git`.)
+    if (name === "unzip" && args.some((a) => /[$`]/.test(a) && (a.startsWith("-") || expandVars(a, scope).startsWith("-")))) return worst(verdict, classify("unzip with an option built at run time"));
+    const extracts = !!t && (t.has("extract") || t.has("get") || t.letter("x")) && !(t.has("to-stdout") || t.letter("O"));
+    for (const a of name === "unzip" ? operands(args) : extracts ? t!.dirs : []) {
+      const p = /[$`]/.test(a) ? resolveWord(a, scope) : undefined;
+      if (p && /(^|\/)\.git(\/|$)/.test(p)) return worst(verdict, ask(`${name} writes in a .git directory`));
+      if (isPiFile(p, scope)) return worst(verdict, piAsk(`${name} writes Pi's own files: ${a}`));
+    }
     for (const a of operands(args)) {
       if (!isLocal(resolveWord(a, scope), scope)) return worst(verdict, classify(`${name} with a path outside the working directory`));
     }
@@ -3851,8 +3869,13 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
   // top level: a branch, a loop, `read` or a second assignment could give it another value. A
   // nested shell does not see unexported variables, so it starts with none.
   const words = parsed.cmds.flatMap((c) => [...c.argv, ...c.out, ...(c.in ?? [])]).join(" ");
-  const namedOnce = (name: string) => (words.match(new RegExp(`(^|[^$\\w{])${name}(?!\\w)`, "g")) ?? []).length === 1;
-  local.unassigned = (name: string) => !new RegExp(`(^|[^$\\w{])${name}(?!\\w)|\\$\\{${name}:?=`).test(words);
+  // (Project review 3, round 4, Mythos: an expansion that assigns is a second assignment, which
+  // the count of bare names does not see: after `x=; : "${x:=.md}"`, `AGENTS$x` is `AGENTS.md`.
+  // Read where the parser reads every expansion, a heredoc's body and `${x[0]:=.md}` included,
+  // and by the text of the words, which is what an `eval` runs.)
+  const defaulted = (name: string) => !!parsed.assigns?.has(name) || new RegExp(`\\$\\{${name}(\\[[^\\]]*\\])?:?=`).test(words);
+  const namedOnce = (name: string) => !defaulted(name) && (words.match(new RegExp(`(^|[^$\\w{])${name}(?!\\w)`, "g")) ?? []).length === 1;
+  local.unassigned = (name: string) => !defaulted(name) && !new RegExp(`(^|[^$\\w{])${name}(?!\\w)`).test(words);
   const track = depth === 0 && !parsed.grouped;
   // The patterns of the parts that decide. A prompt offers one only when it covers them all.
   const patterns = new Set<string | undefined>(parsed.opaque ? [undefined] : []);

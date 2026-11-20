@@ -174,3 +174,59 @@ test("round 3 (Mythos, on the fixes): in a project under a directory of a protec
   for (const command of ["gunzip g*.gz", "sed -i.bak p src/*.ts", "patch -b -z .orig src/*.ts a.diff", "x=out; echo hi > $x.txt"]) assert.equal(await decideUnder(command), "allow", command);
   for (const command of ["sed -i.md p src/../AGENT*", "x=opencode; echo '{}' > $x.json", "gunzip AGENTS.md"]) assert.equal(await decideUnder(command), "ask", command);
 });
+
+test("round 4 (Mythos): an expansion that assigns, and a place an option names with a variable or a glob", async () => {
+  for (const command of [
+    // `${x:=V}` is a second assignment: bash writes AGENTS.md, and runs `rm -rf -- *`.
+    'x=; : "${x:=.md}"; echo hi > AGENTS$x',
+    'x=; : "${x=.md}"; echo hi > AGENTS$x',
+    'x=; : "${x[0]:=.md}"; echo hi > AGENTS$x',
+    'x=; : "${y:-${x:=.md}}"; echo hi > AGENTS$x',
+    'x=; echo "${x:=.md}" > /dev/null; echo hi > AGENTS$x',
+    'x=; y=${x:=.md}; echo hi > AGENTS$x',
+    "x=; : <<E\n${x:=.md}\nE\necho hi > AGENTS$x",
+    'x=; : <<< "${x:=.md}"; echo hi > AGENTS$x',
+    'x=; : "${x:=.git}"; mkdir -p sub/$x/hooks',
+    'x=; : "${x:=-rf -- *}"; rm $x f',
+    // The directory `unzip -d` and `tar -C` name, built at run time or by a glob.
+    "x=git; unzip -o a.zip -d sub/.$x",
+    "x=git; unzip -o a.zip -dsub/.$x",
+    "x=hooks; unzip -o a.zip -d .git/$x",
+    "x=..; unzip -o a.zip -d$x/o",
+    "for x in git; do unzip -o a.zip -d sub/.$x; done",
+    "unzip -o a.zip -d sub/.husk?",
+    "unzip -o a.zip -d sub/.gi[t]",
+    "tar xf a.tar -C sub/.husk?",
+    "tar xf a.tar -C .gi?",
+    "tar xf a.tar --directory=sub/.husk?",
+    "x=git; tar xf a.tar -C sub/.$x",
+    "x=git; unzip -od sub/.$x a.zip",
+    "x=opencode; unzip -o a.zip -d sub/.$x",
+    "x=.claude; unzip -o a.zip -d $x/skills",
+    "x=sub; unzip -o a.zip -d $x/.gi?",
+    "x=/etc; unzip -o a.zip -d$x",
+    "x=-d; unzip -o a.zip $x sub/.git",
+    "x=-od; unzip $x sub/.git a.zip",
+    "unzip -o a.zip -d .git/$y",
+    "tar xf a.tar -C .git/$y",
+  ]) assert.equal(await decide(command), "ask", command);
+  // A place the rules resolve to a protected name asks by the rules' own word, the model on or off.
+  for (const command of ["x=git; unzip -o a.zip -d sub/.$x", "x=git; tar xf a.tar -C sub/.$x"]) {
+    const d = await decideShell(guard, new SessionState(repo), repo, command);
+    assert.match(d.reason, /^(unzip|tar) writes in a \.git directory/, command);
+  }
+  for (const command of [
+    "x=.md; echo hi > notes$x",
+    'x=.md; : "${y:=1}"; echo hi > notes$x',
+    ': "${CI:=false}"; echo hi > notes.txt',
+    "unzip -o a.zip -d z",
+    'unzip -o a.zip -d "$PWD/z"',
+    "x=z; unzip -o a.zip -d $x",
+    "unzip -o a.zip -d s*",
+    "tar xf a.tar -C z",
+    "tar xf a.tar -C s*",
+    "tar tf a.tar -C sub/.gi?",
+    "unzip -l a.zip -d .gi?",
+    "cp -r a b",
+  ]) assert.equal(await decide(command), "allow", command);
+});

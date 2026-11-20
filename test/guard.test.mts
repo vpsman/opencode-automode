@@ -922,8 +922,12 @@ describe("r4 B7 (guard level)", () => {
     assert.deepEqual(named("find . -maxdepth 0 -fprint0 .git/hooks/x"), [".git/hooks/x"]);
     assert.deepEqual(named("find . -fprint out.txt -fls ls.txt"), ["out.txt", "ls.txt"]);
     assert.deepEqual(named("rsync -a --log-file=l.txt --write-batch=b --only-write-batch=c --backup-dir=bk --temp-dir=t --partial-dir=p -T t2 src/ dst/").sort(), ["b", "bk/", "c", "dst/", "l.txt", "p/", "t/", "t2/"].sort());
-    // A place known only when the command runs is not listed (the unnamed write marks the project).
-    assert.deepEqual(named("tar -xf a.tar -C \"$d\""), []);
+    // A place bash expands is listed as it is written (project review 3, round 4: the check of
+    // protected places reads a glob and the text of a word built at run time; where the word leads
+    // is the rules' and the model's to say, and the unnamed write marks the project).
+    assert.deepEqual(named("tar -xf a.tar -C \"$d\""), ["$d/"]);
+    assert.deepEqual(named("tar -xf a.tar -C sub/.gi?"), ["sub/.gi?/"]);
+    assert.deepEqual(named("unzip -o a.zip -d .git/$x"), [".git/$x/"]);
   });
   test("r4 B7-11: a move is a write of unnamed files unless every source is known to be a file", () => {
     const unknown = (command: string, filesOnly?: (sources: string[]) => boolean) => writesOf(parse(command).cmds, filesOnly).unknown;
