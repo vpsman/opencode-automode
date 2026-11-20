@@ -5823,10 +5823,14 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   }
   if (gitIssue) return asked(askBy(gitIssue));
   if (writeIssue) return asked(askBy(writeIssue));
-  if (verdict.action === "ask") return asked(fromRules(verdict));
+  // (Round 62: an ask only for a tool's spelling gives way to the other checks' asks, which name
+  // what the call does; it is still an ask.)
+  const spelling = verdict.action === "ask" && !!verdict.spelling;
+  if (verdict.action === "ask" && !spelling) return asked(fromRules(verdict));
   if (extra?.action === "ask") return asked(askBy(extra.reason));
   if (placedIssue) return asked(askBy(placedIssue));
   if (unseen) return asked(askBy(`the project's git layout cannot be checked whole: ${unseen}`));
+  if (spelling) return asked(fromRules(verdict));
   if (verdict.action === "allow" && !extra) return allowed(fromRules(verdict));
   const why = extra?.reason ?? reword(verdict.reason);
   if (!guard.useClassifier) return asked({ effect: "ask", by: "no-model", rule: "classify", reason: `rules leave this to the model, which is off (${why})` });

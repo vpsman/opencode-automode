@@ -231,11 +231,14 @@ test("NODE_COMPILE_CACHE that is a writable root itself is a problem", async () 
 
 // Round 4.
 test("decompressors that write the project: -d inside a cluster, and an output directory", async () => {
-  for (const writer of ["gzip -dk test.js.gz", "xz -dk f.xz", "zstd -dqf --output-dir-flat=. /tmp/x/test.js.zst", "zstd -d -f --output-dir-flat=. /tmp/x/test.js.zst"]) {
+  for (const writer of ["gzip -dk test.js.gz", "xz -dk f.xz"]) {
     const s = new SessionState(repo);
     await effect(writer, s);
     assert.notEqual(await effect("npm test", s), "allow", writer);
   }
+  // (Council project review 2, round 62: zstd's output directories are a spelling the rules do not
+  // read, so the call asks.)
+  for (const writer of ["zstd -dqf --output-dir-flat=. /tmp/x/test.js.zst", "zstd -d -f --output-dir-flat=. /tmp/x/test.js.zst"]) assert.equal(await effect(writer), "ask", writer);
 });
 
 test("a call the model allows marks the project as written", async () => {

@@ -2498,7 +2498,8 @@ export function textGuard(raw: string, bare: string, ctx: TextContext): GuardVer
 
   // Printing the environment prints every secret in it.
   if (name === "printenv") add("ask", "printenv prints the environment");
-  if (path.basename(rawWords[0] ?? "") === "env" && rawWords.slice(1).every((w) => w.startsWith("-") || ASSIGN.test(w))) add("ask", "env prints the environment");
+  // (Round 61, Sol: `env --help` and `env --version` print their text, no environment.)
+  if (path.basename(rawWords[0] ?? "") === "env" && rawWords.slice(1).every((w) => w.startsWith("-") || ASSIGN.test(w)) && !rawWords.slice(1).some((w) => w === "--help" || w === "--version")) add("ask", "env prints the environment");
   if ((DECLARERS.has(name) && !operands.length) || (name === "set" && !args.length)) add("ask", `${name} without a name prints every variable`);
 
   // Variables set for a command, or exported for the ones after it.
@@ -7169,7 +7170,9 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
     // never started: `find --version -exec env --version \;`.)
     // (Round 60, Opus: only behind a find that only prints and is no `-exec`'s own command; a
     // sibling `-exec sort --help \;` or `-exec find --help \;` owns no later `-exec`.)
-    if (programs(cmd.argv).some((p) => p < at && path.basename(cmd.argv[p]) === "find" && !(p > 0 && /^-(exec|execdir|ok|okdir)$/.test(cmd.argv[p - 1])) && printsOnly("find", cmd.argv.slice(p + 1)))) continue;
+    // (Round 61, Opus: only a find at the call's top level, before any `-exec`, wrapped or not:
+    // `-exec timeout 5 find --help \;` owns nothing either.)
+    if (programs(cmd.argv).some((p) => p < at && path.basename(cmd.argv[p]) === "find" && !cmd.argv.slice(0, p).some((w) => /^-(exec|execdir|ok|okdir)$/.test(w)) && printsOnly("find", cmd.argv.slice(p + 1)))) continue;
     const dashes = args.indexOf("--");
     const files = [...(dashes < 0 ? args : args.slice(0, dashes)).filter((a) => !a.startsWith("-")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
 

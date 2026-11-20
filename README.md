@@ -156,10 +156,16 @@ For each shell tool call:
      word. A word named like a credential file is read as a file wherever it stands, except
      where git only names it to filter commits: `git show HEAD:secrets.json`, `git diff` and
      `git log -p secrets.json` ask, `git log -1 secrets.json` (no patch) does not; and except
-     in a call that only prints its help or version (sort, tar, ps, cp/mv/ln/install, rsync and
-     the compressors, read by each tool's own options: `gzip --help .netrc` reads nothing), and
-     for sort's own reading (only its last `--files0-from`, and `--random-source` only in a
-     random sort).
+     in a call that only prints its help or version (cp/mv/ln/install), and for sort's own
+     reading (only its last `--files0-from`, and `--random-source` only in a random sort).
+   - **find, tar, rsync, sort, ps and the compressors** (gzip, xz, zstd, bzip2 and their
+     aliases) are read only in their plain spellings: whole long option names, short flags in
+     a cluster, and the common valued options in their usual form (`tar -xzf a.tgz -C dst`,
+     `sort -t: -k3n`, `ps -eo pid,comm`, `find . -name x -exec cmd {} +`). Any other option or
+     spelling asks: an abbreviated long option, a rare option (`find -fprint`, `tar -T`,
+     `rsync -e`, `sort -T`, `ps -O`, `zstd -o`), an old `+POS` sort key, a help or version word
+     mixed with other options. That is by design: these tools take many spellings, and the
+     rules read only those they are tested on.
    - **Per command**, also inside `sh -c`, `sudo`, `xargs`, with the program named by path
      (`/usr/bin/npm`), and behind every wrapper and runner the rules look through
      (`timeout 60`, `nice -n 5`, `uv run`, `poetry run`, `pipenv run`, `pdm run`,

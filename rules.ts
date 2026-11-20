@@ -34,6 +34,9 @@ export type Action = "allow" | "classify" | "ask" | "deny";
 export interface Verdict {
   action: Action;
   reason: string;
+  // An ask only because a tool is spelled in a way its reader is not trusted with
+  // (`unreadSpelling`): another check's ask, with a reason of its own, is shown instead.
+  spelling?: true;
   // A user allow rule cannot replace this verdict.
   locked?: boolean;
   // An ask that stays an ask with the chat decider: your own ask rules and the critical asks.
@@ -439,14 +442,6 @@ const NAMES_ONLY = new Set(
 const PATTERN_FIRST = new Set(["grep", "egrep", "fgrep", "rg", "ag", "ack", "sed", "awk", "gawk", "jq", "yq"]);
 
 // The credential file a simple command would read, if any.
-// Whether an `env` cluster holds `-i` before a letter that takes a value (`-u`, `-C`, `-S`).
-function envClusterClears(word: string): boolean {
-  for (const letter of word.slice(1)) {
-    if (letter === "i") return true;
-    if ("uCS".includes(letter)) return false;
-  }
-  return false;
-}
 function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope): string | undefined {
   if (NAMES_ONLY.has(name)) return undefined;
   // (Round 51, Sol and Astra: a call that only prints its help or version reads no file. Round 54,
@@ -466,17 +461,31 @@ function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope)
     // (Round 57, Sol: the assignments before the program, or behind `env`, the last one winning;
     // an operand of that shape is a file.)
     // (Round 58, Opus: `env -i` and `env -u _POSIX2_VERSION` clear it for sort.)
+    // (Round 59 and 60: `env -vi`, `env -ui`. Round 61, Opus: env's options read as env reads
+    // them, a separate `-v` or `-0` before `-i` included: flags, and `-a`/`-u`/`-C`/`-S` with a
+    // value attached or in the next word.)
     let posix: string | undefined;
+    let inEnv = false;
     for (let k = 0; k < cmd.argv.length; k++) {
       const w = cmd.argv[k];
       if (/^_POSIX2_VERSION=/.test(w)) posix = w;
-      // (Round 59, Opus: in a cluster too, `env -vi`; and any prefix of the long name. Round 60, Sol
-      // and Astra: read letter by letter, a letter that takes a value ending the cluster: in
-      // `env -ui` and `env -uquiet` the `i` is `-u`'s.)
-      else if ((/^-[^-]/.test(w) && envClusterClears(w)) || (w.length > 3 && "--ignore-environment".startsWith(w)) || w === "-") posix = "_POSIX2_VERSION=0";
-      else if ((w === "-u" || w === "--unset") && cmd.argv[k + 1] === "_POSIX2_VERSION") (posix = "_POSIX2_VERSION=0"), k++;
-      else if (w === "-u_POSIX2_VERSION" || w === "--unset=_POSIX2_VERSION") posix = "_POSIX2_VERSION=0";
-      else if (!(w === "env" || /^[A-Za-z_]\w*=/.test(w))) break;
+      else if (w === "env") inEnv = true;
+      else if (inEnv && (w === "-" || (w.length > 3 && "--ignore-environment".startsWith(w)))) posix = "_POSIX2_VERSION=0";
+      else if (inEnv && /^--(unset|chdir|split-string|argv0)$/.test(w)) {
+        if (w === "--unset" && cmd.argv[k + 1] === "_POSIX2_VERSION") posix = "_POSIX2_VERSION=0";
+        k++;
+      } else if (inEnv && w === "--unset=_POSIX2_VERSION") posix = "_POSIX2_VERSION=0";
+      else if (inEnv && /^--./.test(w)) continue;
+      else if (inEnv && /^-[^-]/.test(w)) {
+        for (let j = 1; j < w.length; j++) {
+          if (w[j] === "i") posix = "_POSIX2_VERSION=0";
+          if ("auCS".includes(w[j])) {
+            const value = j < w.length - 1 ? w.slice(j + 1) : cmd.argv[++k];
+            if (w[j] === "u" && value === "_POSIX2_VERSION") posix = "_POSIX2_VERSION=0";
+            break;
+          }
+        }
+      } else if (!/^[A-Za-z_]\w*=/.test(w)) break;
     }
     for (const w of sortReading(args, posix !== undefined ? posix2Strict(Number(posix.slice(16))) : undefined).reads) {
       const secret = secretIn(w, scope, false, true);
@@ -2685,6 +2694,163 @@ const isDirectory = (p: string) => {
   }
 };
 
+// ---- the spellings the readers are trusted with ----
+
+// The option readers above (find, tar, rsync, sort, ps and the compressors) were written to read
+// every spelling GNU takes, and every round of review found one more they read differently. They
+// are now trusted only with the plain spellings listed here: whole option names, short flags in a
+// cluster, the common valued options in their usual form. Any other word (an abbreviated long
+// option, a rare option, an old-style key, a query word mixed with other options) asks, so a
+// reader's slip on a rare spelling can no longer allow a call. Asking on a call these lists leave
+// out is by design, not a defect. Each list grows only with a test of what the tool does.
+const FIND_VALUED = new Set(
+  `-name -iname -path -ipath -wholename -iwholename -regex -iregex -regextype -type -xtype -user -group -perm -size -mtime -mmin -atime -amin
+   -ctime -cmin -newer -samefile -inum -links -maxdepth -mindepth -printf`.split(/\s+/),
+);
+const FIND_BARE = new Set(`-print -print0 -ls -delete -prune -quit -empty -true -false -depth -xdev -mount -daystart -readable -writable -executable
+   -nouser -nogroup -not -a -and -o -or ( ) !`.split(/\s+/));
+function findPlain(args: string[]): boolean {
+  let k = args[0] === "--" ? 1 : 0;
+  // Start points: plain names, never `-`, `)` or `,`, which find reads in ways of their own.
+  while (k < args.length && !/^-./.test(args[k]) && args[k] !== "(" && args[k] !== "!") {
+    if (["-", ")", ","].includes(args[k])) return false;
+    k++;
+  }
+  for (; k < args.length; k++) {
+    const w = args[k];
+    if (w === "-exec" || w === "-execdir") {
+      // The command runs to `;`, or to `+` straight after `{}`; find judges it as a command.
+      const end = args.findIndex((a, i) => i > k && (a === ";" || (a === "+" && args[i - 1] === "{}")));
+      if (end < 0 || end === k + 1) return false;
+      k = end;
+    } else if (FIND_VALUED.has(w) || /^-newer[aBcm][aBcmt]$/.test(w)) {
+      if (++k >= args.length) return false;
+    } else if (!FIND_BARE.has(w)) return false;
+  }
+  return true;
+}
+// One word of short options, `-czf` or tar's old `czf`: flags from `flags`, then at most one valued
+// letter, last, or (a letter of `attached`) with its value as the rest of the word, `-k2,2n`.
+// Returns whether the next word is that letter's value, or undefined if not plain.
+function cluster(word: string, flags: string, valued: string, from: number, attached = ""): boolean | undefined {
+  if (word.length <= from) return undefined;
+  for (let k = from; k < word.length; k++) {
+    if (valued.includes(word[k])) return k === word.length - 1 ? true : attached.includes(word[k]) ? false : undefined;
+    if (!flags.includes(word[k])) return undefined;
+  }
+  return false;
+}
+// The long options a tool takes in plain form: `flags` whole, `valued` as `--name=value` or
+// `--name value`.
+type Plain = { short: string; shortValued: string; attached?: string; flags: string[]; valued: string[]; oldStyle?: boolean; operand?: (w: string) => boolean };
+function optionsPlain(args: string[], t: Plain): boolean {
+  for (let k = 0; k < args.length; k++) {
+    const w = args[k];
+    if (w === "--") return args.slice(k + 1).every((a) => !t.operand || t.operand(a));
+    if (w.startsWith("--")) {
+      const eq = w.indexOf("=");
+      const head = w.slice(2, eq < 0 ? undefined : eq);
+      if (eq < 0 && t.flags.includes(head)) continue;
+      if (!t.valued.includes(head)) return false;
+      if (eq < 0 && ++k >= args.length) return false;
+      continue;
+    }
+    if (w.startsWith("-") && w !== "-") {
+      const next = cluster(w, t.short, t.shortValued, 1, t.attached);
+      if (next === undefined) return false;
+      if (next && ++k >= args.length) return false;
+      continue;
+    }
+    // tar reads a first word without a dash as its options.
+    if (k === 0 && t.oldStyle) {
+      const next = cluster(w, t.short, t.shortValued, 0);
+      if (next === undefined) return false;
+      if (next && ++k >= args.length) return false;
+      continue;
+    }
+    if (t.operand && !t.operand(w)) return false;
+  }
+  return true;
+}
+const TAR_PLAIN: Plain = {
+  short: "ctxvzjJapkO",
+  shortValued: "fC",
+  flags: "create extract list verbose gzip bzip2 xz to-stdout keep-old-files no-same-owner no-same-permissions exclude-vcs wildcards no-wildcards".split(" "),
+  valued: ["file", "directory", "exclude", "strip-components"],
+  oldStyle: true,
+};
+const RSYNC_PLAIN: Plain = {
+  short: "avrlptgoDzhcuinqPHxEm",
+  shortValued: "",
+  flags: "archive verbose recursive links perms times group owner devices specials compress human-readable checksum update itemize-changes dry-run quiet progress partial stats hard-links one-file-system delete".split(" "),
+  valued: ["exclude", "include", "info"],
+};
+// sort: no old `+POS` key, in any place (which GNU sort reads by _POSIX2_VERSION).
+const SORT_PLAIN: Plain = {
+  short: "bdfgiMhnRrVcCmsuz",
+  shortValued: "ktoS",
+  attached: "ktS",
+  flags: "reverse numeric-sort unique ignore-case human-readable version-sort general-numeric-sort stable check merge zero-terminated ignore-leading-blanks dictionary-order month-sort random-sort".split(" "),
+  valued: ["key", "field-separator", "output", "buffer-size", "parallel"],
+  operand: (w) => !w.startsWith("+"),
+};
+const COMPRESSOR_PLAIN: Plain = {
+  short: "dckvfqtl123456789",
+  shortValued: "",
+  flags: "decompress uncompress stdout to-stdout keep force verbose quiet test list fast best".split(" "),
+  valued: [],
+};
+// ps: the BSD and UNIX letters that select processes and choose a standard format, and `-o` with
+// fields that are not the environment. Every word without a dash is BSD options.
+const PS_FIELDS = new Set(
+  `pid ppid pgid sid uid user ruser euser group comm args cmd command %cpu %mem pcpu pmem etime etimes time cputime stat state rss vsz sz tty
+   tname tt start lstart stime start_time nlwp ni nice pri psr wchan lwp tid f c class cls rtprio`.split(/\s+/),
+);
+// A format list: each comma-separated piece a field from the list, with a header after `=` that
+// holds no comma (so the list is the same whether ps reads a header to the end of the word or to
+// the next comma).
+const psFormat = (v: string) => v.split(",").every((piece) => /^([a-z%_]+)(=[^,]*)?$/.test(piece) && PS_FIELDS.has(piece.split("=")[0]));
+// A sort list: fields from the list, each with an optional `+` or `-`.
+const psSort = (v: string) => v.split(",").every((piece) => PS_FIELDS.has(piece.replace(/^[+-]/, "")));
+function psPlain(args: string[]): boolean {
+  for (let k = 0; k < args.length; k++) {
+    const w = args[k];
+    if (w === "--forest" || w === "--no-headers") continue;
+    if (w.startsWith("--sort=")) {
+      if (!psSort(w.slice(7))) return false;
+      continue;
+    }
+    if (w === "--sort") {
+      if (!psSort(args[++k] ?? "")) return false;
+      continue;
+    }
+    const bsd = !w.startsWith("-");
+    const next = bsd ? cluster(w, "auxwfjlrh", "o", 0) : cluster(w, "eAafFlwHj", "puCo", 1);
+    if (next === undefined) return false;
+    if (!next) continue;
+    const v = args[++k];
+    if (v === undefined) return false;
+    const letter = w.at(-1);
+    if (letter === "p" && !/^\d+(,\d+)*$/.test(v)) return false;
+    if ((letter === "u" || letter === "C") && !/^[\w.-]+(,[\w.-]+)*$/.test(v)) return false;
+    if (letter === "o" && !psFormat(v)) return false;
+  }
+  return true;
+}
+// Undefined when the call is spelled plainly; otherwise why it asks.
+export function unreadSpelling(name: string, args: string[]): string | undefined {
+  if (args.length === 1 && /^--(help|version)$/.test(args[0])) return undefined;
+  const plain =
+    name === "find" ? findPlain(args)
+    : name === "tar" || name === "gtar" ? optionsPlain(args, TAR_PLAIN)
+    : name === "rsync" ? optionsPlain(args, RSYNC_PLAIN)
+    : name === "sort" ? optionsPlain(args, SORT_PLAIN)
+    : name === "ps" ? psPlain(args)
+    : Object.hasOwn(COMPRESSORS, name) ? optionsPlain(args, COMPRESSOR_PLAIN)
+    : true;
+  return plain ? undefined : `${name} with an option or spelling the rules do not read`;
+}
+
 // ---- rules for one simple command ----
 
 function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = false): Verdict {
@@ -3069,6 +3235,10 @@ export const findExpression = (w: string) => /^-./.test(w) || /^[(!),]$/.test(w)
 // (Round 59, Astra: where a start point may stand, `)` and `,` are files: find takes them for an
 // expression only after one has begun.)
 export const findStartExpression = (w: string) => /^-./.test(w) || w === "(" || w === "!";
+// The files find writes no file to: a device it opens by name, the path normalised without `..`
+// (round 61, Sol and Astra: `/dev/./null`, `/dev//stdout`). Not `/dev/fd/N`, which find reopens:
+// the file behind the descriptor is written (round 61, Opus).
+const findSink = (p: string) => !p.split("/").includes("..") && /^\/dev\/(null|zero|full|stdout|stderr|tty)$/.test(path.posix.normalize(p));
 export function findActions(args: string[]): { at: number[]; names: string[]; files0: boolean; prints: boolean } {
   const at: number[] = [];
   let files0 = false;
@@ -3095,7 +3265,7 @@ export function findActions(args: string[]): { at: number[]; names: string[]; fi
     }
     if (w === "-files0-from") files0 = true;
     // (Round 60, Sol: an output action to a device sink, `-fprint0 /dev/stdout`, writes no file.)
-    if (/^-(delete|exec|execdir|ok|okdir)$/.test(w) || (/^-(fprint|fprint0|fprintf|fls)$/.test(w) && !DEV_SINKS.test(args[k + 1] ?? ""))) at.push(k);
+    if (/^-(delete|exec|execdir|ok|okdir)$/.test(w) || (/^-(fprint|fprint0|fprintf|fls)$/.test(w) && !findSink(args[k + 1] ?? ""))) at.push(k);
     if (/^-(exec|execdir|ok|okdir)$/.test(w)) {
       while (k + 1 < args.length && !(args[k + 1] === ";" || (args[k + 1] === "+" && args[k] === "{}"))) k++;
       k++;
@@ -3135,7 +3305,8 @@ function find(args: string[], scope: Scope): Verdict {
   for (const exec of execs) {
     const end = args.findIndex((a, i) => i > exec && (a === ";" || (a === "+" && args[i - 1] === "{}")));
     // {} stands for a path under the search roots, which were checked above.
-    const inner = args.slice(exec + 1, end < 0 ? undefined : args[end] === "+" ? end - 1 : end).map((a) => (a === "{}" ? "." : a));
+    // (Round 61, Opus: the `{}` before `+` is the command's last word, a path, `rm -rf {} +`.)
+    const inner = args.slice(exec + 1, end < 0 ? undefined : end).map((a) => (a === "{}" ? "." : a));
     verdict = worst(verdict, simple({ argv: inner, out: [], dyn: inner.map((a) => /[$`]/.test(a)) }, scope, 1));
   }
   return verdict;
@@ -3234,7 +3405,17 @@ function simple(cmd: Simple, scope: Scope, depth = 0): Verdict {
   return worst(out, builtin);
 }
 
+// Only the plain spellings are left to the option readers (`unreadSpelling`); any other asks. The
+// readers still run, so a stronger verdict (a deny, a guarded file) or an ask of their own, with
+// its reason and the folder it offers, is kept.
 function command(cmd: Simple, scope: Scope, depth: number): Verdict {
+  const verdict = commandRead(cmd, scope, depth);
+  const argv = unwrap(cmd.argv);
+  const unread = argv.length && argv[0] !== UNMODELLED ? unreadSpelling(path.basename(argv[0]), argv.slice(1)) : undefined;
+  return unread ? worst(verdict, { ...ask(unread), spelling: true }) : verdict;
+}
+
+function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
   let verdict = ALLOW;
   const argv = unwrap(cmd.argv);
   if (argv[0] === UNMODELLED) return classify("shell syntax or a wrapper option the rules do not model");
