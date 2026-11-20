@@ -82,7 +82,7 @@ const WRAPPABLE = new Set(["bash", "sh"]);
 // offered "a difference asks, or ends the wrapping of that shell"; the maintainer took the
 // second. Under dash nothing is allowed without a prompt, and the prompt says so.
 const REALLY: Record<string, string[]> = { bash: ["bash"], sh: ["bash"] };
-const wrappable = (shell: string) => (REALLY[path.basename(shell)] ?? []).includes(path.basename(realpath(shell)));
+const wrappable = (shell: string) => ((Object.hasOwn(REALLY, path.basename(shell)) ? REALLY[path.basename(shell)] : undefined) ?? []).includes(path.basename(realpath(shell)));
 
 // The state directory holds every command the agent ran: private to the user, and hidden from
 // sandboxed commands (see the plan's hidePaths).
@@ -155,7 +155,11 @@ function selftest(): string | undefined {
 
 // opencode resolves a tool's workdir against the session directory, expanding a leading `~`.
 const resolveWorkdir = (base: string, dir: string) => path.resolve(base, dir === "~" ? HOME : dir.startsWith("~/") ? path.join(HOME, dir.slice(2)) : dir);
-const clip = (text: string, max = 4000) => (text.length > max ? `${text.slice(0, max)} ... (${text.length} chars)` : text);
+// By code points, so a character is never cut in half (round 39, Sol).
+const clip = (text: string, max = 4000) => {
+  const chars = Array.from(text);
+  return chars.length > max ? `${chars.slice(0, max).join("")} ... (${chars.length} chars)` : text;
+};
 const callKey = (messageID: string, id: string) => `${messageID}\u0000${id}`;
 // lockwrite takes its lists newline-separated; plan() reports a path with a newline as a problem.
 const joined = (paths: string[]) => paths.join("\n");

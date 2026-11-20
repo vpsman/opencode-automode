@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 import { DEFAULT_ASK, decideShell, mirrorable, SessionState, takeMoment, type Guard } from "../decide.ts";
 import { canonical } from "../canon.ts";
 SessionState.moment = takeMoment;
-import { compileRules } from "../rules.ts";
+import { compileRules, parse } from "../rules.ts";
 import { DEFAULT_CLASSIFIER } from "../kev.ts";
 
 assert.ok(process.env.GIT_CONFIG_GLOBAL?.startsWith(os.homedir()), "run through test/run.mjs, which supplies a throwaway $HOME");
@@ -499,8 +499,8 @@ test("round 14: gzip's short prefixes, xz --files, a link patch makes, $$( in do
     fs.mkdirSync(path.join(b, "p"));
     fs.writeFileSync(path.join(b, "p", "package.json"), "{}");
     const f = new SessionState(repo);
-    await effect(`xz -d --files=${b}/list`, f);
-    assert.notEqual((await decideShell(guard, f, path.join(b, "p"), "npm test")).effect, "allow", "xz --files");
+    // (Round 62: --files is a spelling the rules do not read; the call asks.)
+    assert.equal(await effect(`xz -d --files=${b}/list`, f), "ask", "xz --files");
     fs.mkdirSync(path.join(b, "e", "sub"), { recursive: true });
     fs.mkdirSync(path.join(b, "k", "deep"), { recursive: true });
     const l = new SessionState(repo);
@@ -842,4 +842,776 @@ test("round 32: unzip -l - --l extracts; npm version past an option's value; rul
   }
   for (const c of ["echo hi > /dev/stderr", "echo hi > /dev/stdout", "npm test 2>/dev/null", "cp f /dev/null", "ls -h", "git --version", "node --version"]) assert.equal(await effect(c), "allow", c);
   for (const c of ["echo x | zsh -h", "echo x | mytool -V"]) assert.notEqual(await effect(c), "allow", c);
+});
+
+// ---- round 33 ----
+
+test("round 33: a quote inside a tilde's prefix, npm field words, Tcl's --help, /dev/full and /dev/shm, brace ranges past 2^53, whole-number timeouts", async () => {
+  // Astra: the printer cannot quote text inside a `~` prefix after `=` or `:` without changing it.
+  assert.ok("ask" in canonical("echo x=~#=~"), "x=~#=~ asks");
+  assert.equal(canonical("PATH=~/bin:~/x ls").text, "PATH=~/bin:~/x ls");
+  // Sol: `version` as a field word of npm view or info is no write.
+  for (const reader of ["npm view sample version description", "npm view sample description version", "npm info x version"]) {
+    const s = new SessionState(repo);
+    assert.equal(await effect(reader, s), "allow", reader);
+    assert.equal(await effect("npm test", s), "allow", `npm test after ${reader}`);
+  }
+  for (const writer of ["npm version patch", "pnpm -w version 1.2.3"]) {
+    const s = new SessionState(repo);
+    const wrote = await effect(writer, s);
+    assert.ok(wrote !== "allow" || (await effect("npm test", s)) !== "allow", writer);
+  }
+  // Opus: Tcl's shells and erl take --help as an argument for the script on standard input.
+  for (const c of ["echo x | tclsh --help", "tclsh8.6 --version", "erl --version"]) assert.notEqual(await effect(c), "allow", c);
+  // Mythos: /dev/full and /dev/shm are writable, as the README says.
+  for (const c of ["echo x > /dev/full", "echo x > /dev/shm/cp2-r33"]) assert.equal(await effect(c), "allow", c);
+  // Astra: a range whose ends are past 2^53 is not followed (it used not to end).
+  assert.equal(parse("echo {9007199254740992..9007199254740992}").opaque, true);
+  // Astra, Sol: a timeout that is not a whole number fails to ask, before any request.
+  const { scoreCommand } = await import("../kev.ts");
+  const scored = await scoreCommand({ ...DEFAULT_CLASSIFIER, timeoutMs: 100.5 }, { tool: "bash", cwd: repo, command: "ls" });
+  assert.ok("error" in scored);
+  const { loadConfig } = await import("../config.ts");
+  assert.match(loadConfig(path.join(base, "no-such-config.json"), { classifier: { timeoutMs: 100.5 } }).problem ?? "", /timeoutMs/);
+  assert.equal(loadConfig(path.join(base, "no-such-config.json"), { classifier: { timeoutMs: 5000 } }).problem, undefined);
+});
+
+// ---- round 34 ----
+
+test("round 34: a second ~ in a made word's prefix, signed brace padding, unittest names, git log patch options, pnpm --color, cp -t, csh --help, dd of=/dev/full, the timer's limit", async () => {
+  // Astra: `{~,x}:~` makes `~:~`, whose tilde prefix holds the second `~`.
+  assert.ok("ask" in canonical("printf %s {~,x}:~"));
+  assert.equal(canonical("echo {~,x}/a").text, "echo ~/a x/a");
+  // Astra, Sol: the sign comes before the zeros, as bash prints them.
+  assert.deepEqual(parse("echo {-02..1}").cmds[0].argv.slice(1), ["-02", "-01", "000", "001"]);
+  // Mythos: unittest calls a name it is given; stdlib callables run standard input.
+  for (const c of ["echo 'import os' | python3 -m unittest code.interact", "python3 -m unittest builtins.breakpoint <<< c", "echo c | python3 -m pytest --pdb"]) assert.notEqual(await effect(c), "allow", c);
+  assert.equal(await effect("python3 -m json.tool < package.json"), "allow");
+  // Mythos, Opus: git log's patch options print a credential file's content.
+  for (const c of ["git log -U3 .env", "git log --unified=3 .env", "git log --cc .env", "git log -c .env", "git log --binary .env", "git log --remerge-diff .env", "git whatchanged -U1 .env"]) assert.notEqual(await effect(c), "allow", c);
+  assert.equal(await effect("git log -1 --oneline secrets.json"), "allow");
+  // Mythos, Opus: pnpm's --color is a flag, so `version` after it is the subcommand.
+  const s = new SessionState(repo);
+  const wrote = await effect("pnpm --color version 1.2.3", s);
+  assert.ok(wrote !== "allow" || (await effect("npm test", s)) !== "allow", "pnpm --color version");
+  // Mythos: with cp -t every operand is a source.
+  for (const c of ["cp -t /tmp/cp2-r34 .env", "cp --target-directory=/tmp/cp2-r34 .env"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["echo x | csh --help", "echo x | tclkit --version"]) assert.notEqual(await effect(c), "allow", c);
+  // Astra, Sol: a timeout past what the timer holds fails to ask, before any request.
+  const { scoreCommand } = await import("../kev.ts");
+  assert.ok("error" in (await scoreCommand({ ...DEFAULT_CLASSIFIER, timeoutMs: 4294967296 }, { tool: "bash", cwd: repo, command: "ls" })));
+});
+
+// ---- round 35 ----
+
+test("round 35: unittest names the project defines, compiler options from a stream, install --strip-program, rsync's empty host, cp -vt, git log past -C, brace words bash drops", async () => {
+  // All four: unittest walks any attribute after the module and calls what it reaches.
+  const p = fs.realpathSync(fs.mkdtempSync(path.join(base, "r35-")));
+  try {
+    fs.mkdirSync(path.join(p, "tests"));
+    fs.writeFileSync(path.join(p, "tests", "__init__.py"), "");
+    fs.writeFileSync(path.join(p, "tests", "test_a.py"), "import unittest\n\nclass TestA(unittest.TestCase):\n    def test_one(self):\n        pass\n");
+    fs.mkdirSync(path.join(p, "code"));
+    fs.mkdirSync(path.join(p, "json"));
+    execFileSync("git", ["init", "-q", p]);
+    const at = async (c: string) => (await decideShell(guard, new SessionState(p), p, c)).effect;
+    for (const c of ["python3 -m unittest tests.test_a", "python3 -m unittest tests.test_a.TestA", "python3 -m unittest tests.test_a.TestA.test_one", "python3 -m unittest tests/test_a.py"]) assert.equal(await at(c), "allow", c);
+    for (const c of ["echo x | python3 -m unittest tests.test_a.unittest.case.sys.breakpointhook", "echo x | python3 -m unittest code.interact", "python3 -m unittest json.dumps", "python3 -m unittest tests.test_a.TestB"]) assert.notEqual(await at(c), "allow", c);
+  } finally {
+    fs.rmSync(p, { recursive: true, force: true });
+  }
+  // Mythos: options from standard input, a descriptor or a process substitution.
+  for (const c of ["printf x | rustc @/dev/stdin m.rs", "rustc @<(printf x) m.rs", "gcc @/dev/stdin g.c", "gcc -Wl,@/dev/stdin g.c", "clang --config /dev/stdin g.c"]) assert.notEqual(await effect(c), "allow", c);
+  // Mythos: install runs its strip program; rsync's `:x` is remote; cp -vt reads every operand.
+  for (const c of ["printf x | install -s --strip-program=/bin/sh /dev/stdin out/x", "rsync -e 'sh -c id' f :x", "cp -vt out .env", "mv -vt out .env", "cp --target out .env", "git log --check .env", "echo c | ( pytest --pdb )", "python3 -m mypy --install-types"]) assert.notEqual(await effect(c), "allow", c);
+  // Sol: git's own options before log, and --full-diff alone, show no content.
+  for (const c of ["git -C . log -1 --oneline -- secrets.json", "git log -1 --full-diff --oneline secrets.json"]) assert.equal(await effect(c), "allow", c);
+  // Astra, Opus, Sol: words as bash makes them.
+  assert.deepEqual(parse("printf %s {,x}").cmds[0].argv, ["printf", "%s", "x"]);
+  assert.deepEqual(parse("printf %s ''{,x}").cmds[0].argv, ["printf", "%s", "", "x"]);
+  assert.deepEqual(parse("echo x{y{1,2}").cmds[0].argv, ["echo", "x{y1", "x{y2"]);
+  assert.equal(parse("echo {+1..3}").opaque, true);
+});
+
+// ---- round 36 ----
+
+test("round 36: unittest paths and names after --, option files by where they lead, install --strip-, cp -St, git log -pw, brace words per alternative", async () => {
+  const p = fs.realpathSync(fs.mkdtempSync(path.join(base, "r36-")));
+  try {
+    fs.mkdirSync(path.join(p, "tests"));
+    fs.writeFileSync(path.join(p, "tests", "__init__.py"), "");
+    fs.writeFileSync(path.join(p, "tests", "test_a.py"), "import unittest\n\nclass TestA(unittest.TestCase):\n    def test_one(self):\n        pass\n");
+    fs.mkdirSync(path.join(p, "code"));
+    fs.writeFileSync(path.join(p, "code", "interact.py"), "");
+    execFileSync("git", ["init", "-q", p]);
+    const at = async (c: string) => (await decideShell(guard, new SessionState(p), p, c)).effect;
+    // Opus, Mythos: a path is the dotted name unittest imports; a name after `--` is a name.
+    for (const c of ["echo x | python3 -m unittest code/interact.py", "python3 -m unittest -- -k code.interact", "python3 -m unittest -- --durations code.interact"]) assert.notEqual(await at(c), "allow", c);
+    for (const c of ["python3 -m unittest tests/test_a.py", "python3 -m unittest tests.test_a.TestA"]) assert.equal(await at(c), "allow", c);
+  } finally {
+    fs.rmSync(p, { recursive: true, force: true });
+  }
+  // Opus, Sol, Mythos: an option file by where its path leads.
+  for (const c of ["gcc @//dev/stdin g.c", "gcc @/./dev/stdin g.c", "gcc @/tmp/../dev/stdin g.c", `gcc @${"../".repeat(repo.split("/").length)}dev/stdin g.c`, "rustc @//dev/stdin m.rs", "gcc -Wl,@//dev/stdin g.c"]) assert.notEqual(await effect(c), "allow", c);
+  assert.equal(await effect("gcc @flags.rsp g.c"), "allow");
+  // Opus, Sol: `--strip-` is a prefix getopt takes. Mythos: `-St` is suffix t; `-pw` prints a patch.
+  for (const c of ["install -s --strip-=/bin/sh f out/x", "cp -St .env out/x", "install -St .env out/i", "cp --suffix -t .env out/y", "git log -pw .env", "git log -pz .env", "gcc -include.env g.c", "gcc -Wl,@.env g.c", "python3 -m mypy --python-exec=./x ."]) assert.notEqual(await effect(c), "allow", c);
+  // Astra, Opus, Sol, Mythos: brace words as bash makes them.
+  assert.deepEqual(parse("printf %s start {,'x'}").cmds[0].argv, ["printf", "%s", "start", "x"]);
+  assert.deepEqual(parse("printf %s ''{,x}").cmds[0].argv, ["printf", "%s", "", "x"]);
+  assert.deepEqual(parse("echo {a}b,c}").cmds[0].argv, ["echo", "a}b", "c"]);
+  assert.equal(parse("echo {a..c..+1}").opaque, true);
+  assert.equal(parse("echo {Z..a}").opaque, true);
+});
+
+// ---- round 37 ----
+
+test("round 37: option files where the command runs, declare's compound values, pip -v, unittest's loaded modules, brace expansion as bash does it", async () => {
+  // Opus: a relative option file, resolved where the command runs.
+  for (const c of ["cd /dev && gcc @stdin g.c", "cd / && gcc @dev/stdin g.c", "cd /dev && rustc @stdin m.rs"]) assert.notEqual(await effect(c), "allow", c);
+  // Mythos: declare and its kin read `a=(...)` again, as a compound assignment.
+  for (const c of ["declare -a 'a=($(git push --force origin main))'", "declare -a 'a=($(cat .env))'", "typeset -A 'm=([$(id)]=1)'", "x='($(id))'; declare -a \"a=$x\""]) assert.notEqual(await effect(c), "allow", c);
+  // Mythos: `-v` is verbose for pip, cargo and uv.
+  for (const c of ["pip -v install x", "cargo -v add serde", "uv -v sync", "python3 -m pip config set global.x y", "gcc -Wp,-include.env g.c", "pytest -o python_functions=interact x.py"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["npm -v", "pip --version", "python3 -m pip list"]) assert.equal(await effect(c), "allow", c);
+  // Mythos: a built-in module, or one unittest has loaded, is not the project's.
+  const p = fs.realpathSync(fs.mkdtempSync(path.join(base, "r37-")));
+  try {
+    fs.mkdirSync(path.join(p, "builtins"));
+    fs.writeFileSync(path.join(p, "builtins", "__init__.py"), "");
+    fs.writeFileSync(path.join(p, "builtins", "breakpoint.py"), "");
+    execFileSync("git", ["init", "-q", p]);
+    for (const c of ["echo x | python3 -m unittest builtins.breakpoint", "echo x | python3 -m unittest builtins/breakpoint.py"]) assert.notEqual((await decideShell(guard, new SessionState(p), p, c)).effect, "allow", c);
+  } finally {
+    fs.rmSync(p, { recursive: true, force: true });
+  }
+  // Astra, Sol, Mythos: words as bash makes them.
+  const words = (w: string) => parse(`echo ${w}`).cmds[0].argv.slice(1);
+  assert.deepEqual(words("{}x,y}"), ["{}x,y}"]);
+  assert.deepEqual(words("{{a},b},c}"), ["{a},c}", "b,c}"]);
+  // (Round 38: a group with a comma only further in is not modelled.)
+  assert.equal(parse("echo {..{,}}").opaque, true);
+  assert.equal(parse("echo {1..{2,3}}").opaque, true);
+  assert.deepEqual(words("{x,{y,z}}w"), ["xw", "yw", "zw"]);
+});
+
+// ---- round 38 ----
+
+test("round 38: git bisect view's command, venv targets, systemctl -H anywhere, pytest -o spellings, rsync's outputs and daemon, brace quirks unmodelled", async () => {
+  // Mythos: `git bisect view <words>` runs `git <words>`.
+  assert.notEqual(await effect("git bisect view git -c alias.x=x x"), "allow");
+  assert.equal(await effect("git bisect view --stat"), "allow");
+  // Mythos: venv writes its directory; --clear empties it.
+  for (const c of ["python3 -m venv --clear .", "python3 -m venv --clear ~", "python3 -m venv .git/hooks", "uv venv --clear ."]) assert.notEqual(await effect(c), "allow", c);
+  assert.equal(await effect("python3 -m venv .venv"), "allow");
+  // Mythos: systemctl and loginctl read -H anywhere.
+  for (const c of ["systemctl status -H user@host", "systemctl is-active x --host=user@host", "loginctl list-sessions -H h", "systemctl status x -M foo"]) assert.notEqual(await effect(c), "allow", c);
+  // Opus, Mythos: every spelling of pytest's -o.
+  for (const c of ["pytest -opython_functions=interact x.py", "pytest --override-ini=python_functions=interact x.py", "rsync -a f g --log-file=/opt/cp2-r38/x", "rsync --daemon", "nm --plugin x.so f", "docker build --push ."]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["python3 -m pip --version", "cd -P . && ls"]) assert.equal(await effect(c), "allow", c);
+  // Astra, Sol, Mythos: bash's brace quirks are not modelled.
+  for (const w of ["{{{x,y}}}", "1{},}", "{{a,b}}", "a{},0}"]) assert.equal(parse(`echo ${w}`).opaque, true, w);
+});
+
+// ---- round 39 ----
+
+test("round 39: operands after --, option-named write places outside, deletions by rsync and tar, \\😀 printed whole", async () => {
+  // Opus: every word after `--` is an operand, `-/../.git` included.
+  for (const c of ["mkdir - && rm -rf -- -/../.git", "mkdir - && echo x | tee -a -- -/../.git/config", `tee -- -/${"../".repeat(repo.split("/").length)}opt/cp2-r39 < f`, "python3 -m venv --clear -- -/../.git"]) assert.notEqual(await effect(c), "allow", c);
+  // Mythos: places the guard reads right are held to the outside test.
+  for (const c of ["cp f ~/.bashrc -S bak", "install f ~/.local/bin/x -m 755", "tar -xf a.tar -C../out", "tar -xf a.tar --directory=../out", "find . -name f -fprint0 ~/.bashrc", "rsync -aT../out f g", "chmod --reference=f ~/.bashrc"]) assert.notEqual(await effect(c), "allow", c);
+  // Mythos: deletions held to rm's test.
+  for (const c of ["rsync -a --remove-source-files ~/Documents/ d/", "tar -cf a.tar --remove-files .git", "rsync -a --delete sub/ ~/x", "pytest --basetemp=.", "python3 -m venv --upgrade-deps .venv", "journalctl --cursor-file=.git/hooks/pre-commit -n 1", "nm --pl ./x.so f", "python3 -m compileall ~/"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["cp f g", "tar -cf a.tar f", "git bisect visualize -n 1 --oneline"]) assert.equal(await effect(c), "allow", c);
+  // Astra: a backslash quotes the whole code point.
+  const p = canonical("echo \\😀");
+  assert.ok(!("ask" in p) && p.text === "echo '😀'", JSON.stringify(p));
+});
+
+// ---- round 40 ----
+
+test("round 40: -- in every reader, chmod modes and --ref, option writes by prefix, tar --remove-files lists, ps e, \"$*$@\", rsync dry runs", async () => {
+  const up = "../".repeat(repo.split("/").length);
+  // Opus: every reader takes the words after `--` as files.
+  for (const c of ["mkdir - && cat -- -/../.env", "mkdir - && rm -- -/../.git/config", "gzip .git/config", "mkdir - && gzip -- -/../.git/config", `mkdir - && tar -cf a.tar --remove-files -- -/${up}opt/x`, `mkdir - && sed -i -- s/a/b/ -/${up}opt/x`, `python3 -m venv --clear -- -/${up}opt/x`]) assert.notEqual(await effect(c), "allow", c);
+  // Mythos: a mode that looks like an option, --reference by prefix, option writes by prefix.
+  for (const c of ["chmod -w ~/.bashrc", "chmod -R -rwx ~/Documents", "chmod --ref=f ~/.bashrc", "journalctl --cursor-fil=/opt/x -n1", "tar -c --remove-files -f a.tar --dir=/home Documents", "tar --remove-files -cf a.tar -T list.txt", "ps axeww", "ps -eo pid,environ"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["chmod --reference /bin/true f", "chmod -R a-w sub", "ps aux", "ps -C sleep", "python3 -m compileall -q -d /usr/src/demo f", "tar -tf a.tar -- -F", "rsync -ani --delete ./d/ ./e/"]) assert.equal(await effect(c), "allow", c);
+  // Sol: an rsync dry run records no write.
+  const s = new SessionState(repo);
+  assert.equal(await effect("rsync -ani f g", s), "allow");
+  assert.equal(await effect("npm test", s), "allow");
+  // Astra: "$@" beside other text in a word asks rather than being printed in parts.
+  assert.ok("ask" in canonical('printf "<%s>" "$*$@" END'));
+});
+
+// ---- round 41 ----
+
+test("round 41: rsync and tar read by position, a copy into a directory by the source's name, chmod -700, ps e clusters, dash-led paths walked, self-describing variables", async () => {
+  // Opus, Mythos, Sol: rsync's dry run, listing and option values by position.
+  for (const c of ["rsync -a --delete --exclude -n ./d/ ~/", "rsync -aen f ~/.bashrc", "rsync --daemon --config -n", "rsync -an --log-file=.git/hooks/pre-commit f g"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["rsync -ani f g"]) {
+    const s = new SessionState(repo);
+    assert.equal(await effect(c, s), "allow", c);
+    assert.equal(await effect("npm test", s), "allow", `npm test after ${c}`);
+  }
+  // Opus, Mythos: tar's members and options by position.
+  for (const c of ["tar -cf a.tar --remove-files conf .git", "tar -c --exclude -- -I ./x.sh -f a.tar f", "tar --remove-files -cf a.tar --add-fil=/opt/x"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["tar -tf a.tar --exclude -F", "tar -tf a.tar -- a:b", "tar -cf a.tar f"]) assert.equal(await effect(c), "allow", c);
+  // Opus: a copy into a directory writes the source's name there.
+  for (const c of ["cp -r /opt/ev/.git .", "chmod -700 ~/.bashrc", "ps axeg", "ps ep 1", "mkdir - && awk 1 -/../.env", "mkdir - && uniq -- f -/../.git/hooks/pre-commit", "mkdir - && ln -s ~ ./-/h && echo evil >> -/h/.bashrc"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["ps aux", "gzip -l .git/qa.gz", "cp f g"]) assert.equal(await effect(c), "allow", c);
+  // Astra: a command that reads its own text or line asks when printing changes it.
+  assert.ok("ask" in canonical('printf "%s\\n" "$BASH_COMMAND"'));
+  assert.ok("ask" in canonical('# heading\nprintf "%s\\n" "$LINENO"'));
+});
+
+// ---- round 42 ----
+
+test("round 42: rsync and tar options by their real tables, compressors by position, a directory's contents copied with its .git, ~+, ps by position, self-reading by name", async () => {
+  // Opus, Mythos: a flag the readers took for an option with a value hid the next word.
+  const tars = ["tar --backup -I ./x.sh -cf a.tar f", "tar --occurrence -I ./x.sh -xf a.tar", "tar --backup -F ./x.sh -cf a.tar f", "tar --backup -L 1 -cf a.tar f", "tar -c --backup -f h:a.tar f", "tar --list -I ./x.sh -f a.tar", "tar --list -M -f a.tar", "tar --list -f host:a.tar", "tar -cf a.tar --remove-files --backup .git", "tar -tf host:x --xattrs-include --force-local"];
+  const rsyncs = ["rsync -e ./x.sh --munge-links x:y z", "rsync --munge-links --remove-source-files ../out/victim g", "rsync --munge-links --daemon", "rsync f --checksum host:dst", "rsync --backup host:/etc/passwd d/", "rsync --partial f ~/.bashrc", "rsync -a --backup --remove-source-files ~/docs/ d/", "rsync --partial --daemon", "rsync --read-batch=b ~/", "rsync --log-format -n f ~/.bashrc"];
+  // Mythos: a compressor's option value is no listing, test or stdout letter.
+  const zips = ["gzip -Sc .git/HEAD", "gzip -dSc .git/hooks/pre-commitc", "xz -Flzma .git/HEAD", "xz -Ccrc32 .git/HEAD", "zstd -D dict .git/HEAD", "zstd -o .git/x f"];
+  // Opus, Mythos: a directory's contents bring the .git they hold; `~+` is where it runs.
+  fs.mkdirSync(path.join(base, "ev", ".git"), { recursive: true });
+  const copies = ["cp -r ../ev/. .", "cp -rT ../ev .", "cp -r --no-target-directory ../ev .", "rsync -a ../ev/ .", "cp -r ../ev/.git ~+", "cp -r ../ev/.git ~+/."];
+  const pss = ["ps -oenviron", "ps -eoenviron", "ps -e -opid,environ", "ps -Oenviron", "ps -o 'pid environ'", "ps g e", "ps --forest e", "ps --headers e", "ps -o environ:60", "ps opid,environ"];
+  for (const c of [...tars, ...rsyncs, ...zips, ...copies, ...pss]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["tar -tf a.tar --exclude --to-command", "tar -tf a.tar -- a:b", "cp f ~+/g"]) assert.equal(await effect(c), "allow", c);
+  // Sol: reads that write nothing leave no write in the session's record.
+  for (const c of ["tar -tf a.tar --exclude -x", "tar -xOf a.tar f", "gzip -dc f.gz", "gunzip -t f.gz", "xz -dc f.xz", "zcat f.gz"]) {
+    const s = new SessionState(repo);
+    assert.equal(await effect(c, s), "allow", c);
+    assert.equal(await effect("npm test", s), "allow", `npm test after ${c}`);
+  }
+  const s = new SessionState(repo);
+  assert.equal(await effect("gzip -d f.gz", s), "allow");
+  assert.notEqual(await effect("npm test", s), "allow");
+  // All four: the self-reading names in the printed text, by name.
+  for (const c of ["\n\necho ${#BASH_EXECUTION_STRING}", "echo  hi; declare -p BASH_EXECUTION_STRING", '# heading\nprintf "%s\\n" "$LINE\\\nNO"', "# c\necho $((LINENO))", "# c\n(( n = LINENO ))", "# c\nf(){ caller; }; f"]) assert.ok("ask" in canonical(c), JSON.stringify(c));
+  assert.ok(!("ask" in canonical("echo ok # $LINENO")));
+});
+
+// ---- round 43 ----
+
+test("round 43: tables hold no inherited names, tar's old style with a dash and hidden options, rsync --server and -T=, ps read again as BSD, compressor prefixes and zstd -o, .git in copies by -t, globs and depth", async () => {
+  // Astra: a command named like an Object property is judged, not thrown on.
+  fs.writeFileSync(path.join(repo, "constructor"), "#!/bin/sh\necho 1.0\n", { mode: 0o755 });
+  try {
+    for (const c of ["./constructor -V", "constructor", "__proto__ x", "toString"]) assert.notEqual(await effect(c), "allow", c);
+  } finally {
+    fs.rmSync(path.join(repo, "constructor"));
+  }
+  fs.mkdirSync(path.join(base, "ev", ".git"), { recursive: true });
+  fs.mkdirSync(path.join(base, "o2", "in", ".git"), { recursive: true });
+  fs.mkdirSync(path.join(repo, "dst"), { recursive: true });
+  const asks = [
+    // Mythos: tar's first word, a `-` in it, and its hidden options.
+    "tar cIf- ./x.sh b.tar f", "tar cFf- ./x.sh b.tar f", "tar cMf- b.tar f", "tar cf- .git/config f",
+    // Mythos: rsync --server writes from its input; Opus, Mythos: `-T=dir` is `dir`.
+    "rsync --server .git/hooks .", "rsync -a -T=/opt/x f g", "rsync -a -T=.git/x f g",
+    // Opus, Mythos: ps -N is a flag; procps reads dash words again as BSD ones.
+    "ps -N eww", "ps -ex", "ps -e -x", "ps -efx", "ps -auxe", "ps -uaxe", "ps -e -t", "ps -eH -x", "ps --format:environ",
+    // Opus, Mythos: gzip and xz take a long option by its prefix; zstd -o and --rm.
+    "gzip --suf -c .git/config", "gzip --su -c .git/config", "xz --suf -c .git/config", "zstd --rm .git/config -o x", "zstd -d -of .git/hooks/pre-commit p.zst",
+    // Opus, Mythos: a copy into -t, from a glob, or of a .git deeper down.
+    "cp -r -t dst ../ev", "cp -rt dst ../ev/.", "cp -r --target-directory=dst ../ev/.", "cp -r ../e[v] dst", "cp -r ../e?/. dst", "rsync -a ../e[v]/ dst", "cp -r ../o2 .", "rsync -a ../o2/ .",
+  ];
+  for (const c of asks) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["ps -ef", "ps -ef -u root", "tar -tf a.tar notes:today", "cp -t dst f"]) assert.equal(await effect(c), "allow", c);
+  // Mythos: an extraction past --program-name's value is a write.
+  const s = new SessionState(repo);
+  assert.notEqual(await effect("tar -xf a.tar --program-name -O", s), "allow", "a spelling the rules do not read asks (round 62)");
+});
+
+// ---- round 44 ----
+
+test("round 44: ps read again as BSD takes no UNIX value, rsync -M words, sort -m/-c/-C, a decompression to .git, copies that copy nothing or follow links, option values no tar archive", async () => {
+  fs.mkdirSync(path.join(base, "ev", ".git"), { recursive: true });
+  fs.mkdirSync(path.join(base, "o2", "in", ".git"), { recursive: true });
+  fs.mkdirSync(path.join(base, "ev2"), { recursive: true });
+  if (!fs.existsSync(path.join(base, "ev2", "l"))) fs.symlinkSync("../ev", path.join(base, "ev2", "l"));
+  fs.mkdirSync(path.join(repo, "dst"), { recursive: true });
+  const asks = [
+    // Opus: `-x` sends procps to BSD, where `-u` takes nothing and `-e` is `e`.
+    "ps -xu -e", "ps -xg -e", "ps -xs -e", "ps -xu -eww",
+    // Opus: what -M hands the receiving side is held to the write test.
+    "rsync -a -M--log-file=../outside.log f g", "rsync -a -M --log-file=.git/x f g", "rsync -a --remote-option=--log-file=.git/x f g",
+    // Opus: sort's -m, -c and -C are flags before -o (sort refuses -c or -C with -o, round 45,
+    // Sol: those two rows ask only as the conservative reading).
+    "sort -mo ../x f", "sort -co../x f", "sort -Co../x f", "sort -mo.git/hooks/pre-commit f",
+    // Opus: a decompression in place to a name .git; a copy that follows links.
+    "gzip -d sub/.git.gz", "xz -d sub/.git.xz", "zstd -d sub/.git.zst", "zstd -Do dict .git/out f", "cp -rL ../ev2 dst",
+  ];
+  for (const c of asks) assert.notEqual(await effect(c), "allow", c);
+  // Sol, Astra: an option's value is no archive; a process list of digits stays UNIX; a copy that
+  // copies nothing brings nothing; a listing writes no -o file.
+  // (Round 44: zstd's `-D` takes the next word, the cluster going on, as its `-o` does: in
+  // `zstd -Ddict .git/HEAD` the dictionary is `.git/HEAD`, and nothing is written; tried, 1.5.7.)
+  for (const c of ["tar -tf a.tar --exclude notes:today", "rsync -an ../o2 dst/", "cp --version ../o2 dst/"]) assert.equal(await effect(c), "allow", c);
+  const s = new SessionState(repo);
+  assert.notEqual(await effect("zstd --list -o dst/out f.zst", s), "allow", "a spelling the rules do not read asks (round 62)");
+  assert.equal(await effect("npm test", s), "allow");
+  const m = new SessionState(repo);
+  assert.equal(await effect("sort -mo x.test.js f", m), "allow");
+  assert.notEqual(await effect("npm test", m), "allow");
+});
+
+// ---- round 45 ----
+
+test("round 45: --help after -- is a file, copies that follow links by -k or --deref, a decompression's output name, ps values the UNIX reading takes or refuses, copies and dry runs that write nothing", async () => {
+  fs.mkdirSync(path.join(base, "ev", ".git"), { recursive: true });
+  fs.mkdirSync(path.join(base, "o2", "in", ".git"), { recursive: true });
+  fs.mkdirSync(path.join(base, "ev2"), { recursive: true });
+  if (!fs.existsSync(path.join(base, "ev2", "l"))) fs.symlinkSync("../ev", path.join(base, "ev2", "l"));
+  fs.mkdirSync(path.join(repo, "dst"), { recursive: true });
+  fs.mkdirSync(path.join(repo, "sub"), { recursive: true });
+  for (const n of [".git.gz", ".gitignore.gz", "innocent.gz"]) fs.writeFileSync(path.join(repo, "sub", n), "x");
+  const asks = [
+    // Opus: `--help` after `--` names a file; -k, --copy-dirlinks and --deref follow links.
+    "cp -r -- --help ../o2 dst/", "rsync -a -- --help ../o2 dst/", "rsync -rk ../ev2 dst/", "rsync -r --copy-dirlinks ../ev2 dst/", "cp -r --deref ../ev2 dst/",
+    // Opus: the output name by glob, -S, -N and -r.
+    "gzip -d sub/.g*.gz", "gzip -d sub/.[g]it.gz", "gzip -d -S ignore.gz sub/.gitignore.gz", "gzip -dN sub/innocent.gz", "gunzip --name sub/innocent.gz", "gzip -dr sub",
+    // Opus: a separate value that starts with `-` is refused by the UNIX reading.
+    "ps -e -u -x", "ps -e -g -x", "ps -eg -x",
+  ];
+  for (const c of asks) assert.notEqual(await effect(c), "allow", c);
+  // Sol, Astra: values the UNIX reading takes; output names exactly `.git`; no-copy copies.
+  for (const c of ["gzip -d .gitlab-ci.yml.gz", "rsync -ani f .git/fixtures/", "cp --version f .git/fixtures/"]) assert.equal(await effect(c), "allow", c);
+  for (const c of ["cp --version f dst/"]) {
+    const s = new SessionState(repo);
+    assert.equal(await effect(c, s), "allow", c);
+    assert.equal(await effect("npm test", s), "allow", `npm test after ${c}`);
+  }
+});
+
+// ---- round 46 ----
+
+test("round 46: copies read by position before --help, zstd's other suffixes, glob classes, --copy-unsafe-links, ps lists and terminals, version queries write nothing", async () => {
+  fs.mkdirSync(path.join(base, "ev", ".git"), { recursive: true });
+  fs.mkdirSync(path.join(base, "ev2"), { recursive: true });
+  if (!fs.existsSync(path.join(base, "ev2", "l"))) fs.symlinkSync("../ev", path.join(base, "ev2", "l"));
+  fs.mkdirSync(path.join(repo, "dst"), { recursive: true });
+  fs.mkdirSync(path.join(repo, "sub"), { recursive: true });
+  for (const n of [".git.gz", ".git.xz"]) fs.writeFileSync(path.join(repo, "sub", n), "x");
+  const asks = [
+    // Opus: an option's value is no --help.
+    "cp -S --help f .git/hooks/pre-commit", "mv -S --help f .git/hooks/pre-commit", "install -S --version f .git/hooks/pre-commit", "cp --suffix --help f .git/hooks/pre-commit", "cp -S --help f ../outside",
+    // Opus: zstd strips gzip's and xz's suffixes too; classes bash reads; links out of the tree.
+    "zstd -d sub/.git.gz", "zstd -d sub/.git.xz", "gzip -d sub/.[[:alpha:]]it.gz", "gzip -d sub/.[^x]it.gz", "rsync -r --copy-unsafe-links ../ev2 dst/",
+  ];
+  for (const c of asks) assert.notEqual(await effect(c), "allow", c);
+  const s = new SessionState(repo);
+  assert.equal(await effect("cp -S --help f x.test.js", s), "allow");
+  assert.notEqual(await effect("npm test", s), "allow");
+  // Sol, Astra: lists and terminals ps takes; `-S`'s value `--`; version queries.
+  for (const c of ["ps -e -C -x -o pid", "cp -S -- --version f .git/fixtures/", "install --strip-program=strip --version"]) assert.equal(await effect(c), "allow", c);
+  const d = new SessionState(repo);
+  assert.notEqual(await effect("rsync -ani --partial-dir=scratch f dst/", d), "allow", "a spelling the rules do not read asks (round 62)");
+  assert.equal(await effect("npm test", d), "allow");
+});
+
+// ---- round 47 ----
+
+test("round 47: ps conflicts read again as BSD, gzip's suffixes in any case, rsync --version's log, xz's queries, sort's --, ps terminals", async () => {
+  fs.mkdirSync(path.join(repo, "dst"), { recursive: true });
+  fs.mkdirSync(path.join(repo, "sub"), { recursive: true });
+  for (const n of [".git.GZ", ".git_Z", ".git-GZ"]) fs.writeFileSync(path.join(repo, "sub", n), "x");
+  // Opus: a thread display beside a forest fails the UNIX reading after parsing; gzip folds case.
+  for (const c of ["ps -eTH", "ps -e -T -H -o pid,args", "ps -eT --forest", "ps -eLm", "gunzip sub/.git.GZ", "gzip -d sub/.git_Z", "gunzip sub/.git-GZ", "rsync -n --version --log-file=.git/x f dst/"]) assert.notEqual(await effect(c), "allow", c);
+  // Sol, Astra: queries and spellings that write nothing and print no environment.
+  for (const c of ["sort -c -- --compress-program", "ps -eH"]) assert.equal(await effect(c), "allow", c);
+  // Sol: rsync --version still writes its log, which the record keeps.
+  const s = new SessionState(repo);
+  assert.notEqual(await effect("rsync -n --version --log-file=version.log f dst/", s), "allow", "a spelling the rules do not read asks (round 62)");
+});
+
+// ---- round 48 ----
+
+test("round 48: sort read by position, ps -O given BSD keys, parsed ps flags only, zstd's .zstd, rsync's last log and help queries", async () => {
+  fs.mkdirSync(path.join(repo, "dst"), { recursive: true });
+  fs.mkdirSync(path.join(repo, "sub"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "sub", ".git.zstd"), "x");
+  // Opus: `--` as an option's value ends nothing; `-O p` sends procps to BSD; zstd's `.zstd`.
+  for (const c of ["sort --random-source -- --compress-program=sh -S 1K f", "sort -T -- --compress-program=sh f", "sort --compress-prog sh f", "ps -eT -O p", "ps -eTOp", "ps -Op -eT", "ps -eTO+p", "zstd -d sub/.git.zstd"]) assert.notEqual(await effect(c), "allow", c);
+  // Sol: the last --log-file is the one rsync opens; an empty one opens none.
+  const s = new SessionState(repo);
+  assert.notEqual(await effect("rsync --version --log-file=unused.log --log-file= f dst/", s), "allow", "a spelling the rules do not read asks (round 62)");
+  assert.equal(await effect("npm test", s), "allow");
+});
+
+// ---- round 49 ----
+
+test("round 49: sort's outputs read by position, rsync's help in order with its log, ps -O macros, help tokens", async () => {
+  fs.mkdirSync(path.join(repo, "dst"), { recursive: true });
+  // Opus: `--random-source --` takes `--` as its value; a log before a help word is written.
+  for (const c of ["sort --random-source -- -o .git/config f", "sort --random-source -- --output=.git/config f", "sort --random-source -- -o ../x f", "rsync --log-file=.git/config --help", "rsync --log-file=.git/config --info=help", "rsync --log-file=../outside.log --help", "ps -eT -O p"]) assert.notEqual(await effect(c), "allow", c);
+  const s = new SessionState(repo);
+  assert.notEqual(await effect("printf x | sort --random-source -- -o t.test.js", s), "allow", "a spelling the rules do not read asks (round 62)");
+});
+
+// ---- round 50 ----
+
+test("round 50: sort's -y takes a value, help and version queries do nothing else in every check", async () => {
+  // Opus: in `-yk` the `k` is -y's value, so -o and --compress-program are read.
+  for (const c of ["sort -yk -o .git/config f", "sort -yk -o ../outside f", "sort -yk --compress-program=sh f", "rsync --log-file=.git/config --help", "rsync --daemon"]) assert.notEqual(await effect(c), "allow", c);
+  const w = new SessionState(repo);
+  assert.notEqual(await effect("printf x | sort -yk -o t.test.js", w), "allow", "a spelling the rules do not read asks (round 62)");
+  // Sol, Astra: a help or version query writes, reads and runs nothing.
+  for (const c of ["cp -S -- --version", "rsync --info=HELP -- --literal"]) assert.equal(await effect(c), "allow", c);
+});
+
+// ---- round 51 ----
+
+test("round 51: help and version queries read and run nothing, in every layer; sort's reads by position; a value is no command", async () => {
+  // Sol, Astra: queries that print and exit.
+  for (const c of ["cp --help -S cp -- --literal"]) assert.equal(await effect(c), "allow", c);
+  // The same tools still read, run and write where they do.
+  for (const c of ["gzip .netrc", "sort --files0-from=.netrc", "sort --random-source=.netrc -R f", "ps -eTH", "tar --multi-volume -cf a.tar f", "sort --help > .git/config", "cp -S cp f .git/x"]) assert.notEqual(await effect(c), "allow", c);
+  // Sol: an ambiguous long option stops sort before it writes.
+  const s = new SessionState(repo);
+  assert.notEqual(await effect("sort --ver --output=report", s), "allow", "a spelling the rules do not read asks (round 62)");
+  assert.equal(await effect("npm test", s), "allow");
+});
+
+// ---- round 52 ----
+
+test("round 52: ps -D takes a value, sort's last list and its random source, a writer's name behind a plain tool, rsync's version reaches no host", async () => {
+  // Opus: `--help` as -D's value is no help, and `e` then prints environments.
+  for (const c of ["ps -D --help aux e", "ps -eD --help e", "ps -D V axe", "ps --date-format --help e", "sort --files0-from=files --files0-from=.netrc", "sort -R --random-source=.netrc f", "sort --sort=random --random-source=.netrc f", "rsync -a f example:foo"]) assert.notEqual(await effect(c), "allow", c);
+  // Sol, Astra: what sort does not read, a file named cp, a version query.
+  for (const c of ["sort -- cp .git/report"]) assert.equal(await effect(c), "allow", c);
+});
+
+// ---- round 53 ----
+
+test("round 53: ps reads on after -D's attached value, sort's random keys, a writer's name is a command only behind a runner, zstd's numbers, rsync's queries", async () => {
+  // Opus: `-Doenviron` prints environments; a key with R reads the random source.
+  for (const c of ["ps -Doenviron", "ps -DOenviron", "ps -p1 -Doenviron", "sort -k1R --random-source=.env f", "sort --key=1R --random-source=.env f", "sort -R -k1 --random-source=.netrc f", "parallel cp f .git/x", "ssh host cp f .git/x", "find . -exec cp f .git/x \\;", "zstd -T1 .netrc", "rsync --version --log-file=.git/x f"]) assert.notEqual(await effect(c), "allow", c);
+  // Sol, Astra: a key's own ordering, a file named cp behind a reader, zstd -T1V, rsync queries.
+  for (const c of ["sha256sum -- cp .git/report", "od -- cp .git/report", "tar -tf cp -- .git/report"]) assert.equal(await effect(c), "allow", c);
+});
+
+// ---- round 54 ----
+
+test("round 54: plain tools by allowlist again, find -exec's words end at its terminator, sort's old keys, rsync's version opens its filter files", async () => {
+  // Opus: a wrapper the rules do not know keeps the .git write check; find -exec's `;` is no word.
+  for (const c of ["eatmydata cp f .git/hooks/pre-commit", "eatmydata tee .git/hooks/pre-commit", "eatmydata cp f opencode.json", "find . -maxdepth 0 -exec cp f .git/hooks/pre-commit \\;", "find . -exec cp f .git/x ';' -print"]) {
+    const d = await decideShell(guard, new SessionState(repo), repo, c);
+    assert.equal(d.effect, "ask", c);
+    assert.match(d.reason, /writes (\.git|opencode)/, c);
+  }
+  // Sol: rsync opens filter and list files before it prints its version.
+  for (const c of ["rsync --include-from=.netrc --version", "rsync --version --exclude-from=.netrc", "sort -R +0 -1 --random-source=.netrc rows"]) assert.notEqual(await effect(c), "allow", c);
+  // Sol, Astra: an old key's own ordering; git pathspecs and readers' operands named cp.
+  for (const c of ["git ls-files --others -- cp .git/report", "od -- cp .git/report"]) assert.equal(await effect(c), "allow", c);
+});
+
+// ---- round 55 ----
+
+test("round 55: rsync opens filter files as it reads each option, before a later help or any version; rg's operands", async () => {
+  // Astra: exactly the files rsync opens before a query exits (tried, rsync 3.5.0).
+  for (const c of ["rsync --version --exclude-from=.netrc", "rsync --version --filter='merge .netrc'", "rsync --version -f '. .netrc'", "rsync --exclude-from=.netrc --help", "rsync --exclude-from=.netrc --info=help", "rsync --include-from=.netrc --help", "rsync --filter='merge .netrc' --info=help", "rsync -f 'merge .netrc' --help"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["rg --files -- cp .git/report"]) assert.equal(await effect(c), "allow", c);
+  // Sol: git's pathspecs after its subcommand, find's predicate values, a `+` word sort takes
+  // for a file (`+0xR`); git's own subcommand and find's -exec command are still read.
+  for (const c of ["git ls-files --others cp .git/report", "find . -name cp -o -path ./.git/report -print"]) assert.equal(await effect(c), "allow", c);
+  for (const c of ["git -C . mv f ./--zz", "find . -exec cp f .git/x \\;", "sort -R +0 --random-source=.netrc rows"]) assert.notEqual(await effect(c), "allow", c);
+});
+
+// ---- round 56 ----
+
+test("round 56: find's actions read in place, rsync's short filter rules with modifiers, git's option values, sort under _POSIX2_VERSION", async () => {
+  // Astra: a literal -exec is no action outside find's action place.
+  for (const c of ["rg --files -- -exec cp .git/report", "git ls-files --others -- -exec cp .git/report", "find . -name -exec -o -name cp -o -path ./.git/report", "git -C nested/cp ls-files --others -- f .git/report"]) assert.equal(await effect(c), "allow", c);
+  for (const c of ["find . -name x -exec cp f .git/x \\;", "find . -type f -exec true \\; -exec cp f .git/x \\;", "find . -newermt 2020 -exec cp f .git/x \\;", "git -C . mv f ./--zz"]) assert.notEqual(await effect(c), "allow", c);
+  // Opus: `.-`, `.e`, `merge,/` open their file before a query exits.
+  for (const c of ["rsync --version --filter='.- .netrc'", "rsync -f'.- .netrc' --version", "rsync --version --filter='merge,/- .netrc'", "rsync --filter='.- .netrc' --help", "rsync --filter='merge,/ .netrc' --info=help"]) assert.notEqual(await effect(c), "allow", c);
+  // Sol: under _POSIX2_VERSION=200112, `+0R` is a file: the call goes to the model for the
+  // variable, not to a credential ask.
+  const d = await decideShell(guard, new SessionState(repo), repo, "_POSIX2_VERSION=200112 sort +0R --random-source=.netrc rows");
+  assert.doesNotMatch(d.reason, /credential/);
+});
+
+// ---- round 57 ----
+
+test("round 57: find is the program a command runs, its outputs where it reads them, sort's paired old keys", async () => {
+  // Astra: a pathspec named find owns no action; -name takes -fprint0 as its pattern.
+  for (const c of ["git ls-files -- find -exec cp .git/report", "find . -name -fprint0 -print"]) assert.equal(await effect(c), "allow", c);
+  // Sol: a find placed only after a non-action -exec owns none; an operand shaped like an
+  // assignment sets nothing.
+  assert.equal(await effect("rg --files -- -exec find -exec cp .git/report"), "allow");
+  process.env._POSIX2_VERSION = "200112";
+  try {
+    assert.notEqual(await effect("sort +0R --random-source=.netrc _POSIX2_VERSION=199209 rows"), "allow", "a spelling the rules do not read asks (round 62)");
+  } finally {
+    delete process.env._POSIX2_VERSION;
+  }
+  // Opus: find's start points come after its leading options; a .git start point asks.
+  for (const c of ["find -L ~ -name '*.bak' -delete", "find -P .. -name x -delete", "find -H ~/.ssh -type f -exec cat {} +", "find -O3 /etc -exec cat {} +", "find -files0-from list -delete", "find .git/hooks -delete", "find .git -name config -exec rm {} +"]) {
+    const d = await decideShell(guard, new SessionState(repo), repo, c);
+    assert.equal(d.effect, "ask", c);
+    assert.match(d.reason, /outside the working directory|start points read from a file|in a \.git directory/, c);
+  }
+  assert.notEqual(await effect("find -L src -name '*.ts'"), "allow", "a spelling the rules do not read asks (round 62)");
+  for (const c of ["find . -fprint0 .git/x", "find . -name x -fprint .git/x", "find . -exec cp f .git/x \\;"]) assert.notEqual(await effect(c), "allow", c);
+});
+
+// ---- round 58 ----
+
+test("round 58: sort's old keys stay keys after a pair, env -i clears _POSIX2_VERSION, find's start points and help, nested finds in linear time", async () => {
+  const old = process.env._POSIX2_VERSION;
+  process.env._POSIX2_VERSION = "200112";
+  try {
+    // Opus: after `+0 -1`, `+0R` is a key; `env -i` gives sort no _POSIX2_VERSION.
+    for (const c of ["sort +0 -1 +0R --random-source=.netrc rows", "env -i sort +0R --random-source=.netrc rows"]) assert.notEqual(await effect(c), "allow", c);
+  } finally {
+    if (old === undefined) delete process.env._POSIX2_VERSION;
+    else process.env._POSIX2_VERSION = old;
+  }
+  // Opus: a lone `-` or `!x` is a start point; Sol: find's help runs no action; Astra, Sol:
+  // `-name -files0-from` is a pattern.
+  for (const c of ["find - ~ -name '*.bak' -delete", "find '!x' ~ -delete", "find . -exec find -fprintf \\; -exec cp f .git/x \\;"]) assert.notEqual(await effect(c), "allow", c);
+  for (const c of ["find . -name -files0-from -print"]) assert.equal(await effect(c), "allow", c);
+  const d = await decideShell(guard, new SessionState(repo), repo, "find . -name -files0-from -exec ls -d {} +");
+  assert.doesNotMatch(d.reason, /start points read from a file/);
+  // Opus: nested finds are read in time that grows slowly with the depth (round 59, Sol: two
+  // depths compared; the words are not one valid find, which is no matter to the reading).
+  const time = async (n: number) => {
+    const deep = "find . " + "-exec find ".repeat(n) + "-exec cp f .git/x " + "\\; ".repeat(n + 1);
+    const started = Date.now();
+    assert.notEqual(await effect(deep), "allow");
+    return Date.now() - started;
+  };
+  await time(4);
+  const shallow = await time(12);
+  const deeper = await time(24);
+  assert.ok(deeper < 5000 && deeper < 20 * Math.max(shallow, 25), `${shallow} ms at 12, ${deeper} ms at 24`);
+});
+
+// ---- round 59 ----
+
+test("round 59: find's help and version start nothing, -D's help in its list, start points named ) and ,, find's -exec pattern after a write", async () => {
+  for (const c of ["find ')' ~ -delete", "find . -exec env --unrecognized {} +", "find . -exec cp f .git/x \\;"]) assert.notEqual(await effect(c), "allow", c);
+  // Opus: find opens an output file as it reads it, before a later help word prints.
+  for (const c of ["find . -fprint .git/config -help", "find . -fprint ../outside -help", "find . -fls .git/config --help", "find . -fprintf .git/config x -help", "find , ~ -name '*.bak' -delete"]) assert.notEqual(await effect(c), "allow", c);
+  // Opus: sort takes `+POS` keys again from _POSIX2_VERSION 200809; `env -vi` clears it.
+  const old = process.env._POSIX2_VERSION;
+  try {
+    process.env._POSIX2_VERSION = "200809";
+    assert.notEqual(await effect("sort +0R --random-source=.netrc rows"), "allow");
+    process.env._POSIX2_VERSION = "200112";
+    assert.notEqual(await effect("env -vi sort +0R --random-source=.netrc rows"), "allow");
+  } finally {
+    if (old === undefined) delete process.env._POSIX2_VERSION;
+    else process.env._POSIX2_VERSION = old;
+  }
+  // Sol: after a session write, `-name -exec` is a pattern, no program.
+  const s = new SessionState(repo);
+  assert.equal(await effect("printf x > noted.txt", s), "allow");
+  assert.equal(await effect("find . -name -exec -print", s), "allow");
+  assert.notEqual(await effect("find . -name x -exec ls {} +", s), "allow");
+});
+
+// ---- round 60 ----
+
+test("round 60: every find action is judged, the guard skips only behind a find that prints, env's clusters read in order, find's outputs to device sinks", async () => {
+  // Opus: an action behind `-exec true \;`, a `+` that ends no action, a sibling `--help`.
+  // (Round 61, Sol: each row is held to its own reason, not only to "not allow", which find's
+  // generic `-exec` ask with the model off would also meet.)
+  for (const [c, why] of [
+    ["find . -exec true \\; -exec npm publish \\;", /npm publish/],
+    ["find . -exec true \\; -exec ssh host.invalid uptime \\;", /ssh/],
+    ["find . -exec true {} + -exec cat ~/.ssh/id_ed25519 \\;", /credential/],
+    ["find . -maxdepth 0 -exec xargs -E + npm publish {} +", /npm publish/],
+    ["find . -exec sort --help \\; -exec gcc -wrapper /tmp/x t.c \\;", /gcc -wrapper/],
+    ["find . -exec find --help \\; -exec gcc -wrapper /tmp/x t.c \\;", /gcc -wrapper/],
+  ] as const) {
+    const d = await decideShell(guard, new SessionState(repo), repo, c);
+    assert.equal(d.effect, "ask", c);
+    assert.match(d.reason, why, c);
+  }
+  assert.equal(await effect("find . -exec true \\; -exec rm -rf ~ \\;"), "deny");
+  // Sol, Astra: `-u` takes the rest of its word, so `env -ui` clears nothing.
+  const old = process.env._POSIX2_VERSION;
+  try {
+    process.env._POSIX2_VERSION = "200112";
+    assert.notEqual(await effect("env -vi sort +0R --random-source=.netrc rows"), "allow");
+  } finally {
+    if (old === undefined) delete process.env._POSIX2_VERSION;
+    else process.env._POSIX2_VERSION = old;
+  }
+});
+
+// ---- round 61 ----
+
+test("round 61: find's sinks by their normalised names and never /dev/fd, the print-only skip at the top level only, env's options in full, rm {} +", async () => {
+  fs.writeFileSync(path.join(repo, "a.test.js"), "\n");
+  // Opus: find reopens /dev/fd/N, writing the file behind it.
+  for (const [c, why] of [
+    ["find . -maxdepth 0 -fprintf /dev/fd/0 x < a.test.js", /descriptor/],
+    ["find . -exec timeout 5 find --help \\; -exec gcc -wrapper /tmp/x t.c \\;", /gcc -wrapper/],
+    ["find . -exec rm -rf {} +", /rm -r of \./],
+  ] as const) {
+    const d = await decideShell(guard, new SessionState(repo), repo, c);
+    assert.equal(d.effect, "ask", c);
+    assert.match(d.reason, why, c);
+  }
+  // Sol: env's own help prints no environment; it asks as a wrapper option the guard does not read.
+  for (const c of ["env --help", "env --version"]) assert.doesNotMatch((await decideShell(guard, new SessionState(repo), repo, c)).reason, /prints the environment/, c);
+  // Opus: env's flags in separate words before -i.
+  const old = process.env._POSIX2_VERSION;
+  try {
+    process.env._POSIX2_VERSION = "200112";
+    for (const c of ["env -v -i sort +0R --random-source=.netrc rows", "env --debug -i sort +0R --random-source=.netrc rows"]) assert.notEqual(await effect(c), "allow", c);
+    assert.notEqual(await effect("env -ui sort +0R --random-source=.netrc rows"), "allow", "a spelling the rules do not read asks (round 62)");
+  } finally {
+    if (old === undefined) delete process.env._POSIX2_VERSION;
+    else process.env._POSIX2_VERSION = old;
+  }
+});
+
+// ---- round 62 ----
+
+// The readers of find, tar, rsync, sort, ps and the compressors are trusted only with plain
+// spellings (rules.ts, `unreadSpelling`); every other spelling asks. These calls were allowed by
+// earlier rounds' fixes to how the readers took a rare spelling; they now ask by design.
+test("round 62: rare spellings of the option-heavy tools ask, plain ones are read", async () => {
+  for (const c of [
+    "rsync -ani --out-format '%n:%l' f g",
+    "rsync -ani --out-format --log-file f g",
+    "ps axoetime",
+    "ps t e",
+    "tar --checkpoint=1 -tf a.tar",
+    "tar --force-loc -tf tag:archive",
+    "tar -tfFILM",
+    "ps -eLf",
+    "ps -eo pid --sort environ",
+    "tar tf- a.tar",
+    "ps -e -p1",
+    "ps -e -p1 -o pid,comm",
+    "rsync --list-only -r ../o2 dst/",
+    "zstd --list -of .git/out f.zst",
+    "zstd -Ddict .git/HEAD",
+    "gzip -dn -- .git.notes.gz",
+    "ps -e -p'1 2' -o pid",
+    "ps -e -p+1 -o pid,comm",
+    "ps -e -u0 -o pid",
+    "ps -e -uroot -o pid,comm",
+    "rsync --list-only .git/fixtures/",
+    "rsync -abi --dry-run -M--backup-dir=.git/fixtures f dst/",
+    "gzip --version .git/fixtures/",
+    "ps -e -t'?' -o pid,comm",
+    "ps -e -t- -o pid",
+    "ps -e -u0,root -o pid",
+    "rsync --version f .git/fixtures/",
+    "rsync -ani --partial-dir=.git/fixtures f dst/",
+    "xz --version .git/fixtures/",
+    "zstd --version -o .git/fixtures/out f",
+    "ps -e -t - -o pid,comm",
+    "ps -e -t/dev/tty -o pid,comm",
+    "ps -eT",
+    "rsync -n --help --log-file=.git/fixtures/help.log f dst/",
+    "xz --filters-help .git/fixture",
+    "xz --info-memory .git/fixture",
+    "ps -e -O tt",
+    "ps -eT -C --forest -o pid,comm",
+    "ps -eT -C -H -o pid,comm",
+    "ps -eT -O c",
+    "rsync --debug=help --log-file=.git/debug.log",
+    "rsync --info=help --log-file=.git/info.log",
+    "sort -c --files0-from --compress-program",
+    "sort -c -T --compress-program f",
+    "ps -e -O THREAD",
+    "ps -eT -O DefSysV",
+    "rsync --debug=help0 --log-file=.git/debug.log",
+    "rsync --help --log-file=.git/a",
+    "rsync --info=HELP --log-file=.git/info.log",
+    "rsync --info=name,help --log-file=.git/info.log",
+    "rsync --version -M--log-file=.git/remote-version.log f dst/",
+    "sort -c --random-source -o .git/sample",
+    "ps --help=all -eTH",
+    "rsync --daemon --help",
+    "rsync --help --files-from=.netrc",
+    "sort --help --output=.git/example",
+    "sort --version --output=.git/example",
+    "gzip --help .netrc",
+    "ps --help:all -eTH",
+    "ps -N --help -eTH",
+    "ps -opcpu --help -eTH",
+    "rsync --version --server",
+    "sort --help --files0-from=.netrc",
+    "sort --random-source --files0-from=.netrc f",
+    "tar --help --files-from=.netrc",
+    "tar --help --multi-volume",
+    "tar --show-defaults --index-file=.git/report",
+    "xz --help --files=.netrc",
+    "zstd --help --filelist=.netrc",
+    "zstd --help .netrc",
+    "ps --date-format=x --help aux e",
+    "ps -D x -p 1",
+    "rsync --version example:foo",
+    "sort --files0-from=.netrc --files0-from=files",
+    "sort --random-source=.netrc f",
+    "rsync --log-file= --help .netrc f",
+    "rsync --version --stats .netrc f",
+    "sort -R -k1,1n --random-source=.netrc rows",
+    "zstd -T1V .netrc",
+    "rsync --help --include-from=.netrc",
+    "sort -R +0n --random-source=.netrc rows",
+    "sort -R +0n -1 --random-source=.netrc rows",
+    "rsync --help --exclude-from=.netrc",
+    "rsync --info=help --exclude-from=.netrc",
+    "rsync --version --files-from=.netrc",
+    "rsync --version --filter='dir-merge .netrc'",
+    "sort +0xR --random-source=.netrc rows",
+    "sort +0n -1 --random-source=.netrc -R rows",
+    "find -D help . -exec printf x {} +",
+    "find -help . -exec printf x {} +",
+    "find ')' ',' -maxdepth 0 -print",
+    "find --version -exec env --version \\;",
+    "find -D tree,help . -exec ls {} +",
+    "find . -maxdepth 0 -help -exec env --unrecognized {} +",
+    "find -D help . -fprint .git/config",
+    "find . -help -fprint o",
+    "find . -fprint0 /dev/stdout -help",
+    "find . -maxdepth 0 -fprint0 /dev/stdout",
+    "env -ui sort +0R --random-source=.netrc rows",
+    "env -uquiet sort +0R --random-source=.netrc rows",
+    "find . -fprint0 /dev/./null -help",
+    "find . -maxdepth 0 -fprint0 /dev/./stdout",
+    "find . -maxdepth 0 -fprint0 /dev//stdout",
+    "rsync --list-only f",
+    "gzip -d --tes f.gz",
+    "xz -d --tes f.xz",
+    "rsync --dry-run --read-batch=batch dst/",
+    "sort --check=quiet -- -output",
+    "sort -y -- -output",
+    "sort --help --output=report",
+    "tar --help --index-file=report",
+  ]) assert.equal(await effect(c), "ask", c);
+  for (const c of [
+    "find . -name '*.ts' -type f",
+    "find . -maxdepth 2 -type d -print0",
+    "tar -czf out.tgz src",
+    "tar xzf out.tgz",
+    "tar -xvf a.tar -C dst",
+    "rsync -av src/ dst/",
+    "rsync -avn --delete --exclude node_modules src/ dst/",
+    "sort -t: -k3n f",
+    "sort -nk2 -u f",
+    "ps aux",
+    "ps -eo pid,comm,%cpu",
+    "ps -p 1 -o pid=environ",
+    "ps -eo pid,user,%cpu,args --sort=-%cpu",
+    "ps axo pid,ppid,stat,cmd",
+    "gzip -dc f.gz",
+    "zstd -19 -k f",
+    "find --help",
+    "sort --version",
+  ]) assert.equal(await effect(c), "allow", c);
+  // A deny behind a rare spelling is still a deny.
+  assert.equal(await effect("find -L . -exec true \\; -exec rm -rf ~ \\;"), "deny");
 });

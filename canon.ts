@@ -540,11 +540,13 @@ class Lexer {
         if (before?.type === "word" && bare(before) === "=~" && this.regex()) continue;
       }
       if (c === "\\") {
-        // A backslash quotes the character after it (a newline was dropped above).
-        const quoted = this.s[this.i + 1];
+        // A backslash quotes the character after it (a newline was dropped above): the whole code
+        // point, both halves of a surrogate pair (round 39, Astra: `\😀`).
+        const quoted = this.s.codePointAt(this.i + 1);
         if (quoted === undefined) ask("a backslash at the end");
-        this.lit(quoted!, true);
-        this.i += 2;
+        const ch = String.fromCodePoint(quoted!);
+        this.lit(ch, true);
+        this.i += 1 + ch.length;
       } else if (c === "'") {
         const end = this.s.indexOf("'", this.i + 1);
         if (end < 0) ask("an unterminated quote");
@@ -1228,6 +1230,10 @@ class Printer {
         if (part.kind === "lit" && last?.kind === "lit" && last.quoted === part.quoted) last.text += part.text;
         else word.parts.push(part.kind === "lit" ? { ...part } : part);
       };
+      // (Council project review 2, round 34, Astra: a made word that begins with `~` keeps its
+      // tilde's prefix up to the first slash; a `~` quoted inside that prefix (`{~,x}:~`) stops
+      // bash expanding the first. Such a word asks.)
+      if (text.startsWith("~") && text.slice(1, text.indexOf("/") < 0 ? undefined : text.indexOf("/")).includes("~")) ask("a word the braces make that begins with `~` and holds another `~` before its first slash, which the printer would quote");
       [...text].forEach((ch, at) => {
         const code = ch.charCodeAt(0);
         if (code >= PRIVATE && code < PRIVATE + table.length) push(table[code - PRIVATE]);
@@ -1460,6 +1466,11 @@ class Printer {
     // (An assignment's own `name=` is no text of the value: `i=$((i+1))` is as before.)
     const filled = parts.filter((q, n) => !(q.kind === "lit" && (q.text === "" || (n === 0 && !q.quoted && /^[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=$/.test(q.text)))));
     if (filled.length > 1 && filled.some((q) => q.kind === "arith")) ask("a word that holds arithmetic and other text, whose value the rules cannot read (they read 0 in its place)");
+    // (Council project review 2, round 40, Astra: `"$@"` and `"${a[@]}"` beside anything else in a
+    // word make words by bash's own rules (`"$*$@"` with no parameters is no word at all); printed
+    // as separate quoted parts they make other ones.)
+    const atList = (q: Part) => (q.kind === "var" && q.quoted && q.name === "@") || (q.kind === "param" && q.quoted && (q.head === "@" || /\[@\]$/.test(q.head)));
+    if (filled.some(atList) && parts.filter((q) => !(q.kind === "lit" && q.text === "")).length > 1) ask('a word that joins "$@" with other text, whose words bash makes by its own rules');
     parts.forEach((p, n) => {
       if (p.kind === "arith" && parts.slice(0, n).every((q) => q.kind === "lit" && q.text === "")) this.arithLed = true;
       if (p.kind === "lit") {
@@ -1468,6 +1479,10 @@ class Printer {
         else if (parts.length === 1 && (p.text === "{" || p.text === "}")) add(p.text);
         else {
           // Unquoted text: what bash acts on stays bare, the rest is literal.
+          // (Council project review 2, round 33, Astra: a `~` after `=` or `:` is expanded by bash up
+          // to the end of its prefix, and a quote printed inside that prefix changes where the prefix
+          // ends: `x=~#=~` expands its last `~`, `x=~'#'=~` does not. Such a word asks.)
+          if (/[=:]~/.test(p.text) && [...p.text].some((ch) => !PLAIN.test(ch) && !ACTIVE.includes(ch))) ask("a `~` after `=` or `:` beside text the printer would quote, which changes where bash ends the tilde's prefix");
           let text = "";
           const flush = () => {
             if (text) add(quote(text));
@@ -2001,6 +2016,7 @@ function print(command: string, depth: number, where?: string): Printed & { defi
   }
 }
 
+const SELF_READING = /\b(LINENO|BASH_COMMAND|BASH_EXECUTION_STRING|BASH_LINENO|caller)\b|\$\{?[#!]?_\b|\$\{!/;
 export function canonical(command: string): Canonical {
   try {
     if (CONTROL.test(command)) return { ask: "a control character (a carriage return, an escape or the like) or a Unicode line separator" };
@@ -2015,6 +2031,15 @@ export function canonical(command: string): Canonical {
     const { text, judged, bashOnly, inputs, judgedInputs, arithLed, literals } = print(command, 0);
     if (/^[-+]/.test(text)) return { ask: "a command line that starts with - or + once blanks, comments and line continuations are gone, which the shell would read as its own options" };
     if (Buffer.byteLength(text) > MAX_TEXT) return { ask: "a command too long to hand to the shell in one piece once printed" };
+    // A command that reads its own text or place (`$LINENO`, `$BASH_COMMAND`,
+    // `$BASH_EXECUTION_STRING`, `$BASH_LINENO`, `$_`) sees the printed text, not the written one
+    // (council project review 2, round 41, Astra; declined in rounds 30 and 39, closed here).
+    // (Round 42, all four: read in the printed text, where line continuations are joined and
+    // comments gone, and by name, as arithmetic, `${#…}`, `declare -p` and a later `eval` read it,
+    // with `caller` and an indirect `${!…}`. A name in single quotes counts too: `eval`, `trap` and
+    // `PS4` read quoted text as code. `set -v` echoes the printed text, which is what runs: kept,
+    // as the maintainer's D-fixes allow `set -vx; ls`.)
+    if (text !== command && SELF_READING.test(text)) return { ask: "a command that reads its own text or line number, which printing it would change" };
     return { text, judged, bashOnly, inputs, judgedInputs, arithLed, literals, ...(folds ? { folded: true } : {}) };
   } catch (e) {
     if (e instanceof Ask) return { ask: e.message };

@@ -108,8 +108,9 @@ function apply(config: Config, raw: unknown, where: string, problems: string[], 
           if (typeof v === "number" && v > 0 && v <= 1) config.classifier.askAbove = v;
           else bad("classifier.askAbove", "a number above 0 and at most 1");
         } else if (name === "timeoutMs") {
-          if (typeof v === "number" && v >= 100 && v <= 120_000) config.classifier.timeoutMs = v;
-          else bad("classifier.timeoutMs", "a number of milliseconds between 100 and 120000");
+          // (Council project review 2, round 33: a whole number, as AbortSignal.timeout takes.)
+          if (Number.isInteger(v) && (v as number) >= 100 && (v as number) <= 120_000) config.classifier.timeoutMs = v as number;
+          else bad("classifier.timeoutMs", "a whole number of milliseconds between 100 and 120000");
         } else if (name === "endpoint") {
           if (typeof v === "string" && /^(unix:\/|https?:\/\/)\S+$/.test(v)) config.classifier.endpoint = v;
           else bad("classifier.endpoint", "unix:/path/to/socket or an http(s) URL");

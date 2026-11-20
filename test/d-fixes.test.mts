@@ -2279,7 +2279,7 @@ const D5_ON_PURPOSE: string[] = [
   "rm -rf node_mod*; npx tsc", "rm -rf ./n*; npx tsc", "trap 'rm -rf node_mod*' DEBUG; npx tsc", "echo cm0gLXJmIG5vZGVfbW9kdWxlcw== | base64 -d | sh; npx tsc", "printf 'rm -rf node_\\155odules' | sh; npx tsc",
   // a command that removes or swaps the tool without naming it;
   "F=-fdx; git clean $F; npx tsc", "git stash -a && npx tsc", "git checkout other && npx tsc", "git switch other && npx tsc", "npm uninstall dep && npx tsc", "npm prune && npx tsc", "npm run reset && npx tsc", "make reset && npx tsc", "./reset.sh && npx tsc",
-  "bash reset.sh; npx tsc", "sh < reset.sh; npx tsc", "tar --remove-files -cf /tmp/a.tar . && npx tsc", "cp -r ../tpl/. . && npx tsc", "cp -rT tpl . && npx tsc", "npx rimraf . && npx tsc", "find . -delete; npx tsc", "chmod -R a-x .; npx tsc",
+  "bash reset.sh; npx tsc", "sh < reset.sh; npx tsc", "cp -r ../tpl/. . && npx tsc", "cp -rT tpl . && npx tsc", "npx rimraf . && npx tsc", "find . -delete; npx tsc", "chmod -R a-x .; npx tsc",
   // a change of what npm reads.
   "npm set script-shell=./x && npx tsc", "npm pkg set bin.tsc=./x.js && npx tsc", "echo x >> .npmrc; npx tsc", "cp other.json package.json && npx tsc", "sed -i 's/fixture/x/' package.json; npx tsc",
 ];
@@ -2475,6 +2475,8 @@ describe("r4 28, fifth pass (2): nothing else about the other commands is read",
   // The 54 calls the fourth pass newly asked about, and the everyday forms: each exactly the
   // model, with the reading's reason.
   npxCases(() => dir, "classify", [...D5_NEW_ASKS, ...D5_EVERYDAY].map((c) => [c, /\(npx (tsc|eslint|jest): the project has node_modules\/\.bin\//] as [string, RegExp]));
+  // (Council project review 2, round 62: a spelling the rules do not read (`unreadSpelling`) asks.)
+  npxCases(() => dir, "ask", ["tar --remove-files -cf /tmp/a.tar . && npx tsc"]);
   npxCases(() => dir, "classify", D5_SCRIPT.map((c) => [c, NPX_OR_SCRIPT] as [string, RegExp]));
   // LEFT TO THE MODEL ON PURPOSE (see D5_ON_PURPOSE): a spelling without the letters, a command
   // that removes or swaps the tool without naming it, a change of what npm reads. The fourth

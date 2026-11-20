@@ -60,5 +60,29 @@ A few things keep the plugin trustworthy, so please keep them true:
   Pi's labelled suites live in its repository under `bench/suites`. Don't commit command logs
   from your own sessions: they contain paths, hostnames and sometimes secrets.
 
+## Reviewing the rules
+
+A review of the rules, by a person or a model, works to one bar:
+
+- **Blocking: an allow that should have asked or been denied**, shown by a command that the
+  plugin allows (a decision probe or a failing test) and what it does that should not be
+  auto-allowed. A fix that brings back an allow an earlier fix closed is blocking too.
+- **Not blocking: an ask that could have been an allow.** Over-asking is how the plugin fails
+  closed. Note it; it is fixed only when the call is common and the fix is small and tested.
+- **Out of scope: a rare spelling a reader does not model.** find, tar, rsync, sort, ps and the
+  compressors are read only in their plain spellings (`unreadSpelling` in `rules.ts`), and
+  everything else asks. A finding that such a call asks is by design. A finding that a plain
+  spelling is read wrongly is in scope. The list of plain spellings grows only with a test of
+  what the tool does with the new spelling.
+- **Declined by design** (the README says why): `touch`, `mkdir` and a compressor's copy of a
+  project file are not writes of content; a git hook's own writes are not in the session's
+  record; approved calls run outside the sandbox and leave no write record; opencode's
+  `formatter` and `lsp` run project files; jest's regex operand; `gcc @file` and
+  `clang --config` (a place not known after a write); `jq -n env`; code in a project script's
+  own arguments (`npm test -- -e ...`).
+
+The fix for a gap in a reader is to ask on what it does not read, not to read one more
+spelling.
+
 Small, focused pull requests are easiest to review. Tests and benchmark rows that show a bug
 are as welcome as the fix.

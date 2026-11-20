@@ -608,8 +608,10 @@ describe("the canonical printer: bash and the rules' parser make the same words 
     for (const command of commands) {
       const r = spawnSync(shell, ["-c", command], { cwd: dir, encoding: "utf8", env: { PATH: `${dir}:/usr/bin:/bin`, HOME: "/home/nobody", x: "abc", y: "p q", LC_ALL: "C" } });
       // Every run of the stand-in, whatever the exit status: two runs that both fail must not
-      // compare as equal for that reason alone.
-      out.push(r.error ? undefined : [`exit ${r.status}`, ...recorded(r.stdout).flatMap((words) => ["|", ...words])]);
+      // compare as equal for that reason alone. A shell that cannot be started at all fails the
+      // test (round 39, Sol: two undefined results compared as equal).
+      if (r.error) throw new Error(`${shell} could not be run for ${JSON.stringify(command)}: ${r.error.message}`);
+      out.push([`exit ${r.status}`, ...recorded(r.stdout).flatMap((words) => ["|", ...words])]);
     }
     return out;
   };
@@ -786,7 +788,9 @@ describe("the canonical printer: bash and the rules' parser make the same words 
     const snapshot = (command: string, n: number, tag: string) => {
       const work = path.join(dir, `files-${tag}-${n}`);
       fs.mkdirSync(work);
-      spawnSync("/bin/bash", ["-c", command], { cwd: work, encoding: "utf8", env: { PATH: `${dir}:/usr/bin:/bin`, HOME: "/home/nobody", x: "abc", LC_ALL: "C" } });
+      const r = spawnSync("/bin/bash", ["-c", command], { cwd: work, encoding: "utf8", env: { PATH: `${dir}:/usr/bin:/bin`, HOME: "/home/nobody", x: "abc", LC_ALL: "C" } });
+      // A shell that cannot start leaves two empty snapshots, which would compare as equal (round 40, Sol).
+      if (r.error) throw new Error(`/bin/bash could not be run for ${JSON.stringify(command)}: ${r.error.message}`);
       return JSON.stringify(fs.readdirSync(work).sort().map((name) => [name, fs.readFileSync(path.join(work, name), "utf8")]));
     };
     const bad: string[] = [];

@@ -34,6 +34,9 @@ export type Action = "allow" | "classify" | "ask" | "deny";
 export interface Verdict {
   action: Action;
   reason: string;
+  // An ask only because a tool is spelled in a way its reader is not trusted with
+  // (`unreadSpelling`): another check's ask, with a reason of its own, is shown instead.
+  spelling?: true;
   // A user allow rule cannot replace this verdict.
   locked?: boolean;
   // An ask that stays an ask with the chat decider: your own ask rules and the critical asks.
@@ -120,8 +123,10 @@ export function within(p: string, dir: string, strict = false): boolean {
   return rel !== ".." && !rel.startsWith(".." + path.sep) && !path.isAbsolute(rel);
 }
 
-const TMP_DIRS = [...new Set(["/tmp", "/var/tmp", os.tmpdir()].map(realish))];
-const DEV_SINKS = /^\/dev\/(null|zero|stdout|stderr|tty|fd\/\d+)$/;
+// (/dev/shm is shared memory: a temp directory, as the README and guard.ts count it.)
+const TMP_DIRS = [...new Set(["/tmp", "/var/tmp", "/dev/shm", os.tmpdir()].map(realish))];
+// (/dev/full takes no write: every write to it fails, which is what a test of a write error wants.)
+const DEV_SINKS = /^\/dev\/(null|zero|full|stdout|stderr|tty|fd\/\d+)$/;
 // (opencode-automode: a sink is told by the path as written, absolute and without `..`, not by
 // resolving it in this process, whose own descriptors are not the command's: `/dev/stderr` led to
 // a terminal here and to a pipe there. A word that resolves to /dev/null through links is a sink
@@ -414,11 +419,14 @@ function isSecretPath(p: string): boolean {
 
 // The credential file a shell word names, if any. Handles `--file=path`, curl's `@file` and
 // git's `rev:path`. In a command, words with spaces and URLs are text, not paths.
-function secretIn(word: string, scope: Scope, isPath = false): string | undefined {
+function secretIn(word: string, scope: Scope, isPath = false, operand = false): string | undefined {
   if (!isPath && (/\s/.test(word) || /^[a-z][a-z0-9+.-]*:\/\//i.test(word))) return undefined;
-  const text = word.replace(/^[^=/]*=/, "").replace(/^@/, "");
+  // An operand (after `--`) is a path whatever it starts with (round 40, Opus: `cat -- -/../.env`).
+  const text = operand ? word : word.replace(/^[^=/]*=/, "").replace(/^@/, "");
   for (const candidate of new Set([text, text.slice(text.lastIndexOf(":") + 1)])) {
-    if (!candidate || candidate.startsWith("-")) continue;
+    // (Round 41, Mythos: a word that starts with `-` and holds a slash, `-/../.env`, is a path
+    // through a directory named like an option, as an option's value or an awk operand reads it.)
+    if (!candidate || (candidate.startsWith("-") && !operand && !/^-[^=]*\//.test(candidate))) continue;
     const p = resolveWord(candidate, scope);
     if (isSecretPath(expandHome(candidate)) || (p && (isSecretPath(p) || isSecretPath(followLinks(p, scope))))) return candidate;
   }
@@ -436,20 +444,113 @@ const PATTERN_FIRST = new Set(["grep", "egrep", "fgrep", "rg", "ag", "ack", "sed
 // The credential file a simple command would read, if any.
 function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope): string | undefined {
   if (NAMES_ONLY.has(name)) return undefined;
+  // (Round 51, Sol and Astra: a call that only prints its help or version reads no file. Round 54,
+  // Sol: rsync opens its filter and list files before it prints its version, so those are read
+  // there; its help exits first.)
+  // (Round 55, Astra: exactly the files rsync opens before the query exits.)
+  if (name === "rsync" && rsyncReading(args).prints) {
+    for (const v of rsyncReading(args).opensBeforeExit) {
+      const secret = secretIn(v, scope, false, true);
+      if (secret) return secret;
+    }
+    return undefined;
+  }
+  if (printsOnly(name, args)) return undefined;
+  // (Round 51, Sol: sort's files are its operands and its option values, read by position.)
+  if (name === "sort") {
+    // (Round 57, Sol: the assignments before the program, or behind `env`, the last one winning;
+    // an operand of that shape is a file.)
+    // (Round 58, Opus: `env -i` and `env -u _POSIX2_VERSION` clear it for sort.)
+    // (Round 59 and 60: `env -vi`, `env -ui`. Round 61, Opus: env's options read as env reads
+    // them, a separate `-v` or `-0` before `-i` included: flags, and `-a`/`-u`/`-C`/`-S` with a
+    // value attached or in the next word.)
+    let posix: string | undefined;
+    let inEnv = false;
+    for (let k = 0; k < cmd.argv.length; k++) {
+      const w = cmd.argv[k];
+      if (/^_POSIX2_VERSION=/.test(w)) posix = w;
+      else if (w === "env") inEnv = true;
+      else if (inEnv && (w === "-" || (w.length > 3 && "--ignore-environment".startsWith(w)))) posix = "_POSIX2_VERSION=0";
+      else if (inEnv && /^--(unset|chdir|split-string|argv0)$/.test(w)) {
+        if (w === "--unset" && cmd.argv[k + 1] === "_POSIX2_VERSION") posix = "_POSIX2_VERSION=0";
+        k++;
+      } else if (inEnv && w === "--unset=_POSIX2_VERSION") posix = "_POSIX2_VERSION=0";
+      else if (inEnv && /^--./.test(w)) continue;
+      else if (inEnv && /^-[^-]/.test(w)) {
+        for (let j = 1; j < w.length; j++) {
+          if (w[j] === "i") posix = "_POSIX2_VERSION=0";
+          if ("auCS".includes(w[j])) {
+            const value = j < w.length - 1 ? w.slice(j + 1) : cmd.argv[++k];
+            if (w[j] === "u" && value === "_POSIX2_VERSION") posix = "_POSIX2_VERSION=0";
+            break;
+          }
+        }
+      } else if (!/^[A-Za-z_]\w*=/.test(w)) break;
+    }
+    for (const w of sortReading(args, posix !== undefined ? posix2Strict(Number(posix.slice(16))) : undefined).reads) {
+      const secret = secretIn(w, scope, false, true);
+      if (secret) return secret;
+    }
+    return undefined;
+  }
   // git log and its kin name paths to filter commits by, and show their content only with a patch.
   if (name === "git") {
-    const sub = operands(args)[0];
-    if (["log", "shortlog", "rev-list", "whatchanged"].includes(sub ?? "") && !args.some((a) => /^(-p|-u|--patch|--patch-with-\w+|-L.*|--full-diff|-[a-zA-Z]*[pu])$/.test(a))) return undefined;
+    // (Round 35, Sol: the subcommand past git's own options, `-C dir` and `-c key=value`.)
+    let g = 0;
+    while (g < args.length && args[g].startsWith("-")) g += /^(-C|-c|--git-dir|--work-tree|--namespace|--attr-source|--config-env)$/.test(args[g]) ? 2 : 1;
+    const sub = args[g];
+    // (Round 34, Mythos and Opus: every option that makes git log print a patch: -U<n>, --unified,
+    // the merge diffs (-c, --cc, --dd, -m, --remerge-diff, --diff-merges= other than off/none),
+    // --binary, word diffs and function context; long ones by any prefix git accepts.)
+    // (`--full-diff` only widens a patch another option asks for; `--check` prints the lines it
+    // flags, round 35.)
+    const patchLong = ["patch", "unified", "cc", "dd", "remerge-diff", "binary", "word-diff", "color-words", "function-context", "check", "patch-with-stat", "patch-with-raw"];
+    const shows = (a: string) =>
+      /^(-[a-zA-Z0-9]*[pumcW][a-zA-Z0-9]*|-U\d*|-L.*)$/.test(a) ||
+      (/^--diff-merges(=|$)/.test(a) && !/^--diff-merges=(off|none)$/.test(a)) ||
+      patchLong.some((name) => longIs(a, name));
+    if (["log", "shortlog", "rev-list", "whatchanged"].includes(sub ?? "") && !args.some(shows)) return undefined;
   }
   // An in-place edit shows nothing, and a destination is written, not read.
   if (name === "sed" && args.some((a) => /^(-i|--in-place)/.test(a) || /^-[a-zA-Z]*i/.test(a))) return undefined;
   let words = args;
   if (PATTERN_FIRST.has(name)) words = operands(args).slice(1);
-  else if (COPIERS.has(name)) words = operands(args).slice(0, -1);
+  else if (COPIERS.has(name)) {
+    // With `-t DIR` (`--target-directory`) the destination is named first and every operand is a
+    // source (round 34, Mythos).
+    // (Round 35: in a cluster, `-vt DIR`, and by any prefix of the long name, `--target DIR`.)
+    const separate = (a: string) => (/^-[a-zA-Z]*t$/.test(a) && !a.startsWith("--")) || (a.length >= 3 && !a.includes("=") && "--target-directory".startsWith(a));
+    const attached = (a: string) => (/^-[a-zA-Z]*t./.test(a) && !a.startsWith("--")) || (/^--t[\w-]*=/.test(a) && "--target-directory".startsWith(a.split("=")[0]));
+    const t = args.findIndex(separate);
+    const target = t >= 0 || args.some(attached);
+    // (Round 36, Mythos: a `-t` can be another option's value, `-St` is suffix t; with any `-t` in
+    // sight every operand is read, the directory too.)
+    words = target ? operands(args) : operands(args).slice(0, -1);
+  }
+  // A compiler names the files it reads inside other words too: `-include.env`, `-imacros`,
+  // `-Wp,-include,.env`, `-Wl,@.env` (round 36, Mythos); its diagnostics print their lines.
+  if (/^(gcc|g\+\+|cc|c\+\+|clang|clang\+\+)(-\d+(\.\d+)*)?$/.test(name)) {
+    words = [
+      ...words,
+      ...args.flatMap((a) => [
+        ...(/^-(include|imacros)./.test(a) && !a.startsWith("--") ? [a.replace(/^-(include|imacros)/, "")] : []),
+        ...(/^-W[lap],/.test(a) ? a.split(",").slice(1).map((w) => w.replace(/^@/, "").replace(/^-(include|imacros)(?=.)/, "")) : []),
+      ]),
+    ];
+  }
   // `--env-file .env` hands the file to a program and shows nothing.
   words = words.filter((w, i) => !/^--env-file(=|$)/.test(w) && words[i - 1] !== "--env-file");
-  for (const word of [...words, ...(cmd.in ?? [])]) {
+  // (Round 41, Mythos: a word that starts with `-` and holds a slash is a path to the programs that
+  // read it as an operand, `awk 1 -/../.env`.)
+  const dashPaths = args.filter((a) => /^-[^=]*\//.test(a) && !words.includes(a));
+  for (const word of [...words, ...dashPaths, ...(cmd.in ?? [])]) {
     const secret = secretIn(word, scope) ?? globSecret(word, scope);
+    if (secret) return secret;
+  }
+  // Every word after `--` is a file, one that begins with `-` too.
+  const dashes = args.indexOf("--");
+  if (dashes >= 0) for (const word of args.slice(dashes + 1)) {
+    const secret = secretIn(word, scope, false, true);
     if (secret) return secret;
   }
   return undefined;
@@ -477,6 +578,31 @@ function globSecret(word: string, scope: Scope): string | undefined {
   } catch {}
   const hit = names.find((n) => re.test(n) && isSecretPath(path.join(p, n)));
   return hit ? path.join(path.dirname(text), hit) : isSecretPath(path.join(p, base.replace(/[*?]/g, ""))) ? text : undefined;
+}
+
+// The names a glob in the last part of a word matches where the command runs, spelled as the
+// word spells its directory; undefined where a directory part holds a glob or cannot be read.
+function globNames(word: string, scope: Scope): string[] | undefined {
+  // (Round 46, Opus: a POSIX class, `[^`, an equivalence or collating class, or a backslash is
+  // left to the model, as this reader does not match them as bash does.)
+  if (/[*?[]/.test(path.dirname(word)) || /\s/.test(word) || /\[[:=.^]|\\/.test(word)) return undefined;
+  const dir = resolveWord(path.dirname(word), scope);
+  if (!dir) return undefined;
+  const base = path.basename(word);
+  let re: RegExp;
+  try {
+    re = new RegExp(`^${base.replace(/[.+^${}()|\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".").replace(/\[!/g, "[^")}$`, "s");
+  } catch {
+    return undefined;
+  }
+  try {
+    // bash matches a leading `.` only when the pattern spells one; a name with none matches as
+    // the word (nullglob off).
+    const hits = fs.readdirSync(dir).filter((n) => re.test(n) && (base.startsWith(".") || !n.startsWith(".")));
+    return hits.length ? hits.map((n) => (word.includes("/") ? `${path.dirname(word)}/${n}` : n)) : [word];
+  } catch {
+    return undefined;
+  }
 }
 
 // Whether a read-only program reads a file whose name the shell expands: a substitution, or a
@@ -536,6 +662,8 @@ export interface Simple {
   dyn?: boolean[];
   // The operator that follows the command: `;`, a newline, `&&`, `||`, `|`, `&`, `(` or `)`.
   next?: string;
+  // Its standard input is a pipe from the command before it.
+  piped?: boolean;
   // Inside a command substitution (or a heredoc body's): it runs while the command that holds it
   // is expanded, and is listed before it.
   nested?: boolean;
@@ -565,6 +693,15 @@ interface ParseState {
 
 // Commands whose effect on later commands the rules follow; a function by one of these names is not modelled.
 const SHADOWS_STATE = new Set(["cd", "pushd", "popd", "command", "builtin", "exec", "eval", "source", ".", "set", "shopt", "unset", "export", "declare", "typeset", "local", "readonly", "read", "printf", "test", "[", "trap", "alias", "unalias", "hash", "enable", "type", "env", "ln", "mapfile", "readarray", "getopts", "wait"]);
+// Where an empty quote stood in a word, until brace expansion is done (see `add` in parseList).
+const EMPTY_QUOTE = "\uE000";
+const unmark = (w: string, m: string): [string, string] => {
+  if (!w.includes(EMPTY_QUOTE)) return [w, m];
+  let text = "";
+  let tags = "";
+  for (let k = 0; k < w.length; k++) if (w[k] !== EMPTY_QUOTE) (text += w[k]), (tags += m[k]);
+  return [text, tags];
+};
 const RESERVED = new Set(["if", "then", "elif", "else", "fi", "do", "done", "while", "until", "for", "in", "case", "esac", "select", "function", "time", "coproc", "!", "{", "}", "[[", "]]"]);
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/s;
 
@@ -598,9 +735,12 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
   const cases: ("pattern" | "body")[] = [];
   const heredocs: { delimiter: string; quoted: boolean; strip: boolean; owner: Simple }[] = [];
 
+  // An empty quote (`''`, `""`) leaves EMPTY_QUOTE, tagged `Q`, where it stood: brace expansion
+  // keeps a word it makes empty only when that word holds a quote (`''{,x}`, not `{,'x'}`). The
+  // marks are taken out before the words are stored.
   const add = (text: string, tags: string) => {
-    word += text;
-    mask += tags;
+    word += text === "" ? EMPTY_QUOTE : text;
+    mask += text === "" ? "Q" : tags;
     hasWord = true;
   };
   // Before the program: only keywords so far.
@@ -609,8 +749,9 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
     if (kind === "" && commandPosition() && /[^u]/.test(m)) {
       // A quoted word is never a keyword, and a quoted name or `=` is no assignment: bash runs
       // `"x=/a"` and `\{` as programs.
-      const eq = w.indexOf("=");
-      if (RESERVED.has(w) || (ASSIGNMENT.test(w) && /[^u]/.test(m.slice(0, eq + 1)))) opaque();
+      const plain = unmark(w, m);
+      const eq = plain[0].indexOf("=");
+      if (RESERVED.has(plain[0]) || (ASSIGNMENT.test(plain[0]) && /[^u]/.test(plain[1].slice(0, eq + 1)))) opaque();
     }
     const words = expandBraces(w, m);
     if (!words) {
@@ -620,7 +761,8 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
     }
     // A brace pattern in a word that also holds an expansion: the order of the two is not modelled.
     if (words.length > 1 && /[eE]/.test(m)) opaque();
-    words2push(words, kind);
+    // bash drops a word the braces make empty, unless something in it was quoted (`{,x}` is `x`).
+    words2push((words.length > 1 ? words.filter(([text, tags]) => unmark(text, tags)[0] !== "" || /[qQ]/.test(tags)) : words).map(([text, tags]) => unmark(text, tags)), kind);
   };
   const words2push = (words: [string, string][], kind: RedirectKind) => {
     for (const [w, m] of words) {
@@ -760,6 +902,7 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
       i = end;
     } else if (c === '"') {
       hasWord = true;
+      const before = word.length;
       let j = i + 1;
       for (; j < s.length && s[j] !== '"'; j++) {
         const d = s[j];
@@ -777,6 +920,7 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
         else add(d, "q");
       }
       if (j >= s.length) return (opaque(), s.length);
+      if (word.length === before) add("", "");
       i = j;
     } else if (c === "$") {
       i = dollar(i, false);
@@ -887,7 +1031,7 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
       cur.subshell = true;
       if (c === "|" && next === "&") i++;
       pushCmd(c);
-      if (c === "|") cur.subshell = true;
+      if (c === "|") cur.subshell = cur.piped = true;
     } else if (c === "(" && cases.at(-1) === "pattern" && !hasWord && cur.argv.length === 0) {
       // A pattern may open with `(`.
     } else if (c === ")" && cases.at(-1) === "pattern") {
@@ -1154,54 +1298,89 @@ function arithmeticSafe(command: string, names: Set<string>): boolean {
 // `1 2 3`. Quoted braces, `${`, and braces without a comma or a sequence stay as they are.
 // Undefined when the expansion would be too large to follow.
 function expandBraces(word: string, mask: string, budget = { n: 0 }): [string, string][] | undefined {
+  // As bash does it (round 37): the first `{` that opens an expansion splits the word into a
+  // preamble, the alternatives (or a sequence) and a postamble. Each alternative and the postamble
+  // are expanded on their own, never the joined text again. `{}` opens nothing; a `{` opens an
+  // expansion when a comma stands in it at any depth, or it holds a sequence.
+  const isSeq = (body: string) => /^([-+]?\d+|[A-Za-z])\.\.([-+]?\d+|[A-Za-z])(\.\.[-+]?\d+)?$/.test(body);
   for (let open = 0; open < word.length; open++) {
     if (word[open] !== "{" || mask[open] !== "u") continue;
+    if (word[open + 1] === "}" && mask[open + 1] === "u") {
+      // bash passes over `{}` only at the start of a word; elsewhere, with a comma in the word,
+      // what it makes is not modelled (round 38).
+      if (open > 0 && /,/.test(word.slice(open))) return undefined;
+      open++;
+      continue;
+    }
     let depth = 0;
+    let nested = false;
     const commas: number[] = [];
     let close = -1;
     for (let k = open + 1; k < word.length; k++) {
       if (mask[k] !== "u") continue;
       if (word[k] === "{") depth++;
       else if (word[k] === "}") {
-        if (depth === 0) {
+        if (depth > 0) {
+          depth--;
+          continue;
+        }
+        // Before a comma, a `}` that does not end a sequence is text: `{a}b,c}` is `a}b c`.
+        if (commas.length || nested || isSeq(word.slice(open + 1, k)) || !word.slice(k + 1).includes(",")) {
           close = k;
           break;
         }
-        depth--;
-      } else if (word[k] === "," && depth === 0) commas.push(k);
+      } else if (word[k] === ",") {
+        if (depth === 0) commas.push(k);
+        else nested = true;
+      }
     }
-    if (close < 0) return [[word, mask]];
-    const pre = [word.slice(0, open), mask.slice(0, open)];
-    const post = [word.slice(close + 1), mask.slice(close + 1)];
+    if (close < 0) continue;
+    const body = word.slice(open + 1, close);
     let alternatives: [string, string][] = [];
+    let expandEach = true;
     if (commas.length) {
       let from = open + 1;
       for (const k of [...commas, close]) {
         alternatives.push([word.slice(from, k), mask.slice(from, k)]);
         from = k + 1;
       }
-    } else {
-      const body = word.slice(open + 1, close);
-      const seq = /^(-?\d+|[A-Za-z])\.\.(-?\d+|[A-Za-z])(\.\.(-?\d+))?$/.exec(body);
-      if (!seq || /[^u]/.test(mask.slice(open, close + 1))) continue;
+    } else if (isSeq(body) && !/[^u]/.test(mask.slice(open, close + 1))) {
+      const seq = /^([-+]?\d+|[A-Za-z])\.\.([-+]?\d+|[A-Za-z])(\.\.([-+]?\d+))?$/.exec(body)!;
+      // A `+` sign, and a letter range across the characters between Z and a: not modelled.
+      if (body.includes("+")) return undefined;
       const numeric = /\d/.test(seq[1]) && /\d/.test(seq[2]);
       if (!numeric && (/\d/.test(seq[1]) || /\d/.test(seq[2]))) continue;
       const a = numeric ? Number(seq[1]) : seq[1].charCodeAt(0);
       const b = numeric ? Number(seq[2]) : seq[2].charCodeAt(0);
+      if (!numeric && Math.min(a, b) <= 90 && Math.max(a, b) >= 97) return undefined;
       const step = Math.abs(Number(seq[4] ?? 1)) || 1;
-      if (Math.abs(b - a) / step > 1000) return undefined;
+      // Past 2^53 adding the step changes nothing, and the loop would not end.
+      if (![a, b, step].every(Number.isSafeInteger) || Math.abs(b - a) / step > 1000) return undefined;
       const width = numeric && [seq[1], seq[2]].some((x) => /^-?0\d/.test(x)) ? Math.max(seq[1].length, seq[2].length) : 0;
       for (let v = a; a <= b ? v <= b : v >= b; v += a <= b ? step : -step) {
-        const text = numeric ? String(v).padStart(width, "0") : String.fromCharCode(v);
+        // The sign comes before the zeros, `-02 -01 000 001`.
+        const text = numeric ? (v < 0 ? "-" : "") + String(Math.abs(v)).padStart(v < 0 ? width - 1 : width, "0") : String.fromCharCode(v);
         alternatives.push([text, "u".repeat(text.length)]);
       }
-    }
+      expandEach = false;
+    } else if (nested) {
+      // A group with a comma only further in: bash's reading of it (`{..{,}}` is `.. ..`, but
+      // `{{a,b}}` is `{a} {b}`) is not modelled (round 38).
+      return undefined;
+    } else continue;
+    const pre: [string, string] = [word.slice(0, open), mask.slice(0, open)];
+    const post = expandBraces(word.slice(close + 1), mask.slice(close + 1), budget);
+    if (!post) return undefined;
     const out: [string, string][] = [];
-    for (const [w, m] of alternatives) {
-      if (++budget.n > 1000) return undefined;
-      const more = expandBraces(pre[0] + w + post[0], pre[1] + m + post[1], budget);
-      if (!more) return undefined;
-      out.push(...more);
+    for (const alt of alternatives) {
+      const inner = expandEach ? expandBraces(alt[0], alt[1], budget) : [alt];
+      if (!inner) return undefined;
+      for (const [w, m] of inner) {
+        for (const [pw, pm] of post) {
+          if (++budget.n > 1000) return undefined;
+          out.push([pre[0] + w + pw, pre[1] + m + pm]);
+        }
+      }
     }
     return out;
   }
@@ -1384,7 +1563,12 @@ const RUNNER_OPTIONS: Record<string, OptionTable> = {
   pnpm: { flags: "r", long: ["recursive", "parallel"] },
 };
 
-const operands = (args: string[]) => args.filter((a) => !a.startsWith("-"));
+// The operands: words that are no option, and every word after `--` (round 39, Opus: `rm -rf --
+// -/../.git` names a path).
+const operands = (args: string[]) => {
+  const dashes = args.indexOf("--");
+  return [...(dashes < 0 ? args : args.slice(0, dashes)).filter((a) => !a.startsWith("-")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
+};
 // Drops a wrapper's leading options; `takesValue` matches the ones followed by a value.
 function afterFlags(args: string[], takesValue: RegExp): string[] {
   let i = 0;
@@ -1679,10 +1863,12 @@ function sed(args: string[], scope: Scope): Verdict {
   let inPlace = false;
   let sandbox = false;
   let k = 0;
+  let dashed = false;
   for (; k < args.length && args[k].startsWith("-") && args[k] !== "-"; k++) {
     const a = args[k];
     if (a === "--") {
       k++;
+      dashed = true;
       break;
     }
     if (a.startsWith("--")) {
@@ -1713,7 +1899,8 @@ function sed(args: string[], scope: Scope): Verdict {
   const rest = args.slice(k);
   if (!scripts.length) scripts.push(rest.shift() ?? "");
   if (!sandbox && !scripts.every(sedScriptSafe)) return classify("sed script that runs commands or reads or writes other files");
-  return inPlace ? writeTargets("sed", ["script", ...rest.filter((a) => !a.startsWith("-"))], scope) : ALLOW;
+  // After a `--` every word is a file (round 40, Opus).
+  return inPlace ? writeTargets("sed", ["script", "--", ...(dashed ? rest : operands(rest))], scope) : ALLOW;
 }
 
 // An awk program that only reads its input and prints. Not: system(), getline (from a command or
@@ -1764,17 +1951,110 @@ function make(args: string[], scope: Scope): Verdict {
 // tar options that run a program: a checkpoint action, a compressor, --to-command, the volume
 // scripts, a remote shell; and an archive named host:file, which tar opens through rsh.
 function tarProblem(args: string[]): string | undefined {
+  const t = tarReading(args);
   const running = ["checkpoint-action", "use-compress-program", "to-command", "info-script", "new-volume-script", "rsh-command", "rmt-command"];
-  for (let k = 0; k < args.length; k++) {
-    const a = args[k];
-    if (running.some((name) => longIs(a, name))) return `tar ${a.split("=")[0]} runs a program`;
-    // Short clusters, and the old style where the first word is a cluster without its dash.
-    const cluster = /^-[A-Za-z]+$/.test(a) ? a.slice(1) : k === 0 && /^[A-Za-z]+$/.test(a) ? a : "";
-    if (/[IF]/.test(cluster)) return "tar -I or -F runs a program";
-    const archive = /^--file=/.test(a) ? a.slice(7) : a === "--file" || /f$/.test(cluster) ? args[k + 1] : /^-f./.test(a) && !a.startsWith("--") ? a.slice(2) : undefined;
-    if (archive !== undefined && /^[^/]*:/.test(archive) && !args.includes("--force-local")) return "tar on a remote archive runs a remote shell";
-  }
+  const run = running.find((name) => t.has(name));
+  if (run) return `tar --${run} runs a program`;
+  // Short clusters, and the old style where the first word is a cluster without its dash, read by
+  // position: a dash cluster's letters end at one that takes a value (round 42, the reader's).
+  if (t.letter("I") || t.letter("F")) return "tar -I or -F runs a program";
+  if (t.archives.some((f) => /^[^/]*:/.test(f)) && !t.has("force-local")) return "tar on a remote archive runs a remote shell";
   return undefined;
+}
+
+// Modules that are built in, or that `python3 -m unittest` has imported before it looks a name up
+// (CPython 3.13); a project package of the same name does not take their place.
+const UNITTEST_LOADED = new Set(
+  `abc argparse array ast atexit binascii builtins bz2 cmath codecs collections contextlib copy copyreg dataclasses difflib dis encodings enum
+   errno faulthandler fcntl fnmatch functools gc genericpath gettext grp heapq importlib inspect io itertools keyword linecache locale lzma
+   marshal math opcode operator os posix posixpath pprint pwd pyexpat re reprlib runpy select shutil signal site sitecustomize stat sys syslog
+   textwrap time token tokenize traceback types unicodedata unittest warnings weakref zipimport zlib`.split(/\s+/),
+);
+
+// The names `python3 -m unittest` is given (it imports and calls each): files or modules of the
+// project, read from where the command runs, or `discover` with its options.
+// What a tool that deletes files as a side effect (rsync --delete or --remove-source-files, tar
+// --remove-files) may delete: outside the project and in a .git directory, as rm -r would; the
+// project's own files are left to the decider as before (the maintainer's d-fixes D5 decisions).
+function deletion(target: string, scope: Scope): Verdict {
+  const v = rm(["-r", "--", target], scope);
+  if (v.action === "ask" && /deletes the whole project/.test(v.reason)) {
+    const p = resolveWord(target, scope);
+    return p && /(^|\/)\.git(\/|$)/.test(p) ? v : ALLOW;
+  }
+  return v;
+}
+
+// `python3 -m venv DIR...` and `uv venv [DIR]`: each directory is written; with `--clear` it is
+// emptied first, as `rm -r` would.
+function venvTargets(args: string[], valued: string[], scope: Scope): Verdict {
+  const dashes = args.indexOf("--");
+  const dirs = [...(dashes < 0 ? args : args.slice(0, dashes)).filter((a, k) => !a.startsWith("-") && !valued.includes(args[k - 1] ?? "")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
+  const clear = (dashes < 0 ? args : args.slice(0, dashes)).some((a) => (longIs(a, "clear") && a.length > 3) || a === "-c");
+  let verdict = ALLOW;
+  for (const d of dirs) {
+    const p = resolveWord(d, scope);
+    if (p && /(^|\/)\.git(\/|$)/.test(p)) verdict = worst(verdict, ask(`a virtual environment in a .git directory: ${d}`));
+    verdict = worst(verdict, clear ? rm(["-r", "--", d], scope) : writeTargets("mkdir", ["--", d], scope));
+  }
+  return verdict;
+}
+
+function unittestNamesOwn(args: string[], scope: Scope): boolean {
+  if (args[0] === "discover") return true;
+  // Every word after `--` is a name (round 36, Mythos).
+  const dash = args.indexOf("--");
+  const head = dash < 0 ? args : args.slice(0, dash);
+  const names = [...head.filter((a, k) => !a.startsWith("-") && !/^(-k|--durations)$/.test(head[k - 1] ?? "")), ...(dash < 0 ? [] : args.slice(dash + 1))];
+  if (!names.length) return true;
+  if (!scope.cwd) return false;
+  const cwd = scope.cwd;
+  return names.every((name) => {
+    let n = name;
+    if (/[$`]/.test(n)) return false;
+    // A path to a test file: unittest turns it into the dotted name it imports (`code/interact.py`
+    // is `code.interact`, which a directory without __init__.py leaves to the standard module), so
+    // it is held to the same walk (round 36, Opus and Mythos).
+    if (n.includes("/") || n.endsWith(".py")) {
+      const p = resolveWord(n, scope);
+      if (!p || !isLocal(p, scope) || inTmp(p) || !/\.py$/.test(p) || !within(p, cwd, true)) return false;
+      n = path.relative(cwd, p).slice(0, -3).split(path.sep).join(".");
+    }
+    // A dotted name: packages (directories with __init__.py) down to a module file, then at most a
+    // class and a method that the module's own text defines. (Round 35, all four: unittest walks
+    // any attribute after the module, `test_a.unittest.case.sys.breakpointhook`, and calls what it
+    // reaches; a directory without __init__.py does not shadow a standard module.)
+    const parts = n.split(".");
+    if (!parts.every((p) => /^[A-Za-z_]\w*$/.test(p))) return false;
+    // A built-in module, or one python -m unittest has loaded by then, is never the project's
+    // (round 37, Mythos: `builtins.breakpoint` with a `builtins/` package).
+    if (UNITTEST_LOADED.has(parts[0]) || parts[0].startsWith("_")) return false;
+    let dir = cwd;
+    for (let i = 0; i < parts.length; i++) {
+      const file = path.join(dir, `${parts[i]}.py`);
+      if (fs.existsSync(path.join(dir, parts[i], "__init__.py")) && i < parts.length - 1 && !fs.existsSync(file)) {
+        dir = path.join(dir, parts[i]);
+        continue;
+      }
+      if (!fs.existsSync(file)) return fs.existsSync(path.join(dir, parts[i], "__init__.py")) && i === parts.length - 1 && within(dir, cwd);
+      const rest = parts.slice(i + 1);
+      if (rest.length > 2) return false;
+      if (!rest.length) return isLocal(file, scope) && !inTmp(file);
+      // A regular file of a modest size only: a FIFO named like a module would hold the decision.
+      let text = "";
+      try {
+        const st = fs.statSync(file);
+        if (!st.isFile() || st.size > 4_000_000) return false;
+        text = fs.readFileSync(file, "utf8");
+      } catch {
+        return false;
+      }
+      if (rest[0] && !new RegExp(`^class ${rest[0]}\\b`, "m").test(text)) return false;
+      if (rest[1] && !new RegExp(`^[ \\t]+(async[ \\t]+)?def ${rest[1]}\\b`, "m").test(text)) return false;
+      return isLocal(file, scope) && !inTmp(file);
+    }
+    return false;
+  });
 }
 
 // ---- nested shells ----
@@ -1819,13 +2099,773 @@ function shell(name: string, args: string[], dyn: (k: number) => boolean, cmd: S
   return evaluateParsed(parse(text), scope, depth + 1);
 }
 
+// rsync's command line read by position, as its option parser reads it (round 41, all four):
+// options anywhere until `--`, a value after each option that takes one (attached, after `=`, or
+// the next word, and in a short cluster the rest of the word after a letter that takes one).
+// (Round 42, Mythos and Opus: rsync takes no abbreviated long option, `--dry` is an error, so a
+// name is matched whole; `--munge-links` is a flag; the list is rsync 3.5's `--help` with the
+// aliases it keeps, `--log-format`, `--cc`, `--zc`, `--zl`, `--zt`, `--time-limit`.)
+const RSYNC_LONG_VALUED = new Set(`out-format log-format log-file log-file-format rsh exclude include filter files-from exclude-from include-from
+  password-file partial-dir temp-dir backup-dir suffix compare-dest copy-dest link-dest chmod chown usermap groupmap timeout contimeout
+  bwlimit max-size min-size block-size port sockopts outbuf remote-option iconv checksum-choice cc compress-choice zc compress-level zl
+  compress-threads zt skip-compress info debug modify-window max-delete max-alloc stop-after time-limit stop-at write-batch read-batch
+  only-write-batch protocol address rsync-path config dparam checksum-seed early-input copy-as confine-root stderr`.split(/\s+/));
+// (Round 55, Astra: rsync opens `--include-from`/`--exclude-from` files and the files of `merge`
+// and `.` filter rules as it reads each option, before a later `--help` or any `--version`
+// prints; `dir-merge`, `:` and `--files-from` open nothing then: tried, rsync 3.5.0.)
+// (Round 56, Opus: a short `.` rule takes its modifiers without a comma, `.-`, `.e`, and `merge,`
+// takes `/` among them; any modifiers are matched, which only over-asks on ones rsync refuses.)
+const RSYNC_EAGER_RULE = /^(?:merge(?:,[^ _]*)?|\.[^ _]*)[ _](.+)$/;
+export function rsyncReading(args: string[]) {
+  const longs: [string, string | undefined][] = [];
+  const letters: string[] = [];
+  const shorts: [string, string | undefined][] = [];
+  const operands: string[] = [];
+  // The files opened while the options are read, in order, with each help word's place.
+  const order: { opens?: string; help?: true }[] = [];
+  const eager = (name: string, value: string | undefined) => {
+    if (value === undefined) return;
+    if (name === "include-from" || name === "exclude-from") order.push({ opens: value });
+    const rule = name === "filter" ? RSYNC_EAGER_RULE.exec(value) : null;
+    if (rule) order.push({ opens: rule[1] });
+  };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") {
+      operands.push(...args.slice(i + 1));
+      break;
+    }
+    if (a.startsWith("--")) {
+      const eq = a.indexOf("=");
+      const head = eq < 0 ? a : a.slice(0, eq);
+      const value = eq >= 0 ? a.slice(eq + 1) : RSYNC_LONG_VALUED.has(head.slice(2)) ? args[++i] : undefined;
+      longs.push([head, value]);
+      eager(head.slice(2), value);
+      if (head === "--help" || ((head === "--info" || head === "--debug") && (value ?? "").split(",").some((t) => /^help\d*$/i.test(t)))) order.push({ help: true });
+    } else if (a.startsWith("-") && a.length > 1) {
+      for (let k = 1; k < a.length; k++) {
+        letters.push(a[k]);
+        if ("eTfBM@".includes(a[k])) {
+          // (Round 43, Opus and Mythos: popt drops a `=` before an attached value, `-T=dir`.)
+          const value = k < a.length - 1 ? a.slice(k + 1).replace(/^=/, "") : args[++i];
+          shorts.push([a[k], value]);
+          if (a[k] === "f") eager("filter", value);
+          break;
+        }
+      }
+    } else operands.push(a);
+  }
+  // What only takes away (a dry run, a listing) is matched whole; what adds a danger by any prefix.
+  const has = (name: string) => longs.some(([h]) => h === `--${name}`);
+  const prefixed = (name: string) => longs.some(([h]) => h.length >= 4 && `--${name}`.startsWith(h));
+  const dryRun = letters.includes("n") || has("dry-run");
+  const listOnly = has("list-only");
+  // (Round 42, Mythos: `--read-batch` replays a recorded update into its one operand.)
+  const batch = prefixed("read-batch");
+  // (Round 43, Mythos: `--server` writes what standard input sends into its operand, which is no
+  // source; Sol: a dry run of a batch writes nothing.)
+  const server = prefixed("server") || prefixed("sender");
+  // (Round 46, Sol: `--version`, `-V` and `--help` print and copy nothing.)
+  // (Round 47, Sol: `--version` still opens its `--log-file`; `--help` opens nothing.)
+  // (Round 48, Astra: `--info=help` and `--debug=help` print their lists and exit too. Round 49:
+  // a `help` among the words of the list, in any case, `--info=name,HELP`, `--debug=help0`; and
+  // rsync reads its options in order, so a `--log-file` before the help word is opened and the
+  // help written into it (Opus): help writes nothing only where it comes first.)
+  const isHelp = ([h, v]: [string, string | undefined]) => h === "--help" || ((h === "--info" || h === "--debug") && (v ?? "").split(",").some((t) => /^help\d*$/i.test(t)));
+  const firstHelp = longs.findIndex(isHelp);
+  const firstLog = longs.findIndex(([h, v]) => h === "--log-file" && v !== "");
+  const help = firstHelp >= 0 && (firstLog < 0 || firstHelp < firstLog);
+  const prints = has("version") || firstHelp >= 0 || letters.includes("V");
+  // The files opened before a help or version query exits: those before the first help word, or
+  // all of them for a version query.
+  const helpAt = order.findIndex((e) => e.help);
+  const opensBeforeExit = (helpAt >= 0 ? order.slice(0, helpAt) : order).flatMap((e) => (e.opens !== undefined ? [e.opens] : []));
+  return { longs, letters, shorts, operands, dryRun, listOnly, batch, server, prints, help, opensBeforeExit, daemon: prefixed("daemon"), copiesNothing: prints || (!server && (dryRun || listOnly || (!batch && operands.length < 2))), values: (name: string) => {
+      // (Round 48, Sol: the last `--log-file` is the one rsync opens, and an empty one none.)
+      // A help word stops the reading where it stands: a log named after it is never opened.
+      const all = (firstHelp >= 0 ? longs.slice(0, firstHelp) : longs).filter(([h]) => h === `--${name}`).map(([, v]) => v ?? "");
+      return name === "log-file" ? all.slice(-1).filter((v) => v !== "") : all;
+    } };
+}
+
+// tar's command line read by position (round 41): the old style (a first word of letters without
+// a dash, whose letters that take a value take the next words in turn), short clusters, long
+// options with their values, and `--` ending the options only where an option stands.
+// (Round 42, all four: GNU tar takes a long option by a prefix only where the prefix names one
+// option, and a whole name wins, `--list` over `--listed-incremental`; `--backup`, `--occurrence`,
+// `--checkpoint` and the like take a value only after `=`. The names are tar 1.35's `--help`,
+// with the hidden `--program-name` (a value) and `--HANG` (round 43, Mythos).)
+const TAR_LONG_VALUED = `add-file after-date blocking-factor checkpoint-action directory exclude exclude-from exclude-ignore exclude-ignore-recursive
+  exclude-tag exclude-tag-all exclude-tag-under file files-from format group group-map hole-detection index-file info-script label level
+  listed-incremental mode mtime new-volume-script newer newer-mtime no-quote-chars owner owner-map pax-option quote-chars quoting-style
+  record-size rmt-command rsh-command sort sparse-version starting-file strip-components suffix tape-length to-command transform
+  use-compress-program volno-file warning xattrs-exclude xattrs-include xform program-name`.split(/\s+/);
+const TAR_LONG_FLAGS = `absolute-names acls anchored append atime-preserve auto-compress backup block-number bzip2 catenate check-device check-links
+  checkpoint clamp-mtime compare compress concatenate confirmation create delay-directory-restore delete dereference diff exclude-backups
+  exclude-caches exclude-caches-all exclude-caches-under exclude-vcs exclude-vcs-ignores extract force-local full-time get gunzip gzip
+  hard-dereference help ignore-case ignore-command-error ignore-failed-read ignore-zeros incremental interactive keep-directory-symlink
+  keep-newer-files keep-old-files list lzip lzma lzop multi-volume no-acls no-anchored no-auto-compress no-check-device
+  no-delay-directory-restore no-ignore-case no-ignore-command-error no-null no-overwrite-dir no-recursion no-same-owner no-same-permissions
+  no-seek no-selinux no-unquote no-verbatim-files-from no-wildcards no-wildcards-match-slash no-xattrs null numeric-owner occurrence
+  old-archive one-file-system one-top-level overwrite overwrite-dir portability posix preserve-order preserve-permissions read-full-records
+  recursion recursive-unlink remove-files restrict same-order same-owner same-permissions seek selinux show-defaults show-omitted-dirs
+  show-snapshot-field-ranges show-stored-names show-transformed-names skip-old-files sparse test-label to-stdout totals touch uncompress
+  ungzip unlink-first unquote update usage utc verbatim-files-from verbose verify version wildcards wildcards-match-slash xattrs xz zstd HANG`.split(/\s+/);
+const TAR_LONGS = [...TAR_LONG_VALUED, ...TAR_LONG_FLAGS];
+// The option a long word names, as getopt_long reads it: a whole name, else the one name it is a
+// prefix of. Undefined where it names none or several (tar stops with an error).
+export const tarLong = (head: string) => {
+  const name = head.slice(2);
+  if (TAR_LONGS.includes(name)) return name;
+  const all = TAR_LONGS.filter((n) => n.startsWith(name));
+  return name && all.length === 1 ? all[0] : undefined;
+};
+const TAR_SHORT_VALUED = "bCfFgHIKLNTVX";
+export function tarReading(args: string[]) {
+  const clusters: string[] = [];
+  const longs: [string, string | undefined][] = [];
+  const archives: string[] = [];
+  const dirs: string[] = [];
+  const members: string[] = [];
+  const shortValues: (string | undefined)[] = [];
+  const takeShort = (letter: string, value: string | undefined) => {
+    if (letter !== "f") shortValues.push(value);
+    if (letter === "f" && value !== undefined) archives.push(value);
+    if (letter === "C" && value !== undefined) dirs.push(value);
+  };
+  let i = 0;
+  // (Round 43, Mythos: tar takes any first word without a dash as the old style, and a `-` in it
+  // ends the options as `--` would: `tar cIf- ./x.sh b.tar f`.)
+  let ended = false;
+  if (args[0] && !args[0].startsWith("-")) {
+    const dash = args[0].indexOf("-");
+    const letters = dash < 0 ? args[0] : args[0].slice(0, dash);
+    clusters.push(letters);
+    i = 1;
+    for (const letter of letters) if (TAR_SHORT_VALUED.includes(letter)) takeShort(letter, args[i++]);
+    ended = dash >= 0;
+  }
+  if (ended) members.push(...args.slice(i));
+  else for (; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") {
+      members.push(...args.slice(i + 1));
+      break;
+    }
+    if (a.startsWith("--")) {
+      const eq = a.indexOf("=");
+      const head = eq < 0 ? a : a.slice(0, eq);
+      const full = tarLong(head);
+      const value = eq >= 0 ? a.slice(eq + 1) : full && TAR_LONG_VALUED.includes(full) ? args[++i] : undefined;
+      // The whole name where it names one; the word as written where it names none or several.
+      longs.push([full ? `--${full}` : head, value]);
+      if (full === "file" && value !== undefined) archives.push(value);
+      if (full === "directory" && value !== undefined) dirs.push(value);
+    } else if (a.startsWith("-") && a.length > 1) {
+      // The letters only: in `-tfFILM` the rest of the word after `f` is the archive's name.
+      let k = 1;
+      while (k < a.length && !TAR_SHORT_VALUED.includes(a[k])) k++;
+      clusters.push(a.slice(1, k + 1));
+      if (k < a.length) takeShort(a[k], k < a.length - 1 ? a.slice(k + 1) : args[++i]);
+    } else members.push(a);
+  }
+  const has = (name: string) => longs.some(([h]) => h === `--${name}`);
+  const values = (name: string) => longs.filter(([h]) => h === `--${name}`).map(([, v]) => v ?? "");
+  const letter = (l: string) => clusters.some((c) => c.includes(l));
+  // The words an option other than `-f`/`--file` took as its value (round 44, Sol and Astra).
+  const optionValues = [...longs.filter(([h]) => h !== "--file").map(([, v]) => v), ...shortValues].filter((v): v is string => v !== undefined);
+  return { clusters, longs, archives, dirs, members, has, values, letter, optionValues };
+}
+
+// Whether ps prints environments (round 42, all four), read as procps-ng 4 reads its words: a
+// word with one dash is a cluster of UNIX letters, one without a dash of BSD letters, and in both a
+// letter that takes a value takes the rest of the word or the next word; a long option takes the
+// next word where it takes a value. BSD `e` prints them, so does the field `environ` in a format
+// (`-o`, `-O`, `o`, `O`, `--format`; a sort key prints nothing), the fields split at commas and
+// blanks, and what follows a `=` in one value its heading.
+// (Round 43, Mythos: where the UNIX reading fails, a letter that is no UNIX option, `-ex`, or a
+// letter that takes a value with none left, `-e -t`, procps reads the dash words again as BSD
+// ones, and a UNIX `e` then prints environments. Opus: `-N` is a flag; `--format:` takes a value.)
+// (Round 52, Opus: procps-ng 4's `-D`/`--date-format` takes a value too.)
+const PS_UNIX_VALUED = "CDGgoOpqstuU";
+const PS_UNIX_FLAGS = "AacdefFHjLlMmNPTVwyZ";
+const PS_BSD_VALUED = "oOkpqtU";
+const PS_LONG_VALUED = /^--(format|sort|cols|columns|width|rows|lines|pid|ppid|tty|user|User|group|Group|sid|quick-pid|date-format)$/;
+// The user and group names this machine knows (round 45: an attached name the UNIX reading takes).
+let knownNames: Set<string> | undefined;
+const namesHere = () => {
+  if (!knownNames) {
+    knownNames = new Set();
+    for (const file of ["/etc/passwd", "/etc/group"]) {
+      try {
+        for (const line of fs.readFileSync(file, "utf8").split("\n")) if (line && !line.startsWith("#")) knownNames.add(line.split(":")[0]);
+      } catch {}
+    }
+  }
+  return knownNames;
+};
+// Whether the UNIX reading takes a value attached to its letter (round 45, Sol and Astra): a list
+// of numbers (`-p1`, `-p+1`, `-u0`, `-p'1 2'`) for a letter that takes ids, a command name for
+// `-C`, and, where ps runs here, names this machine knows for `-u`/`-U`/`-g`/`-G`.
+// (Round 46, Sol and Astra: a list mixing ids and names, `-u0,root`; a terminal `-t-`, `-t'?'`
+// or one this machine has.)
+function psValueTaken(letter: string, value: string, here: boolean): boolean {
+  if ("oOCD".includes(letter)) return true;
+  const items = value.split(/[,\s]+/);
+  if (!items.length || items.some((n) => n === "")) return false;
+  if ("pqs".includes(letter)) return items.every((n) => /^\+?\d+$/.test(n));
+  if ("uUgG".includes(letter)) return items.every((n) => /^\+?\d+$/.test(n) || (here && namesHere().has(n)));
+  // (Round 47, Astra: an absolute path to a terminal, `-t/dev/tty`.)
+  if (letter === "t") return items.every((n) => n === "-" || n === "?" || (here && /^[\w/]+$/.test(n) && (n.startsWith("/dev/") ? fs.existsSync(n) : ["", "tty", "pts/"].some((p) => fs.existsSync(`/dev/${p}${n}`)))));
+  return false;
+}
+// The format fields procps-ng 4.0.4 knows made of letters only (`ps L`), and `environ`.
+const PS_LETTER_FIELDS = new Set(`environ ${`args atime blocked bsdstart bsdtime c caught cgname cgroup cgroupns class cls cmd comm command context cp cpuid
+  cputime cputimes cuc cuu drs dsiz egid egroup eip esp etime etimes euid euser exe f fgid fgroup flag flags fname fsgid
+  fsgroup fsuid fsuser fuid fuser gid group ignored intpri ipcns label lastcpu lim longtname lsession lstart luid lwp
+  lxc machine majflt minflt mntns netns ni nice nlwp numa oom oomadj opri ouid pagein pcpu pending pgid pgrp pid pidns
+  pmem policy ppid pri priority psr pss rbytes rchars rgid rgroup rops rss rssize rsz rtprio ruid ruser s sched seat
+  sess session sgid sgroup sid sig sigcatch sigignore sigmask size slice spid stackp start stat state stime suid supgid
+  supgrp suser svgid svgroup svuid svuser sz tgid thcount tid time timens times tname tpgid trs trss tsig tsiz tt tty
+  ucmd ucomm uid uname unit user userns uss util utsns uunit vsize vsz wbytes wcbytes wchan wchars wname wops zone`}`.split(/\s+/));
+export function psEnvironments(args: string[], here = true): boolean {
+  const formats: string[] = [];
+  let unixE = false;
+  let again = false;
+  // The UNIX letters read as flags, not values (round 48, Sol and Astra: in `-C -H` the `-H` is a
+  // command's name).
+  let unixFlags = "";
+  let forest = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith("--")) {
+      const cut = a.search(/[=:]/);
+      const head = cut < 0 ? a : a.slice(0, cut);
+      const value = cut >= 0 ? a.slice(cut + 1) : PS_LONG_VALUED.test(head) ? args[++i] : undefined;
+      if (head === "--format" && value !== undefined) formats.push(value);
+      if (head === "--forest") forest = true;
+      continue;
+    }
+    const unix = a.startsWith("-");
+    const valued = unix ? PS_UNIX_VALUED : PS_BSD_VALUED;
+    // Read again as BSD, a dash word's letters up to an `o` (which takes the rest) are flags.
+    if (unix && a.slice(1).split(/[oO]/)[0].includes("e")) unixE = true;
+    for (let k = unix ? 1 : 0; k < a.length; k++) {
+      if (!unix && a[k] === "e") return true;
+      // (Round 53, Opus: procps takes the rest of the word as `-D`'s date format and still reads
+      // its letters as options, `ps -Doenviron`: they are read on.)
+      if (unix && a[k] === "D" && k < a.length - 1) continue;
+      if (valued.includes(a[k])) {
+        const value = k < a.length - 1 ? a.slice(k + 1) : args[++i];
+        // (Round 48, Opus: a UNIX `-O` given BSD sort keys, `-O p`, `-O +pt`, is refused by the
+        // format reader and read again as BSD: procps-ng 4.0.4.)
+        // (Round 49, Astra: only BSD's sort-key letters; a format macro, `THREAD`, `DefSysV`, is
+        // read as one.)
+        if (unix && a[k] === "O" && value !== undefined && /^([+-]?[gjkmnoprtuvyCGJKMNPRSTU])+$/.test(value) && (/[+-]/.test(value) || !PS_LETTER_FIELDS.has(value))) again = true;
+        // A value the UNIX reading may refuse (`-uaxe` names the user `axe`) sends it to BSD; a
+        // value it takes does not (round 44 and 45, Sol and Astra). A separate word that starts
+        // with `-` is refused, and the BSD reading takes it (round 45, Opus: `ps -e -u -x`).
+        // (`-C` takes any word as a command's name, `-C -x` too, round 46, Astra.)
+        // (Round 47, Sol and Astra: `-t -` names no terminal, as `-t-` does.)
+        if (unix && (value === undefined || (k < a.length - 1 ? !psValueTaken(a[k], value, here) : value.startsWith("-") && !"oOCD".includes(a[k]) && !(a[k] === "t" && value === "-")))) again = true;
+        if ("oO".includes(a[k]) && value !== undefined) formats.push(value);
+        break;
+      }
+      if (unix && !PS_UNIX_FLAGS.includes(a[k])) again = true;
+      if (unix) unixFlags += a[k];
+    }
+  }
+  // (Round 47, Opus: procps reads the words again as BSD ones when the UNIX reading fails after
+  // parsing too: a thread display beside a forest, `-eTH`, `-eT --forest`; `-L` beside `-m`;
+  // `-T` beside `-m` or `-L`.)
+  const threads = ["T", "L", "m"].filter((l) => unixFlags.includes(l));
+  if ((threads.length && (forest || unixFlags.includes("H"))) || threads.length > 1) again = true;
+  if (unixE && again) return true;
+  // (Round 44, Opus: read again as BSD, `-u` in `ps -xu -e` takes no value, so `-e` is BSD `e`.)
+  if (again) {
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (!a.startsWith("-") || a.startsWith("--")) continue;
+      for (let k = 1; k < a.length; k++) {
+        if (a[k] === "e") return true;
+        if (PS_BSD_VALUED.includes(a[k])) {
+          if (k === a.length - 1) i++;
+          break;
+        }
+      }
+    }
+  }
+  return formats.some((f) => {
+    for (const field of f.split(/[\s,]+/)) {
+      if (field.split(/[=:]/)[0].replace(/^[+-]/, "") === "environ") return true;
+      if (field.includes("=")) return false;
+    }
+    return false;
+  });
+}
+
+// gzip, xz, zstd and bzip2 read by position (round 42, Mythos and Sol): a letter that takes a value
+// ends its cluster (`-Sc` names the suffix `c`), with the rest of the word or the next word, and
+// zstd's `-T4`-like letters with the rest of the word only. A listing, a test or output to
+// standard output writes nothing in place; `-o` names the file written.
+// (Round 43, Opus, Mythos, Sol, Astra: gzip and xz take a long option by any prefix that names one
+// (getopt_long: `--su` is `--suffix`, `--tes` is `--test`), bzip2 and zstd only whole; zstd's `-o`
+// takes the next word wherever it stands in a cluster (`-of FILE`), or what follows `=`; zstd
+// `--rm` removes its input after an `-o` too; the table is looked up by its own keys.)
+type CompressorTable = { family: string; valued: string; attached: string; longs: string[]; longValued: string[]; prefixes: boolean; stdout?: true; decompress?: true };
+const XZ_LONGS = `compress decompress uncompress test list keep force stdout to-stdout single-stream no-sparse no-sync suffix files files0 format check
+  ignore-check extreme fast best threads block-size block-list flush-timeout memlimit-compress memlimit-decompress memlimit-mt-decompress memlimit
+  no-adjust filters filters1 filters2 filters3 filters4 filters5 filters6 filters7 filters8 filters9 filters-help lzma1 lzma2 x86 arm arm64
+  armthumb powerpc ia64 sparc riscv delta quiet verbose no-warn robot info-memory help long-help version`.split(/\s+/);
+const COMPRESSORS: Record<string, CompressorTable> = {
+  gzip: { family: "gzip", valued: "Sb", attached: "", prefixes: true, longValued: ["suffix", "bits"], longs: "ascii to-stdout stdout decompress uncompress force help keep list license no-name name quiet silent synchronous recursive suffix test verbose version fast best lzw bits rsyncable".split(" ") },
+  xz: { family: "xz", valued: "SFCTM", attached: "", prefixes: true, longValued: ["suffix", "format", "check", "threads", "block-size", "block-list", "flush-timeout", "memlimit-compress", "memlimit-decompress", "memlimit-mt-decompress", "memlimit", "filters", ...[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `filters${n}`)], longs: XZ_LONGS },
+  zstd: { family: "zstd", valued: "", attached: "TBMbei", prefixes: false, longValued: ["trace", "filelist", "output-dir-flat", "output-dir-mirror", "patch-from"], longs: [] },
+  bzip2: { family: "bzip2", valued: "", attached: "", prefixes: false, longValued: [], longs: [] },
+};
+for (const [alias, base, extra] of [["gunzip", "gzip", "d"], ["zcat", "gzip", "dc"], ["unxz", "xz", "d"], ["xzcat", "xz", "dc"], ["lzma", "xz", ""], ["unlzma", "xz", "d"], ["lzcat", "xz", "dc"], ["unzstd", "zstd", "d"], ["zstdcat", "zstd", "dc"], ["zstdmt", "zstd", ""], ["bunzip2", "bzip2", "d"], ["bzcat", "bzip2", "dc"]] as const) {
+  COMPRESSORS[alias] = { ...COMPRESSORS[base], ...(extra.includes("d") ? { decompress: true } : {}), ...(extra.includes("c") ? { stdout: true } : {}) };
+}
+export function compressorReading(name: string, args: string[]) {
+  const table = Object.hasOwn(COMPRESSORS, name) ? COMPRESSORS[name] : undefined;
+  if (!table) return undefined;
+  // The option a long word names: whole, or (getopt_long) the one name it is a prefix of.
+  const resolve = (head: string) => {
+    const word = head.slice(2);
+    if (!table.prefixes || table.longs.includes(word)) return word;
+    const all = table.longs.filter((n) => n.startsWith(word));
+    return word && all.length === 1 ? all[0] : head;
+  };
+  const letters: string[] = [];
+  const longs: string[] = [];
+  const operands: string[] = [];
+  const outputs: string[] = [];
+  const suffixes: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") {
+      operands.push(...args.slice(i + 1));
+      break;
+    }
+    if (a.startsWith("--")) {
+      const eq = a.indexOf("=");
+      const name = resolve(eq < 0 ? a : a.slice(0, eq));
+      longs.push(name);
+      const value = eq >= 0 ? a.slice(eq + 1) : table.longValued.includes(name) ? args[++i] : undefined;
+      if (name === "suffix" && value !== undefined) suffixes.push(value);
+    } else if (a.startsWith("-") && a.length > 1) {
+      for (let k = 1; k < a.length; k++) {
+        letters.push(a[k]);
+        // (zstd's `-o` and `-D` each take the next word, the cluster going on: `-Do DICT OUT`.)
+        if (table.family === "zstd" && (a[k] === "o" || a[k] === "D")) {
+          if (a[k + 1] === "=") {
+            if (a[k] === "o") outputs.push(a.slice(k + 2));
+            break;
+          }
+          if (i + 1 < args.length) (a[k] === "o" ? outputs : []).push(args[++i]);
+          continue;
+        }
+        // (Round 53, Astra: zstd reads the number after `-T` and goes on, `-T1V` is `-T1 -V`.)
+        if (table.attached.includes(a[k])) {
+          if (table.family !== "zstd") break;
+          while (k + 1 < a.length && /[0-9]/.test(a[k + 1])) k++;
+          if (k + 1 < a.length && /[KM]/.test(a[k + 1])) k++;
+          if (k + 1 < a.length && a[k + 1] === "i") k++;
+          if (k + 1 < a.length && a[k + 1] === "B") k++;
+          continue;
+        }
+        if (table.valued.includes(a[k])) {
+          const value = k === a.length - 1 ? args[++i] : a.slice(k + 1);
+          if (a[k] === "S" && value !== undefined) suffixes.push(value);
+          break;
+        }
+      }
+    } else operands.push(a);
+  }
+  const long = (...names: string[]) => longs.some((h) => names.includes(h));
+  const stdout = !!table.stdout || letters.includes("c") || long("stdout", "to-stdout");
+  const test = letters.includes("t") || long("test");
+  // (Round 46, Sol: a version, help or licence query prints and writes nothing.)
+  // (Round 47, Astra and Sol: xz's `--info-memory` and `--filters-help` print too.)
+  const prints = letters.some((l) => "VhH".includes(l) || (l === "L" && table.family !== "xz")) || long("version", "help", "long-help", "license", "info-memory", "filters-help");
+  const list = letters.includes("l") || long("list") || prints;
+  // A decompression by any prefix getopt would take: the side that adds a write.
+  const decompress = !!table.decompress || letters.includes("d") || longs.some((h) => h.length > 0 && ("decompress".startsWith(h.replace(/^--/, "")) || "uncompress".startsWith(h.replace(/^--/, ""))));
+  const removes = long("rm");
+  // (Round 44, Sol: a listing or a test writes no `-o` file either.)
+  const reads = test || list;
+  // (Round 45, Opus: what a decompression names its output: the input less its suffix, `-S`'s
+  // first; gzip's `-N` takes the name the archive holds, and `-r` the files a directory holds.
+  // Round 46, Opus: zstd also takes gzip, xz, lzma and lz4 files and strips their suffixes.)
+  // (Round 47, Opus: gzip compares a suffix ignoring case, `.git.GZ`; zstd's `.t*` suffixes end
+  // in `.tar`.)
+  const DEFAULT_SUFFIXES: Record<string, string[]> = { gzip: [".gz", "-gz", ".z", "-z", "_z", ".tgz", ".taz"], xz: [".xz", ".lzma", ".lz", ".txz", ".tlz"], zstd: [".zst", ".tzst", ".zstd", ".gz", ".tgz", ".xz", ".txz", ".lzma", ".lz4", ".tlz4"], bzip2: [".bz2", ".bz", ".tbz2", ".tbz"] };
+  const fold = table.family === "gzip";
+  const unnamed = letters.includes("N") && table.family === "gzip" ? "-N" : letters.includes("r") || long("recursive") ? "-r" : long("name") && table.family === "gzip" ? "--name" : undefined;
+  const outputName = (input: string) => {
+    for (const s of [...suffixes, ...(DEFAULT_SUFFIXES[table.family] ?? [])]) {
+      const ends = fold ? input.toLowerCase().endsWith(s.toLowerCase()) : input.endsWith(s);
+      if (s && input.length > s.length && ends) return input.slice(0, -s.length) + (/^\.t[a-z0-9]+$/i.test(s) && !suffixes.includes(s) ? ".tar" : "");
+    }
+    return undefined;
+  };
+  return { operands, outputs: reads ? [] : outputs, decompress, reads, prints, inPlace: !(stdout || reads) && (!outputs.length || removes), family: table.family, unnamed, outputName };
+}
+
+// A copy that copies nothing (round 45, Sol and Opus): an rsync dry run, listing or single
+// operand, and a `--help`/`--version` (by a prefix getopt takes) among the option words before
+// `--` of cp, mv, ln or install.
+// (Round 46, Opus and Astra: read by position, an option's value is no `--help`, `cp -S --help`,
+// and no `--` either, `cp -S -- --version`.)
+const COPY_VALUED: Record<string, { short: string; long: string[] }> = {
+  cp: { short: "St", long: ["suffix", "target-directory", "no-preserve", "sparse"] },
+  mv: { short: "St", long: ["suffix", "target-directory"] },
+  ln: { short: "St", long: ["suffix", "target-directory"] },
+  install: { short: "Stgmo", long: ["suffix", "target-directory", "group", "mode", "owner", "strip-program"] },
+};
+export function copiesNothing(name: string, args: string[]): boolean {
+  if (name === "rsync") return rsyncReading(args).copiesNothing;
+  const table = Object.hasOwn(COPY_VALUED, name) ? COPY_VALUED[name] : undefined;
+  if (!table) return false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") return false;
+    if (a.startsWith("--")) {
+      const word = a.slice(2).split("=")[0];
+      if (word && "help".startsWith(word)) return true;
+      if (word.length >= 4 && "version".startsWith(word)) return true;
+      if (!a.includes("=") && word && table.long.some((n) => n.startsWith(word))) i++;
+    } else if (a.startsWith("-") && a.length > 1) {
+      for (let k = 1; k < a.length; k++) {
+        if (table.short.includes(a[k])) {
+          if (k === a.length - 1) i++;
+          break;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+// Whether sort runs a compressor (round 48, Opus, Sol, Astra): its words read by position, as
+// getopt_long reads them, with the options that take a value (GNU sort 9.7); `--` ends the
+// options only where an option could stand (`sort --random-source -- --compress-program=sh`).
+const SORT_LONGS = `ignore-leading-blanks dictionary-order ignore-case general-numeric-sort ignore-nonprinting month-sort human-numeric-sort
+  numeric-sort random-sort random-source reverse sort version-sort batch-size check compress-program debug files0-from key merge output stable
+  buffer-size field-separator temporary-directory parallel unique zero-terminated help version`.split(/\s+/);
+const SORT_LONG_VALUED = ["random-source", "sort", "batch-size", "compress-program", "files0-from", "key", "output", "buffer-size", "field-separator", "temporary-directory", "parallel"];
+// (Round 49, Opus, Sol, Astra: the same reading gives the files `-o`/`--output` name, for the
+// guard's write record: `sort --random-source -- -o .git/config f` writes `.git/config`.)
+// (Round 50, Opus: `-y` takes a value too, an attached one, GNU sort's `-bcCdfghik:mMno:rRsS:t:T:uVy::z`; Sol,
+// Astra: `--help`/`--version` as options print and write nothing.)
+// (Round 51, Sol: the files it reads, operands and `--files0-from`/`--random-source` values; a long
+// option sort does not know or cannot tell apart, `--ver`, stops it before it does anything.)
+// (Round 56, Sol: with `_POSIX2_VERSION` 200112 or later, sort takes no `+POS` key: the word is a
+// file.)
+// (Round 59, Opus: only for 200112 <= v < 200809; GNU sort takes `+POS` keys again from 200809.)
+export const posix2Strict = (v: number) => v >= 200112 && v < 200809;
+export function sortReading(args: string[], posix2 = posix2Strict(Number(process.env._POSIX2_VERSION ?? 0))): { compressor: boolean; outputs: string[]; prints: boolean; reads: string[]; lists: string[] } {
+  let compressor = false;
+  let prints = false;
+  const outputs: string[] = [];
+  const reads: string[] = [];
+  const lists: string[] = [];
+  let source: string | undefined;
+  let random = false;
+  let traditional = false;
+  const keys: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") {
+      reads.push(...args.slice(i + 1));
+      break;
+    }
+    if (a.startsWith("--")) {
+      const eq = a.indexOf("=");
+      const word = (eq < 0 ? a : a.slice(0, eq)).slice(2);
+      const all = SORT_LONGS.filter((n) => n.startsWith(word));
+      const name = SORT_LONGS.includes(word) ? word : all.length === 1 ? all[0] : undefined;
+      const value = name && SORT_LONG_VALUED.includes(name) ? (eq >= 0 ? a.slice(eq + 1) : args[++i]) : undefined;
+      if (!name) prints = true;
+      if (name === "compress-program") compressor = true;
+      if (name === "output" && value !== undefined) outputs.push(value);
+      // (Round 52, Sol and Astra: only the last `--files0-from` is read, and `--random-source` only
+      // in a random sort.)
+      if (name === "files0-from" && value !== undefined) lists.splice(0, lists.length, value);
+      if (name === "random-source" && value !== undefined) source = value;
+      if (name === "random-sort" || (name === "sort" && value !== undefined && "random".startsWith(value) && value !== "")) random = true;
+      if (name === "key" && value !== undefined) keys.push(value);
+      if (name === "help" || name === "version") prints = true;
+    // (Round 57, Astra: under _POSIX2_VERSION 200112 or later, GNU sort still takes `+POS` for a key
+    // where a `-POS` follows it. Round 58, Opus: and once it has, every later `+POS` is a key too.
+    // POSIXLY_CORRECT is not read: the sandbox gives commands none, Astra and Sol.)
+    } else if (/^\+\d+(\.\d+)?[bdfgiMhnRrV]*$/.test(a) && (!posix2 || traditional || /^-\d/.test(args[i + 1] ?? ""))) {
+      traditional = true;
+      // (Round 54, Sol and Astra: the old key syntax, `+POS1 [-POS2]`, with its modifiers at
+      // either end, `sort -R +0n -1`.)
+      let key = a.slice(1);
+      // (Round 55, Sol: only with modifiers sort takes; `+0xR` is a file.)
+      if (/^-\d+(\.\d+)?[bdfgiMhnRrV]*$/.test(args[i + 1] ?? "")) key += `,${args[++i].slice(1)}`;
+      keys.push(key);
+    } else if (a.startsWith("-") && a.length > 1) {
+      for (let k = 1; k < a.length; k++) {
+        // (`-y` takes only a value in its own word, `-yk`; alone it takes nothing: `sort -y --
+        // -output` sorts the file `-output`, tried.)
+        if (a[k] === "y") break;
+        if (a[k] === "R") random = true;
+        if ("koStT".includes(a[k])) {
+          const value = k === a.length - 1 ? args[++i] : a.slice(k + 1);
+          if (a[k] === "o" && value !== undefined) outputs.push(value);
+          if (a[k] === "k" && value !== undefined) keys.push(value);
+          break;
+        }
+      }
+    } else reads.push(a);
+  }
+  // (Round 53, Opus, Sol, Astra: a key with `R` among its modifiers sorts at random; a key with
+  // any modifier of its own takes none of the global ordering options, so a global `-R` is a
+  // random sort only where some key has none, or there are no keys.)
+  const modifiers = (key: string) => key.replace(/[0-9.,]/g, "");
+  const randomized = keys.some((key) => modifiers(key).includes("R")) || (random && (keys.length === 0 || keys.some((key) => modifiers(key) === "")));
+  reads.push(...lists, ...(randomized && source !== undefined ? [source] : []));
+  return prints ? { compressor: false, outputs: [], prints, reads: [], lists: [] } : { compressor, outputs, prints, reads, lists };
+}
+export const sortRunsCompressor = (args: string[]) => sortReading(args).compressor;
+
+// Whether a call only prints its help or version and exits (round 50, Sol and Astra), read by the
+// tool's own reader so an option's value is no such word: sort, tar, ps, cp/mv/ln/install, the
+// compressors, and rsync with its help before any log (a version query still writes its log, and
+// is read by rsync's own checks).
+export function printsOnly(name: string, args: string[]): boolean {
+  if (name === "sort") return sortReading(args).prints;
+  if (name === "tar" || name === "gtar") {
+    const t = tarReading(args);
+    // (Round 51, Astra and Sol: `--show-defaults` and `--show-snapshot-field-ranges` print too.)
+    return ["help", "usage", "version", "show-defaults", "show-snapshot-field-ranges"].some((n) => t.has(n)) || t.clusters.some((c) => c.includes("?"));
+  }
+  if (name === "ps") {
+    // (Round 51, Sol and Astra: read as psEnvironments reads the words: `-N` is a flag, `-opcpu`
+    // holds its value; `--help:all` as `--help=all`.)
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (/^--(help|version|info)([=:]|$)/.test(a)) return true;
+      if (a.startsWith("--")) {
+        if (PS_LONG_VALUED.test(a)) i++;
+        continue;
+      }
+      const unix = a.startsWith("-");
+      if (a === "-V" || a === "V") return true;
+      const valued = unix ? PS_UNIX_VALUED : PS_BSD_VALUED;
+      for (let k = unix ? 1 : 0; k < a.length; k++) {
+        if (unix && a[k] === "D" && k < a.length - 1) continue;
+        if (valued.includes(a[k])) {
+          if (k === a.length - 1) i++;
+          break;
+        }
+      }
+    }
+    return false;
+  }
+  const z = compressorReading(name, args);
+  if (z) return z.prints;
+  if (["cp", "mv", "ln", "install"].includes(name)) return copiesNothing(name, args);
+  // (Round 59, Astra and Sol: find's `-help`, `-version` and `-D help`; Opus: with no output file
+  // opened before it.)
+  if (name === "find") {
+    const f = findActions(args);
+    return f.prints && f.at.length === 0;
+  }
+  // (Round 53, Sol: a version query reads nothing; it writes its log, which rsync's own checks read.)
+  if (name === "rsync") {
+    const r = rsyncReading(args);
+    // (Round 54 and 55: a query that opens a filter file first does read it.)
+    return r.prints && !r.opensBeforeExit.length && (r.help || !r.values("log-file").length);
+  }
+  // (The compressors' queries are read by compressorReading, as writing nothing.)
+  return false;
+}
+
+// A directory there now; false for anything else, a link loop included (round 40, Sol: ELOOP).
+const isDirectory = (p: string) => {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+};
+
+// ---- the spellings the readers are trusted with ----
+
+// The option readers above (find, tar, rsync, sort, ps and the compressors) were written to read
+// every spelling GNU takes, and every round of review found one more they read differently. They
+// are now trusted only with the plain spellings listed here: whole option names, short flags in a
+// cluster, the common valued options in their usual form. Any other word (an abbreviated long
+// option, a rare option, an old-style key, a query word mixed with other options) asks, so a
+// reader's slip on a rare spelling can no longer allow a call. Asking on a call these lists leave
+// out is by design, not a defect. Each list grows only with a test of what the tool does.
+const FIND_VALUED = new Set(
+  `-name -iname -path -ipath -wholename -iwholename -regex -iregex -regextype -type -xtype -user -group -perm -size -mtime -mmin -atime -amin
+   -ctime -cmin -newer -samefile -inum -links -maxdepth -mindepth -printf`.split(/\s+/),
+);
+const FIND_BARE = new Set(`-print -print0 -ls -delete -prune -quit -empty -true -false -depth -xdev -mount -daystart -readable -writable -executable
+   -nouser -nogroup -not -a -and -o -or ( ) !`.split(/\s+/));
+function findPlain(args: string[]): boolean {
+  let k = args[0] === "--" ? 1 : 0;
+  // Start points: plain names, never `-`, `)` or `,`, which find reads in ways of their own.
+  while (k < args.length && !/^-./.test(args[k]) && args[k] !== "(" && args[k] !== "!") {
+    if (["-", ")", ","].includes(args[k])) return false;
+    k++;
+  }
+  for (; k < args.length; k++) {
+    const w = args[k];
+    if (w === "-exec" || w === "-execdir") {
+      // The command runs to `;`, or to `+` straight after `{}`; find judges it as a command.
+      const end = args.findIndex((a, i) => i > k && (a === ";" || (a === "+" && args[i - 1] === "{}")));
+      if (end < 0 || end === k + 1) return false;
+      k = end;
+    } else if (FIND_VALUED.has(w) || /^-newer[aBcm][aBcmt]$/.test(w)) {
+      if (++k >= args.length) return false;
+    } else if (!FIND_BARE.has(w)) return false;
+  }
+  return true;
+}
+// One word of short options, `-czf` or tar's old `czf`: flags from `flags`, then at most one valued
+// letter, last, or (a letter of `attached`) with its value as the rest of the word, `-k2,2n`.
+// Returns whether the next word is that letter's value, or undefined if not plain.
+function cluster(word: string, flags: string, valued: string, from: number, attached = ""): boolean | undefined {
+  if (word.length <= from) return undefined;
+  for (let k = from; k < word.length; k++) {
+    if (valued.includes(word[k])) return k === word.length - 1 ? true : attached.includes(word[k]) ? false : undefined;
+    if (!flags.includes(word[k])) return undefined;
+  }
+  return false;
+}
+// The long options a tool takes in plain form: `flags` whole, `valued` as `--name=value` or
+// `--name value`.
+type Plain = { short: string; shortValued: string; attached?: string; flags: string[]; valued: string[]; oldStyle?: boolean; operand?: (w: string) => boolean };
+function optionsPlain(args: string[], t: Plain): boolean {
+  for (let k = 0; k < args.length; k++) {
+    const w = args[k];
+    if (w === "--") return args.slice(k + 1).every((a) => !t.operand || t.operand(a));
+    if (w.startsWith("--")) {
+      const eq = w.indexOf("=");
+      const head = w.slice(2, eq < 0 ? undefined : eq);
+      if (eq < 0 && t.flags.includes(head)) continue;
+      if (!t.valued.includes(head)) return false;
+      if (eq < 0 && ++k >= args.length) return false;
+      continue;
+    }
+    if (w.startsWith("-") && w !== "-") {
+      const next = cluster(w, t.short, t.shortValued, 1, t.attached);
+      if (next === undefined) return false;
+      if (next && ++k >= args.length) return false;
+      continue;
+    }
+    // tar reads a first word without a dash as its options.
+    if (k === 0 && t.oldStyle) {
+      const next = cluster(w, t.short, t.shortValued, 0);
+      if (next === undefined) return false;
+      if (next && ++k >= args.length) return false;
+      continue;
+    }
+    if (t.operand && !t.operand(w)) return false;
+  }
+  return true;
+}
+const TAR_PLAIN: Plain = {
+  short: "ctxvzjJapkO",
+  shortValued: "fC",
+  flags: "create extract list verbose gzip bzip2 xz to-stdout keep-old-files no-same-owner no-same-permissions exclude-vcs wildcards no-wildcards".split(" "),
+  valued: ["file", "directory", "exclude", "strip-components"],
+  oldStyle: true,
+};
+const RSYNC_PLAIN: Plain = {
+  short: "avrlptgoDzhcuinqPHxEm",
+  shortValued: "",
+  flags: "archive verbose recursive links perms times group owner devices specials compress human-readable checksum update itemize-changes dry-run quiet progress partial stats hard-links one-file-system delete".split(" "),
+  valued: ["exclude", "include", "info"],
+};
+// sort: no old `+POS` key, in any place (which GNU sort reads by _POSIX2_VERSION).
+const SORT_PLAIN: Plain = {
+  short: "bdfgiMhnRrVcCmsuz",
+  shortValued: "ktoS",
+  attached: "ktS",
+  flags: "reverse numeric-sort unique ignore-case human-readable version-sort general-numeric-sort stable check merge zero-terminated ignore-leading-blanks dictionary-order month-sort random-sort".split(" "),
+  valued: ["key", "field-separator", "output", "buffer-size", "parallel"],
+  operand: (w) => !w.startsWith("+"),
+};
+const COMPRESSOR_PLAIN: Plain = {
+  short: "dckvfqtl123456789",
+  shortValued: "",
+  flags: "decompress uncompress stdout to-stdout keep force verbose quiet test list fast best".split(" "),
+  valued: [],
+};
+// ps: the BSD and UNIX letters that select processes and choose a standard format, and `-o` with
+// fields that are not the environment. Every word without a dash is BSD options.
+const PS_FIELDS = new Set(
+  `pid ppid pgid sid uid user ruser euser group comm args cmd command %cpu %mem pcpu pmem etime etimes time cputime stat state rss vsz sz tty
+   tname tt start lstart stime start_time nlwp ni nice pri psr wchan lwp tid f c class cls rtprio`.split(/\s+/),
+);
+// A format list: each comma-separated piece a field from the list, with a header after `=` that
+// holds no comma (so the list is the same whether ps reads a header to the end of the word or to
+// the next comma).
+const psFormat = (v: string) => v.split(",").every((piece) => /^([a-z%_]+)(=[^,]*)?$/.test(piece) && PS_FIELDS.has(piece.split("=")[0]));
+// A sort list: fields from the list, each with an optional `+` or `-`.
+const psSort = (v: string) => v.split(",").every((piece) => PS_FIELDS.has(piece.replace(/^[+-]/, "")));
+function psPlain(args: string[]): boolean {
+  for (let k = 0; k < args.length; k++) {
+    const w = args[k];
+    if (w === "--forest" || w === "--no-headers") continue;
+    if (w.startsWith("--sort=")) {
+      if (!psSort(w.slice(7))) return false;
+      continue;
+    }
+    if (w === "--sort") {
+      if (!psSort(args[++k] ?? "")) return false;
+      continue;
+    }
+    const bsd = !w.startsWith("-");
+    const next = bsd ? cluster(w, "auxwfjlrh", "o", 0) : cluster(w, "eAafFlwHj", "puCo", 1);
+    if (next === undefined) return false;
+    if (!next) continue;
+    const v = args[++k];
+    if (v === undefined) return false;
+    const letter = w.at(-1);
+    if (letter === "p" && !/^\d+(,\d+)*$/.test(v)) return false;
+    if ((letter === "u" || letter === "C") && !/^[\w.-]+(,[\w.-]+)*$/.test(v)) return false;
+    if (letter === "o" && !psFormat(v)) return false;
+  }
+  return true;
+}
+// Undefined when the call is spelled plainly; otherwise why it asks.
+export function unreadSpelling(name: string, args: string[]): string | undefined {
+  if (args.length === 1 && /^--(help|version)$/.test(args[0])) return undefined;
+  const plain =
+    name === "find" ? findPlain(args)
+    : name === "tar" || name === "gtar" ? optionsPlain(args, TAR_PLAIN)
+    : name === "rsync" ? optionsPlain(args, RSYNC_PLAIN)
+    : name === "sort" ? optionsPlain(args, SORT_PLAIN)
+    : name === "ps" ? psPlain(args)
+    : Object.hasOwn(COMPRESSORS, name) ? optionsPlain(args, COMPRESSOR_PLAIN)
+    : true;
+  return plain ? undefined : `${name} with an option or spelling the rules do not read`;
+}
+
 // ---- rules for one simple command ----
 
 function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = false): Verdict {
-  const paths = FIRST_OPERAND_NOT_PATH.has(cmd) ? operands(args).slice(1) : operands(args);
+  // (Round 39, Mythos: with `--reference=FILE` chmod/chown/chgrp take no mode or owner operand.)
+  // (Round 40: a mode can look like an option, `chmod -w f`, and `--reference` is matched by any
+  // prefix; its value, as a separate word, is the file read, not a target.)
+  const head = args.indexOf("--") < 0 ? args : args.slice(0, args.indexOf("--"));
+  const reference = head.findIndex((a) => longIs(a, "reference") && a.split("=")[0].length >= 4);
+  // (Round 41, Mythos: an octal mode after a dash too, `chmod -700 f`.)
+  const modeAsOption = cmd === "chmod" && head.some((a) => (/^-[rwxXstugoa+=,-]+$/.test(a) && /[rwxXst]/.test(a)) || /^-[0-7]{1,4}$/.test(a));
+  const words = reference >= 0 && !head[reference].includes("=") ? args.filter((_, k) => k !== reference + 1) : args;
+  const paths = FIRST_OPERAND_NOT_PATH.has(cmd) && reference < 0 && !modeAsOption ? operands(words).slice(1) : operands(words);
   const sources = paths.slice(0, -1);
   const dest = paths.length > 1 ? resolveWord(paths.at(-1)!, scope) : undefined;
-  const intoDir = COPIERS.has(cmd) && paths.length > 1 && (sources.length > 1 || paths.at(-1)!.endsWith("/") || (!!dest && fs.statSync(dest, { throwIfNoEntry: false })?.isDirectory()));
+  const intoDir = COPIERS.has(cmd) && paths.length > 1 && (sources.length > 1 || paths.at(-1)!.endsWith("/") || (!!dest && isDirectory(dest)));
   const targets = WRITERS[cmd] === "last" ? paths.slice(-1) : paths;
   for (const t of targets) {
     // Copied into a directory, the files land inside it: `cp a.rs /tmp` writes /tmp/a.rs.
@@ -1991,7 +3031,10 @@ function git(args: string[], scope: Scope): Verdict {
   if (sub === "stash") return words.includes("drop") || words.includes("clear") ? ask("git stash drop deletes stashed changes") : ALLOW;
   if (sub === "tag") return opt("delete", "d", "mFu") ? ask("git tag -d deletes a tag") : opt("force", "f", "mFu") ? ask("git tag -f replaces a tag, which keeps no reflog") : ALLOW;
   if (sub === "rebase" && (opt("interactive", "i", "xsX") || opt("exec", "x", "sX") || opt("edit-todo"))) return classify("git rebase that runs commands or an editor");
-  if (sub === "bisect" && words[0] === "run") return classify("git bisect run runs a command");
+  // (Round 38, Mythos: `git bisect view <words>` runs `git <words>`, or the program when it is tig
+  // or git-something; with options only it is git log.)
+  const viewAt = rest.findIndex((a) => a === "view" || a === "visualize");
+  if (sub === "bisect" && (words[0] === "run" || (["view", "visualize"].includes(words[0] ?? "") && rest[viewAt + 1] !== undefined && !rest[viewAt + 1].startsWith("-")))) return classify(`git bisect ${words[0]} runs a command`);
   if (sub === "grep" && (opt("open-files-in-pager", "O", "eABCfm"))) return classify("git grep -O runs a pager program");
   if (sub === "reset" || sub === "clean" || sub === "restore") return ALLOW;
   if (sub === "config") return gitConfig(opts, rest, dir, scope);
@@ -2066,6 +3109,9 @@ function subcommand(tool: string, args: string[], scope?: Scope): Verdict {
   const table = SUBCOMMANDS[tool];
   const lead = LEAD_OPTIONS[tool];
   let sub = operands(args)[0];
+  // (Round 38, Mythos: systemctl and loginctl read their options anywhere; -H, -M and --root
+  // reach another host, machine or tree.)
+  if ((tool === "systemctl" || tool === "loginctl") && args.some((a) => /^-[a-zA-Z]*[HM]/.test(a) && !a.startsWith("--") || ["host", "machine", "root"].some((o) => longIs(a, o) && a.split("=")[0].length > 3))) return ask(`${tool} on another host, machine or root`);
   if (lead && args[0]?.startsWith("-")) {
     const k = leadingOptions(args, lead);
     const unknown = (why: string) => (ASK_BY_DEFAULT[tool] ? ask(`${tool} ${why}`) : classify(`${tool} ${why}`));
@@ -2175,22 +3221,95 @@ function optionValues(args: string[], valued: string, long: string[]): [string, 
   return out;
 }
 
+// find's words read as find reads them (round 56, Astra): its options and paths, then
+// predicates, some of which take one or two values (`-name -exec` names a pattern), and actions,
+// whose command runs to its `;` or `{} +`. `at` holds the place of each action word.
+const FIND_ONE = new Set(
+  `-name -iname -path -ipath -wholename -iwholename -regex -iregex -regextype -type -xtype -user -group -perm -size -mtime -mmin -atime -amin -ctime
+   -cmin -newer -anewer -cnewer -samefile -inum -links -maxdepth -mindepth -fprint -fprint0 -fls -printf -lname -ilname -uid -gid -used -context
+   -files0-from -fstype`.split(/\s+/),
+);
+// (Round 58, Opus: as find's `looks_like_expression` tells, a word is an expression only if it is a
+// `-` followed by more, or exactly `(`, `!`, `)` or `,`: a lone `-` or `!x` is a start point.)
+export const findExpression = (w: string) => /^-./.test(w) || /^[(!),]$/.test(w);
+// (Round 59, Astra: where a start point may stand, `)` and `,` are files: find takes them for an
+// expression only after one has begun.)
+export const findStartExpression = (w: string) => /^-./.test(w) || w === "(" || w === "!";
+// The files find writes no file to: a device it opens by name, the path normalised without `..`
+// (round 61, Sol and Astra: `/dev/./null`, `/dev//stdout`). Not `/dev/fd/N`, which find reopens:
+// the file behind the descriptor is written (round 61, Opus).
+const findSink = (p: string) => !p.split("/").includes("..") && /^\/dev\/(null|zero|full|stdout|stderr|tty)$/.test(path.posix.normalize(p));
+export function findActions(args: string[]): { at: number[]; names: string[]; files0: boolean; prints: boolean } {
+  const at: number[] = [];
+  let files0 = false;
+  let prints = false;
+  let k = 0;
+  while (k < args.length && /^-[HLP]$|^-D$|^-O\d*$/.test(args[k])) {
+    // (Round 59, Astra and Sol: `help` anywhere in -D's comma list.)
+    if (args[k] === "-D" && (args[k + 1] ?? "").split(",").includes("help")) prints = true;
+    k += args[k] === "-D" ? 2 : 1;
+  }
+  // `-D help` prints before find reads its expression (round 59, Opus: it opens no output).
+  if (prints) return { at: [], names: [], files0: false, prints };
+  if (args[k] === "--") k++;
+  while (k < args.length && !findStartExpression(args[k])) k++;
+  for (; k < args.length; k++) {
+    const w = args[k];
+    // (Round 58, Sol: `-help` and `-version` print and run no action; Astra and Sol:
+    // `-files0-from` as find reads it, not a `-name` pattern. Round 59, Opus: find opens each
+    // output file as it reads it, so those named before the help word are written; the reading
+    // stops there.)
+    if (/^--?(help|version)$/.test(w)) {
+      prints = true;
+      break;
+    }
+    if (w === "-files0-from") files0 = true;
+    // (Round 60, Sol: an output action to a device sink, `-fprint0 /dev/stdout`, writes no file.)
+    if (/^-(delete|exec|execdir|ok|okdir)$/.test(w) || (/^-(fprint|fprint0|fprintf|fls)$/.test(w) && !findSink(args[k + 1] ?? ""))) at.push(k);
+    if (/^-(exec|execdir|ok|okdir)$/.test(w)) {
+      while (k + 1 < args.length && !(args[k + 1] === ";" || (args[k + 1] === "+" && args[k] === "{}"))) k++;
+      k++;
+    } else if (w === "-fprintf" || /^-newer[aBcmt][aBcmt]$/.test(w)) k += w === "-fprintf" ? 2 : 1;
+    else if (FIND_ONE.has(w)) k++;
+  }
+  // A query keeps the output actions read before it; it runs and deletes nothing.
+  const kept = prints ? at.filter((i) => /^-(fprint|fprint0|fprintf|fls)$/.test(args[i])) : at;
+  return { at: kept, names: kept.map((i) => args[i]), files0: prints ? false : files0, prints };
+}
+
 function find(args: string[], scope: Scope): Verdict {
-  const firstOption = args.findIndex((a) => /^(-|\(|!)/.test(a));
-  const roots = firstOption < 0 ? args : args.slice(0, firstOption);
-  const acts = args.some((a) => /^-(delete|exec|execdir|ok|okdir|fprint|fprintf|fls)$/.test(a));
-  if (!acts) return ALLOW;
+  // (Round 57, Opus: the start points come after find's own leading options, `-H -L -P -D x -O<n>`,
+  // and `--`: `find -L ~ -delete` starts at `~`.)
+  let lead = 0;
+  while (lead < args.length && /^-[HLP]$|^-D$|^-O\d*$/.test(args[lead])) lead += args[lead] === "-D" ? 2 : 1;
+  if (args[lead] === "--") lead++;
+  const rest = args.slice(lead);
+  const firstOption = rest.findIndex(findStartExpression);
+  const roots = firstOption < 0 ? rest : rest.slice(0, firstOption);
+  const actions = findActions(args);
+  if (!actions.at.length) return ALLOW;
+  // Start points read from a file are places the rules cannot tell.
+  if (actions.files0) return ask("find deletes or runs commands at start points read from a file");
   for (const r of roots.length ? roots : ["."]) {
     const p = resolveWord(r, scope);
     if (isPiFile(p, scope)) return piAsk(`find deletes or runs commands in Pi's own files: ${r}`);
     if (!isLocal(p, scope)) return outside(`find deletes or runs commands outside the working directory: ${r}`, p);
+    // (Round 57, Opus: a start point in a .git directory, where git finds hooks and config.)
+    if (/(^|\/)\.git(\/|$)/.test(p ?? r)) return ask(`find deletes or runs commands in a .git directory: ${r}`);
   }
-  const exec = args.findIndex((a) => /^-(exec|execdir|ok|okdir)$/.test(a));
-  if (exec < 0) return classify("find -delete");
-  const end = args.findIndex((a, i) => i > exec && (a === ";" || a === "+"));
-  // {} stands for a path under the search roots, which were checked above.
-  const inner = args.slice(exec + 1, end < 0 ? undefined : end).map((a) => (a === "{}" ? "." : a));
-  return worst(classify("find -exec"), simple({ argv: inner, out: [], dyn: inner.map((a) => /[$`]/.test(a)) }, scope, 1));
+  // (Round 60, Opus: every action find runs, not only the first, each ending where find ends it:
+  // at `;`, or at `+` straight after `{}`; `find . -exec true \; -exec rm -rf ~ \;`.)
+  const execs = actions.at.filter((i) => /^-(exec|execdir|ok|okdir)$/.test(args[i]));
+  if (!execs.length) return classify("find -delete or a -fprint write");
+  let verdict = classify("find -exec");
+  for (const exec of execs) {
+    const end = args.findIndex((a, i) => i > exec && (a === ";" || (a === "+" && args[i - 1] === "{}")));
+    // {} stands for a path under the search roots, which were checked above.
+    // (Round 61, Opus: the `{}` before `+` is the command's last word, a path, `rm -rf {} +`.)
+    const inner = args.slice(exec + 1, end < 0 ? undefined : end).map((a) => (a === "{}" ? "." : a));
+    verdict = worst(verdict, simple({ argv: inner, out: [], dyn: inner.map((a) => /[$`]/.test(a)) }, scope, 1));
+  }
+  return verdict;
 }
 
 // Drops leading keywords, VAR=value assignments and wrappers such as `timeout 60` or `env`.
@@ -2254,7 +3373,7 @@ function redirects(cmd: Simple, scope: Scope): Verdict {
   for (const target of cmd.out) {
     const p = resolveWord(target, scope);
     if (devSink(target, p)) continue;
-    if (p && /^\/dev\//.test(p)) return deny(`writes to the device ${target}`);
+    if (p && /^\/dev\//.test(p) && !inTmp(p)) return deny(`writes to the device ${target}`);
     if (isGuarded(p, scope)) verdict = worst(verdict, guardAsk("redirect overwrites the auto-mode guard's own files"));
     else if (isPiFile(p, scope)) verdict = worst(verdict, piAsk(`redirect writes Pi's own files: ${target}`));
     else if (!isLocal(p, scope)) verdict = worst(verdict, outside(`redirect writes outside the working directory: ${target}`, p));
@@ -2286,7 +3405,17 @@ function simple(cmd: Simple, scope: Scope, depth = 0): Verdict {
   return worst(out, builtin);
 }
 
+// Only the plain spellings are left to the option readers (`unreadSpelling`); any other asks. The
+// readers still run, so a stronger verdict (a deny, a guarded file) or an ask of their own, with
+// its reason and the folder it offers, is kept.
 function command(cmd: Simple, scope: Scope, depth: number): Verdict {
+  const verdict = commandRead(cmd, scope, depth);
+  const argv = unwrap(cmd.argv);
+  const unread = argv.length && argv[0] !== UNMODELLED ? unreadSpelling(path.basename(argv[0]), argv.slice(1)) : undefined;
+  return unread ? worst(verdict, { ...ask(unread), spelling: true }) : verdict;
+}
+
+function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
   let verdict = ALLOW;
   const argv = unwrap(cmd.argv);
   if (argv[0] === UNMODELLED) return classify("shell syntax or a wrapper option the rules do not model");
@@ -2349,6 +3478,20 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   // here. `--help` and `--version` stay.)
   if (args.length === 1 && (/^--(version|help)$/.test(args[0]) || (/^-[Vh]$/.test(args[0]) && (READ_ONLY.has(name) || DEV_TOOLS.has(name) || !!SUBCOMMANDS[name] || !!RUNNERS[name] || INTERPRETERS.has(name))))) return verdict;
 
+  // (Round 37, Mythos: declare and its kin read an assignment word again, `a=(...)` as a compound
+  // assignment that expands what it holds, `declare -a 'a=($(cmd))'`. The parenthesised text is
+  // read as commands; a value the outer shell expands is not modelled.)
+  if (["declare", "typeset", "local", "readonly", "export"].includes(name)) {
+    for (let k = 0; k < args.length; k++) {
+      const m = /^[A-Za-z_]\w*(\[[^\]]*\])?\+?=(.*)$/s.exec(args[k]);
+      if (!m) continue;
+      if (dyn(k)) {
+        verdict = worst(verdict, classify(`${name} of a value the shell expands, which ${name} reads again`));
+        continue;
+      }
+      if (m[2].startsWith("(")) verdict = worst(verdict, classify(`${name} of a compound assignment`), evaluateParsed(parse(m[2].replace(/^\(|\)$/g, "")), scope, depth + 1));
+    }
+  }
   if (SHELLS.has(name)) return worst(verdict, shell(name, args, dyn, cmd, scope, depth));
   // eval runs its words joined, after the shell has expanded them: a variable in them is code
   // the rules cannot see.
@@ -2371,7 +3514,73 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
       return worst(verdict, inner.length ? simple(tail(inner), scope, depth + 1) : ALLOW);
     }
   }
-  if (name === "rsync" && operands(args).some((a) => /^[\w.@-]+:/.test(a))) return worst(verdict, ask("rsync copies to or from a remote host"));
+  // (Round 50, Sol and Astra: a call that only prints its help or version does nothing else.)
+  if (printsOnly(name, args)) return verdict;
+  // (Round 35, Mythos: a colon before the first slash makes an operand remote for rsync, with an
+  // empty host too (`:x`), and `-e` then runs locally.)
+  // rsync, read by position (rsyncReading, round 41): a remote operand asks, so does --daemon;
+  // the files it writes besides its destination (log, batch, backup, temp, partial places) are
+  // held to the write test, a dry run's too; a dry run, a listing or one operand copies and deletes
+  // nothing; --remove-source-files deletes its sources and --delete what the destination holds
+  // beyond the source (held to rm's test outside the project and for .git, rounds 39 and 40).
+  if (name === "rsync") {
+    const r = rsyncReading(args);
+    // (Round 52, Astra: a version query reaches no host.)
+    if (!r.prints && r.operands.some((a) => /^[^/]*:/.test(a))) return worst(verdict, ask("rsync copies to or from a remote host"));
+    if (r.daemon && !r.prints) return worst(verdict, ask("rsync --daemon starts a server"));
+    if (r.server && !r.prints) return worst(verdict, classify("rsync --server writes what its standard input sends"));
+    // (Round 44, Opus: what `-M`/`--remote-option` hands the receiving side, which for a local
+    // copy is this machine, is read as rsync's own words: `-M--log-file=../x`.)
+    const remote = rsyncReading([...r.shorts.filter(([l]) => l === "M").map(([, v]) => v ?? ""), ...r.values("remote-option")]);
+    // (Round 45, Sol: a dry run writes its log and batch, but no backup, partial or temp files.)
+    const places = (x: ReturnType<typeof rsyncReading>) => (r.help ? [] : r.prints ? x.values("log-file") : [...["log-file", "write-batch", "only-write-batch", ...(r.dryRun || r.listOnly ? [] : ["backup-dir", "partial-dir", "temp-dir"])].flatMap((n) => x.values(n)), ...(r.dryRun || r.listOnly ? [] : x.shorts.filter(([l]) => l === "T").map(([, v]) => v ?? ""))]);
+    // (Round 49, Sol: a version or help query starts no receiver, so its `-M` words open nothing.)
+    const outputs = [...places(r), ...(r.prints ? [] : places(remote))];
+    if (outputs.some((f) => /(^|\/)\.git(\/|$)/.test(resolveWord(f, scope) ?? f))) return worst(verdict, ask("rsync writes a file in a .git directory"));
+    if (outputs.length) {
+      const w = writeTargets("tee", ["--", ...outputs], scope);
+      if (w.action !== "allow") return worst(verdict, { ...w, reason: w.reason.replace(/^tee/, "rsync") });
+    }
+    if (r.copiesNothing) return verdict;
+    // (Round 42, Mythos: `--read-batch` replays a recorded update, deletions included, into its
+    // one operand: held to the write test there, then left to the model.)
+    if (r.batch) {
+      const w = writeTargets("tee", ["--", ...r.operands.slice(-1)], scope);
+      return worst(verdict, w.action !== "allow" ? { ...w, reason: w.reason.replace(/^tee/, "rsync --read-batch") } : classify("rsync --read-batch replays a recorded update"));
+    }
+    const removes = r.longs.some(([h]) => /^--remove-(source|sent)-files$/.test(h) || (h.length >= 9 && "--remove-source-files".startsWith(h)));
+    const deletes = r.longs.some(([h]) => /^--del/.test(h));
+    let gone = ALLOW;
+    if (removes) for (const src of r.operands.slice(0, -1)) gone = worst(gone, deletion(src, scope));
+    if (deletes) gone = worst(gone, deletion(r.operands.at(-1)!, scope));
+    if (gone.action !== "allow") return worst(verdict, gone);
+  }
+  // Files written by an option (round 39, Mythos): held to the write test.
+  // Long options by any prefix the tool takes (round 40, Mythos: `--cursor-fil=`).
+  const optionWrites: Record<string, { short: RegExp; long: string[] }> = { journalctl: { short: /^$/, long: ["cursor-file"] }, zip: { short: /^-(O|b)$/, long: ["out", "temp-path"] }, docker: { short: /^$/, long: ["iidfile", "metadata-file"] } };
+  if (Object.hasOwn(optionWrites, name)) {
+    const table = optionWrites[name];
+    const named = args.flatMap((a, k) => {
+      const eq = a.indexOf("=");
+      const head = eq > 0 ? a.slice(0, eq) : a;
+      const isLong = head.startsWith("--") && head.length >= 4 && table.long.some((o) => longIs(head, o));
+      if (eq > 0 && isLong) return [a.slice(eq + 1)];
+      if (isLong || table.short.test(a)) return [args[k + 1] ?? ""];
+      const attached = name === "zip" ? /^-(O|b)(.+)$/.exec(a) : null;
+      return attached ? [attached[2]] : [];
+    });
+    if (named.some((f) => /(^|\/)\.git(\/|$)/.test(resolveWord(f, scope) ?? f))) return worst(verdict, ask(`${name} writes a file in a .git directory`));
+    if (named.length) {
+      const w = writeTargets("tee", ["--", ...named], scope);
+      if (w.action !== "allow") return worst(verdict, { ...w, reason: w.reason.replace(/^tee/, name) });
+    }
+  }
+  // (Round 40, Mythos: ps prints other processes' environments with BSD `e` or `environ`.)
+  // (Round 42, all four: read by position, psEnvironments.)
+  if (name === "ps" && psEnvironments(args)) return worst(verdict, ask("ps that prints other processes' environments"));
+  // (setfacl --restore takes its paths from a file.)
+  if (name === "setfacl" && args.some((a) => longIs(a, "restore") && a.split("=")[0].length >= 4)) return worst(verdict, classify("setfacl --restore changes the files a list names"));
+  if (name === "nm" && args.some((a) => longIs(a, "plugin") && a.split("=")[0].length >= 4)) return worst(verdict, classify("nm --plugin loads a shared object"));
   if (name === "xargs") {
     const k = leadingOptions(args, { flags: "0oprtx", valued: "adEILnPs", long: ["null", "interactive", "no-run-if-empty", "verbose", "exit", "open-tty", "show-limits"], longValued: ["arg-file", "delimiter", "eof", "replace", "max-lines", "max-args", "max-procs", "max-chars", "process-slot-var"] });
     if (k < 0 || args.slice(0, k).some((a) => /^-[eil]/.test(a))) return worst(verdict, classify("xargs with options the rules do not model"));
@@ -2385,9 +3594,9 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
     const of = args.find((a) => a.startsWith("of="))?.slice(3);
     if (of === undefined) return worst(verdict, classify("dd"));
     const p = resolveWord(of, scope);
-    if (p && /^\/dev\//.test(p) && !DEV_SINKS.test(p)) return deny(`dd writes to the device ${of}`);
+    if (p && /^\/dev\//.test(p) && !DEV_SINKS.test(p) && !inTmp(p)) return deny(`dd writes to the device ${of}`);
     if (isPiFile(p, scope)) return worst(verdict, piAsk(`dd writes Pi's own files: ${of}`));
-    return worst(verdict, isLocal(p, scope) ? classify("dd") : outside(`dd writes outside the working directory: ${of}`, p));
+    return worst(verdict, isLocal(p, scope) || (!!p && DEV_SINKS.test(p)) ? classify("dd") : outside(`dd writes outside the working directory: ${of}`, p));
   }
   if ((name === "chmod" || name === "chown" || name === "chgrp") && hasFlag(args, "R", "--recursive")) {
     for (const t of operands(args).slice(1)) {
@@ -2402,7 +3611,9 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
     if (problem.action !== "allow") return worst(verdict, problem);
   }
   if (name === "sort") {
-    if (args.some((a) => longIs(a, "compress-program"))) return worst(verdict, classify("sort --compress-program runs a program"));
+    // (Round 47, Sol: a word after `--` is a file, `sort -c -- --compress-program`. Round 48: read
+    // by position, sortRunsCompressor.)
+    if (sortRunsCompressor(args)) return worst(verdict, classify("sort --compress-program runs a program"));
   }
   if (name === "rg" && args.some((a) => /^--(pre|hostname-bin)(=|$)/.test(a))) return worst(verdict, classify(`rg ${args.find((a) => /^--(pre|hostname-bin)/.test(a))!.split("=")[0]} runs a program`));
   if ((name === "fd" || name === "fdfind") && args.some((a) => /^(-x|-X|--exec|--exec-batch)(=|$)/.test(a) || /^-[a-zA-Z]*[xX]$/.test(a))) return worst(verdict, classify("fd -x runs a command"));
@@ -2416,12 +3627,48 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
     if (list.some((f) => /[$`]/.test(f))) return worst(verdict, classify("file -f of a list named by an expansion"));
   }
   if ((name === "zip" && args.some((a) => a === "-TT" || longIs(a, "unzip-command"))) ) return worst(verdict, classify("zip -TT runs a program"));
+  // (Round 35, Mythos: install -s runs the strip program on what it copied.)
+  // (Round 36: `--strip-` is already a prefix getopt takes.)
+  if (name === "install" && !copiesNothing(name, args) && args.some((a) => a.split("=")[0].startsWith("--strip-") && longIs(a, "strip-program"))) return worst(verdict, classify("install --strip-program runs a program on the file it writes"));
+  // (Round 45, Sol: a copy that copies nothing writes nothing, `cp --version f dst/`.)
+  if (WRITERS[name] && copiesNothing(name, args)) return verdict;
   if (WRITERS[name]) return worst(verdict, writeTargets(name, args, scope, !!cmd.heredoc && !cmd.expands));
   if (name === "tar" || name === "zip" || name === "unzip" || name === "gzip" || name === "gunzip" || name === "xz" || name === "zstd") {
+    // (Round 39, Mythos: --remove-files deletes the members after archiving them: held to rm's test,
+    // and unread under a -C/--directory.)
+    // (Round 39, Mythos: --remove-files deletes the members after archiving them: held to rm's
+    // test, and unread under a -C/--directory or from a list. Read by position, round 41.)
+    const t = name === "tar" ? tarReading(args) : undefined;
+    if (t && t.has("remove-files")) {
+      if (t.dirs.length || t.has("files-from") || t.clusters.some((c) => c.includes("T"))) return worst(verdict, classify("tar --remove-files under another directory or from a list"));
+      let gone = ALLOW;
+      for (const m of [...t.members, ...t.values("add-file")]) gone = worst(gone, deletion(m, scope));
+      if (gone.action !== "allow") return worst(verdict, gone);
+    }
+    // --add-file names a member like an operand (round 41, Mythos: held to the same outside test).
+    if (t) for (const f of t.values("add-file")) if (!isLocal(resolveWord(f, scope), scope)) return worst(verdict, classify(`tar with a path outside the working directory`));
     const problem = name === "tar" ? tarProblem(args) : undefined;
     if (problem) return worst(verdict, classify(problem));
     // Archives read and write paths given as operands and after -f / -C / -d.
-    for (const a of args.filter((x) => !x.startsWith("-"))) {
+    // A compressor replaces its input with the compressed file beside it: one in a .git directory
+    // is a write there (round 40, Opus: `gzip -- -/../.git/config`).
+    // (Not a listing, a test, or output to standard output, round 41, Sol.)
+    // (Round 42, Mythos: read by position, compressorReading; `-o` names a file it writes.)
+    const z = compressorReading(name, args);
+    if (z && [...(z.inPlace ? z.operands : []), ...z.outputs].some((a) => /(^|\/)\.git(\/|$)/.test(resolveWord(a, scope) ?? a))) return worst(verdict, ask(`${name} writes in a .git directory`));
+    // (Round 44, Opus: a decompression in place names its output by the input less its suffix:
+    // `gzip -d sub/.git.gz` writes `sub/.git`. Round 45, Opus, Sol, Astra: that name exactly, with
+    // `-S` read, and a glob read as the names it matches here; `-N` and `-r` write names the
+    // command does not show.)
+    if (z && z.decompress && z.inPlace) {
+      if (z.unnamed) return worst(verdict, classify(`${name} -d ${z.unnamed} writes names the command does not show`));
+      for (const a of z.operands) {
+        const names = /[*?[]/.test(a) ? globNames(a, scope) : [a];
+        if (names === undefined) return worst(verdict, classify(`${name} -d of a glob the rules cannot list`));
+        if (names.some((n) => path.basename(z.outputName(n) ?? "") === ".git")) return worst(verdict, ask(`${name} -d writes a file named .git`));
+      }
+    }
+    for (const a of operands(args)) {
       if (!isLocal(resolveWord(a, scope), scope)) return worst(verdict, classify(`${name} with a path outside the working directory`));
     }
     return verdict;
@@ -2439,6 +3686,8 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   if (name === "npm" && operands(args)[0] === "config" && ["set", "delete", "edit"].includes(operands(args)[1])) {
     return worst(verdict, ask("npm config changes settings outside the project"));
   }
+  // (Round 38: build options that publish or reach out.)
+  if (name === "docker" && operands(args)[0] === "build" && args.some((a) => /^--(push|output|ssh|secret)(=|$)/.test(a) || /^-o/.test(a))) return worst(verdict, classify("docker build that publishes, exports or uses credentials"));
   if (name === "docker") {
     const [group, action] = operands(args);
     if (group === "compose" || group === "buildx") return worst(verdict, classify(`docker ${group}`));
@@ -2446,9 +3695,48 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
       return worst(verdict, DOCKER_GROUPS[group].split(" ").includes(action) ? ALLOW : classify(`docker ${group} ${action ?? ""}`.trim()));
     }
   }
+  if (name === "uv" && operands(args)[0] === "venv") {
+    const v = venvTargets(args.slice(args.indexOf("venv") + 1), ["--python", "-p", "--prompt", "--index-url", "--extra-index-url"], scope);
+    if (v.action !== "allow") return worst(verdict, v);
+  }
   if (SUBCOMMANDS[name]) return worst(verdict, subcommand(name, args, scope));
+  // (Round 35: whatever feeds its standard input, a group, a subshell, `exec <`, and in addopts.)
+  // (Round 37, Mythos: `-o python_functions=interact` makes pytest call a function the call names.)
+  // (Round 39: pytest empties --basetemp before it uses it: held to rm's test.)
+  if (name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) {
+    // (Also inside `-o addopts=...`, round 40, Mythos.)
+    const base = args.flatMap((a, k) => [...(a === "--basetemp" ? [args[k + 1] ?? ""] : []), ...[...a.matchAll(/(?:^|[\s=])--basetemp[=\s]+([^\s'"]+)/g)].map((m) => m[1])]);
+    for (const b of base) {
+      const gone = rm(["-r", "--", b], scope);
+      if (gone.action !== "allow") return worst(verdict, gone);
+    }
+  }
+  if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "compileall") {
+    // (Round 40, Astra: -d, -s, -p, -x, -i, -r, -j, -o and -e take a value, which names no
+    // output; Mythos: a .git target asks.)
+    const rest = args.slice(2);
+    const dirs = operands(rest.filter((a, k) => !/^-[dspxirjoe]$/.test(rest[k - 1] ?? "")));
+    for (const d of dirs) {
+      const p = resolveWord(d, scope);
+      if (p && /(^|\/)\.git(\/|$)/.test(p)) return worst(verdict, ask(`compileall writes in a .git directory: ${d}`));
+      const out = writeTargets("mkdir", ["--", d], scope);
+      if (out.action !== "allow") return worst(verdict, out);
+    }
+  }
+  if ((name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) && args.some((a) => /python_(functions|classes|files)=/.test(a))) return worst(verdict, classify("pytest collecting functions the call names"));
+  if ((name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) && args.some((a) => /(^|[\s=])--(pdb|trace)/.test(a))) return worst(verdict, classify("pytest's debugger, which reads commands from standard input"));
+  if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "mypy" && args.some((a) => (longIs(a, "install-types") || longIs(a, "python-executable")) && a.split("=")[0].length > 4)) return worst(verdict, classify("mypy that installs packages or runs another interpreter"));
   if (READ_ONLY.has(name) || DEV_TOOLS.has(name)) return verdict;
-  if (/^python3?$/.test(name) && args[0] === "-m" && PY_MODULES.has(args[1]) && !cmd.heredoc) return verdict;
+  // (Council project review 2, round 34, Mythos: unittest imports and calls any name it is given,
+  // `python3 -m unittest code.interact` then runs standard input as Python; its names must be the
+  // project's own files or modules. pytest's debugger, below, reads commands from standard input.)
+  // (Round 37, Mythos: `python3 -m pip` is pip, with pip's subcommand table; round 38: a lone
+  // version or help query is one.)
+  if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pip") return args.length === 3 && /^(-V|--version|-h|--help)$/.test(args[2]) ? verdict : worst(verdict, subcommand("pip", args.slice(2), scope));
+  // (Round 38, Mythos: venv writes its directory, and --clear empties it first.)
+  // (`--upgrade-deps` runs pip install in the new environment.)
+  if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "venv") return worst(verdict, args.some((a) => longIs(a, "upgrade-deps") && a.length > 4) ? classify("venv --upgrade-deps installs packages") : ALLOW, venvTargets(args.slice(2), ["--prompt"], scope));
+  if (/^python3?$/.test(name) && args[0] === "-m" && PY_MODULES.has(args[1]) && !cmd.heredoc && (args[1] !== "unittest" || unittestNamesOwn(args.slice(2), scope))) return verdict;
   // `node --test`: the test runner over the project's test files, as `npm test` runs it.
   if (name === "node" && args[0] === "--test" && !cmd.heredoc) {
     const k = leadingOptions(args, { long: ["test", "test-only", "test-force-exit", "experimental-test-coverage", "experimental-strip-types", "no-warnings", "enable-source-maps"], longValued: ["test-name-pattern", "test-skip-pattern", "test-concurrency", "test-timeout", "disable-warning"] });
@@ -2563,7 +3851,10 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
       if (["cd", "pushd", "popd"].includes(cmd.argv[0])) local.cwd = undefined;
     } else if (cmd.argv[0] === "cd" && local.cwd) {
       // `cd -` goes to $OLDPWD, which is not known.
-      const to = cmd.argv.length === 2 && cmd.argv[1] !== "-" ? resolveWord(cmd.argv[1], local) : cmd.argv.length === 1 ? HOME : undefined;
+      // `cd -L`, `cd -P` and `cd --` before one word go there too (round 38).
+      const cdArgs = cmd.argv.slice(1);
+      while (cdArgs.length > 1 && /^(-L|-P|--)$/.test(cdArgs[0])) cdArgs.shift();
+      const to = cdArgs.length === 1 && cdArgs[0] !== "-" ? resolveWord(cdArgs[0], local) : cdArgs.length === 0 ? HOME : undefined;
       const there = !!to && !!fs.statSync(to, { throwIfNoEntry: false })?.isDirectory();
       local.cwd = there || (to && cmd.next === "&&") ? to : undefined;
       failableCd = !there && local.cwd !== undefined;
@@ -2608,3 +3899,18 @@ export function readVerdict(tool: string, target: string, scope: Scope): Verdict
   const secret = secretIn(target.startsWith("@") ? target.slice(1) : target, scope, true);
   return secret ? criticalAsk(`${tool} of a credential file: ${target}`) : undefined;
 }
+
+// Tables looked up by a word of the command hold no inherited names (council project review 2,
+// round 43, Astra: `./constructor -V` found Object's `constructor` in a table): their prototypes,
+// and those of the plain objects they hold, are taken away once the module is loaded.
+export function bare(...tables: object[]): void {
+  const seen = new Set<object>();
+  const strip = (o: unknown) => {
+    if (o === null || typeof o !== "object" || seen.has(o) || Object.getPrototypeOf(o) !== Object.prototype) return;
+    seen.add(o);
+    Object.setPrototypeOf(o, null);
+    for (const v of Object.values(o)) strip(v);
+  };
+  for (const t of tables) strip(t);
+}
+bare(SUBCOMMANDS, DOCKER_GROUPS, ASK_BY_DEFAULT, ALWAYS_ASK, WRITERS, RUNNERS, LEAD_OPTIONS, RUNNER_OPTIONS, WRAPPER_OPTIONS, COMPRESSORS, DOWNLOAD_FILES);

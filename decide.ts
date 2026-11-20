@@ -22,7 +22,12 @@ import {
   commitWrites,
   fileVerdict,
   isRootLike,
+  bare,
   makeScope,
+  psEnvironments,
+  findActions,
+  copiesNothing,
+  printsOnly,
   readVerdict,
   realish,
   within,
@@ -1801,6 +1806,9 @@ const psSortOk = (value: string) => value.split(",").every((k) => PS_FIELDS.has(
 // same word after -o, or the next); --sort takes sort keys; -p -u -U -C --pid --ppid select.
 // BSD words (no dash) are flags from a list, `o` taking a format; `e` (environment) is not one.
 function psOk(argv: string[]): boolean {
+  // (Round 43, Mythos: procps reads `-ex` and the like again as BSD words, where `e` prints
+  // environments: the rules' reading of ps decides that first.)
+  if (psEnvironments(argv.slice(1), false)) return false;
   const FLAGS = "eAfFlwHjTLMyZaxu";
   const SELECT = new Set(["-p", "-u", "-U", "-C", "--pid", "--ppid"]);
   for (let i = 1; i < argv.length; i++) {
@@ -3874,7 +3882,8 @@ function optionNamedPath(cmds: Simple[], dirsOf: (cmd: Simple) => string[] | und
     return undefined;
   };
   for (const cmd of cmds) {
-    const makers = programs(cmd.argv).filter((at) => Object.hasOwn(PARENT_MAKERS, path.basename(cmd.argv[at])) && cmd.argv.slice(at + 1).some((a) => PARENT_MAKERS[path.basename(cmd.argv[at])].test(a)));
+    // (Round 50, Sol: a copy that copies nothing makes nothing, `rsync --info=HELP -- --literal`.)
+    const makers = programs(cmd.argv).filter((at) => Object.hasOwn(PARENT_MAKERS, path.basename(cmd.argv[at])) && cmd.argv.slice(at + 1).some((a) => PARENT_MAKERS[path.basename(cmd.argv[at])].test(a)) && !copiesNothing(path.basename(cmd.argv[at]), cmd.argv.slice(at + 1)));
     for (const at of programs(cmd.argv)) {
       if (path.basename(cmd.argv[at]) !== "sed") continue;
       for (const arg of cmd.argv.slice(at + 1)) {
@@ -3910,6 +3919,38 @@ function optionNamedPath(cmds: Simple[], dirsOf: (cmd: Simple) => string[] | und
 // word. The landed path is walked as the kernel walks it (a link to `.git` counts), and read from
 // the project's top down where it lies in the project (a project kept under a directory of such
 // a name is not written "into" it by every write).
+// Whether the word at `i` (an `-exec`-like word) is an action of a `find` (round 56), as rules.ts
+// `findActions` reads find's words.
+// (Round 57, Astra and Sol: the find a command runs, not a word named find, `git ls-files --
+// find -exec`; one placed only after an `-exec` is a find only where that `-exec` is an action,
+// `rg --files -- -exec find -exec cp .git/x`. Round 58, Opus: remembered per word, as the
+// recursion was exponential in nested finds; and any running find before it may own it, not
+// only the nearest, whose own command may have ended.)
+const findActionMemo = new WeakMap<string[], Map<number, boolean>>();
+function findAction(argv: string[], i: number): boolean {
+  let memo = findActionMemo.get(argv);
+  if (!memo) findActionMemo.set(argv, (memo = new Map()));
+  const known = memo.get(i);
+  if (known !== undefined) return known;
+  memo.set(i, false);
+  const at = programs(argv);
+  const runs = (p: number): boolean => at.includes(p) && !(p > 0 && /^-(exec|execdir|ok|okdir)$/.test(argv[p - 1]) && !findAction(argv, p - 1));
+  let result = false;
+  for (let p = i - 1; p >= 0 && !result; p--) if (path.basename(argv[p]) === "find" && runs(p) && findActions(argv.slice(p + 1)).at.includes(i - p - 1)) result = true;
+  memo.set(i, result);
+  return result;
+}
+
+// File tools that run no program their words name (rounds 52 and 54): behind one, a word named
+// like a writer is an operand. An allowlist: the programs that may run one are open-ended.
+const PLAIN_TOOLS = new Set(
+  `sort cat head tail wc grep egrep fgrep ls cut tr uniq diff cmp comm nl tac rev fold paste join column stat file du basename dirname readlink
+   realpath echo printf jq yq tree bat seq cp mv ln install rsync tee truncate touch mkdir rmdir chmod chown chgrp setfacl shred unlink rm od
+   xxd hexdump strings sha1sum sha224sum sha256sum sha384sum sha512sum md5sum b2sum b3sum cksum sum base32 base64 iconv expand unexpand fmt pr
+   split csplit shuf numfmt tsort look rg ag ack find zcat xzcat bzcat zstdcat gzip gunzip xz unxz zstd unzstd bzip2 bunzip2 lzma tar zip unzip`.split(/\s+/),
+);
+// `~+` is the directory the command runs in (round 42, Mythos).
+const herePlus = (word: string) => (word === "~+" ? "." : word.startsWith("~+/") ? `.${word.slice(2)}` : word);
 function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined, dirsOf?: (cmd: Simple) => string[] | undefined, roots?: string[]): string | undefined {
   // Also every place the guard's own list of writes names (`cp -t`, `sort -o`, git's `--output`).
   const extra = writesOf(cmds).writes;
@@ -3917,13 +3958,106 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
     const targets = [...cmd.out, ...extra.filter((w) => w.cmd === cmd).map((w) => w.word)];
     // Round 4, N3: the targets that make a file (see NAME_KEEPERS), with the operands after `--`.
     const made = extra.filter((w) => w.cmd === cmd && !NAME_KEEPERS.has(w.by ?? "")).map((w) => w.word);
+    // (Round 51, Sol: after a program that only prints its help, a later word is a command only
+    // where the parser places one: in `cp --help -S cp -- --literal` the second `cp` is a value.)
+    // (Round 56, Astra: a word after `-exec` is a command only where the `-exec` is find's action,
+    // not an operand of another program, `rg --files -- -exec cp .git/x`, nor a predicate's
+    // value, `find . -name -exec -o -name cp`.)
+    const placed = programs(cmd.argv).filter((p) => !(p > 0 && /^-(exec|execdir|ok|okdir)$/.test(cmd.argv[p - 1]) && !findAction(cmd.argv, p - 1)));
+    const quiet = placed.filter((p) => printsOnly(path.basename(cmd.argv[p]), cmd.argv.slice(p + 1)) || copiesNothing(path.basename(cmd.argv[p]), cmd.argv.slice(p + 1)));
     cmd.argv.forEach((word, at) => {
+      if (!placed.includes(at) && quiet.some((p) => p < at)) return;
+      // (Round 52, Astra: behind a plain file tool, which runs no program, a word named like a
+      // writer is an operand: `sort -- cp .git/report` sorts two files. Round 54, Opus: an
+      // allowlist again, as round 53's list of runners left every wrapper it did not name
+      // (`eatmydata cp f .git/x`) without this check; Sol and Astra's readers are on it.)
+      const owner = placed.filter((p) => p < at).at(-1);
+      if (!placed.includes(at) && owner !== undefined && PLAIN_TOOLS.has(path.basename(cmd.argv[owner]))) return;
+      // (git's own subcommand is a writer's name, `git mv f ./--zz`; its pathspecs after `--` are
+      // operands, `git ls-files -- cp .git/x`.)
+      // (Round 55, Sol: every word after the subcommand is a pathspec or an option's value,
+      // `git ls-files --others cp .git/x`.)
+      if (!placed.includes(at) && owner !== undefined && path.basename(cmd.argv[owner]) === "git") {
+        let sub = owner + 1;
+        while (sub < at && cmd.argv[sub].startsWith("-")) sub += /^(-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--config-env)$/.test(cmd.argv[sub]) ? 2 : 1;
+        // Behind git, only its subcommand's own place can name a writer (round 56, Sol: a global
+        // option's value, `git -C nested/cp ls-files`, is none).
+        if (at !== sub) return;
+      }
       const how = Object.hasOwn(WRITER_OPERANDS, path.basename(word)) ? WRITER_OPERANDS[path.basename(word)] : undefined;
-      const args = cmd.argv.slice(at + 1);
-      const files = args.filter((a) => !a.startsWith("-"));
+      // (Round 54, Opus: inside `find -exec`, the command's words end at the `;` or `{} +` that
+      // closes it: `find . -exec cp f .git/x \;` writes `.git/x`, not `;/x`.)
+      let args = cmd.argv.slice(at + 1);
+      if (cmd.argv.slice(0, at).some((w) => /^-(exec|execdir|ok|okdir)$/.test(w))) {
+        const end = args.findIndex((w, k) => w === ";" || (w === "+" && args[k - 1] === "{}"));
+        if (end >= 0) args = args.slice(0, args[end] === "+" ? end - 1 : end);
+      }
+      // (Round 50, Sol: a copy that copies nothing names no destination and makes no file.)
+      if (how && (copiesNothing(path.basename(word), args) || printsOnly(path.basename(word), args))) return;
+      // Every word after `--` is a file, one that begins with `-` too (round 40, Opus).
+      const dashes = args.indexOf("--");
+      const files = [...(dashes < 0 ? args : args.slice(0, dashes)).filter((a) => !a.startsWith("-")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
       if (path.basename(word) === "sed" && !args.some((a) => /^(-[a-zA-Z]*i|--in-place)/.test(a))) return;
       if (path.basename(word) === "dd") targets.push(...args.filter((a) => a.startsWith("of=")).map((a) => a.slice(3)));
-      else if (how) targets.push(...(how === "last" ? files.slice(-1) : files));
+      // (Round 45, Sol: a copy that copies nothing writes no destination.)
+      else if (how && !copiesNothing(path.basename(word), args)) targets.push(...(how === "last" ? files.slice(-1) : files));
+      // (Round 41, Opus: a copy into a directory writes each source's name there: `cp -r ev/.git .`
+      // writes `./.git`. Judged by where each lands.)
+      // (Round 42, Mythos: `~+` is where it runs. Opus: a copy of a directory's contents, `src/.`,
+      // rsync's `src/`, `-T`, brings the `.git` it holds to where the contents land.)
+      // (Round 43, Opus: also into a `-t`/`--target-directory` directory, and from the names a glob
+      // source expands to; Mythos: a `.git` at any depth of the source, gitIn.)
+      const tool = path.basename(word);
+      let tdir: string | undefined;
+      let tWord: string | undefined;
+      if (how === "last" && tool !== "rsync") {
+        for (let k = 0; k < args.length && args[k] !== "--"; k++) {
+          const a = args[k];
+          if (/^--targ/.test(a) && "--target-directory".startsWith(a.split("=")[0])) {
+            tdir = a.includes("=") ? a.slice(a.indexOf("=") + 1) : (tWord = args[k + 1]);
+          } else if (/^-[^-]/.test(a) && a[a.slice(1).search(/[Sgmot]/) + 1] === "t" && a.slice(1).search(/[Sgmot]/) >= 0) {
+            // (The letter before any other that takes a value: `-St` names the suffix `t`.)
+            const rest = a.slice(a.slice(1).search(/[Sgmot]/) + 2);
+            tdir = rest || (tWord = args[k + 1]);
+          }
+        }
+      }
+      const given = tdir !== undefined ? files.filter((f, k) => !(f === tWord && k === files.indexOf(tWord))) : files.slice(0, -1);
+      // (Round 44, Sol: a copy that copies nothing, an rsync dry run or listing, `cp --version`,
+      // brings nothing. Opus: `-L` copies what links lead to, so the walk follows them.)
+      // (Round 45, Opus: `--help` after `--` is a file; rsync's `-k`/`--copy-dirlinks` and cp's
+      // `--deref` follow links too.)
+      const nothing = copiesNothing(tool, args);
+      const head = args.indexOf("--") < 0 ? args : args.slice(0, args.indexOf("--"));
+      const follow = head.some((a) => (a.length >= 5 && "--dereference".startsWith(a)) || a === "--copy-links" || a === "--copy-dirlinks" || a === "--copy-unsafe-links" || (tool === "rsync" ? /^-[a-zA-Z]*[Lk]/.test(a) : /^-[a-zA-Z]*L/.test(a)));
+      if (how === "last" && !nothing && given.length && (tdir !== undefined || files.length > 1)) {
+        const dest = herePlus(tdir ?? files.at(-1)!);
+        const dir = cwdOf(cmd);
+        const asFile = tdir === undefined && tool !== "rsync" && args.some((a) => a === "--no-target-directory" || /^-[a-zA-Z]*T/.test(a));
+        let into = tdir !== undefined || (!asFile && (dest.endsWith("/") || files.length > 2));
+        if (!into && !asFile && dir !== undefined) {
+          try {
+            into = fs.statSync(path.resolve(dir, tilde(dest))).isDirectory();
+          } catch {}
+        }
+        for (const written of given) {
+          const word0 = herePlus(written);
+          const names = dir !== undefined && /[*?[]/.test(word0) ? (expandNames(word0, dir) ?? [word0]) : [word0];
+          for (const src of names) {
+            const contents = asFile || /\/\.\/*$/.test(src) || (tool === "rsync" && src.endsWith("/"));
+            const landing = into && !contents ? `${dest.replace(/\/+$/, "")}/${path.basename(src.replace(/\/+$/, ""))}` : dest;
+            if (into && !contents) targets.push(landing);
+            // (The project's own root is no such source: its `.git` is the one already trusted; a
+            // nested clone or a directory elsewhere is.)
+            // (A link copies nothing: `ln` makes the one name only.)
+            if (dir === undefined || tool === "ln") continue;
+            const from = path.resolve(dir, tilde(src));
+            if ((roots ?? []).some((r) => physical(r) === physical(from))) continue;
+            const found = gitIn(from, follow);
+            if (found !== undefined) targets.push(`${landing.replace(/\/+$/, "")}/${found}`);
+          }
+        }
+      }
       if (how && !NAME_KEEPERS.has(path.basename(word))) {
         const end = args.indexOf("--");
         const operands = end < 0 ? files : [...files.filter((f) => args.indexOf(f) < end), ...args.slice(end + 1)];
@@ -3946,7 +4080,7 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       const name = protectedNameIn(target, PROTECTED_NAMES, cwdOf(cmd));
       if (name === ".git") return `writes ${target}: a path inside or named .git, where git finds hooks and config`;
       if (name) return `writes ${target}, which opencode or a git hook loads and runs`;
-      const t = tilde(target);
+      const t = tilde(herePlus(target));
       if (/[$`*?[\]{}]/.test(target) || /^~[^/]/.test(t) || /^&/.test(target) || roots === undefined) continue;
       for (const dir of path.isAbsolute(t) ? ["/"] : (dirsOf?.(cmd) ?? [])) {
         const full = path.isAbsolute(t) ? t : `${dir}/${t}`;
@@ -5134,6 +5268,33 @@ function descriptorsReached(raw: string): string[] {
   }
   return DESCRIPTOR.test(cur) ? [cur] : [];
 }
+// Where a directory holds a `.git` at any depth (council project review 2, round 43, Mythos), as
+// a path below it; `.git` itself where the walk runs out of its budget before it could tell.
+// With `follow`, links are walked as the copy that dereferences them walks them (round 44, Opus).
+function gitIn(dir: string, follow = false, budget = { left: 4000 }, below = ""): string | undefined {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(path.join(dir, below), { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  for (const e of entries) {
+    if (--budget.left < 0) return ".git";
+    const rel = below ? `${below}/${e.name}` : e.name;
+    if (e.name === ".git") return rel;
+    let isDir = e.isDirectory();
+    if (follow && e.isSymbolicLink()) {
+      try {
+        isDir = fs.statSync(path.join(dir, rel)).isDirectory();
+      } catch {}
+    }
+    if (isDir) {
+      const found = gitIn(dir, follow, budget, rel);
+      if (found !== undefined) return found;
+    }
+  }
+  return undefined;
+}
 // Whether a directory holds a symbolic link at any depth (council project review 2, round 22), or
 // is too large to tell within a small budget; a link to a place inside the directory counts too.
 function holdsLink(dir: string, budget = { left: 4000 }): boolean {
@@ -5392,6 +5553,32 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
       if (v.action !== "allow") writeIssue = v.reason.replace(/^edit /, `${path.basename(w.cmd.argv[0] ?? "")} writes `);
     }
   }
+  // (Council project review 2, round 39, Mythos: the places the guard reads by a program's own
+  // options, which the rules "checked" by their plainer reading of the words, are held to the
+  // rules' write test too: `cp f ~/.bashrc -S bak`, `tar -xf a.tar -C../out`, `find -fprint0 ~/x`,
+  // `rsync -aT../out`. Not redirects, tee, truncate, sed -i or dd, which the rules read as bash
+  // does. Tested on a copy of the pending record; a directory by a path inside it. Asked about
+  // after every other check, whose reasons say more.)
+  let placedIssue: string | undefined;
+  for (const w of found.writes.filter((x) => x.checked && !["tee", "truncate", "sed", "dd", ">"].includes(x.by ?? ""))) {
+    if (placedIssue) break;
+    if (/^\/dev\/(null|zero|full|stdout|stderr|tty|fd\/\d+)$/.test(tilde(w.word))) continue;
+    const p = resolve(w.word, w.cmd);
+    if (!p || (!path.isAbsolute(tilde(w.word)) && where.cwd.get(w.cmd) === undefined)) continue;
+    // A directory is judged by the names that land in it: each source's base name, or, with none,
+    // a name nothing in it has (round 40, Sol: an unrelated link already there is not the write).
+    let at = [p];
+    try {
+      if (w.dir || w.word.endsWith("/") || fs.statSync(p).isDirectory()) at = (w.sources?.length ? w.sources.map((s) => path.basename(s)) : [".automode-placed-check"]).map((n) => path.join(p, n));
+    } catch {}
+    for (const q of at) {
+      const v = fileVerdict("edit", q, { ...scope, pending: new Map(scope.pending) });
+      if (v.action !== "allow") {
+        placedIssue = v.reason.replace(/^edit /, `${path.basename(w.cmd.argv[0] ?? "")} writes `);
+        break;
+      }
+    }
+  }
   const cwdOf = (c: Simple) => where.cwd.get(c);
   // Directories where this call writes files the check cannot list (round 4, finding 4, signed
   // off): the session keeps them once the call is allowed, and a file run by its path below one
@@ -5636,9 +5823,14 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   }
   if (gitIssue) return asked(askBy(gitIssue));
   if (writeIssue) return asked(askBy(writeIssue));
-  if (verdict.action === "ask") return asked(fromRules(verdict));
+  // (Round 62: an ask only for a tool's spelling gives way to the other checks' asks, which name
+  // what the call does; it is still an ask.)
+  const spelling = verdict.action === "ask" && !!verdict.spelling;
+  if (verdict.action === "ask" && !spelling) return asked(fromRules(verdict));
   if (extra?.action === "ask") return asked(askBy(extra.reason));
+  if (placedIssue) return asked(askBy(placedIssue));
   if (unseen) return asked(askBy(`the project's git layout cannot be checked whole: ${unseen}`));
+  if (spelling) return asked(fromRules(verdict));
   if (verdict.action === "allow" && !extra) return allowed(fromRules(verdict));
   const why = extra?.reason ?? reword(verdict.reason);
   if (!guard.useClassifier) return asked({ effect: "ask", by: "no-model", rule: "classify", reason: `rules leave this to the model, which is off (${why})` });
@@ -5759,3 +5951,6 @@ export function decideRead(guard: Guard, session: SessionState, cwd: string, tar
   const verdict = readVerdict("read", target, scopeFor(guard, session, cwd));
   return verdict ? fromRules(verdict) : undefined;
 }
+
+// (Round 43: see rules.ts `bare`.)
+bare(LS_REMOTE_OPTIONS, RESET_OPTIONS, GIT_STATE_BY, GIT_TODO, CREATE_OPTIONS, REMOTE, HOOKS_RUN, GIT_SHORT_REFUSED, GLOB_AFTER, GIT_WRITE, NEEDS_OUTSIDE, WRITER_OPERANDS, PARENT_MAKERS, HOOKS_OF, HOOK_OPTIONS);

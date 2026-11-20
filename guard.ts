@@ -16,7 +16,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { bashVerdict, fileVerdict, parse, readVerdict, within, type Matcher, type Scope, type Simple } from "./rules.ts";
+import { bare, bashVerdict, compressorReading, copiesNothing, findActions, printsOnly, sortReading, sortRunsCompressor, fileVerdict, parse, readVerdict, rsyncReading, tarReading, within, type Matcher, type Scope, type Simple } from "./rules.ts";
 import { gitArgs, gitEnv } from "./sandbox.ts";
 
 const HOME = os.homedir();
@@ -390,6 +390,10 @@ function shellProblem(cmds: Simple[]): string | undefined {
       // `-h` or `-V`, taken for help or a version. For these that word is an option, and they go
       // on to run their standard input (`rbash -h` is hashall, `ex -V` is verbose).
       if (at.has(i) && rest.length === 1 && /^-[hV]$/.test(rest[0]) && STDIN_RUNNERS.has(name)) return `${name} ${rest[0]}: an option of ${name}, which then runs what its standard input holds`;
+      // (Round 33, Opus: Tcl's shells and erl take any first word that begins with `-` as an
+      // argument for the script, `--help` and `--version` included, and then run standard input.
+      // Round 34, Mythos: BSD csh reads `--help` as its letters, and runs standard input too.)
+      if (at.has(i) && rest.length === 1 && /^--(help|version)$/.test(rest[0]) && /^(tclsh|tclkit|tclkitsh|itclsh|wish|wishx|expect|expectk|jimsh|erl|csh|bsd-csh)[\d.]*$/.test(name)) return `${name} ${rest[0]}: an argument for ${name}'s script, which then runs what its standard input holds`;
       if (BASH_LIKE.has(name)) {
         const found = optionsProblem(rest, true);
         if (found === "-O") return `${name} -O, which changes how the shell reads its code`;
@@ -2494,7 +2498,8 @@ export function textGuard(raw: string, bare: string, ctx: TextContext): GuardVer
 
   // Printing the environment prints every secret in it.
   if (name === "printenv") add("ask", "printenv prints the environment");
-  if (path.basename(rawWords[0] ?? "") === "env" && rawWords.slice(1).every((w) => w.startsWith("-") || ASSIGN.test(w))) add("ask", "env prints the environment");
+  // (Round 61, Sol: `env --help` and `env --version` print their text, no environment.)
+  if (path.basename(rawWords[0] ?? "") === "env" && rawWords.slice(1).every((w) => w.startsWith("-") || ASSIGN.test(w)) && !rawWords.slice(1).some((w) => w === "--help" || w === "--version")) add("ask", "env prints the environment");
   if ((DECLARERS.has(name) && !operands.length) || (name === "set" && !args.length)) add("ask", `${name} without a name prints every variable`);
 
   // Variables set for a command, or exported for the ones after it.
@@ -3522,7 +3527,9 @@ const RUNS_NOTHING = RULES_NOOP;
 // The programs bash and the wrapped programs really run, from argv[start] on: every wrapper,
 // runner and program position (pushed to `out`). Returns a reason when the reading is unknown,
 // and the index of the main program (the first that is neither a wrapper nor a runner).
-function faithful(argv: string[], start: number, out: number[]): { main: number; problem?: string } {
+// (Council project review 2, round 58, Opus: each `-exec` start is read once in a call, as a
+// find's words were read again for every find inside it, exponential in nested finds.)
+function faithful(argv: string[], start: number, out: number[], seen = new Set<number>()): { main: number; problem?: string } {
   let i = start;
   let assignments = true;
   let keywords = true;
@@ -3563,8 +3570,16 @@ function faithful(argv: string[], start: number, out: number[]): { main: number;
       continue;
     }
     if (name === "find") {
+      // (Round 59, Astra and Sol: a find that only prints its help or version starts no command.)
+      if (printsOnly("find", argv.slice(i + 1))) return { main: i };
       let problem: string | undefined;
-      for (let j = i + 1; j < argv.length; j++) if (/^-(exec|execdir|ok|okdir)$/.test(argv[j])) problem ??= faithful(argv, j + 1, out).problem;
+      // (Round 59, Sol: the actions find reads as actions, `-name -exec` being a pattern.)
+      const actions = new Set(findActions(argv.slice(i + 1)).at.map((k) => i + 1 + k));
+      for (let j = i + 1; j < argv.length; j++) {
+        if (!/^-(exec|execdir|ok|okdir)$/.test(argv[j]) || !actions.has(j) || seen.has(j + 1)) continue;
+        seen.add(j + 1);
+        problem ??= faithful(argv, j + 1, out, seen).problem;
+      }
       return { main: i, problem };
     }
     return { main: i };
@@ -3587,8 +3602,16 @@ function traverse(argv: string[]): Traversal {
   // (kept as the loop goes: asking it of the whole prefix at each word made a command of 40,000
   // words take seconds).
   let wrappersOnly = true;
+  // (Round 59, Sol: a word after an `-exec` that the find before it reads as a predicate's value,
+    // `find . -name -exec -print`, is no program; an `-exec` behind any other program is still
+    // taken for one, which can only ask more.)
+  const valueOfFind = (k: number) => {
+    let p = k - 1;
+    while (p >= 0 && !(path.basename(argv[p]) === "find" && (p === 0 || at.has(p)))) p--;
+    return p >= 0 && !findActions(argv.slice(p + 1)).at.includes(k - p - 1);
+  };
   for (let i = 0; i < argv.length; i++) {
-    if (i === 0 || /^-(exec|execdir|ok|okdir)$/.test(argv[i - 1])) at.add(i);
+    if (i === 0 || (/^-(exec|execdir|ok|okdir)$/.test(argv[i - 1]) && !valueOfFind(i - 1))) at.add(i);
     else if (wrappersOnly && !WRAPPER_WORD.test(argv[i])) at.add(i);
     wrappersOnly &&= WRAPPER_NAMES.has(path.basename(argv[i])) || WRAPPER_WORD.test(argv[i]) || ASSIGN.test(argv[i]);
   }
@@ -3796,7 +3819,9 @@ export function withoutGlobals(manager: string, args: string[]): string[] | unde
 }
 
 function installProblem(manager: string, managerArgs: string[], placeOk?: (dir: string) => boolean): string | undefined {
-  if (/^(-v|-V|--version|-h|--help)$/.test(managerArgs[0] ?? "")) return undefined;
+  // A version or help query alone installs nothing. (Round 37, Mythos: with more words `-v` is
+  // verbose for pip, cargo and uv, `pip -v install x`; the subcommand is read as usual.)
+  if (managerArgs.length === 1 && /^(-v|-V|--version|-h|--help)$/.test(managerArgs[0])) return undefined;
   const at = afterGlobals(manager, managerArgs, placeOk);
   // Options with no subcommand at all (`npm --version`) install nothing.
   if (typeof at === "string") return managerArgs.some((a) => !a.startsWith("-")) ? at : undefined;
@@ -4218,9 +4243,34 @@ function managerProblem(name: string, args: string[]): string | undefined {
 // prefix of a long option.
 const CMAKE_SAFE = /^CMAKE_(BUILD_TYPE|INSTALL_PREFIX|EXPORT_COMPILE_COMMANDS|(C|CXX|CUDA|OBJC|OBJCXX|HIP)_(STANDARD|STANDARD_REQUIRED|EXTENSIONS)|POSITION_INDEPENDENT_CODE|VERBOSE_MAKEFILE|COLOR_DIAGNOSTICS|COLOR_MAKEFILE|INTERPROCEDURAL_OPTIMIZATION|UNITY_BUILD|MESSAGE_LOG_LEVEL|FIND_DEBUG_MODE|SKIP_RPATH|SKIP_INSTALL_RPATH|BUILD_WITH_INSTALL_RPATH|OSX_ARCHITECTURES|OSX_DEPLOYMENT_TARGET|(RUNTIME|LIBRARY|ARCHIVE)_OUTPUT_DIRECTORY|EXPORT_PACKAGE_REGISTRY|FIND_PACKAGE_PREFER_CONFIG|DISABLE_PRECOMPILE_HEADERS|SUPPRESS_REGENERATION|WARN_DEPRECATED|ERROR_DEPRECATED|INSTALL_MESSAGE|BUILD_PARALLEL_LEVEL)$/;
 const RUSTUP_PROXIES = new Set(["rustc", "rustfmt", "rustdoc", "cargo", "cargo-clippy", "clippy-driver", "cargo-fmt", "rust-gdb", "rust-gdbgui", "rust-lldb", "rust-analyzer", "rls", "cargo-miri"]);
-function buildToolProblem(name: string, args: string[]): string | undefined {
+function buildToolProblem(name: string, args: string[], cwd?: string): string | undefined {
   const own = args.slice(0, args.includes("--") ? args.indexOf("--") : args.length);
   const operands = own.filter((a) => !a.startsWith("-"));
+  // (Council project review 2, round 35, Mythos: an `@file` of options, or clang's `--config`,
+  // read from standard input, a descriptor, a device or a process substitution holds options the
+  // call chose, `-wrapper` or `-C link-arg` included. For the linker or assembler too.)
+  if (COMPILER.test(name) || /^(rustc|rustdoc|ccache|ld|ld\.\w+|as)$/.test(name)) {
+    // (Round 36, Opus, Sol, Mythos: by where the path leads, not its spelling: `//dev/stdin`,
+    // `/./dev/stdin`, `/tmp/../dev/stdin`, a link. A relative name is the project's own option
+    // file (the declined `gcc @file` class) unless it climbs with `..` towards a device.)
+    // (Round 37, Opus: a relative one is resolved where the command runs, through links, as the
+    // kernel walks it: `cd /dev && gcc @stdin`, a project link to /dev/stdin.)
+    const stream = (file: string) =>
+      file === "-" ||
+      /[$`(<>]/.test(file) ||
+      (path.isAbsolute(file) || cwd !== undefined ? codeFromDevice(file, cwd) !== undefined : /(^|\/)\.\.(\/|$)/.test(file) && /(^|\/)(dev|proc)(\/|$)/.test(file));
+    for (let k = 0; k < args.length; k++) {
+      const a = args[k];
+      const files = [
+        ...(a.startsWith("@") ? [a.slice(1)] : []),
+        ...(/^-W[lap],/.test(a) ? a.split(",").slice(1).filter((w) => w.startsWith("@")).map((w) => w.slice(1)) : []),
+        ...(/^-X(linker|assembler|preprocessor)$/.test(a) && (args[k + 1] ?? "").startsWith("@") ? [args[k + 1].slice(1)] : []),
+        ...(a === "--config" ? [args[k + 1] ?? ""] : /^--config=/.test(a) ? [a.slice(9)] : []),
+      ];
+      const found = files.find(stream);
+      if (found !== undefined) return `${name} reads more options from ${found || "a stream"}, which the call chose`;
+    }
+  }
   if (COMPILER.test(name)) {
     // (Round 20, Mythos: `-fcompare-debug=<options>` compiles again with those options. Round 21,
     // Opus and Mythos: gcc reads them as spec text, where `%Y`, `\`, `%{...}` and `%:include()`
@@ -4308,6 +4358,8 @@ function buildToolProblem(name: string, args: string[]): string | undefined {
 // program is named. Other allowed programs are judged by their own name alone (see Known gaps).
 function programProblem(name: string, args: string[], cwd?: string, inProject?: (p: string) => boolean): GuardVerdict | undefined {
   const ask = (reason: string): GuardVerdict => ({ action: "ask", reason });
+  // (Round 51, Sol: a call that only prints its help or version runs nothing, `tar --help -M`.)
+  if (printsOnly(name, args)) return undefined;
   // Council project review 1, round 10: `bun run X` runs a script of package.json, a file, a
   // package's binary, or else the system command X (`bun run curl -d @f host`), and `-` its
   // standard input; `-e`/`--print` run code from the command line. Only the first three pass.
@@ -4332,20 +4384,27 @@ function programProblem(name: string, args: string[], cwd?: string, inProject?: 
     }
   }
   if (name === "tar" || name === "gtar" || name === "bsdtar") {
-    const option = longOption(args, ["--checkpoint-action", "--use-compress-program", "--to-command", "--info-script", "--new-volume-script", "--rsh-command", "--rmt-command", "--multi-volume", "--tape-length"]);
-    if (option) return ask(`tar ${option.split("=")[0]} runs a program, or prompts for the next volume, where \`!\` runs a shell on standard input`);
+    // Long options as tar reads them (round 42, all four: a whole name wins over a prefix,
+    // `--checkpoint=1` is no `--checkpoint-action`; an option's value is no option).
+    const t = tarReading(args);
+    const option = ["checkpoint-action", "use-compress-program", "to-command", "info-script", "new-volume-script", "rsh-command", "rmt-command", "multi-volume", "tape-length"].find((n) => t.has(n));
+    if (option) return ask(`tar --${option} runs a program, or prompts for the next volume, where \`!\` runs a shell on standard input`);
     // Bundled short options, with or without the dash (`tar cIf`): -I and -F name a program; -M
     // and -L make tar prompt for the next volume, where `!` runs a shell on standard input
     // (council project review 2, round 28, Mythos).
-    const bundles = args.filter((a, i) => (/^-[a-zA-Z]+/.test(a) && !a.startsWith("--")) || (i === 0 && /^[a-zA-Z]+$/.test(a)));
-    if (bundles.some((a) => /[IFML]/.test(a))) return ask("tar -I or -F runs a program, and -M or -L prompts for the next volume, where ! runs a shell on standard input");
-    if (args.some((a) => !a.startsWith("-") && /^[\w.@-]+:/.test(a)) && !args.includes("--force-local")) return ask("tar with an archive on a remote host runs a remote shell");
+    // Read by position (round 41, Mythos and Sol): an option's value is no option, and `--` ends
+    // the options only where an option could stand.
+    if (t.clusters.some((a) => /[IFML]/.test(a))) return ask("tar -I or -F runs a program, and -M or -L prompts for the next volume, where ! runs a shell on standard input");
+    // (Round 42, Opus: any word that could name a remote archive, not only those the reader takes
+    // for one, so this check does not lean on the reader's option values; a member the reader
+    // lists is no archive, round 43, Sol and Astra: `tar -tf a.tar notes:today`.)
+    if ((t.archives.some((a) => /^[^/]*:/.test(a)) || args.some((a) => /^(-[a-zA-Z]*f)?[^-/][^/]*:/.test(a) && !t.members.includes(a) && !t.optionValues.includes(a))) && !t.has("force-local")) return ask("tar with an archive on a remote host runs a remote shell");
   }
-  if (name === "sort" && longOption(args, ["--compress-program"])) return ask("sort --compress-program runs a program");
+  if (name === "sort" && sortRunsCompressor(args)) return ask("sort --compress-program runs a program");
   // Council project review 2 (Mythos): the compilers and build tools the rules allow by name, with
   // the options and subcommands that run a program or command the call names or load a plugin. (A
   // file of more options, `gcc @args`, is a place the runner check cannot tell: runnerPlaces.)
-  const tool = buildToolProblem(name, args);
+  const tool = buildToolProblem(name, args, cwd);
   if (tool) return ask(tool);
   // (Council project review 2, round 7, Mythos: rustup's proxies take `+<toolchain>`, and a path
   // there runs `<path>/bin/<tool>`; held to a name, as cargo's is.)
@@ -4846,8 +4905,8 @@ const TAR_OPTIONS: Getopt = {
   values: "gCTXfFLbHVIKN",
   long: Object.fromEntries([
     ...longs("flag", "catenate concatenate create delete diff compare append test-label list update extract get check-device incremental ignore-failed-read no-check-device no-seek seek sparse exclude-backups exclude-caches exclude-caches-all exclude-caches-under exclude-vcs exclude-vcs-ignores no-null no-recursion no-unquote no-verbatim-files-from null verbatim-files-from recursion unquote anchored ignore-case no-anchored no-ignore-case no-wildcards no-wildcards-match-slash wildcards wildcards-match-slash keep-directory-symlink keep-newer-files keep-old-files no-overwrite-dir overwrite overwrite-dir recursive-unlink remove-files skip-old-files unlink-first verify ignore-command-error no-ignore-command-error to-stdout clamp-mtime delay-directory-restore touch no-delay-directory-restore no-same-owner no-same-permissions numeric-owner preserve-permissions same-permissions same-owner preserve-order same-order acls no-acls no-selinux no-xattrs selinux xattrs force-local multi-volume read-full-records ignore-zeros old-archive portability posix auto-compress bzip2 xz lzip lzma lzop no-auto-compress zstd gzip gunzip ungzip compress uncompress hard-dereference dereference one-file-system absolute-names full-time check-links block-number show-defaults show-omitted-dirs show-snapshot-field-ranges show-transformed-names utc verbose interactive confirmation restrict usage version help"),
-    ...longs("value", "listed-incremental hole-detection level sparse-version add-file directory exclude exclude-ignore exclude-ignore-recursive exclude-tag exclude-tag-all exclude-tag-under files-from exclude-from to-command group group-map mode mtime owner owner-map sort xattrs-exclude xattrs-include file info-script new-volume-script tape-length rmt-command rsh-command volno-file blocking-factor record-size format label use-compress-program starting-file newer-mtime newer after-date suffix strip-components transform xform checkpoint-action index-file no-quote-chars quote-chars quoting-style warning pax-option"),
-    ...longs("optional", "occurrence one-top-level atime-preserve backup checkpoint totals"),
+    ...longs("value", "listed-incremental hole-detection level sparse-version add-file directory exclude exclude-ignore exclude-ignore-recursive exclude-tag exclude-tag-all exclude-tag-under files-from exclude-from to-command group group-map mode mtime owner owner-map sort xattrs-exclude xattrs-include file info-script new-volume-script tape-length rmt-command rsh-command volno-file blocking-factor record-size format label use-compress-program starting-file newer-mtime newer after-date suffix strip-components transform xform checkpoint-action index-file no-quote-chars quote-chars quoting-style warning pax-option program-name"),
+    ...longs("optional", "occurrence one-top-level atime-preserve backup checkpoint totals HANG"),
   ]),
 };
 // The options with which tar writes where its `-C` does not show: absolute member names, another
@@ -4857,16 +4916,19 @@ const TAR_ELSEWHERE = new Set(["-P", "--absolute-names", "--one-top-level", "--t
 // tar's words with an old-style bundle (`tar xfC a.tar sub`) turned into options, as tar does:
 // each letter of the first word is an option, and the letters that take a value take the words
 // after it in order.
+// (Round 43, Mythos: any first word without a dash, and a `-` in it ends the options as `--`
+// would, as rules.ts `tarReading` reads it: `tar cf- .git/config f` makes `.git/config`.)
 function tarWords(args: string[]): string[] {
   const first = args[0];
-  if (first === undefined || first.startsWith("-") || !/^[a-zA-Z]+$/.test(first)) return args;
+  if (first === undefined || first === "" || first.startsWith("-")) return args;
+  const dash = first.indexOf("-");
   const out: string[] = [];
   let k = 1;
-  for (const letter of first) {
+  for (const letter of dash < 0 ? first : first.slice(0, dash)) {
     out.push(`-${letter}`);
     if (TAR_OPTIONS.values!.includes(letter)) out.push(args[k++] ?? "");
   }
-  return [...out, ...args.slice(k)];
+  return [...out, ...(dash < 0 ? [] : ["--"]), ...args.slice(k)];
 }
 // B9-6: the archive tar writes when it makes one or changes one (`-c`, `-r`, `-u`, `-A`, `--create`,
 // `--append`, `--update`, `--catenate`, `--delete`, in any spelling): every `-f`/`--file` value but
@@ -4913,6 +4975,8 @@ function tarOutputsPlain(words: string[]): string[] {
 function compressorWrites(name: string, args: string[]): { files: string[]; dirs: string[] } {
   const files: string[] = [];
   const dirs: string[] = [];
+  // (Round 44, Sol: a listing or a test writes nothing, `zstd --list -o out f.zst`.)
+  if (compressorReading(name, args)?.reads) return { files, dirs };
   const short = (letter: string, into: string[]) => {
     for (let i = 0; i < args.length; i++) {
       const a = args[i];
@@ -5070,11 +5134,15 @@ function rustcQuery(args: string[]): boolean {
   return true;
 }
 function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string[]) => boolean): string | undefined {
+  // (Round 45, Sol: `cp --version f dst/` copies nothing.)
+  if (copiesNothing(name, args)) return undefined;
   // A name the URL or the server chooses (round 4, finding 17, second pass).
   if (name === "curl" || name === "wget") return fetcherWrites(name, args).chosen[0]?.why;
   if (name === "tar" || name === "gtar" || name === "bsdtar") {
-    const first = args[0] ?? "";
-    if (longOption(args, ["--extract", "--get"]) || args.some((a) => /^-[a-zA-Z]*x/.test(a) && !a.startsWith("--")) || /^[a-zA-Z]*x/.test(first)) return `${name} -x writes the files the archive names`;
+    // Read by position (round 42, Sol: `tar -tf a.tar --exclude -x` lists; `-xO` writes to
+    // standard output only).
+    const t = tarReading(args);
+    if ((t.has("extract") || t.has("get") || t.letter("x")) && !(t.has("to-stdout") || t.letter("O"))) return `${name} -x writes the files the archive names`;
   }
   if ((name === "unzip" && unzipWords(args).writes) || name === "7z" || name === "cpio" || name === "rar" || name === "unrar") return `${name} writes the files the archive names`;
   // (Council project review 1, round 4: `-d` anywhere in a cluster, `gzip -dk`; and the other
@@ -5100,18 +5168,49 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
   if (["npm", "pnpm", "yarn"].includes(name)) {
     // (Round 32, all four: wherever the word stands, as an option's value may come first; yarn's
     // bare `version` prompts for the new one.)
-    const words = args.filter((a) => !a.startsWith("-"));
-    const v = words.indexOf("version");
-    const k = words.indexOf("pkg");
-    if ((v >= 0 && (words.length > v + 1 || name === "yarn" || args.some((a) => /^--(major|minor|patch|pre\w*|new-version)/.test(a)))) || (k >= 0 && ["set", "delete", "fix"].includes(words[k + 1] ?? ""))) return `${name} ${v >= 0 ? "version" : "pkg"} rewrites package.json`;
+    // (Round 33, Sol: only where the subcommand stands. `npm view x version` names a field. The
+    // subcommand is the first word after the options; a known option that takes a value skips it,
+    // and after an option this check does not know either word may be the subcommand.)
+    const valued = /^(--loglevel|--prefix|-w|--workspace|--registry|--userconfig|--globalconfig|--cache|--tag|--otp|--access|-C|--dir|-F|--filter|--cwd|--reporter|--workspace-concurrency)$/;
+    // (Round 34: `--color` is a flag, as PM_GLOBALS and the rules read it.)
+    const known = /^(-[sqdgyvr]+|--(silent|quiet|verbose|workspaces|include-workspace-root|if-present|color|no-color|offline|prefer-offline|global|yes|recursive|workspace-root|frozen-lockfile|immutable|json|parseable|long|no-git-tag-version|git-tag-version|allow-same-version|force)|--[\w-]+=.*)$/;
+    const at: number[] = [];
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (a === "--") {
+        at.push(i + 1);
+        break;
+      }
+      if (!a.startsWith("-")) {
+        at.push(i);
+        break;
+      }
+      // (pnpm's -w is a flag, the workspace root; npm's takes a workspace.)
+      if (name === "pnpm" && a === "-w") continue;
+      if (valued.test(a)) i++;
+      else if (!known.test(a)) at.push(i + 1, i + 2);
+    }
+    const subs = at.map((i) => args[i]).filter((w): w is string => w !== undefined && !w.startsWith("-"));
+    const rest = (sub: string) => args.slice(args.indexOf(sub) + 1).filter((a) => !a.startsWith("-"));
+    const version = subs.find((w) => w === "version");
+    const pkg = subs.find((w) => w === "pkg");
+    if ((version && (rest(version).length > 0 || name === "yarn" || args.some((a) => /^--(major|minor|patch|pre\w*|new-version)/.test(a)))) || (pkg && ["set", "delete", "fix"].includes(rest(pkg)[0] ?? ""))) return `${name} ${version ? "version" : "pkg"} rewrites package.json`;
   }
   if (name === "ccache" && args.length && COMPILER.test(args[0])) return unnamedWrite(args[0], args.slice(1), filesOnly);
-  if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|unlz4)$/.test(name) || (/^(gzip|xz|zstd|bzip2|lzop|lz4|lzip|brotli)$/.test(name) && args.some((a) => /^-[a-zA-Z0-9]*d[a-zA-Z0-9]*$/.test(a) || (a.length > 2 && ("--decompress".startsWith(a) || "--uncompress".startsWith(a))))) || (name === "lzop" && args.some((a) => /^-[a-zA-Z0-9]*x/.test(a)))) return `${name} -d writes files next to its input`;
+  // (Round 42, Sol: gzip, xz, zstd and bzip2 read by position; a listing, a test or output to
+  // standard output writes nothing; the other compressors as before.)
+  const z = compressorReading(name, args);
+  if (z) {
+    if (z.decompress && (z.inPlace || z.outputs.length)) return `${name} -d writes files next to its input`;
+  } else if (/^(gunzip|unxz|unzstd|bunzip2|uncompress|unlz4)$/.test(name) || (/^(gzip|xz|zstd|bzip2|lzop|lz4|lzip|brotli)$/.test(name) && args.some((a) => /^-[a-zA-Z0-9]*d[a-zA-Z0-9]*$/.test(a) || (a.length > 2 && ("--decompress".startsWith(a) || "--uncompress".startsWith(a))))) || (name === "lzop" && args.some((a) => /^-[a-zA-Z0-9]*x/.test(a)))) return `${name} -d writes files next to its input`;
   if (name === "patch") {
     const got = getopt(args, PATCH_OPTIONS);
     if (got.unknown || !got.opts.some((o) => ["--dry-run", "-o", "--output"].includes(o.name))) return "patch writes the files the diff names";
   }
-  if (name === "rsync") return "rsync writes the files it copies";
+  // (A dry run writes nothing but a log the rules hold, round 40, Sol.)
+  // (A dry run, a listing, or one operand writes nothing but a log the rules hold; read by
+  // position, round 41.)
+  if (name === "rsync" && !rsyncReading(args).copiesNothing) return "rsync writes the files it copies";
   // Read by the tool's own options (round 4, finding 4, second pass: `--recur`, `--arc`).
   if (["cp", "mv", "install"].includes(name)) {
     const words = copyWords(name, args);
@@ -5245,7 +5344,11 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
     for (const at of programs(cmd.argv)) {
       const name = path.basename(cmd.argv[at]);
       const args = cmd.argv.slice(at + 1);
-      const files = args.filter((a) => !a.startsWith("-"));
+      // (Round 50, Sol: a call that only prints its help or version writes nothing.)
+      if (printsOnly(name, args)) continue;
+      // Every word after `--` is a file, `-/../x` included (round 39, Opus).
+      const dashes = args.indexOf("--");
+      const files = [...(dashes < 0 ? args : args.slice(0, dashes)).filter((a) => !a.startsWith("-")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
       const add = (word: string | undefined, checked: boolean, extra: Partial<Write> = {}) => void (word !== undefined && writes.push({ word, cmd, checked, by: name, ...extra }));
       const blind = unnamedWrite(name, args, filesOnly && ((sources) => filesOnly(sources, cmd)));
       const call = name === "git" ? gitCall(args) : undefined;
@@ -5254,7 +5357,9 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       if (name === "tee" || name === "truncate") files.forEach((f) => add(f, true));
       else if (name === "sed" && args.some((a) => /^(-[a-zA-Z]*i|--in-place)/.test(a))) files.slice(args.some((a) => /^(-[a-zA-Z]*e$|--expression)/.test(a)) ? 0 : 1).forEach((f) => add(f, true));
       else if ((name === "perl" || name === "ruby") && args.some((a) => /^-[a-zA-Z]*i/.test(a))) files.slice(args.some((a) => /^-[a-zA-Z]*e$/.test(a)) ? 1 : 0).forEach((f) => add(f, false));
-      else if (["cp", "mv", "ln", "install", "rsync"].includes(name)) {
+      // An rsync that copies nothing (a dry run, a listing, one operand) writes no destination; its
+      // option places are still read below (round 41).
+      else if (["cp", "mv", "ln", "install", "rsync"].includes(name) && !copiesNothing(name, args)) {
         // `-t DIR` / `--target-directory=DIR`: every operand is a source (the rules read the last
         // one as the destination and never look at DIR).
         // Read by the tool's own options (round 4, finding 4, second pass: `--target-dir=`,
@@ -5280,8 +5385,10 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
         else if (a.startsWith("--output=")) add(a.slice(9), false);
       });
       else if (name === "sort") {
-        const got = getopt(args, { flags: "bdfghiMnrRsuVz", values: "otkS", long: Object.fromEntries([...longs("value", "output key field-separator buffer-size parallel temporary-directory files0-from compress-program"), ...longs("flag", "reverse unique numeric-sort general-numeric-sort human-numeric-sort month-sort version-sort random-sort stable ignore-case dictionary-order ignore-leading-blanks ignore-nonprinting zero-terminated")]) });
-        for (const o of got.opts) if (["-o", "--output"].includes(o.name)) add(o.value, false);
+        // (Round 44, Opus: -c, -C and -m are flags, -T takes a value. Round 49, Opus, Sol, Astra:
+        // read by rules.ts `sortReading`, GNU sort 9.7's whole table, so an option's value, `--`
+        // included, is no option; an option sort does not know stops it before it writes.)
+        for (const o of sortReading(args).outputs) add(o, false);
       }
       else if (name === "tree") valued(args, "o", "--never").forEach((f) => add(f, false));
       else if (name === "less") [...valued(args, "o", "--log-file"), ...valued(args, "O", "--LOG-FILE")].forEach((f) => add(f, false));
@@ -5290,11 +5397,15 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       // (Council project review 1, round 6: `python3 -m json.tool IN OUT` writes OUT.)
       else if (/^python[0-9.]*$/.test(name) && args.some((a, k) => (a === "-m" && args[k + 1] === "json.tool") || a === "-mjson.tool")) {
         const at = args.findIndex((a, k) => (a === "-m" && args[k + 1] === "json.tool") || a === "-mjson.tool");
-        const operands = args.slice(at + (args[at] === "-m" ? 2 : 1)).filter((a) => a === "-" || !a.startsWith("-"));
+        const rest = args.slice(at + (args[at] === "-m" ? 2 : 1));
+        const end = rest.indexOf("--");
+        const operands = [...(end < 0 ? rest : rest.slice(0, end)).filter((a) => a === "-" || !a.startsWith("-")), ...(end < 0 ? [] : rest.slice(end + 1))];
         if (operands.length > 1) add(operands[1], true);
       }
       else if (name === "uniq" || name === "xxd") {
-        const operands = args.filter((a) => a === "-" || !a.startsWith("-"));
+        // (Round 41, Mythos: the words after `--` are operands, `-/../x` too.)
+        const end = args.indexOf("--");
+        const operands = [...(end < 0 ? args : args.slice(0, end)).filter((a) => a === "-" || !a.startsWith("-")), ...(end < 0 ? [] : args.slice(end + 1))];
         add(operands.length > 1 ? operands.at(-1) : undefined, false);
       }
       else if ((name === "yq" || name === "jq") && args.some((a) => /^(-[a-zA-Z]*i|--inplace)$/.test(a))) files.slice(1).forEach((f) => add(f, false));
@@ -5335,10 +5446,18 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       const compressed = compressorWrites(name, args);
       compressed.files.forEach((f) => add(f, false));
       compressed.dirs.forEach((d) => add(d, false, { dir: true }));
-      if (name === "find") args.forEach((a, k) => void (/^-(fprint0?|fprintf|fls)$/.test(a) && place(args[k + 1], false)));
-      if (name === "rsync") for (const o of getopt(args, COPY_OPTIONS.rsync).opts) {
-        if (["--log-file", "--write-batch", "--only-write-batch"].includes(o.name)) place(o.value, false);
-        if (["--backup-dir", "--temp-dir", "-T", "--partial-dir"].includes(o.name)) place(o.value, true);
+      // (Round 57, Astra: find's output actions where find reads them, `-name -fprint0` is a pattern.)
+      if (name === "find") for (const k of findActions(args).at) if (/^-(fprint0?|fprintf|fls)$/.test(args[k])) place(args[k + 1], false);
+      // (Round 46, Sol: a dry run or listing writes no backup, temp or partial files, as the rules
+      // read it; a version or help query nothing.)
+      const rs = name === "rsync" ? rsyncReading(args) : undefined;
+      // (Round 47, Sol: a version query still writes its log. Round 48, Sol: the last `--log-file`
+      // only, and an empty one none.)
+      if (rs && !rs.help) for (const f of rs.values("log-file")) place(f, false);
+      if (rs && !rs.help) for (const o of getopt(args, COPY_OPTIONS.rsync).opts) {
+        if (!rs.prints && ["--write-batch", "--only-write-batch"].includes(o.name)) place(o.value, false);
+        if (rs.prints) continue;
+        if (["--backup-dir", "--temp-dir", "-T", "--partial-dir"].includes(o.name) && !(rs.dryRun || rs.listOnly)) place(o.value, true);
       }
       if (name === "curl" || name === "wget") {
         // Round 4, finding 17, second pass: every file each writes, where it writes it, and the
@@ -5842,11 +5961,11 @@ function walk(command: string, starts: Places, depth: number, ctx: WalkContext):
     }
     const opens: Record<string, Frame["kind"]> = { "{": "{", if: "if", while: "loop", until: "loop", for: "loop", select: "loop", case: "case" };
     const closes: Record<string, Frame["kind"]> = { "}": "{", fi: "if", done: "loop", esac: "case" };
-    if (opens[w]) {
+    if (Object.hasOwn(opens, w)) {
       const g = open(opens[w], fnPending);
       fnPending = false;
       if (w === "case") g.pattern = false;
-    } else if (closes[w] && cur.argv.length === 0) close(closes[w]);
+    } else if (Object.hasOwn(closes, w) && cur.argv.length === 0) close(closes[w]);
     else if (fnPending && w !== "function") ctx.bail = true;
   };
   const pushWord = () => {
@@ -6704,7 +6823,9 @@ function linkWalk(abs: string, made: Map<string, string[]>, missingToo: boolean)
 // The physical paths a word names from `dir` that differ from the path its text names; none for
 // an expansion, a glob, `~user`, nothing there or a walk the check cannot make.
 function leadsTo(value: string, dir: string, made: Map<string, string[]>): string[] {
-  if (!value || value.startsWith("-") || /[$`*?[]/.test(value) || /^~(?![/+]|$)/.test(value) || /^~\+[^/]/.test(value)) return [];
+  // (Round 41, Mythos: `-/h/.bashrc` is a path through the directory `-`; a word with a slash
+  // before any `=` is walked whatever it starts with.)
+  if (!value || (value.startsWith("-") && !/^-[^=]*\//.test(value)) || /[$`*?[]/.test(value) || /^~(?![/+]|$)/.test(value) || /^~\+[^/]/.test(value)) return [];
   const abs = homeOrHere(value, dir);
   return walks(abs, made).filter((p) => p !== path.normalize(abs));
 }
@@ -6716,7 +6837,7 @@ function writesTo(value: string, dir: string, made: Map<string, string[]>): stri
   // (S5: `$PWD` and `${PWD}` at the start are where the command runs.)
   const here = /^\$(?:PWD|\{PWD\})(?=\/|$)/.exec(value);
   if (here) value = `${dir}${value.slice(here[0].length)}`;
-  if (!value || value.startsWith("-") || /[$`*?[]/.test(value) || /^~(?![/+]|$)/.test(value) || /^~\+[^/]/.test(value)) return [];
+  if (!value || (value.startsWith("-") && !/^-[^=]*\//.test(value)) || /[$`*?[]/.test(value) || /^~(?![/+]|$)/.test(value) || /^~\+[^/]/.test(value)) return [];
   const abs = homeOrHere(value, dir);
   if (/^\/(?:proc|dev)(?:\/|$)/.test(path.normalize(abs))) return [];
   return linkWalk(abs, made, true).filter((p) => p.parted && p.at !== path.resolve(abs)).map((p) => p.at);
@@ -7045,7 +7166,15 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
     if (ASSIGN.test(word)) continue;
     const name = path.basename(word);
     const args = cmd.argv.slice(at + 1);
-    const files = args.filter((a) => !a.startsWith("-"));
+    // (Round 59, Astra and Sol: a program behind a call that only prints its help or version is
+    // never started: `find --version -exec env --version \;`.)
+    // (Round 60, Opus: only behind a find that only prints and is no `-exec`'s own command; a
+    // sibling `-exec sort --help \;` or `-exec find --help \;` owns no later `-exec`.)
+    // (Round 61, Opus: only a find at the call's top level, before any `-exec`, wrapped or not:
+    // `-exec timeout 5 find --help \;` owns nothing either.)
+    if (programs(cmd.argv).some((p) => p < at && path.basename(cmd.argv[p]) === "find" && !cmd.argv.slice(0, p).some((w) => /^-(exec|execdir|ok|okdir)$/.test(w)) && printsOnly("find", cmd.argv.slice(p + 1)))) continue;
+    const dashes = args.indexOf("--");
+    const files = [...(dashes < 0 ? args : args.slice(0, dashes)).filter((a) => !a.startsWith("-")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
 
     // B7-5: an option that reads a file of names, patterns or code is a read of that file, in
     // every place the command may run (listOptions).
@@ -7526,7 +7655,8 @@ function safeAfterWrite(name: string, args: string[], cmd: Simple, ctx: ArgvCont
   if (name === "jq") return !args.some((w) => /^(-[a-zA-Z]*[fL]|--from-file|--library-path)/.test(w) || /\b(import|include)\b/.test(w));
   // zip's `-T`/`-TT` runs a command on the archive.
   if (name === "zip") return !args.some((w) => /^-[a-zA-Z0-9]*T/.test(w) || /^--(test|unzip-command)/.test(w));
-  if (name === "find") return !args.some((w) => /^-(exec|execdir|ok|okdir)$/.test(w));
+  // (Round 59, Sol: find's actions where find reads them, `-name -exec` is a pattern.)
+  if (name === "find") return !findActions(args).names.some((w) => /^-(exec|execdir|ok|okdir)$/.test(w));
   if (name !== "git") return false;
   const call = gitCall(args);
   if (typeof call === "string") return false;
@@ -7637,6 +7767,12 @@ const LIST_OPTIONS: Record<string, ListSpec> = {
   find: { single: ["-files0-from"] },
 };
 function listOptions(name: string, args: string[]): string[] {
+  // (Round 50, Astra: a help or version query reads no list, `rsync --help --files-from=.netrc`.)
+  // (Round 54 and 55: a query opens only the filter files read before it exits.)
+  if (printsOnly(name, args)) return [];
+  if (name === "rsync" && rsyncReading(args).prints) return rsyncReading(args).opensBeforeExit;
+  // (Round 51, Sol: sort's list as its reader reads it, an option's value being no option.)
+  if (name === "sort") return sortReading(args).lists;
   // (B8-8: git's are its subcommand's, read after git's own leading options.)
   const call = name === "git" ? gitCall(args) : undefined;
   if (typeof call === "string") return [];
@@ -8285,3 +8421,6 @@ export function expansionProblem(command: string): GuardVerdict | undefined {
   }
   return undefined;
 }
+
+// (Round 43: see rules.ts `bare`.)
+bare(MAKE_OPTIONS, PATCH_OPTIONS, TAR_OPTIONS, QUOTED, GIT_KEYED_OPTIONS, GIT_MESSAGE_FLAGS, GIT_MESSAGE_SHORT, GIT_OPTIONS, GIT_VALUE_OPTIONS, INSTALLERS, GLOB_CLASSES, GLOB_CLASS_TESTS, DASH_DASH, GIT_DASH_DASH, RUNNERS, WRAPPER_SPECS, WRAPPER_OPERANDS, RUNNER_SPECS, PM_GLOBALS, COPY_OPTIONS, GIT_LIST_OPTIONS, LIST_OPTIONS, RUNNER_SELECTORS, KEYED, GIT_VALUES);
