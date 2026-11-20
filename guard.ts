@@ -16,7 +16,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { bare, bashVerdict, compressorReading, copiesNothing, findActions, printsOnly, sortReading, sortRunsCompressor, fileVerdict, parse, readVerdict, rsyncReading, tarReading, within, type Matcher, type Scope, type Simple } from "./rules.ts";
+import { bare, bashVerdict, compressorReading, copiesNothing, findActions, printsOnly, sortReading, sortRunsCompressor, fileVerdict, parse, readVerdict, rsyncReading, skippable, tarReading, within, type Matcher, type Scope, type Simple } from "./rules.ts";
 import { gitArgs, gitEnv } from "./sandbox.ts";
 
 const HOME = os.homedir();
@@ -545,6 +545,12 @@ export function unmodelled(s: string, depth = 0, within?: { variables: Variables
   if (parsed.opaque) return "shell syntax the rules do not model";
   const shell = shellProblem(parsed.cmds);
   if (shell) return shell;
+  // (Project review 3, round 6, Mythos: a `cd` on a line that a failure before it may end, an
+  // arithmetic expansion's or an assignment's to a read-only variable (rules.ts, `reach`): bash
+  // skips the `cd` with the rest of the line and runs the next line where it was, `: $((1/0)); cd
+  // sub⏎echo hi > ../o.txt`. The checks that place each command read every `cd` as one bash
+  // reaches, so such a call asks. Not in a substitution, which ends with the failure.)
+  if (!within && skippable(s).some((c) => c.argv.some((w) => ["cd", "pushd", "popd"].includes(w)))) return "a cd on a line that an expansion or an assignment before it may end (arithmetic, a substring's length, a read-only variable): bash then skips the cd and runs the next line where it was";
   for (const body of nestedBodies(parsed.cmds)) {
     const inner = unmodelled(body, depth + 1, undefined, variables.assigned);
     if (inner) return `${inner}, in a command a nested shell runs`;

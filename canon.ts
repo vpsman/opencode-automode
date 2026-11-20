@@ -1055,7 +1055,11 @@ let folds = 0;
 // Narrow on purpose. A variable counts only when all of this holds:
 //   - it is assigned in the commands the call begins with: each one word `name=value` and
 //     nothing else, followed by `;`, a newline or `&&`. Those run first and cannot fail, so
-//     everything after them sees the value;
+//     everything after them sees the value. (Project review 3, round 6, Mythos: unless the
+//     list an `&&` joins them to ends with `&`: bash runs that whole list as a job in a shell
+//     of its own, and after `x=foo && true & cp f ".git$x/hooks/pre-commit"` the call's `$x`
+//     is empty. The list is read to its first `;`, newline or `&`; where it holds a compound
+//     command, whose own `;` that may be, any `&` after it counts.)
 //   - the name is plain lower case (no variable bash sets, reads or keeps read-only is), the
 //     value is letters, digits and `_ . , / -`, and begins with none of the last four;
 //   - the call names the variable nowhere else, in any spelling, but as `$name` or `${name}`
@@ -1078,11 +1082,15 @@ let folds = 0;
 // heredoc, or the code handed to a nested shell (which does not see the variable).
 const CONSTANT = /^([a-z][a-z0-9_]*)=([A-Za-z0-9_][A-Za-z0-9_.,\/-]*)$/;
 const UNSPELLED_SETTER = /\(\(|\$\[|\$\{!/;
+// The reserved words that open a compound command, which may hold a `;` of its own.
+const COMPOUND_OPENERS = new Set(["{", "if", "while", "until", "for", "select", "case", "function", "coproc"]);
 const importsFunctions = () => Object.keys(process.env).some((name) => name.startsWith("BASH_FUNC_"));
 // `unspelled`: the printer saw a command that reads a file as shell code, or one whose name is
 // not written out.
 function constantsOf(tokens: Token[], text: string, unspelled: boolean): Map<string, string> {
   const found = new Map<string, string>();
+  // The names whose assignment an `&&` joins to the list that follows them.
+  let joined: string[] = [];
   let n = 0;
   for (;;) {
     while (tokens[n]?.type === "op" && (tokens[n] as Op).op === "\n") n++;
@@ -1093,7 +1101,24 @@ function constantsOf(tokens: Token[], text: string, unspelled: boolean): Map<str
     const m = whole === undefined ? null : CONSTANT.exec(whole);
     if (!m || !leading(w).startsWith(`${m[1]}=`)) break;
     found.set(m[1], m[2]);
+    joined = op.op === "&&" ? [...joined, m[1]] : [];
     n += 2;
+  }
+  if (joined.length) {
+    let end = "";
+    let compound = false;
+    let join = true;
+    for (let k = n; k < tokens.length && !end; k++) {
+      const t = tokens[k];
+      if (t.type === "op" && ["&&", "||", "|"].includes(t.op)) join = true;
+      else if (t.type === "op" && t.op === "\n" && join) continue;
+      else {
+        if (t.type === "op" && [";", "\n", "&"].includes(t.op)) end = t.op;
+        else if (t.type === "op" || (t.type === "word" && COMPOUND_OPENERS.has(fixed(t) ?? ""))) compound = true;
+        join = false;
+      }
+    }
+    if (end === "&" || (compound && tokens.slice(n).some((t) => t.type === "op" && t.op === "&"))) for (const name of joined) found.delete(name);
   }
   if (!found.size) return found;
   if (unspelled || importsFunctions()) return new Map();

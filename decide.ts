@@ -30,6 +30,7 @@ import {
   printsOnly,
   readVerdict,
   realish,
+  skippable,
   within,
   type Action,
   type Matcher,
@@ -5490,7 +5491,9 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   // (Project review 3, round 5, Mythos: a name arithmetic assigns is one the rules do not follow
   // from its assignment, `x=foo; : $((x=5)); echo hi > AGENTS$x`: the judged text holds no
   // arithmetic, so they are told.)
-  scope.reassigned = arithmeticSets;
+  // (Round 6, Mythos: nor one assigned on a line that a failure before the assignment may end,
+  // `: $((1/0)); x=foo⏎echo hi > AGENTS.md$x`: read off the text that runs, for the same reason.)
+  scope.reassigned = new Set([...arithmeticSets, ...skippable(run).flatMap((c) => c.argv.flatMap((w) => /^([A-Za-z_]\w*)(?:\[[^\]]*\])?\+?=/.exec(w)?.[1] ?? []))]);
   const verdict = bashVerdict(text, scope);
   if (verdict.action === "deny") return fromRules(verdict);
   const cwdKnown = !/(^|[\s;&|(])(cd|pushd|popd)(\s|$)/.test(text);

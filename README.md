@@ -90,7 +90,13 @@ For each shell tool call:
      option's letter (`printf -vx`, `wait -px`) anywhere in the call may assign again, nor
      one whose assignment not every run of the call reaches: behind `&&` or `||`, or inside a
      branch, a loop or a group (`false && x=foo; echo hi > .git$x/hooks/pre-commit`,
-     `if ...; then :; x=foo; fi`); and a compressor's operand the
+     `if ...; then :; x=foo; fi`), in a list that runs as a background job
+     (`x=foo && true &`: the whole list is the job), or, in a call of several lines, on a
+     line that a failure before it ends: bash skips the rest of a line, and runs the next,
+     after an arithmetic expansion that fails (`: $((1/0)); x=foo`), a substring length
+     below zero or an assignment to a read-only variable (`UID=1`), so no variable is
+     followed in such a call that names `readonly`, `declare` or `typeset`; and a
+     compressor's operand the
      rules cannot resolve asks. A place an option names (`unzip -d`, `tar -C`, rsync's
      `--log-file`, ...) is tested as a glob where it holds one (`tar -C sub/.gi?`) and, where
      it holds a variable, by the text beside it (`unzip -d .git/$x`) and by what the call's
@@ -277,7 +283,10 @@ For each shell tool call:
      follows a `cd` not every run of the call reaches is judged in each directory it may run
      in, its words and the files it redirects its output to
      (`true || cd sub; echo hi > ../o.txt` asks: without the `cd` that is a file above the
-     project). `~+`, and `$PWD` after a
+     project). In a call of several lines, a `cd` on a line that a failure before it may end
+     (arithmetic, a substring's length, an assignment to a read-only variable) asks: bash
+     skips it with the rest of the line, and runs the next line where it was
+     (`: $((1/0)); cd sub`, then `echo hi > ../o.txt` on the next line). `~+`, and `$PWD` after a
      `cd`, are read as the directory the command runs in (`cd src && echo x > $PWD/out.txt`
      writes `src/out.txt`, and so does `~+/out.txt`; a write through either into a protected
      place asks); another form of `$PWD` after a `cd` (`${PWD%/*}`) and a path
@@ -364,7 +373,8 @@ For each shell tool call:
      (`cat "$f"`), unless it is the variable of a `for f in <files>` loop whose files are
      known (`for f in *.ts; do head -3 "$f"; done` is an allow; a `$` bash leaves alone, as
      in `sed -n '5,$p' f`, names nothing) or a variable the call itself plainly sets to a
-     literal at its start (`name=foo; grep "$name" src` is judged as `grep foo src`); a
+     literal at its start (`name=foo; grep "$name" src` is judged as `grep foo src`; not where
+     the assignment heads a list that runs as a background job, `name=foo && true &`); a
      word that could become an option once bash expands it, for a program whose options
      are checked (`git diff $BASE`, `find "$dir" -name x`, `make $target`), `wc`, `du`,
      `file`, `grep` and `jq` among them, which have options that read a file of names
