@@ -510,3 +510,24 @@ test("closing round (Opus): a compressor's glob for a file the call itself makes
     "zcat z/*.gz",
   ]) assert.equal(await decide(command), "allow", command);
 });
+
+test("closing round (Opus re-check): a glob matches the files the call's earlier commands make", async () => {
+  for (const command of [
+    "printf '{}' | gzip > opencode.json.gz; gunzip ./*.gz",
+    "gzip -c f > lefthook.yml.gz; gunzip ./*.gz",
+    "gzip -c f > AGENTS.md.gz; gzip -d ./*.gz",
+    "gzip -c f > AGENTS.md.gz; gunzip -f ./*",
+    "gzip -c f > z/AGENTS.md.gz; gunzip -f z/*.gz",
+    "gzip -c f > sub/CLAUDE.md.gz; gunzip sub/*.gz",
+    "gzip -c f > .lefthook.yml.gz; gunzip .*.gz",
+    "gzip -c f | tee opencode.json.gz >/dev/null; gunzip ./*.gz",
+    "gzip -c f > ./opencode.json.gz && gunzip *.json.gz",
+    "xz -c f > AGENTS.md.xz; unxz ./*.xz",
+  ]) assert.equal(await decide(command), "ask", command);
+  for (const command of [
+    "gzip -c f > out.json.gz; gunzip ./*.gz",
+    "gzip -c f > n.txt.gz; gunzip -k ./*.gz",
+    "echo hi > notes.txt; gzip ./*.txt",
+    "gzip -c f > logs.gz; zcat ./*.gz",
+  ]) assert.equal(await decide(command), "allow", command);
+});

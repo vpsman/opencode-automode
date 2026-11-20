@@ -45,7 +45,7 @@ import { TEMP_CODE_CACHES, findGitEntries, gitArgs, Scan, gitEnv, gitReadsElsewh
 import { canonical, type Printed } from "./canon.ts";
 import { PathWalkError, PWD_LEAD, fetchDestination, functionNames, pathFinds, pathHas, procRelative, runsItsWords, tempDirs, unseenWriter } from "./guard.ts";
 import { bentEnv, bentPath, gitOnlyReads, runsAnyProgram, runsProjectCode } from "./guard.ts";
-import { abbreviates, allCommands, arithmeticAssignments, braceWords, expandNames, secondNames, expandWord, gitMessageWords, EDITOR_ASSIGNMENT, editorCommand, programs, withoutGlobals, alsoByName, argvGuards, dangerousName, envAssignmentsOk, expansionProblem, gitCall, gitProblem, inputReads, landing, linkedReads, literalTargets, located, physical, placedReads, present, cdTo, type Place, type Places, observer, protectedNameIn, runtimeReads, single, stricter, strict, strictCommands, textGuards, tilde, tildeMismatch, unmodelled, writesOf, writtenBy, type Single, type StrictCommand, getopt, GIT_OPTIONS, lastOf, type Getopt, unreadableGlob, withoutExpansions } from "./guard.ts";
+import { abbreviates, allCommands, arithmeticAssignments, braceWords, expandNames, globMatcher, secondNames, expandWord, gitMessageWords, EDITOR_ASSIGNMENT, editorCommand, programs, withoutGlobals, alsoByName, argvGuards, dangerousName, envAssignmentsOk, expansionProblem, gitCall, gitProblem, inputReads, landing, linkedReads, literalTargets, located, physical, placedReads, present, cdTo, type Place, type Places, observer, protectedNameIn, runtimeReads, single, stricter, strict, strictCommands, textGuards, tilde, tildeMismatch, unmodelled, writesOf, writtenBy, type Single, type StrictCommand, getopt, GIT_OPTIONS, lastOf, type Getopt, unreadableGlob, withoutExpansions } from "./guard.ts";
 
 export type Effect = "allow" | "ask" | "deny";
 
@@ -3963,6 +3963,23 @@ const herePlus = (word: string) => (word === "~+" ? "." : word.startsWith("~+/")
 function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined, dirsOf?: (cmd: Simple) => string[] | undefined, roots?: string[]): string | undefined {
   // Also every place the guard's own list of writes names (`cp -t`, `sort -o`, git's `--output`).
   const extra = writesOf(cmds).writes;
+  // (Project review 3, closing round, Opus: a glob also matches the files the call's earlier
+  // commands make, which no listing at decision time finds: `gzip -c f > opencode.json.gz;
+  // gunzip ./*.gz`. Each name as its writer spells it, matched segment by segment as bash
+  // matches, a leading `.` only by a leading `.`.)
+  const madeBefore = (cmd: Simple) =>
+    cmds
+      .slice(0, cmds.indexOf(cmd))
+      .flatMap((c) => [...c.out, ...extra.filter((w) => w.cmd === c).map((w) => w.word)])
+      .filter((w) => !/[$`*?[\]{}]/.test(w) && !w.startsWith("&"))
+      .map((w) => path.normalize(herePlus(w)));
+  const matchedBy = (word: string, names: string[]) => {
+    const segments = path.normalize(herePlus(word)).split("/");
+    return names.filter((name) => {
+      const parts = name.split("/");
+      return parts.length === segments.length && segments.every((s, i) => (/[*?[]/.test(s) ? globMatcher(s)(parts[i]).match && (s.startsWith(".") || !parts[i].startsWith(".")) : s === parts[i]));
+    });
+  };
   for (const cmd of cmds) {
     // (Project review 3, round 2, Mythos: with the second names a writer gives, a backup or a
     // compressor's output.)
@@ -3972,7 +3989,7 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       // (Each name as the word spells it from where the command runs: a project kept under a
       // directory of a protected name is not written "into" it by the names a glob matches.)
       const all = dirs.map((dir) => expandNames(word, dir)?.map((name) => path.normalize(name)).map((name) => (within(name, dir) ? path.relative(dir, name) || "." : name)));
-      return all.some((n) => n === undefined) ? undefined : all.flatMap((n) => n!);
+      return all.some((n) => n === undefined) ? undefined : [...all.flatMap((n) => n!), ...matchedBy(word, madeBefore(cmd))];
     };
     // (A suffix with a `/` puts the backup under another name's directory: not read.)
     const ends = (suffix: string) => suffix === "" || suffix.includes("/") || PROTECTED_NAMES.some((n) => n.length > suffix.length && n.endsWith(suffix));
