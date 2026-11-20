@@ -929,8 +929,11 @@ message), which is why pushes and ssh use deterministic rules instead.
 - **Builds and tests run the project's code.** In a session that has written nothing in the
   project, `make`, `npm test`, `cargo build` and project scripts are allows, and run what
   the repository holds without the model seeing it. Once the session has written there, or
-  the file that would run has changed since the session began, they go to the model, which
-  sees the command and the start of a named file, not everything a build runs.
+  a file the command names (or make's default makefile) has changed since the session began,
+  they go to the model, which sees the command and the start of a named file, not everything
+  a build runs. Change times are read only for those files: a `package.json` or `build.rs`
+  changed by something else after the session began leaves `npm test` and `cargo build`
+  allowed.
 - **Shells.** The checks model bash 5.2, and only bash, or an `sh` that is bash, is wrapped.
   Under dash, zsh, fish or any other shell every command that would be allowed asks; set
   opencode's shell to bash to use auto mode. A bash older than 5.2 is not told apart, and it
