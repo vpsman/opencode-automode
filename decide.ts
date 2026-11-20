@@ -1723,13 +1723,21 @@ export function scopeFor(guard: Guard, session: SessionState, cwd: string, rules
     picked: guard.picked,
     project: (p) => inCheckout(p, roots),
   });
+  // (Project review 3, round 3, Mythos: a name the call builds from its own variables.)
+  // Read from the project's top down, as writeProblem reads a landed path; a glob is held as
+  // protectedNameIn holds one (the names it matches on disk, or the pattern itself where it is
+  // written to reach a protected name or cannot be listed).
+  scope.protectedName = (p) => {
+    const root = roots.find((r) => within(p, r));
+    return !!protectedNameIn(root === undefined ? p : path.relative(root, p), PROTECTED_NAMES, root ?? "/");
+  };
   // Upstream takes the working directory as the project root; here it is the session's project.
   scope.root = roots.length ? session.project : undefined;
   return scope;
 }
 
 // Upstream's wording names Pi; say what it means here.
-const reword = (reason: string) => reason.replace(/Pi's own files/g, "opencode's own files (config, AGENTS.md, CLAUDE.md)");
+const reword = (reason: string) => reason.replace(/Pi's own files/g, "opencode's own files (config, AGENTS.md, CLAUDE.md, a hook manager's, .git)");
 
 function fromRules(v: Verdict): Decision {
   const effect: Effect = v.action === "deny" ? "deny" : v.action === "allow" ? "allow" : "ask";
@@ -3960,10 +3968,14 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
     const expand = (word: string) => {
       const dirs = dirsOf?.(cmd);
       if (!dirs?.length) return undefined;
-      const all = dirs.map((dir) => expandNames(word, dir));
-      return all.some((n) => n === undefined) ? undefined : all.flatMap((n) => n!.map((name) => path.normalize(name)));
+      // (Each name as the word spells it from where the command runs: a project kept under a
+      // directory of a protected name is not written "into" it by the names a glob matches.)
+      const all = dirs.map((dir) => expandNames(word, dir)?.map((name) => path.normalize(name)).map((name) => (within(name, dir) ? path.relative(dir, name) || "." : name)));
+      return all.some((n) => n === undefined) ? undefined : all.flatMap((n) => n!);
     };
-    const second = secondNames(cmd, extra, expand);
+    // (A suffix with a `/` puts the backup under another name's directory: not read.)
+    const ends = (suffix: string) => suffix === "" || suffix.includes("/") || PROTECTED_NAMES.some((n) => n.length > suffix.length && n.endsWith(suffix));
+    const second = secondNames(cmd, extra, expand, ends);
     if (second.unknown) return second.unknown;
     const targets = [...cmd.out, ...extra.filter((w) => w.cmd === cmd).map((w) => w.word), ...second.names];
     // Round 4, N3: the targets that make a file (see NAME_KEEPERS), with the operands after `--`.

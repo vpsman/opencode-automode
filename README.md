@@ -77,8 +77,16 @@ For each shell tool call:
      to the same test (`tar czf ../a.tgz .` asks as `cp x ../y` does), and so is a write that
      lands in a `.git` where the command runs (`cd .git/hooks && echo x > pre-commit`). So is
      a file's second name: the backup `sed -i<suffix>`, `cp`/`mv`/`ln`/`install -S` and
-     `patch -z`/`-B`/`-Y` make, and what a compressor writes in place (`gunzip AGENTS.md.gz`
-     makes `AGENTS.md`; `gzip AGENTS.md` replaces it).
+     `patch -z`/`-B`/`-Y` make (one name built from all three), and what a compressor writes
+     in place (`gunzip AGENTS.md.gz` and `gunzip AGENTS.md` make `AGENTS.md`; `gzip AGENTS.md`
+     replaces it); a backup name the command line does not show asks: the files a diff
+     names, and, where the suffix can be the end of a protected name (`cp -rS t`, not
+     `cp -r -S .bak`), the files inside a recursive copy, a glob that cannot be listed or a
+     word built at run time. A path
+     built from a variable the call sets to literal text is held to the same test as the rules
+     read it (`x=opencode; echo '{}' > $x.json`); a variable bash gives a value of its own
+     (`REPLY`, `FUNCNAME`, `DIRSTACK`, ...) is not followed, and a compressor's operand the
+     rules cannot resolve asks.
      Plus this plugin's additions (`DEFAULT_ASK` in `decide.ts`, and `guard.ts`): tokens on a
      `curl` line, hunting for credential files, git's own `-c` overrides outside a short
      list, `GIT_*`/`SSH_*`/`LD_*` environment however it is set (`NAME=`, `export`,

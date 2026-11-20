@@ -5343,9 +5343,31 @@ export const WORKTREE_GIT = new Set(["am", "checkout", "switch", "restore", "res
 // session's write record, where a compressor's copy is no write of content (README).
 // `unknown`: a second name the command line does not show, which the caller asks about (round 3,
 // Opus: `patch -b -z .md -p0 < a.diff` backs up the files the diff names).
-export function secondNames(cmd: Simple, writes: Write[], expand: (word: string) => string[] | undefined): { names: string[]; unknown?: string } {
+// `ends`: whether a suffix can be the end of a protected name. A backup of a file the command
+// line does not show is that file's name and the suffix, so only such a suffix can make one
+// (`cp -rS t` can make `.git`; `cp -r -S .bak` makes no protected name, whatever it copies).
+export function secondNames(cmd: Simple, writes: Write[], expand: (word: string) => string[] | undefined, ends: (suffix: string) => boolean = () => true): { names: string[]; unknown?: string } {
   const out: string[] = [];
   let unknown: string | undefined;
+  const glob = (word: string) => /[*?[]/.test(word);
+  // Round 3, Mythos: a glob is the names it matches here (`sed -i.md p *`); one that cannot be
+  // listed, or a word built at run time, gives backup names nobody can list. The pattern itself
+  // stays in the list: one written to reach a protected name is held to it whatever is on disk
+  // (`echo hi > CLAUDE; sed -i.md p CLAUD?`, where the glob is judged before the file is there).
+  const each = (word: string, why: string, matters = true): string[] => {
+    if (/[$`]/.test(word)) {
+      if (matters) unknown ??= `${why} of a name built at run time (${word})`;
+      return [];
+    }
+    if (!glob(word)) return [word];
+    const names = expand(word);
+    if (names === undefined && matters) unknown ??= `${why} of a glob the check cannot list (${word})`;
+    return [word, ...(names ?? [])];
+  };
+  const fixed = (word: string, why: string) => {
+    if (/[$`]/.test(word)) unknown ??= `${why} built at run time (${word})`;
+    return word;
+  };
   for (const at of programs(cmd.argv)) {
     const name = path.basename(cmd.argv[at]);
     const args = cmd.argv.slice(at + 1);
@@ -5354,35 +5376,51 @@ export function secondNames(cmd: Simple, writes: Write[], expand: (word: string)
     if (name === "sed") {
       for (const a of args) {
         const suffix = /^-[a-zA-Z]*i(.+)$/s.exec(a)?.[1] ?? /^--i[a-z-]*=(.+)$/s.exec(a)?.[1];
-        if (suffix !== undefined) for (const w of mine) out.push(w.word + suffix);
+        if (suffix !== undefined) for (const w of mine) for (const n of each(w.word, "sed -i's backup", ends(suffix))) out.push(n + suffix);
       }
     } else if (Object.hasOwn(COPY_OPTIONS, name)) {
-      const suffixes = getopt(args, COPY_OPTIONS[name]).opts.filter((o) => o.name === "-S" || o.name === "--suffix").map((o) => o.value ?? "");
+      const got = getopt(args, COPY_OPTIONS[name]);
+      const suffixes = got.opts.filter((o) => o.name === "-S" || o.name === "--suffix").map((o) => fixed(o.value ?? "", `${name}'s backup suffix`));
+      // Round 3, Mythos: a recursive copy backs up files inside the directories it copies.
+      // (cp and rsync only: ln's `-r` is `--relative`, and mv and install copy no directory's files.)
+      if (suffixes.some(ends) && (name === "cp" || name === "rsync") && got.opts.some((o) => ["-r", "-R", "-a", "--recursive", "--archive"].includes(o.name))) unknown ??= `${name} with a backup suffix in a recursive copy backs up files inside the directories it copies, which no command line shows`;
       for (const s of suffixes) {
         for (const w of mine) {
           // A destination may be a directory: the backup is then of the file each source lands on.
-          if (!w.dir) out.push(w.word + s);
-          for (const src of w.sources ?? []) out.push(`${w.word.replace(/\/+$/, "")}/${path.basename(src.replace(/\/+$/, ""))}${s}`);
+          if (!w.dir) for (const n of each(w.word, `${name}'s backup`, ends(s))) out.push(n + s);
+          for (const src of w.sources ?? []) for (const n of each(src, `${name}'s backup`, ends(s))) out.push(`${w.word.replace(/\/+$/, "")}/${path.basename(n.replace(/\/+$/, ""))}${s}`);
         }
       }
     } else if (name === "patch") {
       const got = getopt(args, PATCH_OPTIONS);
       const opts = got.opts;
-      const of = (...names: string[]) => opts.filter((o) => names.includes(o.name)).map((o) => o.value ?? "");
+      const of = (...names: string[]) => opts.filter((o) => names.includes(o.name)).map((o) => fixed(o.value ?? "", `patch ${o.name}`));
       const naming = opts.find((o) => ["-z", "--suffix", "-B", "--prefix", "-Y", "--basename-prefix"].includes(o.name));
       if (naming && !got.operands.length) unknown ??= `patch ${naming.name} names the backups of the files its diff names, which no command line shows`;
-      for (const w of mine) {
-        for (const s of of("-z", "--suffix")) out.push(w.word + s);
-        for (const p of of("-B", "--prefix")) out.push(p + w.word);
-        for (const p of of("-Y", "--basename-prefix")) out.push(path.join(path.dirname(w.word), p + path.basename(w.word)));
+      // GNU patch builds one name from all three: prefix, directory, basename prefix, basename,
+      // suffix (round 3, Mythos: `patch -b -Y .g -z t sub/i a.diff` makes `sub/.git`).
+      const [zs, bs, ys] = [of("-z", "--suffix"), of("-B", "--prefix"), of("-Y", "--basename-prefix")];
+      if (naming) {
+        for (const w of mine) {
+          for (const n of each(w.word, "patch's backup")) {
+            for (const b of ["", ...bs]) for (const y of ["", ...ys]) for (const z of ["", ...zs]) {
+              if (b || y || z) out.push(b + path.join(path.dirname(n), y + path.basename(n)) + z);
+            }
+          }
+        }
       }
     } else {
       const z = compressorReading(name, args);
       if (!z || !z.inPlace || z.reads) continue;
       for (const operand of z.operands) {
-        for (const n of /[*?[]/.test(operand) ? (expand(operand) ?? [operand]) : [operand]) {
-          const made = z.decompress ? z.outputName(n) : n;
-          if (made !== undefined) out.push(made);
+        // (A word built at run time is the rules' to judge: for gzip, gunzip, xz and zstd it is
+        // resolved from the call's own variables or asked about, rules.ts commandRead; any
+        // other compressor is a command the rules do not know, which goes to the model.)
+        if (/[$`]/.test(operand)) continue;
+        for (const n of glob(operand) ? (expand(operand) ?? [operand]) : [operand]) {
+          // Round 3, Mythos: a name without a known suffix is one gzip completes (`gunzip
+          // AGENTS.md` reads `AGENTS.md.gz`) and writes as given.
+          out.push(z.decompress ? (z.outputName(n) ?? n) : n);
         }
       }
     }

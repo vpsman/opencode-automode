@@ -171,6 +171,10 @@ export interface Scope {
   loopValues?: Map<string, string[]>;
   // Symbolic links the command being checked creates, to the path each leads to.
   links?: Map<string, string>;
+  // True for a path the caller protects by name (decide.ts: `.git`, opencode's project files, a
+  // hook manager's files). Held against a write's path as the rules resolve it, `$x` included
+  // (project review 3, round 3, Mythos: `x=opencode; echo '{}' > $x.json`).
+  protectedName?: (p: string) => boolean;
   // True for a variable the command does not set anywhere: it holds what the environment the
   // command starts with gives it (the environment of opencode, which runs it), or nothing.
   unassigned?: (name: string) => boolean;
@@ -332,7 +336,7 @@ const isGuarded = (p: string | undefined, scope: Scope) => !!p && scope.guarded.
 // in every directory. A change to them changes what later sessions do, so it asks you, also with
 // the chat decider. Your own allow rules can replace that ask.
 const CONTEXT_FILES = new Set(["AGENTS.md", "AGENTS.override.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]);
-const isPiFile = (p: string | undefined, scope: Scope) => !!p && (p.split("/").includes(".pi") || CONTEXT_FILES.has(path.basename(p)) || scope.piDirs.some((d) => within(p, d)));
+const isPiFile = (p: string | undefined, scope: Scope) => !!p && (p.split("/").includes(".pi") || CONTEXT_FILES.has(path.basename(p)) || scope.piDirs.some((d) => within(p, d)) || !!scope.protectedName?.(p));
 const piAsk = (reason: string): Verdict => ({ action: "ask", reason, firm: true });
 const inTmp = (p: string) => TMP_DIRS.some((d) => within(p, d, true));
 // Provably inside the project or a temp directory.
@@ -3678,6 +3682,24 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
         if (names.some((n) => path.basename(z.outputName(n) ?? "") === ".git")) return worst(verdict, ask(`${name} -d writes a file named .git`));
       }
     }
+    // (Project review 3, round 3, Mythos: what a compressor writes in place, read with the call's
+    // own variables, `x=AGENTS.md.gz; gunzip $x`; a name with no known suffix is written as given.
+    // Only a word with an expansion: a plain one is read where the whole command is checked
+    // (guard.ts, secondNames), and a plain glob there too, each name less its suffix, so that
+    // `gunzip *.gz` beside an AGENTS.md does not ask. A glob after the variable is the names it
+    // matches here, `x=sub; gunzip $x/*.gz`; a name the rules cannot resolve asks.)
+    if (z && z.inPlace && !z.reads) {
+      for (const a of z.operands) {
+        if (!/[$`]/.test(a)) continue;
+        const word = expandVars(a, scope);
+        if (/[$`]/.test(word)) return worst(verdict, ask(`${name} writes beside a file whose name is built at run time: ${a}`));
+        const names = /[*?[]/.test(word) ? globNames(word, scope) : [word];
+        if (names === undefined) return worst(verdict, ask(`${name} of a glob the rules cannot list: ${a}`));
+        for (const n of names) {
+          if (isPiFile(resolveWord(z.decompress ? (z.outputName(n) ?? n) : n, scope), scope)) return worst(verdict, piAsk(`${name} writes Pi's own files: ${a}`));
+        }
+      }
+    }
     for (const a of operands(args)) {
       if (!isLocal(resolveWord(a, scope), scope)) return worst(verdict, classify(`${name} with a path outside the working directory`));
     }
@@ -3809,6 +3831,9 @@ const FORK_BOMB = /:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/;
 // `curl ... | python3 -c "..."` is not one: the download is the program's input.
 const PIPE_TO_SHELL = /\b(curl|wget)\b[^|;&\n]*\|\s*(sudo\s+)?(env\s+)?(ba|z|da|k)?sh\b|\b(curl|wget)\b[^|;&\n]*\|\s*(python3?|node|perl|ruby)\s*(-\s*)?($|[|;&\n)])/;
 
+// The variables bash sets or computes by itself (bash 5.2, "Bash Variables"): what one expands to
+// is not the text a command assigned to it.
+const BASH_SETS = /^(_|BASH\w*|COMP_\w+|COMPREPLY|COPROC|DIRSTACK|EPOCH\w+|E?UID|FUNCNAME|GROUPS|HISTCMD|LINENO|LINES|COLUMNS|MAPFILE|OLDPWD|OPT(ARG|IND|ERR)|PIPESTATUS|PPID|PWD|RANDOM|READLINE_\w+|REPLY|SECONDS|SHELLOPTS|SHLVL|SRANDOM)$/;
 // `NAME=value` words of a command that only sets variables (or exports them).
 function assignments(argv: string[]): [string, string][] | undefined {
   const words = argv[0] === "export" ? argv.slice(1) : argv;
@@ -3876,7 +3901,10 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
       // expanded in an assignment.
       const text = expandVars(value, local);
       const i = cmd.argv.findIndex((w) => w.startsWith(`${name}=`));
-      if (namedOnce(name) && /^[\w./~@%+,:=-]*$/.test(text) && !cmd.dyn?.[i]) local.vars!.set(name, text.startsWith("~/") || text === "~" ? HOME + text.slice(1) : text);
+      // (Project review 3, round 3, Mythos: not a name bash gives a value of its own, whatever the
+      // command assigns: `FUNCNAME=x; mkdir sub/.git$FUNCNAME` makes `sub/.git`, `REPLY` is what a
+      // `read` took, `$DIRSTACK` is where the command runs.)
+      if (namedOnce(name) && !BASH_SETS.test(name) && /^[\w./~@%+,:=-]*$/.test(text) && !cmd.dyn?.[i]) local.vars!.set(name, text.startsWith("~/") || text === "~" ? HOME + text.slice(1) : text);
     }
   }
   return verdict.pattern && patterns.size > 1 ? { ...verdict, pattern: undefined } : verdict;
