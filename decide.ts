@@ -3960,6 +3960,8 @@ const PLAIN_TOOLS = new Set(
 );
 // `~+` is the directory the command runs in (round 42, Mythos).
 const herePlus = (word: string) => (word === "~+" ? "." : word.startsWith("~+/") ? `.${word.slice(2)}` : word);
+// Programs that make no file but by a redirect (closing round, Opus's second re-check).
+const ONLY_READS = new Set(["", "cd", "pushd", "popd", "pwd", "ls", "cat", "echo", "printf", "true", "false", ":", "test", "[", "grep", "rg", "head", "tail", "wc", "stat", "file", "du", "df", "sleep", "wait", "zcat"]);
 function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined, dirsOf?: (cmd: Simple) => string[] | undefined, roots?: string[]): string | undefined {
   // Also every place the guard's own list of writes names (`cp -t`, `sort -o`, git's `--output`).
   const extra = writesOf(cmds).writes;
@@ -3980,6 +3982,11 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       return parts.length === segments.length && segments.every((s, i) => (/[*?[]/.test(s) ? globMatcher(s)(parts[i]).match && (s.startsWith(".") || !parts[i].startsWith(".")) : s === parts[i]));
     });
   };
+  // (Project review 3, closing round, Opus's second re-check: whether a command before this one
+  // may make files: a redirect to anything but a device or a descriptor, a write the guard lists,
+  // or any program but a `cd` and a few that only read or print.)
+  const madesFiles = (cmd: Simple) =>
+    cmds.slice(0, cmds.indexOf(cmd)).some((c) => [...c.out, ...extra.filter((w) => w.cmd === c).map((w) => w.word)].some((w) => !/^(&|\/dev\/)/.test(w)) || !ONLY_READS.has(path.basename(c.argv[0] ?? "")));
   for (const cmd of cmds) {
     // (Project review 3, round 2, Mythos: with the second names a writer gives, a backup or a
     // compressor's output.)
@@ -3993,7 +4000,7 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
     };
     // (A suffix with a `/` puts the backup under another name's directory: not read.)
     const ends = (suffix: string) => suffix === "" || suffix.includes("/") || PROTECTED_NAMES.some((n) => n.length > suffix.length && n.endsWith(suffix));
-    const second = secondNames(cmd, extra, expand, ends);
+    const second = secondNames(cmd, extra, expand, ends, madesFiles(cmd));
     if (second.unknown) return second.unknown;
     const targets = [...cmd.out, ...extra.filter((w) => w.cmd === cmd).map((w) => w.word), ...second.names];
     // Round 4, N3: the targets that make a file (see NAME_KEEPERS), with the operands after `--`.

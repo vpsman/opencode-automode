@@ -504,7 +504,6 @@ test("closing round (Opus): a compressor's glob for a file the call itself makes
     "gunzip z/*.gz",
     "gunzip -k z/*.gz",
     "gzip -d z/*.gz",
-    "gzip -c f > out.gz; gunzip out.g?",
     "gunzip sub/a.txt.g?",
     "gzip z/*.txt",
     "zcat z/*.gz",
@@ -525,9 +524,30 @@ test("closing round (Opus re-check): a glob matches the files the call's earlier
     "xz -c f > AGENTS.md.xz; unxz ./*.xz",
   ]) assert.equal(await decide(command), "ask", command);
   for (const command of [
+    "echo hi > notes.txt; gzip ./*.txt",
+    "gzip -c f > logs.gz; zcat ./*.gz",
+  ]) assert.equal(await decide(command), "allow", command);
+});
+
+test("closing round (Opus, second re-check): a decompression's glob after the call may have made files asks", async () => {
+  for (const command of [
+    "gzip -c f > sub/AGENTS.md.gz; cd sub; gunzip ./*.gz",
+    "cd sub; gzip -c f > ../opencode.json.gz; cd ..; gunzip ./*.gz",
+    "gzip -c f > \"$PWD/opencode.json.gz\"; gunzip ./*.gz",
+    "cp sub/AGENTS.md.gz .; gunzip ./*.gz",
+    "cp -t . sub/AGENTS.md.gz; gunzip ./*.gz",
+    "ln sub/AGENTS.md.gz .; gunzip ./*.gz",
+    "tar xzf a.tgz; gunzip ./*.gz",
+    // By design: any file the call makes first, whatever its name.
+    "gzip -c f > out.gz; gunzip out.g?",
     "gzip -c f > out.json.gz; gunzip ./*.gz",
     "gzip -c f > n.txt.gz; gunzip -k ./*.gz",
-    "echo hi > notes.txt; gzip ./*.txt",
+  ]) assert.equal(await decide(command), "ask", command);
+  for (const command of [
+    "gunzip ./*.gz",
+    "cd z && gunzip *.gz",
+    "ls; gunzip ./*.gz",
+    "gunzip ./*.gz 2>/dev/null; ls",
     "gzip -c f > logs.gz; zcat ./*.gz",
   ]) assert.equal(await decide(command), "allow", command);
 });
