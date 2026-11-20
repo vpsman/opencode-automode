@@ -5341,8 +5341,11 @@ export const WORKTREE_GIT = new Set(["am", "checkout", "switch", "restore", "res
 // the input less its suffix, or the input it replaces (`gunzip AGENTS.md.gz`, `gzip AGENTS.md`).
 // Held to the protected-name test like every target (decide.ts, writeProblem); not added to the
 // session's write record, where a compressor's copy is no write of content (README).
-export function secondNames(cmd: Simple, writes: Write[], expand: (word: string) => string[] | undefined): string[] {
+// `unknown`: a second name the command line does not show, which the caller asks about (round 3,
+// Opus: `patch -b -z .md -p0 < a.diff` backs up the files the diff names).
+export function secondNames(cmd: Simple, writes: Write[], expand: (word: string) => string[] | undefined): { names: string[]; unknown?: string } {
   const out: string[] = [];
+  let unknown: string | undefined;
   for (const at of programs(cmd.argv)) {
     const name = path.basename(cmd.argv[at]);
     const args = cmd.argv.slice(at + 1);
@@ -5363,8 +5366,11 @@ export function secondNames(cmd: Simple, writes: Write[], expand: (word: string)
         }
       }
     } else if (name === "patch") {
-      const opts = getopt(args, PATCH_OPTIONS).opts;
+      const got = getopt(args, PATCH_OPTIONS);
+      const opts = got.opts;
       const of = (...names: string[]) => opts.filter((o) => names.includes(o.name)).map((o) => o.value ?? "");
+      const naming = opts.find((o) => ["-z", "--suffix", "-B", "--prefix", "-Y", "--basename-prefix"].includes(o.name));
+      if (naming && !got.operands.length) unknown ??= `patch ${naming.name} names the backups of the files its diff names, which no command line shows`;
       for (const w of mine) {
         for (const s of of("-z", "--suffix")) out.push(w.word + s);
         for (const p of of("-B", "--prefix")) out.push(p + w.word);
@@ -5381,7 +5387,7 @@ export function secondNames(cmd: Simple, writes: Write[], expand: (word: string)
       }
     }
   }
-  return out;
+  return { names: out, ...(unknown ? { unknown } : {}) };
 }
 
 export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Simple) => boolean): { writes: Write[]; unknown?: string; unlisted: Unlisted[] } {

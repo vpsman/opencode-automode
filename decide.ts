@@ -3963,7 +3963,9 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       const all = dirs.map((dir) => expandNames(word, dir));
       return all.some((n) => n === undefined) ? undefined : all.flatMap((n) => n!.map((name) => path.normalize(name)));
     };
-    const targets = [...cmd.out, ...extra.filter((w) => w.cmd === cmd).map((w) => w.word), ...secondNames(cmd, extra, expand)];
+    const second = secondNames(cmd, extra, expand);
+    if (second.unknown) return second.unknown;
+    const targets = [...cmd.out, ...extra.filter((w) => w.cmd === cmd).map((w) => w.word), ...second.names];
     // Round 4, N3: the targets that make a file (see NAME_KEEPERS), with the operands after `--`.
     const made = extra.filter((w) => w.cmd === cmd && !NAME_KEEPERS.has(w.by ?? "")).map((w) => w.word);
     // (Round 51, Sol: after a program that only prints its help, a later word is a command only
