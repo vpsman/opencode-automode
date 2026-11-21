@@ -733,6 +733,25 @@ const RESERVED = new Set(["if", "then", "elif", "else", "fi", "do", "done", "whi
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/s;
 // The variables bash makes read-only (bash 5.2): a plain assignment to one fails, and ends the line.
 const READONLY = /^(BASHOPTS|BASH_VERSINFO|EUID|PPID|SHELLOPTS|UID)(\[[^\]]*\])?\+?=/;
+// Reserved words that can lead a simple command (Project review 3, round 8, Neon: `! UID=1`,
+// `{ UID=1; }`, `if true; then UID=1; fi`, `while UID=1; do :; done`, `time -p UID=1`).
+const LEAD_ASSIGN = new Set(["if", "then", "elif", "else", "do", "while", "until", "!", "{"]);
+function afterLeads(argv: string[]): string[] {
+  let k = 0;
+  while (k < argv.length) {
+    const w = argv[k];
+    if (w === "time") {
+      k++;
+      while (k < argv.length && (argv[k] === "-p" || argv[k] === "--")) {
+        if (argv[k++] === "--") break;
+      }
+    } else if (LEAD_ASSIGN.has(w)) k++;
+    else break;
+  }
+  return argv.slice(k);
+}
+// A word bash may expand into several words (glob, brace expansion, unquoted expansion).
+const MAY_EXPAND = /[*?[\]{}$`]/;
 
 export function parse(command: string, depth = 0): Parsed {
   const result: Parsed = { cmds: [], opaque: depth > 4, grouped: false };
@@ -855,8 +874,9 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
       if (sub) cur.subshell = cur.nested = true;
       // (Project review 3, round 6, Mythos: an expansion read since the last command, its own or
       // one of a command that is not listed, `(( $((1/0)) ))`; or words that only assign, one of
-      // them to a variable bash keeps read-only, `UID=1`.)
-      if (st.aborts.n !== mark || (cur.argv.length > 0 && cur.argv.every((w) => ASSIGNMENT.test(w)) && cur.argv.some((w) => READONLY.test(w)))) cur.aborts = true;
+      // them to a variable bash keeps read-only, `UID=1`, including after leading keywords.)
+      const own = afterLeads(cur.argv);
+      if (st.aborts.n !== mark || (own.length > 0 && own.every((w) => ASSIGNMENT.test(w)) && own.some((w) => READONLY.test(w)))) cur.aborts = true;
       mark = st.aborts.n;
       last = cur;
       result.cmds.push(cur);
@@ -1292,8 +1312,16 @@ function readParam(s: string, start: number, st: ParseState): number {
   // it evaluates can be an error; a length below zero is one (`${y:0:-5}` of a short value, of
   // `$@` or of an array always), so a length passes only as digits. `${FUNCNAME:=x}` ends the
   // line without a word: bash refuses the assignment to a variable it keeps for itself.)
+  // (Project review 3, round 8, Neon: a leading 0 followed by more digits is octal in bash, where
+  // 8 or 9 fails and aborts the line (`${y:0:08}`, `${y:08}`, `${y: -08}`); empty `${y:}` and >2
+  // parts abort too.)
   const parts = m && !m[1] && offsets ? offsets[1].split(":") : [];
-  if ((m?.[4] !== undefined && !/^(\d+|[@*])$/.test(m[4])) || parts.some((part, k) => !(k === 0 ? /^\s*-?\d*\s*$/ : /^\s*\d*\s*$/).test(part)) || (assigns && (BASH_SETS.test(m![2]) || READONLY.test(`${m![2]}=`)))) st.aborts.n++;
+  const plainDec = (p: string, signed: boolean) => (signed ? /^\s*(?:-?(?:0|[1-9]\d*))?\s*$/ : /^\s*(?:0|[1-9]\d*)?\s*$/).test(p);
+  if (
+    (m?.[4] !== undefined && !/^(?:0|[1-9]\d*|[@*])$/.test(m[4])) ||
+    (m && !m[1] && offsets && (offsets[1] === "" || parts.length > 2 || parts.some((part, k) => !plainDec(part, k === 0)))) ||
+    (assigns && (BASH_SETS.test(m![2]) || READONLY.test(`${m![2]}=`)))
+  ) st.aborts.n++;
   const plain =
     !!m &&
     (rest === "" ||
@@ -2259,7 +2287,9 @@ export function rsyncReading(args: string[]) {
   // all of them for a version query.
   const helpAt = order.findIndex((e) => e.help);
   const opensBeforeExit = (helpAt >= 0 ? order.slice(0, helpAt) : order).flatMap((e) => (e.opens !== undefined ? [e.opens] : []));
-  return { longs, letters, shorts, operands, dryRun, listOnly, batch, server, prints, help, opensBeforeExit, daemon: prefixed("daemon"), copiesNothing: prints || (!server && (dryRun || listOnly || (!batch && operands.length < 2))), values: (name: string) => {
+  // (Project review 3, round 8, Neon: one operand that bash may expand into several words,
+  // `rsync sub/*`, `rsync ../*`, has an unknown operand count and may copy.)
+  return { longs, letters, shorts, operands, dryRun, listOnly, batch, server, prints, help, opensBeforeExit, daemon: prefixed("daemon"), copiesNothing: prints || (!server && (dryRun || listOnly || (!batch && operands.length < 2 && !operands.some((o) => MAY_EXPAND.test(o))))), values: (name: string) => {
       // (Round 48, Sol: the last `--log-file` is the one rsync opens, and an empty one none.)
       // A help word stops the reading where it stands: a log named after it is never opened.
       const all = (firstHelp >= 0 ? longs.slice(0, firstHelp) : longs).filter(([h]) => h === `--${name}`).map(([, v]) => v ?? "");
@@ -2983,6 +3013,12 @@ function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = 
       note(dest && intoDir ? path.join(dest, path.basename(source)) : dest, kept === "authored" || kept === "fetched" ? kept : "other", scope);
       if (cmd === "mv") note(from, "other", scope);
     }
+  } else if (COPIERS.has(cmd) && paths.length === 1 && MAY_EXPAND.test(paths[0])) {
+    // (Project review 3, round 8, Neon: one operand bash may expand into several words may supply
+    // both source and destination, unless `-t`/`--target-directory` or `install -d` already does.)
+    const hasTargetDir = cmd !== "rsync" && head.some((a) => shortIn(a, "t", cmd === "install" ? "Sgmo" : "S") || (a.startsWith("--target") && longIs(a, "target-directory")));
+    const installDir = cmd === "install" && head.some((a) => shortIn(a, "d", "Stgmo") || (a.length >= 5 && longIs(a, "directory")));
+    if (!hasTargetDir && !installDir) return ask(`${cmd} with one expanding operand (${paths[0]}): bash may expand it into both source and destination`);
   } else if (CONTENT_WRITERS.has(cmd)) {
     const literal = cmd === "tee" && literalInput;
     // Appending literal text to a file of the project makes it one the session wrote; any other
@@ -3144,7 +3180,7 @@ function gitConfig(opts: string[], rest: string[], dir: Scope, scope: Scope): Ve
   const newRead = action === "get" || action === "list";
   const newWrite = ["set", "unset", "rename-section", "remove-section", "edit"].includes(action ?? "");
   const reads = newRead || opt("get") || opt("get-all") || opt("get-regexp") || opt("get-urlmatch") || opt("get-color") || opt("get-colorbool") || opt("list", "l");
-  const writes = newWrite || opt("unset") || opt("unset-all") || opt("add") || opt("replace-all") || opt("rename-section") || opt("remove-section") || opt("edit", "e") || (!reads && words.length >= 2);
+  const writes = newWrite || opt("unset") || opt("unset-all") || opt("add") || opt("replace-all") || opt("rename-section") || opt("remove-section") || opt("edit", "e") || (!reads && (words.length >= 2 || (words.length === 1 && MAY_EXPAND.test(words[0]))));
   if (!writes) return ALLOW;
   if (opt("global") || opt("system")) return ask("changes git config outside the repository");
   const file = opts.flatMap((a, k) => (longIs(a, "file") ? [a.includes("=") ? a.slice(a.indexOf("=") + 1) : (opts[k + 1] ?? "")] : a === "-f" ? [opts[k + 1] ?? ""] : []));
@@ -3640,7 +3676,7 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
     const removes = r.longs.some(([h]) => /^--remove-(source|sent)-files$/.test(h) || (h.length >= 9 && "--remove-source-files".startsWith(h)));
     const deletes = r.longs.some(([h]) => /^--del/.test(h));
     let gone = ALLOW;
-    if (removes) for (const src of r.operands.slice(0, -1)) gone = worst(gone, deletion(src, scope));
+    if (removes) for (const src of r.operands.length === 1 ? r.operands : r.operands.slice(0, -1)) gone = worst(gone, deletion(src, scope));
     if (deletes) gone = worst(gone, deletion(r.operands.at(-1)!, scope));
     if (gone.action !== "allow") return worst(verdict, gone);
   }
@@ -3847,6 +3883,27 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
   if ((name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) && args.some((a) => /python_(functions|classes|files)=/.test(a))) return worst(verdict, classify("pytest collecting functions the call names"));
   if ((name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) && args.some((a) => /(^|[\s=])--(pdb|trace)/.test(a))) return worst(verdict, classify("pytest's debugger, which reads commands from standard input"));
   if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "mypy" && args.some((a) => (longIs(a, "install-types") || longIs(a, "python-executable")) && a.split("=")[0].length > 4)) return worst(verdict, classify("mypy that installs packages or runs another interpreter"));
+  // (Project review 3, round 8, Neon: `uniq`, `xxd` and `python3 -m json.tool` take `[IN [OUT]]`,
+  // so one operand that bash may expand into several words can overwrite the second match.)
+  const twoOpOperands = (tool: string, list: string[]): string[] => {
+    const out: string[] = [];
+    for (let k = 0; k < list.length; k++) {
+      const a = list[k];
+      if (a === "--") {
+        out.push(...list.slice(k + 1));
+        break;
+      }
+      if (a === "-" || !a.startsWith("-")) out.push(a);
+      else if (tool === "uniq" && (/^-[a-zA-Z]*[fsw]$/.test(a) || /^--(skip-fields|skip-chars|check-chars)$/.test(a))) k++;
+      else if (tool === "xxd" && /^-(c|cols|g|groupsize|l|len|n|name|o|s|seek|R)$/.test(a)) k++;
+      else if (tool === "json.tool" && a === "--indent") k++;
+    }
+    return out;
+  };
+  if (name === "uniq" || name === "xxd") {
+    const ops = twoOpOperands(name, args);
+    if (ops.length === 1 && MAY_EXPAND.test(ops[0])) return worst(verdict, ask(`${name} with one expanding operand (${ops[0]}): bash may expand it into both input and output`));
+  }
   if (READ_ONLY.has(name) || DEV_TOOLS.has(name)) return verdict;
   // (Council project review 2, round 34, Mythos: unittest imports and calls any name it is given,
   // `python3 -m unittest code.interact` then runs standard input as Python; its names must be the
@@ -3857,6 +3914,10 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
   // (Round 38, Mythos: venv writes its directory, and --clear empties it first.)
   // (`--upgrade-deps` runs pip install in the new environment.)
   if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "venv") return worst(verdict, args.some((a) => longIs(a, "upgrade-deps") && a.length > 4) ? classify("venv --upgrade-deps installs packages") : ALLOW, venvTargets(args.slice(2), ["--prompt"], scope));
+  if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "json.tool") {
+    const ops = twoOpOperands("json.tool", args.slice(2));
+    if (ops.length === 1 && MAY_EXPAND.test(ops[0])) return worst(verdict, ask(`${name} -m json.tool with one expanding operand (${ops[0]}): bash may expand it into both input and output`));
+  }
   if (/^python3?$/.test(name) && args[0] === "-m" && PY_MODULES.has(args[1]) && !cmd.heredoc && (args[1] !== "unittest" || unittestNamesOwn(args.slice(2), scope))) return verdict;
   // `node --test`: the test runner over the project's test files, as `npm test` runs it.
   if (name === "node" && args[0] === "--test" && !cmd.heredoc) {
@@ -3933,7 +3994,14 @@ const LEADS = new Set(["{", "if", "while", "until", "then", "else", "elif", "do"
 // before it. A `case`, a `function` or a `coproc`, whose ends the count does not read, leaves it
 // open for the rest of the call, and so does a `[[` whose `]]` is not in the same command.
 function opened(inside: number, argv: string[]): number {
-  for (const w of argv) {
+  for (let i = 0; i < argv.length; i++) {
+    const w = argv[i];
+    if (w === "time") {
+      while (i + 1 < argv.length && (argv[i + 1] === "-p" || argv[i + 1] === "--")) {
+        if (argv[++i] === "--") break;
+      }
+      continue;
+    }
     if (OPENS.has(w)) inside++;
     else if (CLOSES.has(w)) inside--;
     else if (["case", "function", "coproc"].includes(w) || (w === "[[" && argv.at(-1) !== "]]")) inside = Infinity;

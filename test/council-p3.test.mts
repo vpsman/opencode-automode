@@ -597,3 +597,83 @@ test("closing round (Opus, third re-check): a file-making command anywhere in th
     "x=z; gunzip $x/*.gz",
   ]) assert.equal(await decide(command), "allow", command);
 });
+
+test("round 8 (Neon): readonly after keywords, invalid octal substrings, and one-glob writers ask", async () => {
+  const repo8 = path.join(base, "repo8");
+  for (const d of ["sub", "sub2", "sub3", "slink", "src", "dst", "a", "b"]) fs.mkdirSync(path.join(repo8, d), { recursive: true });
+  fs.writeFileSync(path.join(repo8, "sub", "a"), "hello\n");
+  fs.writeFileSync(path.join(repo8, "sub", "AGENTS.md"), "orig\n");
+  fs.writeFileSync(path.join(repo8, "sub2", "a"), "hello\n");
+  fs.writeFileSync(path.join(repo8, "sub2", "AGENTS"), "orig\n");
+  fs.writeFileSync(path.join(repo8, "sub3", "a"), "hello\n");
+  fs.writeFileSync(path.join(repo8, "sub3", "x.test.js"), "orig\n");
+  fs.writeFileSync(path.join(repo8, "f"), "hello\n");
+  fs.writeFileSync(path.join(repo8, "notes.txt"), "hello\n");
+  fs.writeFileSync(path.join(repo8, "src", "a.ts"), "export {};\n");
+  fs.writeFileSync(path.join(repo8, "package.json"), '{"scripts":{"test":"echo ok"}}\n');
+  execFileSync("git", ["init", "-q", "-b", "main", repo8]);
+  fs.writeFileSync(path.join(repo8, "slink", "a"), "hello\n");
+  fs.symlinkSync(path.join(repo8, ".git", "hooks", "pre-commit"), path.join(repo8, "slink", "z"));
+  const decide8 = async (command: string) => (await decideShell(guard, new SessionState(repo8), repo8, command)).effect;
+
+  for (const command of [
+    // Finding 1: readonly assignment after leading keywords aborts the line.
+    "! UID=1; x=foo\nrm -rf $x/home",
+    "{ UID=1; }; x=foo\nrm -rf $x/home",
+    "if true; then UID=1; fi; x=foo\nrm -rf $x/home",
+    "while UID=1; do :; done; x=foo\nrm -rf $x/home",
+    "time UID=1; x=foo\nrm -rf $x/home",
+    "time -p UID=1; x=foo\nrm -rf $x/home",
+    "! UID=1; cd sub\nrm -rf x",
+    // Finding 2: invalid octal literals in substring offsets/lengths.
+    'y=abc; : "${y:0:08}"; x=foo\nrm -rf $x/home',
+    'y=abc; : "${y:08}"; x=foo\nrm -rf $x/home',
+    'y=abc; : "${y: -08}"; x=foo\nrm -rf $x/home',
+    'y=abc; : "${y:0:09}"; x=foo\nrm -rf $x/home',
+    // Finding 3: rsync with one expanding operand does not copy nothing.
+    "rsync sub/*",
+    "rsync sub3/*",
+    "rsync ../*",
+    // Finding 4: two-operand writers with one expanding operand, and glob targets matching symlinks.
+    "cp -b -S .md sub2/*",
+    "uniq sub/*",
+    "uniq sub3/*",
+    "xxd sub/*",
+    "xxd sub3/*",
+    "python3 -m json.tool sub/*",
+    "python3 -m json.tool sub3/*",
+    "cp sub3/*",
+    "cp slink/*",
+    "cp f slink/*",
+    "sed -i 's/a/b/' slink/*",
+    "tee slink/*",
+    "mv sub3/*",
+    "install sub3/*",
+    "ln sub3/*",
+  ]) assert.equal(await decide8(command), "ask", command);
+
+  // Even if approved or followed in a session, `cp sub3/*` asks directly and cannot silently leave `npm test` allowed.
+  const ss = new SessionState(repo8);
+  const d1 = await decideShell(guard, ss, repo8, "cp sub3/*");
+  assert.equal(d1.effect, "ask");
+  d1.approve?.();
+  assert.equal((await decideShell(guard, ss, repo8, "npm test")).effect, "ask");
+
+  for (const command of [
+    "rsync -a src/ dst/",
+    "rsync -n -a src/ dst/",
+    "cp -r a b",
+    "cp src/*.ts dst/",
+    "cp -t dst src/*",
+    "cp --target-directory=dst src/*",
+    "install -d dst/*",
+    "uniq notes.txt",
+    "uniq -f 1 notes.txt",
+    "xxd f",
+    "xxd -l 16 f",
+    "python3 -m json.tool package.json",
+    "python3 -m json.tool --indent 2 package.json",
+    'y=abc; echo "${y:0:2}"',
+    'y=abc; echo "${y: -1}"',
+  ]) assert.equal(await decide8(command), "allow", command);
+});

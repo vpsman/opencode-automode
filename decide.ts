@@ -4138,18 +4138,28 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       if (name === ".git") return `writes ${target}: a path inside or named .git, where git finds hooks and config`;
       if (name) return `writes ${target}, which opencode or a git hook loads and runs`;
       const t = tilde(herePlus(target));
-      if (/[$`*?[\]{}]/.test(target) || /^~[^/]/.test(t) || /^&/.test(target) || roots === undefined) continue;
+      if (/[$`]/.test(target) || /^~[^/]/.test(t) || /^&/.test(target) || roots === undefined) continue;
+      // (Project review 3, round 8, Neon: a glob target can match a symlink to a protected path,
+      // `cp slink/*` or `cp f slink/*` where `slink/z -> ../.git/hooks/pre-commit`: resolve each
+      // match too.)
+      const isGlob = /[*?[\]{}]/.test(target);
       for (const dir of path.isAbsolute(t) ? ["/"] : (dirsOf?.(cmd) ?? [])) {
-        const full = path.isAbsolute(t) ? t : `${dir}/${t}`;
-        // (Council project review 2, round 24, Mythos: a device by its normalised path, not a
-        // `/dev/` prefix of the words, `/dev/../tmp/o/l/hooks/pre-commit`.)
-        if (isDevice(full, undefined) || procRelative(full)) continue;
-        const landed = physical(full);
-        const root = roots.find((r) => within(landed, r));
-        const below = root === undefined ? landed : path.relative(root, landed);
-        const at = protectedNameIn(below, PROTECTED_NAMES);
-        if (at === ".git") return `writes ${target}, which is ${landed} where it runs: a path inside or named .git, where git finds hooks and config`;
-        if (at) return `writes ${target}, which is ${landed} where it runs: a file opencode or a git hook loads and runs`;
+        const landedAll = isGlob
+          ? (expandWord(t, dir) ?? [])
+          : (() => {
+              const full = path.isAbsolute(t) ? t : `${dir}/${t}`;
+              return isDevice(full, undefined) || procRelative(full) ? [] : [physical(full)];
+            })();
+        for (const landed of landedAll) {
+          // (Council project review 2, round 24, Mythos: a device by its normalised path, not a
+          // `/dev/` prefix of the words, `/dev/../tmp/o/l/hooks/pre-commit`.)
+          if (isDevice(landed, undefined) || procRelative(landed)) continue;
+          const root = roots.find((r) => within(landed, r));
+          const below = root === undefined ? landed : path.relative(root, landed);
+          const at = protectedNameIn(below, PROTECTED_NAMES);
+          if (at === ".git") return `writes ${target}, which is ${landed} where it runs: a path inside or named .git, where git finds hooks and config`;
+          if (at) return `writes ${target}, which is ${landed} where it runs: a file opencode or a git hook loads and runs`;
+        }
       }
     }
   }

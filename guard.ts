@@ -607,9 +607,10 @@ function scan(s: string, depth: number, variables: Variables, offset: number, ki
     variables.uses.add(name);
     return undefined;
   };
-  // A subscript or a substring offset from `from`: a number, or a name that holds an integer.
+  // A subscript or a substring offset from `from`: a number (no leading 0 before more digits, which
+  // bash reads as octal), or a name that holds an integer.
   const index = (expr: string, from: number): string | undefined => {
-    const m = /^(-?\d+)$|^(\$?)([A-Za-z_]\w*)$|^\$\{([A-Za-z_]\w*)\}$/.exec(expr);
+    const m = /^(-?(?:0|[1-9]\d*))$|^(\$?)([A-Za-z_]\w*)$|^\$\{([A-Za-z_]\w*)\}$/.exec(expr);
     if (!m) return "an array subscript or offset that is not a number or a plain variable, which bash evaluates as arithmetic";
     if (m[1] !== undefined) return undefined;
     return m[3] !== undefined ? integer(m[3], from + m[2].length) : integer(m[4], from + 2);
@@ -679,7 +680,7 @@ function scan(s: string, depth: number, variables: Variables, offset: number, ki
     words.push(raw);
 
     // What the word sets: `name=5` and `name=$((...))` give an integer; a subscript is arithmetic.
-    const literal = /^([A-Za-z_]\w*)=-?\d+$/.exec(raw);
+    const literal = /^([A-Za-z_]\w*)=-?(?:0|[1-9]\d*)$/.exec(raw);
     const computed = arithmeticValue && arithmeticValue.begin === begin && arithmeticValue.end === end - 1 ? arithmeticValue.name : undefined;
     arithmeticValue = undefined;
     const name = literal?.[1] ?? computed;
@@ -849,7 +850,9 @@ function scan(s: string, depth: number, variables: Variables, offset: number, ki
       if (close < 0) return "an unterminated ${";
       // `${x:offset}` and `${x:offset:length}`, each a number or a variable that holds one.
       let from = i + 1;
-      for (const part of s.slice(from, close).split(":")) {
+      const parts = s.slice(from, close).split(":");
+      if (parts.length > 2) return "a substring expansion with more than an offset and a length";
+      for (const part of parts) {
         const lead = /^ ?/.exec(part)![0].length;
         const found = index(part.slice(lead), from + lead);
         if (found) return found;
@@ -5058,7 +5061,7 @@ function compressorWrites(name: string, args: string[]): { files: string[]; dirs
     }
   } else if (name === "lz4" || name === "lz4c") {
     const operands = args.filter((a) => !a.startsWith("-"));
-    if (!args.some((a) => /^(-[a-zA-Z0-9]*m|--multiple)$/.test(a)) && operands.length > 1) files.push(operands[1]);
+    if (!args.some((a) => /^(-[a-zA-Z0-9]*m|--multiple)$/.test(a)) && (operands.length > 1 || (operands.length === 1 && /[*?[\]{}$`]/.test(operands[0])))) files.push(operands.length > 1 ? operands[1] : operands[0]);
   } else if (name === "zip") {
     const VALUED = /^-(b|n|t|tt|O|P|s|sp|Z|ds)$|^--(output-file|temp-path|suffixes|from-date|before-date|password|split-size|compression-method)$/;
     for (let i = 0; i < args.length; i++) {
@@ -5482,8 +5485,8 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       if (name === "tee" || name === "truncate") files.forEach((f) => add(f, true));
       else if (name === "sed" && args.some((a) => /^(-[a-zA-Z]*i|--in-place)/.test(a))) files.slice(args.some((a) => /^(-[a-zA-Z]*e$|--expression)/.test(a)) ? 0 : 1).forEach((f) => add(f, true));
       else if ((name === "perl" || name === "ruby") && args.some((a) => /^-[a-zA-Z]*i/.test(a))) files.slice(args.some((a) => /^-[a-zA-Z]*e$/.test(a)) ? 1 : 0).forEach((f) => add(f, false));
-      // An rsync that copies nothing (a dry run, a listing, one operand) writes no destination; its
-      // option places are still read below (round 41).
+      // An rsync that copies nothing (a dry run, a listing, one non-expanding operand) writes no
+      // destination; its option places are still read below (round 41).
       else if (["cp", "mv", "ln", "install", "rsync"].includes(name) && !copiesNothing(name, args)) {
         // `-t DIR` / `--target-directory=DIR`: every operand is a source (the rules read the last
         // one as the destination and never look at DIR).
@@ -5492,9 +5495,17 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
         const words = copyWords(name, args);
         const t = words.unknown ? valued(args, "t", "--target-directory").at(-1) : words.target;
         const operands = words.unknown ? files.filter((f) => f !== t && !(name === "install" && valued(args, "m", "--mode").includes(f))) : words.operands;
+        const installsDir = name === "install" && (words.unknown ? args.some((a) => /^-[a-zA-Z]*d/.test(a) || /^--dir/.test(a)) : getopt(args, COPY_OPTIONS.install).opts.some((o) => o.name === "-d" || o.name === "--directory"));
+        const oneExpands = t === undefined && !installsDir && operands.length === 1 && /[*?[\]{}$`]/.test(operands[0]);
         if (t !== undefined) add(t, false, { dir: true, sources: operands });
         else if (operands.length > 1) add(operands.at(-1), true, { sources: operands.slice(0, -1) });
-        else if (name === "ln" && operands.length === 1) add(path.basename(operands[0]), false, { sources: operands });
+        else if (oneExpands) {
+          // (Project review 3, round 8, Neon: one expanding operand may supply both source and destination.)
+          add(operands[0], false, { sources: operands });
+          const why = `${name} ${operands[0]}: one word bash may expand into both source and destination`;
+          unknown ??= why;
+          unlisted.push({ cmd, reason: why, dirs: [undefined] });
+        } else if (name === "ln" && operands.length === 1) add(path.basename(operands[0]), false, { sources: operands });
         // A hard link makes the source the same file as the link: a write through either name
         // writes both, so the source is the session's too.
         if (words.hard) for (const src of t !== undefined || operands.length === 1 ? operands : operands.slice(0, -1)) add(src, false);
@@ -5518,20 +5529,50 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       else if (name === "tree") valued(args, "o", "--never").forEach((f) => add(f, false));
       else if (name === "less") [...valued(args, "o", "--log-file"), ...valued(args, "O", "--LOG-FILE")].forEach((f) => add(f, false));
       // (Round 3: `-` is the input operand, `uniq - out`; the last of two or more operands is the
-      // output, an option's value counted among them, which can only record more.)
+      // output. Project review 3, round 8, Neon: one operand bash may expand into several words
+      // (`uniq sub/*`, `xxd sub/*`, `python3 -m json.tool sub/*`) may supply both input and output.)
       // (Council project review 1, round 6: `python3 -m json.tool IN OUT` writes OUT.)
       else if (/^python[0-9.]*$/.test(name) && args.some((a, k) => (a === "-m" && args[k + 1] === "json.tool") || a === "-mjson.tool")) {
         const at = args.findIndex((a, k) => (a === "-m" && args[k + 1] === "json.tool") || a === "-mjson.tool");
         const rest = args.slice(at + (args[at] === "-m" ? 2 : 1));
-        const end = rest.indexOf("--");
-        const operands = [...(end < 0 ? rest : rest.slice(0, end)).filter((a) => a === "-" || !a.startsWith("-")), ...(end < 0 ? [] : rest.slice(end + 1))];
-        if (operands.length > 1) add(operands[1], true);
+        const operands: string[] = [];
+        for (let k = 0; k < rest.length; k++) {
+          const a = rest[k];
+          if (a === "--") {
+            operands.push(...rest.slice(k + 1));
+            break;
+          }
+          if (a === "-" || !a.startsWith("-")) operands.push(a);
+          else if (a === "--indent") k++;
+        }
+        if (operands.length > 1) add(operands[1], false);
+        else if (operands.length === 1 && /[*?[\]{}$`]/.test(operands[0])) {
+          add(operands[0], false);
+          const why = `${name} -m json.tool ${operands[0]}: one word bash may expand into both input and output`;
+          unknown ??= why;
+          unlisted.push({ cmd, reason: why, dirs: [undefined] });
+        }
       }
       else if (name === "uniq" || name === "xxd") {
         // (Round 41, Mythos: the words after `--` are operands, `-/../x` too.)
-        const end = args.indexOf("--");
-        const operands = [...(end < 0 ? args : args.slice(0, end)).filter((a) => a === "-" || !a.startsWith("-")), ...(end < 0 ? [] : args.slice(end + 1))];
-        add(operands.length > 1 ? operands.at(-1) : undefined, false);
+        const operands: string[] = [];
+        for (let k = 0; k < args.length; k++) {
+          const a = args[k];
+          if (a === "--") {
+            operands.push(...args.slice(k + 1));
+            break;
+          }
+          if (a === "-" || !a.startsWith("-")) operands.push(a);
+          else if (name === "uniq" && (/^-[a-zA-Z]*[fsw]$/.test(a) || /^--(skip-fields|skip-chars|check-chars)$/.test(a))) k++;
+          else if (name === "xxd" && /^-(c|cols|g|groupsize|l|len|n|name|o|s|seek|R)$/.test(a)) k++;
+        }
+        if (operands.length > 1) add(operands.at(-1), false);
+        else if (operands.length === 1 && /[*?[\]{}$`]/.test(operands[0])) {
+          add(operands[0], false);
+          const why = `${name} ${operands[0]}: one word bash may expand into both input and output`;
+          unknown ??= why;
+          unlisted.push({ cmd, reason: why, dirs: [undefined] });
+        }
       }
       else if ((name === "yq" || name === "jq") && args.some((a) => /^(-[a-zA-Z]*i|--inplace)$/.test(a))) files.slice(1).forEach((f) => add(f, false));
       // B7-7: a directory or a file an option names for the program to write in: tar's `-C` and
