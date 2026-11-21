@@ -520,7 +520,7 @@ function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope)
     if (["log", "shortlog", "rev-list", "whatchanged"].includes(sub ?? "") && !args.some(shows)) return undefined;
   }
   // An in-place edit shows nothing, and a destination is written, not read.
-  if (name === "sed" && args.some((a) => /^(-i|--in-place)/.test(a) || /^-[a-zA-Z]*i/.test(a))) return undefined;
+  if (name === "sed" && sedReading(args).inPlace) return undefined;
   let words = args;
   if (PATTERN_FIRST.has(name)) words = operands(args).slice(1);
   else if (COPIERS.has(name)) {
@@ -1315,10 +1315,12 @@ function readParam(s: string, start: number, st: ParseState): number {
   // (Project review 3, round 8, Neon: a leading 0 followed by more digits is octal in bash, where
   // 8 or 9 fails and aborts the line (`${y:0:08}`, `${y:08}`, `${y: -08}`); empty `${y:}` and >2
   // parts abort too.)
+  // (Project review 3, round 9: a value past 2^63-1 wraps negative in bash and aborts the line,
+  // `${y:0:9223372036854775808}`; cap plain numbers at 18 digits, in step with canon.ts and guard.ts.)
   const parts = m && !m[1] && offsets ? offsets[1].split(":") : [];
-  const plainDec = (p: string, signed: boolean) => (signed ? /^\s*(?:-?(?:0|[1-9]\d*))?\s*$/ : /^\s*(?:0|[1-9]\d*)?\s*$/).test(p);
+  const plainDec = (p: string, signed: boolean) => (signed ? /^\s*(?:-?(?:0|[1-9]\d{0,17}))?\s*$/ : /^\s*(?:0|[1-9]\d{0,17})?\s*$/).test(p);
   if (
-    (m?.[4] !== undefined && !/^(?:0|[1-9]\d*|[@*])$/.test(m[4])) ||
+    (m?.[4] !== undefined && !/^(?:0|[1-9]\d{0,17}|[@*])$/.test(m[4])) ||
     (m && !m[1] && offsets && (offsets[1] === "" || parts.length > 2 || parts.some((part, k) => !plainDec(part, k === 0)))) ||
     (assigns && (BASH_SETS.test(m![2]) || READONLY.test(`${m![2]}=`)))
   ) st.aborts.n++;
@@ -1965,49 +1967,86 @@ function sedScriptSafe(script: string): boolean {
   return true;
 }
 
-function sed(args: string[], scope: Scope): Verdict {
+// GNU sed permutes options before `--` (project review 3, round 9: `sed 's/a/b/' ../outside.txt -i`
+// edits in place; abbreviated long options like `--in` / `--in-pl` are also accepted by getopt_long).
+export interface SedReading {
+  inPlace: boolean;
+  sandbox: boolean;
+  scripts: string[];
+  files: string[];
+  suffixes: string[];
+  loadsFile: boolean;
+  unknownShort?: string;
+  unknownLong?: string;
+}
+export function sedReading(args: string[]): SedReading {
   const scripts: string[] = [];
+  const pos: string[] = [];
+  const suffixes: string[] = [];
   let inPlace = false;
   let sandbox = false;
-  let k = 0;
-  let dashed = false;
-  for (; k < args.length && args[k].startsWith("-") && args[k] !== "-"; k++) {
+  let loadsFile = false;
+  let unknownShort: string | undefined;
+  let unknownLong: string | undefined;
+  let ended = false;
+  for (let k = 0; k < args.length; k++) {
     const a = args[k];
+    if (ended || a === "-" || !a.startsWith("-")) {
+      pos.push(a);
+      continue;
+    }
     if (a === "--") {
-      k++;
-      dashed = true;
-      break;
+      ended = true;
+      continue;
     }
     if (a.startsWith("--")) {
       if (a === "--sandbox") sandbox = true;
-      else if (/^--(expression)$/.test(a)) scripts.push(args[++k] ?? "");
-      else if (/^--expression=/.test(a)) scripts.push(a.slice(13));
-      else if (/^--in-place(=|$)/.test(a)) inPlace = true;
-      else if (/^--line-length$/.test(a)) k++;
-      else if (!/^--(quiet|silent|regexp-extended|separate|unbuffered|null-data|posix|debug|follow-symlinks|binary|line-length=\d+)$/.test(a)) return classify(`sed ${a.split("=")[0]}: an option the rules do not model`);
+      else if (a === "--expression") scripts.push(args[++k] ?? "");
+      else if (a.startsWith("--expression=")) scripts.push(a.slice(13));
+      else if (a === "--in-place") inPlace = true;
+      else if (a.startsWith("--in-place=")) {
+        inPlace = true;
+        if (a.length > 11) suffixes.push(a.slice(11));
+      } else if (a === "--file" || a.startsWith("--file=")) {
+        loadsFile = true;
+        if (a === "--file") k++;
+      } else if (a === "--line-length") k++;
+      else if (/^--(quiet|silent|regexp-extended|separate|unbuffered|null-data|posix|debug|follow-symlinks|binary)$/.test(a) || /^--line-length=\d+$/.test(a)) continue;
+      else unknownLong ??= a;
       continue;
     }
-    let j = 1;
-    for (; j < a.length; j++) {
+    for (let j = 1; j < a.length; j++) {
       const ch = a[j];
       if ("nErsuzb".includes(ch)) continue;
       if (ch === "i") {
         inPlace = true;
+        if (j + 1 < a.length) suffixes.push(a.slice(j + 1));
         break;
       }
-      if (ch === "e" || ch === "l") {
+      if (ch === "e" || ch === "l" || ch === "f") {
         const value = j + 1 < a.length ? a.slice(j + 1) : args[++k];
         if (ch === "e") scripts.push(value ?? "");
+        else if (ch === "f") loadsFile = true;
         break;
       }
-      return classify(`sed -${ch}: an option the rules do not model`);
+      unknownShort ??= `-${ch}`;
+      break;
     }
   }
-  const rest = args.slice(k);
-  if (!scripts.length) scripts.push(rest.shift() ?? "");
-  if (!sandbox && !scripts.every(sedScriptSafe)) return classify("sed script that runs commands or reads or writes other files");
+  const hasScriptOpt = scripts.length > 0 || loadsFile;
+  const files = hasScriptOpt ? pos : pos.slice(1);
+  if (!hasScriptOpt) scripts.push(pos[0] ?? "");
+  return { inPlace, sandbox, scripts, files, suffixes, loadsFile, unknownShort, unknownLong };
+}
+
+function sed(args: string[], scope: Scope): Verdict {
+  const r = sedReading(args);
+  if (r.unknownLong) return { ...ask(`sed ${r.unknownLong.split("=")[0]}: an option the rules do not read`), spelling: true };
+  if (r.loadsFile) return classify("sed runs a script from a file");
+  if (r.unknownShort) return classify(`sed ${r.unknownShort}: an option the rules do not model`);
+  if (!r.sandbox && !r.scripts.every(sedScriptSafe)) return classify("sed script that runs commands or reads or writes other files");
   // After a `--` every word is a file (round 40, Opus).
-  return inPlace ? writeTargets("sed", ["script", "--", ...(dashed ? rest : operands(rest))], scope) : ALLOW;
+  return r.inPlace ? writeTargets("sed", ["script", "--", ...r.files], scope) : ALLOW;
 }
 
 // An awk program that only reads its input and prints. Not: system(), getline (from a command or
@@ -2972,7 +3011,194 @@ export function unreadSpelling(name: string, args: string[]): string | undefined
 
 // ---- rules for one simple command ----
 
+// Options of cp, mv, ln and install (GNU coreutils), so valued options (`-S`, `-t`, `-m`, `-o`,
+// `-g`, `--sparse`, ...) consume their values and unknown options make the destination unknown
+// (project review 3, round 9).
+interface CopySpec {
+  flags: string;
+  values: string;
+  long: Record<string, "flag" | "value" | "optional">;
+}
+const copyLongs = (kind: "flag" | "value" | "optional", names: string) => names.split(" ").map((n) => [n, kind] as const);
+const COPY_SPEC: Record<string, CopySpec> = {
+  cp: {
+    flags: "abdfiHlLnPpRrsTuvxZ",
+    values: "St",
+    long: Object.fromEntries([
+      ...copyLongs("flag", "archive attributes-only copy-contents debug force interactive link dereference no-clobber no-dereference parents recursive remove-destination strip-trailing-slashes symbolic-link no-target-directory verbose keep-directory-symlink one-file-system help version"),
+      ...copyLongs("value", "no-preserve sparse suffix target-directory"),
+      ...copyLongs("optional", "backup preserve reflink update context"),
+    ]),
+  },
+  mv: {
+    flags: "bfinTuvZ",
+    values: "St",
+    long: Object.fromEntries([
+      ...copyLongs("flag", "debug exchange force interactive no-clobber no-copy strip-trailing-slashes no-target-directory verbose context help version"),
+      ...copyLongs("value", "suffix target-directory"),
+      ...copyLongs("optional", "backup update"),
+    ]),
+  },
+  ln: {
+    flags: "bdFfiLnPrsTv",
+    values: "St",
+    long: Object.fromEntries([
+      ...copyLongs("flag", "directory force interactive logical no-dereference physical relative symbolic no-target-directory verbose help version"),
+      ...copyLongs("value", "suffix target-directory"),
+      ...copyLongs("optional", "backup"),
+    ]),
+  },
+  install: {
+    flags: "bcCdDpsTvZ",
+    values: "gmoSt",
+    long: Object.fromEntries([
+      ...copyLongs("flag", "compare directory debug preserve-timestamps strip no-target-directory verbose preserve-context help version"),
+      ...copyLongs("value", "group mode owner strip-program suffix target-directory"),
+      ...copyLongs("optional", "backup context"),
+    ]),
+  },
+};
+export interface CopyReading {
+  targets: string[];
+  target?: string;
+  operands: string[];
+  recursive: boolean;
+  hard: boolean;
+  symbolic: boolean;
+  installDir: boolean;
+  unknown?: string;
+}
+export function copyReading(cmd: string, args: string[]): CopyReading {
+  const spec = COPY_SPEC[cmd];
+  const targets: string[] = [];
+  const ops: string[] = [];
+  let recursive = false;
+  let link = false;
+  let symbolic = false;
+  let installDir = false;
+  let unknown: string | undefined;
+  let ended = false;
+  const names = Object.keys(spec.long);
+  for (let i = 0; i < args.length; i++) {
+    const w = args[i];
+    if (ended || w === "-" || !w.startsWith("-")) {
+      ops.push(w);
+      continue;
+    }
+    if (w === "--") {
+      ended = true;
+      continue;
+    }
+    if (w.startsWith("--")) {
+      const eq = w.indexOf("=");
+      const given = (eq < 0 ? w : w.slice(0, eq)).slice(2);
+      const attached = eq < 0 ? undefined : w.slice(eq + 1);
+      const exact = names.filter((n) => n === given);
+      const prefixed = names.filter((n) => n.startsWith(given));
+      const full = exact.length === 1 ? exact[0] : prefixed.length === 1 ? prefixed[0] : undefined;
+      if (!full) {
+        unknown ??= w;
+        continue;
+      }
+      const kind = spec.long[full];
+      if (kind === "value") {
+        const val = attached ?? args[++i] ?? "";
+        if (full === "target-directory") targets.push(val);
+      } else if (kind === "flag") {
+        if (attached !== undefined) unknown ??= w;
+        if (full === "recursive" || full === "archive") recursive = true;
+        else if (full === "link") link = true;
+        else if (full === "symbolic" || full === "symbolic-link") symbolic = true;
+        else if (full === "directory") installDir = true;
+      }
+      continue;
+    }
+    for (let j = 1; j < w.length; j++) {
+      const c = w[j];
+      const rest = w.slice(j + 1);
+      if (spec.values.includes(c)) {
+        const val = rest || (args[++i] ?? "");
+        if (c === "t") targets.push(val);
+        break;
+      }
+      if (spec.flags.includes(c)) {
+        if (c === "r" || c === "R" || c === "a") recursive = true;
+        else if (c === "l") link = true;
+        else if (c === "s") symbolic = true;
+        else if (c === "d") installDir = true;
+      } else {
+        unknown ??= `-${c}`;
+        break;
+      }
+    }
+  }
+  return {
+    targets,
+    target: targets.at(-1),
+    operands: ops,
+    recursive,
+    hard: (cmd === "ln" && !symbolic) || (cmd === "cp" && link),
+    symbolic,
+    installDir: cmd === "install" && installDir,
+    ...(unknown ? { unknown } : {}),
+  };
+}
+
+// Operands of the `[IN [OUT]]` writers (`uniq`, `xxd`, `python3 -m json.tool`). Only exact known
+// option spellings pass; any other option — including an abbreviated `--ind`, `--skip-f` or xxd's
+// single-dash prefix `-co` — makes the output file unknown (project review 3, round 9).
+export function twoOpOperands(tool: "uniq" | "xxd" | "json.tool", list: string[]): { operands: string[]; unknown?: string } {
+  const out: string[] = [];
+  for (let k = 0; k < list.length; k++) {
+    const a = list[k];
+    if (a === "--") {
+      out.push(...list.slice(k + 1));
+      break;
+    }
+    if (a === "-" || !a.startsWith("-")) {
+      out.push(a);
+      continue;
+    }
+    if (tool === "uniq") {
+      if (a.startsWith("--")) {
+        if (/^--(skip-fields|skip-chars|check-chars)$/.test(a)) k++;
+        else if (/^--(skip-fields|skip-chars|check-chars)=/.test(a)) continue;
+        else if (/^--(count|repeated|ignore-case|unique|zero-terminated|help|version)$/.test(a)) continue;
+        else if (/^--(all-repeated|group)(=|$)/.test(a)) continue;
+        else return { operands: out, unknown: a };
+        continue;
+      }
+      if (/^-\d+$/.test(a)) continue;
+      for (let j = 1; j < a.length; j++) {
+        const ch = a[j];
+        if ("cdDiuz".includes(ch)) continue;
+        if ("fsw".includes(ch)) {
+          if (j === a.length - 1) k++;
+          break;
+        }
+        return { operands: out, unknown: a };
+      }
+    } else if (tool === "json.tool") {
+      if (a === "--indent") k++;
+      else if (a.startsWith("--indent=")) continue;
+      else if (/^(-h|--(help|sort-keys|no-ensure-ascii|json-lines|tab|no-indent|compact))$/.test(a)) continue;
+      else return { operands: out, unknown: a };
+    } else {
+      // xxd parses single- and double-dash long names by prefix (`-co 8` is `-cols 8`).
+      if (/^--?(c|cols|g|groupsize|l|len|n|name|o|s|seek|R)$/.test(a)) k++;
+      else if (/^--?(a|autoskip|b|bits|C|capitalize|d|e|E|EBCDIC|h|help|i|include|p|ps|postscript|plain|r|revert|u|uppercase|v|version)$/.test(a)) continue;
+      else if (/^-[cglo](?:0[xX][\da-fA-F]+|\d+)$/.test(a) || /^-s[+-]?(?:0[xX][\da-fA-F]+|\d+)$/.test(a) || /^-R(always|auto|never)$/.test(a)) continue;
+      else return { operands: out, unknown: a };
+    }
+  }
+  return { operands: out };
+}
+
 function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = false): Verdict {
+  const copy = Object.hasOwn(COPY_SPEC, cmd) ? copyReading(cmd, args) : undefined;
+  if (copy?.unknown) return ask(`${cmd} ${copy.unknown}: an option the rules do not read, so its destination is not known`);
+  const badTarget = copy?.targets.find((t) => MAY_EXPAND.test(t));
+  if (badTarget !== undefined) return ask(`${cmd} -t with an expanding target directory (${badTarget}): bash may expand it into both target directory and sources`);
   // (Round 39, Mythos: with `--reference=FILE` chmod/chown/chgrp take no mode or owner operand.)
   // (Round 40: a mode can look like an option, `chmod -w f`, and `--reference` is matched by any
   // prefix; its value, as a separate word, is the file read, not a target.)
@@ -2981,14 +3207,19 @@ function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = 
   // (Round 41, Mythos: an octal mode after a dash too, `chmod -700 f`.)
   const modeAsOption = cmd === "chmod" && head.some((a) => (/^-[rwxXstugoa+=,-]+$/.test(a) && /[rwxXst]/.test(a)) || /^-[0-7]{1,4}$/.test(a));
   const words = reference >= 0 && !head[reference].includes("=") ? args.filter((_, k) => k !== reference + 1) : args;
-  const paths = FIRST_OPERAND_NOT_PATH.has(cmd) && reference < 0 && !modeAsOption ? operands(words).slice(1) : operands(words);
-  const sources = paths.slice(0, -1);
-  const dest = paths.length > 1 ? resolveWord(paths.at(-1)!, scope) : undefined;
-  const intoDir = COPIERS.has(cmd) && paths.length > 1 && (sources.length > 1 || paths.at(-1)!.endsWith("/") || (!!dest && isDirectory(dest)));
-  const targets = WRITERS[cmd] === "last" ? paths.slice(-1) : paths;
+  const paths = copy ? copy.operands : (FIRST_OPERAND_NOT_PATH.has(cmd) && reference < 0 && !modeAsOption ? operands(words).slice(1) : operands(words));
+  const hasTarget = copy?.target !== undefined;
+  const sources = hasTarget ? paths : paths.slice(0, -1);
+  const destWord = hasTarget ? copy!.target! : paths.length > 1 ? paths.at(-1)! : undefined;
+  const dest = destWord !== undefined ? resolveWord(destWord, scope) : undefined;
+  const intoDir = hasTarget || (COPIERS.has(cmd) && paths.length > 1 && (sources.length > 1 || paths.at(-1)!.endsWith("/") || (!!dest && isDirectory(dest))));
+  // With `-t`/`--target-directory`, guard.ts + decide.ts check the literal destination directory
+  // (including `/proc/self/cwd/..` and >4096-char option words); rules.ts still checks `mv` sources
+  // and rejects expanding `-t` values above.
+  const targets = hasTarget ? (WRITERS[cmd] === "all" ? paths : []) : WRITERS[cmd] === "last" ? paths.slice(-1) : paths;
   for (const t of targets) {
     // Copied into a directory, the files land inside it: `cp a.rs /tmp` writes /tmp/a.rs.
-    const written = intoDir && t === paths.at(-1) && dest ? sources.map((s) => path.join(dest, path.basename(s))) : [resolveWord(t, scope)];
+    const written = intoDir && t === destWord && dest && sources.length ? sources.map((s) => path.join(dest, path.basename(s))) : [resolveWord(t, scope)];
     for (const p of written) {
       if (devSink(t, p)) continue;
       if (isGuarded(p, scope)) return guardAsk(`${cmd} changes the auto-mode guard's own files`);
@@ -2997,7 +3228,7 @@ function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = 
     }
   }
   // A symbolic link this command makes is followed by the paths it uses after it.
-  if (cmd === "ln" && paths.length > 1 && args.some((a) => a === "--symbolic" || /^-[a-zA-Z]*s/.test(a))) {
+  if (cmd === "ln" && (hasTarget ? paths.length >= 1 : paths.length > 1) && copy?.symbolic) {
     for (const source of sources) {
       const link = dest && intoDir ? path.join(dest, path.basename(source)) : dest;
       const at = link ? path.dirname(link) : undefined;
@@ -3006,19 +3237,17 @@ function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = 
       if (link && target) (scope.links ??= new Map()).set(link, target);
     }
   }
-  if (COPIERS.has(cmd) && paths.length > 1) {
+  if (COPIERS.has(cmd) && (hasTarget ? paths.length >= 1 : paths.length > 1)) {
     for (const source of sources) {
       const from = resolveWord(source, scope);
       const kept = from && originOf(from, scope);
       note(dest && intoDir ? path.join(dest, path.basename(source)) : dest, kept === "authored" || kept === "fetched" ? kept : "other", scope);
       if (cmd === "mv") note(from, "other", scope);
     }
-  } else if (COPIERS.has(cmd) && paths.length === 1 && MAY_EXPAND.test(paths[0])) {
-    // (Project review 3, round 8, Neon: one operand bash may expand into several words may supply
-    // both source and destination, unless `-t`/`--target-directory` or `install -d` already does.)
-    const hasTargetDir = cmd !== "rsync" && head.some((a) => shortIn(a, "t", cmd === "install" ? "Sgmo" : "S") || (a.startsWith("--target") && longIs(a, "target-directory")));
-    const installDir = cmd === "install" && head.some((a) => shortIn(a, "d", "Stgmo") || (a.length >= 5 && longIs(a, "directory")));
-    if (!hasTargetDir && !installDir) return ask(`${cmd} with one expanding operand (${paths[0]}): bash may expand it into both source and destination`);
+  } else if (COPIERS.has(cmd) && !hasTarget && paths.length === 1 && MAY_EXPAND.test(paths[0])) {
+    // (Project review 3, round 8, Neon & round 9: one operand bash may expand into several words
+    // may supply both source and destination, unless `-t`/`--target-directory` or `install -d`.)
+    if (!copy?.installDir) return ask(`${cmd} with one expanding operand (${paths[0]}): bash may expand it into both source and destination`);
   } else if (CONTENT_WRITERS.has(cmd)) {
     const literal = cmd === "tee" && literalInput;
     // Appending literal text to a file of the project makes it one the session wrote; any other
@@ -3037,7 +3266,8 @@ function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = 
 }
 
 function rm(args: string[], scope: Scope): Verdict {
-  const recursive = hasFlag(args, "r", "--recursive") || hasFlag(args, "R");
+  const head = args.indexOf("--") < 0 ? args : args.slice(0, args.indexOf("--"));
+  const recursive = hasFlag(head, "r", "--recursive") || hasFlag(head, "R") || head.some((a) => longIs(a, "recursive"));
   let verdict = ALLOW;
   for (const t of operands(args)) {
     const p = resolveWord(t, scope);
@@ -3723,10 +3953,13 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
     if (isPiFile(p, scope)) return worst(verdict, piAsk(`dd writes Pi's own files: ${of}`));
     return worst(verdict, isLocal(p, scope) || (!!p && DEV_SINKS.test(p)) ? classify("dd") : outside(`dd writes outside the working directory: ${of}`, p));
   }
-  if ((name === "chmod" || name === "chown" || name === "chgrp") && hasFlag(args, "R", "--recursive")) {
-    for (const t of operands(args).slice(1)) {
-      const p = resolveWord(t, scope);
-      if (p && isRootLike(p)) return deny(`${name} -R on ${t} would change a home or system directory`);
+  if (name === "chmod" || name === "chown" || name === "chgrp") {
+    const head = args.indexOf("--") < 0 ? args : args.slice(0, args.indexOf("--"));
+    if (hasFlag(head, "R", "--recursive") || head.some((a) => longIs(a, "recursive") && a.split("=")[0].length >= 5)) {
+      for (const t of operands(args).slice(1)) {
+        const p = resolveWord(t, scope);
+        if (p && isRootLike(p)) return deny(`${name} -R on ${t} would change a home or system directory`);
+      }
     }
   }
   if (name === "sed") return worst(verdict, sed(args, scope));
@@ -3746,7 +3979,13 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
   // is a program man runs; any option but these few is left to the decider.
   if (name === "man" && args.some((a) => /^-[a-zA-Z]*[PCH]/.test(a) || ["pager", "config-file", "html", "browser", "preprocessor"].some((o) => longIs(a, o)))) return worst(verdict, classify("man with an option that can name a program"));
   if (name === "file") {
-    const list = args.flatMap((a, k) => (a === "-f" || a === "--files-from" ? [args[k + 1] ?? ""] : /^--files-from=/.test(a) ? [a.slice(13)] : /^-f./.test(a) ? [a.slice(2)] : []));
+    const head = args.indexOf("--") < 0 ? args : args.slice(0, args.indexOf("--"));
+    const list = head.flatMap((a, k) => {
+      const isLong = longIs(a, "files-from") && a.split("=")[0].length >= 7;
+      if (a === "-f" || (isLong && !a.includes("="))) return [head[k + 1] ?? ""];
+      if (isLong && a.includes("=")) return [a.slice(a.indexOf("=") + 1)];
+      return /^-f./.test(a) ? [a.slice(2)] : [];
+    });
     const secret = list.map((f) => secretIn(f, scope)).find(Boolean);
     if (secret) return worst(verdict, criticalAsk(`file -f prints the lines of a credential file: ${secret}`));
     if (list.some((f) => /[$`]/.test(f))) return worst(verdict, classify("file -f of a list named by an expansion"));
@@ -3883,26 +4122,14 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
   if ((name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) && args.some((a) => /python_(functions|classes|files)=/.test(a))) return worst(verdict, classify("pytest collecting functions the call names"));
   if ((name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) && args.some((a) => /(^|[\s=])--(pdb|trace)/.test(a))) return worst(verdict, classify("pytest's debugger, which reads commands from standard input"));
   if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "mypy" && args.some((a) => (longIs(a, "install-types") || longIs(a, "python-executable")) && a.split("=")[0].length > 4)) return worst(verdict, classify("mypy that installs packages or runs another interpreter"));
-  // (Project review 3, round 8, Neon: `uniq`, `xxd` and `python3 -m json.tool` take `[IN [OUT]]`,
-  // so one operand that bash may expand into several words can overwrite the second match.)
-  const twoOpOperands = (tool: string, list: string[]): string[] => {
-    const out: string[] = [];
-    for (let k = 0; k < list.length; k++) {
-      const a = list[k];
-      if (a === "--") {
-        out.push(...list.slice(k + 1));
-        break;
-      }
-      if (a === "-" || !a.startsWith("-")) out.push(a);
-      else if (tool === "uniq" && (/^-[a-zA-Z]*[fsw]$/.test(a) || /^--(skip-fields|skip-chars|check-chars)$/.test(a))) k++;
-      else if (tool === "xxd" && /^-(c|cols|g|groupsize|l|len|n|name|o|s|seek|R)$/.test(a)) k++;
-      else if (tool === "json.tool" && a === "--indent") k++;
-    }
-    return out;
-  };
+  // (Project review 3, round 8, Neon & round 9: `uniq`, `xxd` and `python3 -m json.tool` take
+  // `[IN [OUT]]`, so one operand that bash may expand into several words can overwrite the second
+  // match, and any option spelling the reader does not know — such as an abbreviated `--ind` or
+  // `--skip-f` or xxd `-co` — makes the output file unknown.)
   if (name === "uniq" || name === "xxd") {
     const ops = twoOpOperands(name, args);
-    if (ops.length === 1 && MAY_EXPAND.test(ops[0])) return worst(verdict, ask(`${name} with one expanding operand (${ops[0]}): bash may expand it into both input and output`));
+    if (ops.unknown) return worst(verdict, ask(`${name} ${ops.unknown}: an option the rules do not read, so its output file is not known`));
+    if (ops.operands.length === 1 && MAY_EXPAND.test(ops.operands[0])) return worst(verdict, ask(`${name} with one expanding operand (${ops.operands[0]}): bash may expand it into both input and output`));
   }
   if (READ_ONLY.has(name) || DEV_TOOLS.has(name)) return verdict;
   // (Council project review 2, round 34, Mythos: unittest imports and calls any name it is given,
@@ -3916,7 +4143,8 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
   if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "venv") return worst(verdict, args.some((a) => longIs(a, "upgrade-deps") && a.length > 4) ? classify("venv --upgrade-deps installs packages") : ALLOW, venvTargets(args.slice(2), ["--prompt"], scope));
   if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "json.tool") {
     const ops = twoOpOperands("json.tool", args.slice(2));
-    if (ops.length === 1 && MAY_EXPAND.test(ops[0])) return worst(verdict, ask(`${name} -m json.tool with one expanding operand (${ops[0]}): bash may expand it into both input and output`));
+    if (ops.unknown) return worst(verdict, ask(`${name} -m json.tool ${ops.unknown}: an option the rules do not read, so its output file is not known`));
+    if (ops.operands.length === 1 && MAY_EXPAND.test(ops.operands[0])) return worst(verdict, ask(`${name} -m json.tool with one expanding operand (${ops.operands[0]}): bash may expand it into both input and output`));
   }
   if (/^python3?$/.test(name) && args[0] === "-m" && PY_MODULES.has(args[1]) && !cmd.heredoc && (args[1] !== "unittest" || unittestNamesOwn(args.slice(2), scope))) return verdict;
   // `node --test`: the test runner over the project's test files, as `npm test` runs it.
@@ -4208,4 +4436,4 @@ export function bare(...tables: object[]): void {
   };
   for (const t of tables) strip(t);
 }
-bare(SUBCOMMANDS, DOCKER_GROUPS, ASK_BY_DEFAULT, ALWAYS_ASK, WRITERS, RUNNERS, LEAD_OPTIONS, RUNNER_OPTIONS, WRAPPER_OPTIONS, COMPRESSORS, DOWNLOAD_FILES);
+bare(SUBCOMMANDS, DOCKER_GROUPS, ASK_BY_DEFAULT, ALWAYS_ASK, WRITERS, RUNNERS, LEAD_OPTIONS, RUNNER_OPTIONS, WRAPPER_OPTIONS, COMPRESSORS, DOWNLOAD_FILES, COPY_SPEC);

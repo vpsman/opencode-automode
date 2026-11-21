@@ -677,3 +677,88 @@ test("round 8 (Neon): readonly after keywords, invalid octal substrings, and one
     'y=abc; echo "${y: -1}"',
   ]) assert.equal(await decide8(command), "allow", command);
 });
+
+test("round 9 (Opus, Neon)", async () => {
+  const repo9 = path.join(base, "repo9");
+  const outsideFile = path.join(base, "outside9.txt");
+  const outsideDir = path.join(base, "outside9-dir");
+  const guardedDir = path.join(base, "guarded9");
+  const configDir = path.join(os.homedir(), ".config", "opencode");
+  for (const d of ["sub", "sub3", "tdir", "tdir2", "dst", "dir", "src", "outlink", "outdirlink", "grdlnk", "cfglnk"]) fs.mkdirSync(path.join(repo9, d), { recursive: true });
+  for (const d of [outsideDir, guardedDir, configDir]) fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(outsideFile, "outside\n");
+  fs.writeFileSync(path.join(guardedDir, "guard.ts"), "export {};\n");
+  fs.writeFileSync(path.join(configDir, "settings.json"), "{}\n");
+  for (const f of ["sub/a", "sub3/a", "sub3/b", "tdir/x", "tdir2/y", "f", "in", "a", "b", "file", "notes.txt", "src/a.ts"]) fs.writeFileSync(path.join(repo9, f), "hello\n");
+  fs.writeFileSync(path.join(repo9, "package.json"), '{"name":"t"}\n');
+  execFileSync("git", ["init", "-q", "-b", "main", repo9]);
+  // Regular directories holding symlinks outside the project, to a guarded file, and to configDir.
+  fs.symlinkSync(outsideFile, path.join(repo9, "outlink", "z"));
+  fs.symlinkSync(outsideDir, path.join(repo9, "outdirlink", "z"));
+  fs.symlinkSync(path.join(guardedDir, "guard.ts"), path.join(repo9, "grdlnk", "z"));
+  fs.symlinkSync(path.join(configDir, "settings.json"), path.join(repo9, "cfglnk", "z"));
+  const guard9: Guard = { ...guard, guarded: [...guard.guarded, guardedDir] };
+  const decide9 = async (command: string) => (await decideShell(guard9, new SessionState(repo9), repo9, command)).effect;
+
+  for (const command of [
+    // Finding 1: abbreviated long options (and xxd prefix options) hide the output file.
+    "python3 -m json.tool --ind 2 - .git/hooks/pre-commit",
+    "uniq in AGENTS.md --skip-f 0",
+    "uniq --skip-f 0 sub/*",
+    "xxd -co 8 sub3/*",
+    "xxd --co 8 sub3/*",
+    // Finding 2: substring length/offset past 2^63-1 wraps negative and aborts the line.
+    'y=abc; : "${y:0:9223372036854775808}"; x=foo\nrm -rf $x/home',
+    'y=abc; : "${y:9223372036854775808}"; x=foo\nrm -rf $x/home',
+    // Finding 3: -t given a glob, valued options before one glob, and unknown options on copiers.
+    "cp -b -S .md -t tdir/*",
+    "cp -rt tdir2/*",
+    "cp -S .bak sub3/*",
+    "install -m 644 sub3/*",
+    "cp --sparse always sub3/*",
+    "cp --bogus a b",
+    "mv -t tdir/*",
+    "ln -t tdir/*",
+    "install -t tdir/*",
+    // Finding 4: glob write target matching a symlink outside the project, to a guarded file, or to a config dir.
+    "cp f outlink/*",
+    "cp f outdirlink/*",
+    "tee grdlnk/*",
+    "tee cfglnk/*",
+    "rsync f outlink/*",
+    "sed -i 's/a/b/' outlink/*",
+    "uniq f outlink/*",
+    "sort -o outlink/* f",
+    "chmod 644 outlink/*",
+    // Finding 5: GNU sed permutes trailing -i / --in-place and abbreviates --in / --in-pl.
+    "sed 's/a/b/' ../outside.txt -i",
+    "sed 's/a/b/' ../outside.txt --in-place",
+    "sed 's/a/b/' ../outside.txt -ni",
+    "sed 's/a/b/' ../outside.txt -Ei",
+    "sed 's/a/b/' ../outside.txt -i.bak",
+    "sed 's/a/b/' ../outside.txt --in",
+    "sed 's/a/b/' ../outside.txt --in-pl",
+    // Same-shape: abbreviated --recursive on rm, and yq --in-place.
+    "rm --rec .",
+    "rm --rec *",
+    "yq --in-place '.a=1' ../outside.yml",
+  ]) assert.equal(await decide9(command), "ask", command);
+
+  for (const command of [
+    "cp -r a b",
+    "cp src/*.ts dst/",
+    "cp -t dst a b",
+    "install -m 644 a b",
+    "install -C -D a b",
+    "mv a b",
+    "uniq notes.txt",
+    "uniq -c in out",
+    "uniq --skip-fields 1 in",
+    "python3 -m json.tool --indent 2 package.json",
+    'y=abc; echo "${y:0:2}"',
+    "sed -n 1p file",
+    "sed -i 's/a/b/' file",
+    "tee out.log",
+    "cp f dir/",
+  ]) assert.equal(await decide9(command), "allow", command);
+});

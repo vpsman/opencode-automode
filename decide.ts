@@ -27,9 +27,11 @@ import {
   psEnvironments,
   findActions,
   copiesNothing,
+  copyReading,
   printsOnly,
   readVerdict,
   realish,
+  sedReading,
   skippable,
   within,
   type Action,
@@ -4022,7 +4024,9 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
     // value, `find . -name -exec -o -name cp`.)
     const placed = programs(cmd.argv).filter((p) => !(p > 0 && /^-(exec|execdir|ok|okdir)$/.test(cmd.argv[p - 1]) && !findAction(cmd.argv, p - 1)));
     const quiet = placed.filter((p) => printsOnly(path.basename(cmd.argv[p]), cmd.argv.slice(p + 1)) || copiesNothing(path.basename(cmd.argv[p]), cmd.argv.slice(p + 1)));
+    let early: string | undefined;
     cmd.argv.forEach((word, at) => {
+      if (early) return;
       if (!placed.includes(at) && quiet.some((p) => p < at)) return;
       // (Round 52, Astra: behind a plain file tool, which runs no program, a word named like a
       // writer is an operand: `sort -- cp .git/report` sorts two files. Round 54, Opus: an
@@ -4041,7 +4045,8 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
         // option's value, `git -C nested/cp ls-files`, is none).
         if (at !== sub) return;
       }
-      const how = Object.hasOwn(WRITER_OPERANDS, path.basename(word)) ? WRITER_OPERANDS[path.basename(word)] : undefined;
+      const tool = path.basename(word);
+      const how = Object.hasOwn(WRITER_OPERANDS, tool) ? WRITER_OPERANDS[tool] : undefined;
       // (Round 54, Opus: inside `find -exec`, the command's words end at the `;` or `{} +` that
       // closes it: `find . -exec cp f .git/x \;` writes `.git/x`, not `;/x`.)
       let args = cmd.argv.slice(at + 1);
@@ -4050,36 +4055,38 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
         if (end >= 0) args = args.slice(0, args[end] === "+" ? end - 1 : end);
       }
       // (Round 50, Sol: a copy that copies nothing names no destination and makes no file.)
-      if (how && (copiesNothing(path.basename(word), args) || printsOnly(path.basename(word), args))) return;
+      if (how && (copiesNothing(tool, args) || printsOnly(tool, args))) return;
       // Every word after `--` is a file, one that begins with `-` too (round 40, Opus).
       const dashes = args.indexOf("--");
       const files = [...(dashes < 0 ? args : args.slice(0, dashes)).filter((a) => !a.startsWith("-")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
-      if (path.basename(word) === "sed" && !args.some((a) => /^(-[a-zA-Z]*i|--in-place)/.test(a))) return;
-      if (path.basename(word) === "dd") targets.push(...args.filter((a) => a.startsWith("of=")).map((a) => a.slice(3)));
+      if (tool === "sed") {
+        const r = sedReading(args);
+        if (!r.inPlace) return;
+        targets.push(...r.files);
+        return;
+      }
+      const copy = ["cp", "mv", "ln", "install"].includes(tool) ? copyReading(tool, args) : undefined;
+      if (copy?.unknown) {
+        early = `${tool} ${copy.unknown}: an option the check cannot read, so its destination is not known`;
+        return;
+      }
+      const badT = copy?.targets.find((v) => /[*?[\]{}$`]/.test(v));
+      if (badT !== undefined) {
+        early = `${tool} -t ${badT}: target directory bash may expand into both destination and sources`;
+        return;
+      }
+      const tdir = copy?.target;
+      const opFiles = copy ? copy.operands : files;
+      if (tool === "dd") targets.push(...args.filter((a) => a.startsWith("of=")).map((a) => a.slice(3)));
       // (Round 45, Sol: a copy that copies nothing writes no destination.)
-      else if (how && !copiesNothing(path.basename(word), args)) targets.push(...(how === "last" ? files.slice(-1) : files));
+      else if (how && !copiesNothing(tool, args)) targets.push(...(tdir !== undefined ? (how === "last" ? [tdir] : [...opFiles, tdir]) : how === "last" ? opFiles.slice(-1) : opFiles));
       // (Round 41, Opus: a copy into a directory writes each source's name there: `cp -r ev/.git .`
       // writes `./.git`. Judged by where each lands.)
       // (Round 42, Mythos: `~+` is where it runs. Opus: a copy of a directory's contents, `src/.`,
       // rsync's `src/`, `-T`, brings the `.git` it holds to where the contents land.)
       // (Round 43, Opus: also into a `-t`/`--target-directory` directory, and from the names a glob
       // source expands to; Mythos: a `.git` at any depth of the source, gitIn.)
-      const tool = path.basename(word);
-      let tdir: string | undefined;
-      let tWord: string | undefined;
-      if (how === "last" && tool !== "rsync") {
-        for (let k = 0; k < args.length && args[k] !== "--"; k++) {
-          const a = args[k];
-          if (/^--targ/.test(a) && "--target-directory".startsWith(a.split("=")[0])) {
-            tdir = a.includes("=") ? a.slice(a.indexOf("=") + 1) : (tWord = args[k + 1]);
-          } else if (/^-[^-]/.test(a) && a[a.slice(1).search(/[Sgmot]/) + 1] === "t" && a.slice(1).search(/[Sgmot]/) >= 0) {
-            // (The letter before any other that takes a value: `-St` names the suffix `t`.)
-            const rest = a.slice(a.slice(1).search(/[Sgmot]/) + 2);
-            tdir = rest || (tWord = args[k + 1]);
-          }
-        }
-      }
-      const given = tdir !== undefined ? files.filter((f, k) => !(f === tWord && k === files.indexOf(tWord))) : files.slice(0, -1);
+      const given = tdir !== undefined ? opFiles : opFiles.slice(0, -1);
       // (Round 44, Sol: a copy that copies nothing, an rsync dry run or listing, `cp --version`,
       // brings nothing. Opus: `-L` copies what links lead to, so the walk follows them.)
       // (Round 45, Opus: `--help` after `--` is a file; rsync's `-k`/`--copy-dirlinks` and cp's
@@ -4087,11 +4094,11 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       const nothing = copiesNothing(tool, args);
       const head = args.indexOf("--") < 0 ? args : args.slice(0, args.indexOf("--"));
       const follow = head.some((a) => (a.length >= 5 && "--dereference".startsWith(a)) || a === "--copy-links" || a === "--copy-dirlinks" || a === "--copy-unsafe-links" || (tool === "rsync" ? /^-[a-zA-Z]*[Lk]/.test(a) : /^-[a-zA-Z]*L/.test(a)));
-      if (how === "last" && !nothing && given.length && (tdir !== undefined || files.length > 1)) {
-        const dest = herePlus(tdir ?? files.at(-1)!);
+      if ((how === "last" || tool === "mv") && !nothing && given.length && (tdir !== undefined || opFiles.length > 1)) {
+        const dest = herePlus(tdir ?? opFiles.at(-1)!);
         const dir = cwdOf(cmd);
         const asFile = tdir === undefined && tool !== "rsync" && args.some((a) => a === "--no-target-directory" || /^-[a-zA-Z]*T/.test(a));
-        let into = tdir !== undefined || (!asFile && (dest.endsWith("/") || files.length > 2));
+        let into = tdir !== undefined || (!asFile && (dest.endsWith("/") || opFiles.length > 2));
         if (!into && !asFile && dir !== undefined) {
           try {
             into = fs.statSync(path.resolve(dir, tilde(dest))).isDirectory();
@@ -4115,12 +4122,13 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
           }
         }
       }
-      if (how && !NAME_KEEPERS.has(path.basename(word))) {
+      if (how && !NAME_KEEPERS.has(tool)) {
         const end = args.indexOf("--");
-        const operands = end < 0 ? files : [...files.filter((f) => args.indexOf(f) < end), ...args.slice(end + 1)];
+        const operands = copy ? copy.operands : end < 0 ? files : [...files.filter((f) => args.indexOf(f) < end), ...args.slice(end + 1)];
         made.push(...(how === "last" ? operands.slice(-1) : operands));
       }
     });
+    if (early) return early;
     // A file whose name begins with `-` is an option to the program a later glob hands it to
     // (round 4, N3: `touch ./--to-command=rec`, then `tar xf a.tar --to*` or `tar xf a.tar *` in
     // this call, where the glob is judged before the file is there). `-` alone is no option, and
@@ -4145,7 +4153,18 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       const isGlob = /[*?[\]{}]/.test(target);
       for (const dir of path.isAbsolute(t) ? ["/"] : (dirsOf?.(cmd) ?? [])) {
         const landedAll = isGlob
-          ? (expandWord(t, dir) ?? [])
+          ? (() => {
+              const matched = expandWord(t, dir);
+              if (matched === undefined) return [];
+              if (matched.length > 0) return matched;
+              // Empty glob match: bash passes the literal word; check its resolved non-glob
+              // directory prefix so a symlink to an empty `.git/hooks` is still caught without
+              // matching the literal `*` against protected names.
+              const full = path.isAbsolute(t) ? t : `${dir}/${t}`;
+              if (isDevice(full, undefined) || procRelative(full)) return [];
+              const literalPrefix = physical(full).split("/").filter((s) => !/[*?[\]{}]/.test(s)).join("/");
+              return literalPrefix ? [literalPrefix] : [];
+            })()
           : (() => {
               const full = path.isAbsolute(t) ? t : `${dir}/${t}`;
               return isDevice(full, undefined) || procRelative(full) ? [] : [physical(full)];
@@ -5615,40 +5634,95 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
     return true;
   };
   const found = writesOf(cmds, filesOnly);
-  let writeIssue: string | undefined;
+  // (Project review 3, round 9: every current match of a glob write target is held to the same
+  // write checks as a literal target — outside the project, guarded files, config dirs, .git — not
+  // just the protected names checked in writeProblem.)
+  const globMatchIssue = (word: string, cmd: Simple, dirFlag: boolean, sources: string[] | undefined, toolName: string): string | undefined => {
+    const placed = pwdPlaced(word, cmd);
+    const t = tilde(placed);
+    if (/[$`]/.test(placed) || /^~[^/]/.test(t) || !/[*?]|\[.*\]/s.test(word)) return undefined;
+    const dirs = path.isAbsolute(t) ? ["/"] : (where.places.get(cmd)?.map((x) => x.real) ?? (where.cwd.get(cmd) ? [where.cwd.get(cmd)!] : []));
+    for (const dir of dirs) {
+      const matches = expandWord(t, dir);
+      if (matches === undefined) return `${toolName} writes ${word}, a glob the check cannot list`;
+      for (const m of matches) {
+        if (/^\/dev\/(null|zero|full|stdout|stderr|tty|fd\/\d+)$/.test(m)) continue;
+        let at = [m];
+        try {
+          if (dirFlag || word.endsWith("/") || fs.statSync(m).isDirectory()) at = [m, ...(sources?.length ? sources.map((s) => path.basename(s)) : [".automode-placed-check"]).map((n) => path.join(m, n))];
+        } catch {}
+        for (const q of at) {
+          const v = fileVerdict("edit", q, { ...scope, pending: new Map(scope.pending) });
+          if (v.action !== "allow") return v.reason.replace(/^edit /, `${toolName} writes `);
+        }
+      }
+    }
+    return undefined;
+  };
+  let writeIssue: string | undefined = found.ask;
   for (const w of found.writes.filter((x) => !x.checked)) {
     if (writeIssue) break;
+    const toolName = path.basename(w.cmd.argv[0] ?? "");
     const p = resolve(w.word, w.cmd);
     if (p && /^\/dev\/(null|zero|stdout|stderr|fd\/\d+)$/.test(p)) continue;
     if (!p || (!path.isAbsolute(tilde(w.word)) && where.cwd.get(w.cmd) === undefined)) writeIssue = `writes ${w.word}, a place the check cannot tell`;
     else {
       const v = fileVerdict("edit", p, scope);
-      if (v.action !== "allow") writeIssue = v.reason.replace(/^edit /, `${path.basename(w.cmd.argv[0] ?? "")} writes `);
+      if (v.action !== "allow") writeIssue = v.reason.replace(/^edit /, `${toolName} writes `);
     }
   }
   // (Council project review 2, round 39, Mythos: the places the guard reads by a program's own
   // options, which the rules "checked" by their plainer reading of the words, are held to the
   // rules' write test too: `cp f ~/.bashrc -S bak`, `tar -xf a.tar -C../out`, `find -fprint0 ~/x`,
-  // `rsync -aT../out`. Not redirects, tee, truncate, sed -i or dd, which the rules read as bash
-  // does. Tested on a copy of the pending record; a directory by a path inside it. Asked about
-  // after every other check, whose reasons say more.)
+  // `rsync -aT../out`. Project review 3, round 9: `sed -i` is included too now that writesOf
+  // reads sed's permuted options and exact file operands, and every glob write target checks its
+  // resolved matches — checked and unchecked alike, including tee/truncate/dd, after other asks so
+  // rules' own reasons such as ftp URLs win. Tested on a copy of the pending record; a directory
+  // by a path inside it. Asked about after every other check, whose reasons say more.)
   let placedIssue: string | undefined;
-  for (const w of found.writes.filter((x) => x.checked && !["tee", "truncate", "sed", "dd", ">"].includes(x.by ?? ""))) {
+  for (const w of found.writes) {
     if (placedIssue) break;
+    const toolName = path.basename(w.cmd.argv[0] ?? "");
     if (/^\/dev\/(null|zero|full|stdout|stderr|tty|fd\/\d+)$/.test(tilde(w.word))) continue;
-    const p = resolve(w.word, w.cmd);
-    if (!p || (!path.isAbsolute(tilde(w.word)) && where.cwd.get(w.cmd) === undefined)) continue;
-    // A directory is judged by the names that land in it: each source's base name, or, with none,
-    // a name nothing in it has (round 40, Sol: an unrelated link already there is not the write).
-    let at = [p];
-    try {
-      if (w.dir || w.word.endsWith("/") || fs.statSync(p).isDirectory()) at = (w.sources?.length ? w.sources.map((s) => path.basename(s)) : [".automode-placed-check"]).map((n) => path.join(p, n));
-    } catch {}
-    for (const q of at) {
-      const v = fileVerdict("edit", q, { ...scope, pending: new Map(scope.pending) });
-      if (v.action !== "allow") {
-        placedIssue = v.reason.replace(/^edit /, `${path.basename(w.cmd.argv[0] ?? "")} writes `);
-        break;
+    const isGlob = /[*?]|\[.*\]/s.test(w.word);
+    if (w.checked && !["tee", "truncate", "dd", ">"].includes(w.by ?? "")) {
+      const p = resolve(w.word, w.cmd);
+      if (p && (path.isAbsolute(tilde(w.word)) || where.cwd.get(w.cmd) !== undefined)) {
+        // A directory is judged by the names that land in it: each source's base name, or, with none,
+        // a name nothing in it has (round 40, Sol: an unrelated link already there is not the write).
+        let at = [p];
+        try {
+          if (w.dir || w.word.endsWith("/") || fs.statSync(p).isDirectory()) at = (w.sources?.length ? w.sources.map((s) => path.basename(s)) : [".automode-placed-check"]).map((n) => path.join(p, n));
+        } catch {}
+        for (const q of at) {
+          const v = fileVerdict("edit", q, { ...scope, pending: new Map(scope.pending) });
+          if (v.action !== "allow") {
+            placedIssue = v.reason.replace(/^edit /, `${toolName} writes `);
+            break;
+          }
+        }
+      }
+    }
+    if (!placedIssue && isGlob && w.by !== "curl" && w.by !== "wget") placedIssue = globMatchIssue(w.word, w.cmd, !!w.dir, w.sources, toolName);
+  }
+  if (!placedIssue) {
+    const otherWriters = new Set(["chmod", "chown", "chgrp", "touch", "mkdir", "rmdir", "shred", "unlink", "setfacl"]);
+    for (const cmd of cmds) {
+      if (placedIssue) break;
+      for (const at of programs(cmd.argv)) {
+        if (placedIssue) break;
+        const tool = path.basename(cmd.argv[at]);
+        if (!otherWriters.has(tool)) continue;
+        const args = cmd.argv.slice(at + 1);
+        if (printsOnly(tool, args)) continue;
+        const dashes = args.indexOf("--");
+        const head = dashes < 0 ? args : args.slice(0, dashes);
+        const ops = [...head.filter((a) => !a.startsWith("-")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
+        const skipFirst = (tool === "chmod" || tool === "chown" || tool === "chgrp") && !head.some((a) => a.startsWith("--ref") && "--reference".startsWith(a.split("=")[0])) && !(tool === "chmod" && head.some((a) => (/^-[rwxXstugoa+=,-]+$/.test(a) && /[rwxXst]/.test(a)) || /^-[0-7]{1,4}$/.test(a)));
+        for (const op of skipFirst ? ops.slice(1) : ops) {
+          placedIssue = globMatchIssue(op, cmd, false, undefined, tool);
+          if (placedIssue) break;
+        }
       }
     }
   }

@@ -799,7 +799,7 @@ class Lexer {
     if (s[j] === "[") {
       const closeAt = s.indexOf("]", j);
       const inside = closeAt < 0 ? "" : s.slice(j + 1, closeAt);
-      if (closeAt < 0 || !/^(?:[@*]|-?(?:0|[1-9]\d*)|\$?[A-Za-z_]\w*|\$\{[A-Za-z_]\w*\})$/.test(inside)) ask("an array subscript that is not a number, a plain variable, @ or *");
+      if (closeAt < 0 || !/^(?:[@*]|-?(?:0|[1-9]\d{0,17})|\$?[A-Za-z_]\w*|\$\{[A-Za-z_]\w*\})$/.test(inside)) ask("an array subscript that is not a number, a plain variable, @ or *");
       head += s.slice(j, closeAt + 1);
       j = closeAt + 1;
       bash = true;
@@ -815,10 +815,11 @@ class Lexer {
     const op = m![0];
     j += op.length;
     if (op === ":") {
-      // `${x:offset}` and `${x:offset:length}` (no leading 0 before more digits: bash parses 08 as invalid octal).
+      // `${x:offset}` and `${x:offset:length}` (no leading 0 before more digits: bash parses 08 as
+      // invalid octal; at most 18 digits: a value past 2^63-1 wraps negative in bash and aborts).
       const closeAt = s.indexOf("}", j);
       const inside = closeAt < 0 ? "" : s.slice(j, closeAt);
-      if (closeAt < 0 || !/^ ?-?(?:0|[1-9]\d*|\$?[A-Za-z_]\w*)(?:: ?-?(?:0|[1-9]\d*|\$?[A-Za-z_]\w*))?$/.test(inside)) ask("a substring expansion whose offset is not a number or a plain variable");
+      if (closeAt < 0 || !/^ ?-?(?:0|[1-9]\d{0,17}|\$?[A-Za-z_]\w*)(?:: ?-?(?:0|[1-9]\d{0,17}|\$?[A-Za-z_]\w*))?$/.test(inside)) ask("a substring expansion whose offset is not a number or a plain variable");
       bash = true;
       return done(op, [{ kind: "lit", text: inside, quoted: true }], closeAt);
     }
