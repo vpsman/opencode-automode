@@ -75,7 +75,33 @@ For each shell tool call:
      `tar -c` writes and its `--index-file`, `-g` and `--volno-file`, zip's archive and
      `-O`, and the output of `zstd -o` (and `--trace`), brotli, lzip, lzop and lz4 are held
      to the same test (`tar czf ../a.tgz .` asks as `cp x ../y` does), and so is a write that
-     lands in a `.git` where the command runs (`cd .git/hooks && echo x > pre-commit`).
+     lands in a `.git` where the command runs (`cd .git/hooks && echo x > pre-commit`). So is
+     a file's second name: the backup `sed -i<suffix>`, `cp`/`mv`/`ln`/`install -S` and
+     `patch -z`/`-B`/`-Y` make (one name built from all three), and what a compressor writes
+     in place (`gunzip AGENTS.md.gz` and `gunzip AGENTS.md` make `AGENTS.md`; `gzip AGENTS.md`
+     replaces it); a backup name the command line does not show asks: the files a diff
+     names, and, where the suffix can be the end of a protected name (`cp -rS t`, not
+     `cp -r -S .bak`), the files inside a recursive copy, a glob that cannot be listed or a
+     word built at run time. A path
+     built from a variable the call sets to literal text is held to the same test as the rules
+     read it (`x=opencode; echo '{}' > $x.json`); a variable bash gives a value of its own
+     (`REPLY`, `FUNCNAME`, `DIRSTACK`, ...) is not followed, nor is one that a `${x:=word}` or
+     `${x=word}`, arithmetic (`$((x=5))`, `((x++))`) or a builtin given the name on its
+     option's letter (`printf -vx`, `wait -px`) anywhere in the call may assign again, nor
+     one whose assignment not every run of the call reaches: behind `&&` or `||`, or inside a
+     branch, a loop or a group (`false && x=foo; echo hi > .git$x/hooks/pre-commit`,
+     `if ...; then :; x=foo; fi`), in a list that runs as a background job
+     (`x=foo && true &`: the whole list is the job), or, in a call of several lines, on a
+     line that a failure before it ends: bash skips the rest of a line, and runs the next,
+     after an arithmetic expansion that fails (`: $((1/0)); x=foo`), a substring length
+     below zero or an assignment to a read-only variable (`UID=1`), so no variable is
+     followed in such a call that names `readonly`, `declare` or `typeset`; and a
+     compressor's operand the
+     rules cannot resolve asks. A place an option names (`unzip -d`, `tar -C`, rsync's
+     `--log-file`, ...) is tested as a glob where it holds one (`tar -C sub/.gi?`) and, where
+     it holds a variable, by the text beside it (`unzip -d .git/$x`) and by what the call's
+     own variables make it (`x=git; unzip -d sub/.$x`); an `unzip` option word with a
+     variable in it (`-d$x`) goes to the model.
      Plus this plugin's additions (`DEFAULT_ASK` in `decide.ts`, and `guard.ts`): tokens on a
      `curl` line, hunting for credential files, git's own `-c` overrides outside a short
      list, `GIT_*`/`SSH_*`/`LD_*` environment however it is set (`NAME=`, `export`,
@@ -158,12 +184,12 @@ For each shell tool call:
      `git log -p secrets.json` ask, `git log -1 secrets.json` (no patch) does not; and except
      in a call that only prints its help or version (cp/mv/ln/install), and for sort's own
      reading (only its last `--files0-from`, and `--random-source` only in a random sort).
-   - **find, tar, rsync, sort, ps and the compressors** (gzip, xz, zstd, bzip2 and their
-     aliases) are read only in their plain spellings: whole long option names, short flags in
+   - **find, tar, rsync, sort, ps, cloc and the compressors** (gzip, xz, zstd, bzip2 and
+     their aliases) are read only in their plain spellings: whole long option names, short flags in
      a cluster, and the common valued options in their usual form (`tar -xzf a.tgz -C dst`,
      `sort -t: -k3n`, `ps -eo pid,comm`, `find . -name x -exec cmd {} +`). Any other option or
      spelling asks: an abbreviated long option, a rare option (`find -fprint`, `tar -T`,
-     `rsync -e`, `sort -T`, `ps -O`, `zstd -o`), an old `+POS` sort key, a help or version word
+     `rsync -e`, `sort -T`, `ps -O`, `zstd -o`, `cloc --out`), an old `+POS` sort key, a help or version word
      mixed with other options. That is by design: these tools take many spellings, and the
      rules read only those they are tested on.
    - **Per command**, also inside `sh -c`, `sudo`, `xargs`, with the program named by path
@@ -253,7 +279,14 @@ For each shell tool call:
      followed by its text, as bash follows it (`cd sub/link && cd ..` is `sub`). A call
      with any other `cd`, a `pushd` or a `popd` goes to the model whole
      (`cd $dir && ls`, `cd -`), or asks where the rules themselves would judge a relative
-     path in the wrong directory (`if ...; then cd x; fi; cat f`). `~+`, and `$PWD` after a
+     path in the wrong directory (`if ...; then cd x; fi; cat f`). A command that
+     follows a `cd` not every run of the call reaches is judged in each directory it may run
+     in, its words and the files it redirects its output to
+     (`true || cd sub; echo hi > ../o.txt` asks: without the `cd` that is a file above the
+     project). In a call of several lines, a `cd` on a line that a failure before it may end
+     (arithmetic, a substring's length, an assignment to a read-only variable) asks: bash
+     skips it with the rest of the line, and runs the next line where it was
+     (`: $((1/0)); cd sub`, then `echo hi > ../o.txt` on the next line). `~+`, and `$PWD` after a
      `cd`, are read as the directory the command runs in (`cd src && echo x > $PWD/out.txt`
      writes `src/out.txt`, and so does `~+/out.txt`; a write through either into a protected
      place asks); another form of `$PWD` after a `cd` (`${PWD%/*}`) and a path
@@ -340,7 +373,8 @@ For each shell tool call:
      (`cat "$f"`), unless it is the variable of a `for f in <files>` loop whose files are
      known (`for f in *.ts; do head -3 "$f"; done` is an allow; a `$` bash leaves alone, as
      in `sed -n '5,$p' f`, names nothing) or a variable the call itself plainly sets to a
-     literal at its start (`name=foo; grep "$name" src` is judged as `grep foo src`); a
+     literal at its start (`name=foo; grep "$name" src` is judged as `grep foo src`; not where
+     the assignment heads a list that runs as a background job, `name=foo && true &`); a
      word that could become an option once bash expands it, for a program whose options
      are checked (`git diff $BASE`, `find "$dir" -name x`, `make $target`), `wc`, `du`,
      `file`, `grep` and `jq` among them, which have options that read a file of names

@@ -30,6 +30,7 @@ import {
   printsOnly,
   readVerdict,
   realish,
+  skippable,
   within,
   type Action,
   type Matcher,
@@ -44,7 +45,7 @@ import { TEMP_CODE_CACHES, findGitEntries, gitArgs, Scan, gitEnv, gitReadsElsewh
 import { canonical, type Printed } from "./canon.ts";
 import { PathWalkError, PWD_LEAD, fetchDestination, functionNames, pathFinds, pathHas, procRelative, runsItsWords, tempDirs, unseenWriter } from "./guard.ts";
 import { bentEnv, bentPath, gitOnlyReads, runsAnyProgram, runsProjectCode } from "./guard.ts";
-import { abbreviates, allCommands, arithmeticAssignments, braceWords, expandNames, expandWord, gitMessageWords, EDITOR_ASSIGNMENT, editorCommand, programs, withoutGlobals, alsoByName, argvGuards, dangerousName, envAssignmentsOk, expansionProblem, gitCall, gitProblem, inputReads, landing, linkedReads, literalTargets, located, physical, placedReads, present, cdTo, type Place, type Places, observer, protectedNameIn, runtimeReads, single, stricter, strict, strictCommands, textGuards, tilde, tildeMismatch, unmodelled, writesOf, writtenBy, type Single, type StrictCommand, getopt, GIT_OPTIONS, lastOf, type Getopt, unreadableGlob, withoutExpansions } from "./guard.ts";
+import { abbreviates, allCommands, arithmeticAssignments, braceWords, expandNames, globMatcher, secondNames, expandWord, gitMessageWords, EDITOR_ASSIGNMENT, editorCommand, programs, withoutGlobals, alsoByName, argvGuards, dangerousName, envAssignmentsOk, expansionProblem, gitCall, gitProblem, inputReads, landing, linkedReads, literalTargets, located, physical, placedReads, present, cdTo, type Place, type Places, observer, protectedNameIn, runtimeReads, single, stricter, strict, strictCommands, textGuards, tilde, tildeMismatch, unmodelled, writesOf, writtenBy, type Single, type StrictCommand, getopt, GIT_OPTIONS, lastOf, type Getopt, unreadableGlob, withoutExpansions } from "./guard.ts";
 
 export type Effect = "allow" | "ask" | "deny";
 
@@ -1723,13 +1724,21 @@ export function scopeFor(guard: Guard, session: SessionState, cwd: string, rules
     picked: guard.picked,
     project: (p) => inCheckout(p, roots),
   });
+  // (Project review 3, round 3, Mythos: a name the call builds from its own variables.)
+  // Read from the project's top down, as writeProblem reads a landed path; a glob is held as
+  // protectedNameIn holds one (the names it matches on disk, or the pattern itself where it is
+  // written to reach a protected name or cannot be listed).
+  scope.protectedName = (p) => {
+    const root = roots.find((r) => within(p, r));
+    return !!protectedNameIn(root === undefined ? p : path.relative(root, p), PROTECTED_NAMES, root ?? "/");
+  };
   // Upstream takes the working directory as the project root; here it is the session's project.
   scope.root = roots.length ? session.project : undefined;
   return scope;
 }
 
 // Upstream's wording names Pi; say what it means here.
-const reword = (reason: string) => reason.replace(/Pi's own files/g, "opencode's own files (config, AGENTS.md, CLAUDE.md)");
+const reword = (reason: string) => reason.replace(/Pi's own files/g, "opencode's own files (config, AGENTS.md, CLAUDE.md, a hook manager's, .git)");
 
 function fromRules(v: Verdict): Decision {
   const effect: Effect = v.action === "deny" ? "deny" : v.action === "allow" ? "allow" : "ask";
@@ -3951,11 +3960,59 @@ const PLAIN_TOOLS = new Set(
 );
 // `~+` is the directory the command runs in (round 42, Mythos).
 const herePlus = (word: string) => (word === "~+" ? "." : word.startsWith("~+/") ? `.${word.slice(2)}` : word);
+// Programs that make no file but by a redirect, matched bare (no path): closing round, Opus's
+// second and third re-checks.
+const ONLY_READS = new Set(["", "cd", "pushd", "popd", "pwd", "ls", "cat", "echo", "printf", "true", "false", ":", "test", "[", "grep", "rg", "head", "tail", "wc", "stat", "file", "du", "df", "sleep", "wait", "zcat"]);
+const PURE_ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/;
 function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined, dirsOf?: (cmd: Simple) => string[] | undefined, roots?: string[]): string | undefined {
   // Also every place the guard's own list of writes names (`cp -t`, `sort -o`, git's `--output`).
   const extra = writesOf(cmds).writes;
+  // (Project review 3, closing round, Opus: a glob also matches the files the call's other
+  // commands make, which no listing at decision time finds: `gzip -c f > opencode.json.gz;
+  // gunzip ./*.gz`, or in parallel, background, process-substitution or loop order. Each name as
+  // its writer spells it, matched segment by segment as bash matches, a leading `.` only by a
+  // leading `.`.)
+  const madeElsewhere = (cmd: Simple) =>
+    cmds
+      .filter((c) => c !== cmd)
+      .flatMap((c) => [...c.out, ...extra.filter((w) => w.cmd === c).map((w) => w.word)])
+      .filter((w) => !/[$`*?[\]{}]/.test(w))
+      .map((w) => path.normalize(herePlus(w)));
+  const matchedBy = (word: string, names: string[]) => {
+    const segments = path.normalize(herePlus(word)).split("/");
+    return names.filter((name) => {
+      const parts = name.split("/");
+      return parts.length === segments.length && segments.every((s, i) => (/[*?[]/.test(s) ? globMatcher(s)(parts[i]).match && (s.startsWith(".") || !parts[i].startsWith(".")) : s === parts[i]));
+    });
+  };
+  // (Project review 3, closing round, Opus's second and third re-checks: whether any other
+  // command of the call may make files, in any order — pipelines, subshells, background jobs,
+  // process substitutions, loops and functions run later text beside or before earlier text. A
+  // redirect to anything but a normalised device path, a write the guard lists, or any command
+  // other than a bare read-only program or pure variable assignments.)
+  const makesFiles = (cmd: Simple) =>
+    cmds.some(
+      (c) =>
+        c !== cmd &&
+        ([...c.out, ...extra.filter((w) => w.cmd === c).map((w) => w.word)].some((w) => !(path.isAbsolute(w) && isDevice(w, undefined))) ||
+          (!ONLY_READS.has(c.argv[0] ?? "") && !(c.argv.length > 0 && c.argv.every((w) => PURE_ASSIGN.test(w))))),
+    );
   for (const cmd of cmds) {
-    const targets = [...cmd.out, ...extra.filter((w) => w.cmd === cmd).map((w) => w.word)];
+    // (Project review 3, round 2, Mythos: with the second names a writer gives, a backup or a
+    // compressor's output.)
+    const expand = (word: string) => {
+      const dirs = dirsOf?.(cmd);
+      if (!dirs?.length) return undefined;
+      // (Each name as the word spells it from where the command runs: a project kept under a
+      // directory of a protected name is not written "into" it by the names a glob matches.)
+      const all = dirs.map((dir) => expandNames(word, dir)?.map((name) => path.normalize(name)).map((name) => (within(name, dir) ? path.relative(dir, name) || "." : name)));
+      return all.some((n) => n === undefined) ? undefined : [...all.flatMap((n) => n!), ...matchedBy(word, madeElsewhere(cmd))];
+    };
+    // (A suffix with a `/` puts the backup under another name's directory: not read.)
+    const ends = (suffix: string) => suffix === "" || suffix.includes("/") || PROTECTED_NAMES.some((n) => n.length > suffix.length && n.endsWith(suffix));
+    const second = secondNames(cmd, extra, expand, ends, makesFiles(cmd));
+    if (second.unknown) return second.unknown;
+    const targets = [...cmd.out, ...extra.filter((w) => w.cmd === cmd).map((w) => w.word), ...second.names];
     // Round 4, N3: the targets that make a file (see NAME_KEEPERS), with the operands after `--`.
     const made = extra.filter((w) => w.cmd === cmd && !NAME_KEEPERS.has(w.by ?? "")).map((w) => w.word);
     // (Round 51, Sol: after a program that only prints its help, a later word is a command only
@@ -4081,18 +4138,28 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       if (name === ".git") return `writes ${target}: a path inside or named .git, where git finds hooks and config`;
       if (name) return `writes ${target}, which opencode or a git hook loads and runs`;
       const t = tilde(herePlus(target));
-      if (/[$`*?[\]{}]/.test(target) || /^~[^/]/.test(t) || /^&/.test(target) || roots === undefined) continue;
+      if (/[$`]/.test(target) || /^~[^/]/.test(t) || /^&/.test(target) || roots === undefined) continue;
+      // (Project review 3, round 8, Neon: a glob target can match a symlink to a protected path,
+      // `cp slink/*` or `cp f slink/*` where `slink/z -> ../.git/hooks/pre-commit`: resolve each
+      // match too.)
+      const isGlob = /[*?[\]{}]/.test(target);
       for (const dir of path.isAbsolute(t) ? ["/"] : (dirsOf?.(cmd) ?? [])) {
-        const full = path.isAbsolute(t) ? t : `${dir}/${t}`;
-        // (Council project review 2, round 24, Mythos: a device by its normalised path, not a
-        // `/dev/` prefix of the words, `/dev/../tmp/o/l/hooks/pre-commit`.)
-        if (isDevice(full, undefined) || procRelative(full)) continue;
-        const landed = physical(full);
-        const root = roots.find((r) => within(landed, r));
-        const below = root === undefined ? landed : path.relative(root, landed);
-        const at = protectedNameIn(below, PROTECTED_NAMES);
-        if (at === ".git") return `writes ${target}, which is ${landed} where it runs: a path inside or named .git, where git finds hooks and config`;
-        if (at) return `writes ${target}, which is ${landed} where it runs: a file opencode or a git hook loads and runs`;
+        const landedAll = isGlob
+          ? (expandWord(t, dir) ?? [])
+          : (() => {
+              const full = path.isAbsolute(t) ? t : `${dir}/${t}`;
+              return isDevice(full, undefined) || procRelative(full) ? [] : [physical(full)];
+            })();
+        for (const landed of landedAll) {
+          // (Council project review 2, round 24, Mythos: a device by its normalised path, not a
+          // `/dev/` prefix of the words, `/dev/../tmp/o/l/hooks/pre-commit`.)
+          if (isDevice(landed, undefined) || procRelative(landed)) continue;
+          const root = roots.find((r) => within(landed, r));
+          const below = root === undefined ? landed : path.relative(root, landed);
+          const at = protectedNameIn(below, PROTECTED_NAMES);
+          if (at === ".git") return `writes ${target}, which is ${landed} where it runs: a path inside or named .git, where git finds hooks and config`;
+          if (at) return `writes ${target}, which is ${landed} where it runs: a file opencode or a git hook loads and runs`;
+        }
       }
     }
   }
@@ -5465,6 +5532,12 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   // The same rules without the observer, for each command judged again where it runs (B3c).
   const rulesAt: UserRules = { ...rules, deny: rules.deny.filter((m) => m !== watch.matcher) };
   const scope = scopeFor(guard, session, cwd, rules);
+  // (Project review 3, round 5, Mythos: a name arithmetic assigns is one the rules do not follow
+  // from its assignment, `x=foo; : $((x=5)); echo hi > AGENTS$x`: the judged text holds no
+  // arithmetic, so they are told.)
+  // (Round 6, Mythos: nor one assigned on a line that a failure before the assignment may end,
+  // `: $((1/0)); x=foo⏎echo hi > AGENTS.md$x`: read off the text that runs, for the same reason.)
+  scope.reassigned = new Set([...arithmeticSets, ...skippable(run).flatMap((c) => c.argv.flatMap((w) => /^([A-Za-z_]\w*)(?:\[[^\]]*\])?\+?=/.exec(w)?.[1] ?? []))]);
   const verdict = bashVerdict(text, scope);
   if (verdict.action === "deny") return fromRules(verdict);
   const cwdKnown = !/(^|[\s;&|(])(cd|pushd|popd)(\s|$)/.test(text);
@@ -5756,7 +5829,8 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   // its words as the parser has them: plain ones bare (so that the allows above, which compare
   // texts, read them as before), others quoted.
   const shellWord = (w: string) => (/^[A-Za-z0-9_@%+=:,.\/-]+$/.test(w) ? w : `'${w.replace(/'/g, "'\\''")}'`);
-  const judgeAt = (dir: string, words: string[]) => bashVerdict(words.map(shellWord).join(" "), scopeFor(guard, session, dir, rulesAt));
+  // (Project review 3, round 5, Mythos: with the files it redirects its output to, when given.)
+  const judgeAt = (dir: string, words: string[], out: string[] = []) => bashVerdict([...words.map(shellWord), ...out.map((w) => `> ${shellWord(w)}`)].join(" "), scopeFor(guard, session, dir, rulesAt));
   // B8-4: a protected place a word names by the directory's other name (`/proc/self/cwd`, `~+`),
   // where it lands: read from the project's top down, as writeProblem reads a landed write.
   const landedProtected = (file: string): string | undefined => {

@@ -1353,7 +1353,7 @@ test("round 57: find is the program a command runs, its outputs where it reads t
   for (const c of ["find -L ~ -name '*.bak' -delete", "find -P .. -name x -delete", "find -H ~/.ssh -type f -exec cat {} +", "find -O3 /etc -exec cat {} +", "find -files0-from list -delete", "find .git/hooks -delete", "find .git -name config -exec rm {} +"]) {
     const d = await decideShell(guard, new SessionState(repo), repo, c);
     assert.equal(d.effect, "ask", c);
-    assert.match(d.reason, /outside the working directory|start points read from a file|in a \.git directory/, c);
+    assert.match(d.reason, /outside the working directory|start points read from a file|in a \.git directory|own files \(.*\.git\)/, c);
   }
   assert.notEqual(await effect("find -L src -name '*.ts'"), "allow", "a spelling the rules do not read asks (round 62)");
   for (const c of ["find . -fprint0 .git/x", "find . -name x -fprint .git/x", "find . -exec cp f .git/x \\;"]) assert.notEqual(await effect(c), "allow", c);

@@ -171,9 +171,17 @@ export interface Scope {
   loopValues?: Map<string, string[]>;
   // Symbolic links the command being checked creates, to the path each leads to.
   links?: Map<string, string>;
+  // True for a path the caller protects by name (decide.ts: `.git`, opencode's project files, a
+  // hook manager's files). Held against a write's path as the rules resolve it, `$x` included
+  // (project review 3, round 3, Mythos: `x=opencode; echo '{}' > $x.json`).
+  protectedName?: (p: string) => boolean;
   // True for a variable the command does not set anywhere: it holds what the environment the
   // command starts with gives it (the environment of opencode, which runs it), or nothing.
   unassigned?: (name: string) => boolean;
+  // The variables the call assigns where the text the rules are given no longer shows it: by
+  // arithmetic, which the caller's printer takes out (decide.ts; project review 3, round 5). And
+  // those it may not assign for the same reason: behind arithmetic that can end the line (round 6).
+  reassigned?: Set<string>;
 }
 
 const expandHome = (p: string) => (p === "~" || p.startsWith("~/") ? HOME + p.slice(1) : p);
@@ -332,7 +340,7 @@ const isGuarded = (p: string | undefined, scope: Scope) => !!p && scope.guarded.
 // in every directory. A change to them changes what later sessions do, so it asks you, also with
 // the chat decider. Your own allow rules can replace that ask.
 const CONTEXT_FILES = new Set(["AGENTS.md", "AGENTS.override.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]);
-const isPiFile = (p: string | undefined, scope: Scope) => !!p && (p.split("/").includes(".pi") || CONTEXT_FILES.has(path.basename(p)) || scope.piDirs.some((d) => within(p, d)));
+const isPiFile = (p: string | undefined, scope: Scope) => !!p && (p.split("/").includes(".pi") || CONTEXT_FILES.has(path.basename(p)) || scope.piDirs.some((d) => within(p, d)) || !!scope.protectedName?.(p));
 const piAsk = (reason: string): Verdict => ({ action: "ask", reason, firm: true });
 const inTmp = (p: string) => TMP_DIRS.some((d) => within(p, d, true));
 // Provably inside the project or a temp directory.
@@ -662,6 +670,15 @@ export interface Simple {
   dyn?: boolean[];
   // The operator that follows the command: `;`, a newline, `&&`, `||`, `|`, `&`, `(` or `)`.
   next?: string;
+  // `&&` or `||` where that joins the command to one that is not listed: an arithmetic command,
+  // a redirect with no command (`< f && x=1`), a subshell's `)`.
+  after?: "&&" | "||";
+  // `&` where it ends the command's list behind a command that is not listed (`x=1 && ((n)) &`):
+  // `next` is then the `&&` or the `||` in front of that one.
+  ends?: "&";
+  // Something bash does for the command can fail in a way that ends the line it stands on: bash
+  // then skips what is left of that line and runs the next (see `reach`).
+  aborts?: boolean;
   // Its standard input is a pipe from the command before it.
   piped?: boolean;
   // Inside a command substitution (or a heredoc body's): it runs while the command that holds it
@@ -674,6 +691,13 @@ export interface Parsed {
   opaque: boolean;
   // Parenthesised subshells: `cd` tracking is unreliable.
   grouped: boolean;
+  // The variables a `${name=word}` or `${name:=word}` of the command may assign, wherever it
+  // stands: a word, a heredoc's body, another expansion; `${name[0]:=word}` too. And those its
+  // arithmetic assigns (`$((name=1))`, `((name++))`, a subscript, an offset).
+  assigns?: Set<string>;
+  // The command has more than one line: a newline outside quotes ends a command somewhere in it
+  // (not a line continuation, which joins two lines into one).
+  lines?: boolean;
 }
 
 // The parser follows bash: quoting (`'...'`, `"..."`, `$'...'`, backslashes, line continuations),
@@ -689,6 +713,9 @@ interface ParseState {
   result: Parsed;
   // Variable names read by arithmetic, checked against the whole command once it is parsed.
   arith: Set<string>;
+  // How many expansions read so far can fail and end their line (Simple.aborts): the count is
+  // shared by every depth of the parse, and a command is marked when it moved while it was read.
+  aborts: { n: number };
 }
 
 // Commands whose effect on later commands the rules follow; a function by one of these names is not modelled.
@@ -704,11 +731,32 @@ const unmark = (w: string, m: string): [string, string] => {
 };
 const RESERVED = new Set(["if", "then", "elif", "else", "fi", "do", "done", "while", "until", "for", "in", "case", "esac", "select", "function", "time", "coproc", "!", "{", "}", "[[", "]]"]);
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/s;
+// The variables bash makes read-only (bash 5.2): a plain assignment to one fails, and ends the line.
+const READONLY = /^(BASHOPTS|BASH_VERSINFO|EUID|PPID|SHELLOPTS|UID)(\[[^\]]*\])?\+?=/;
+// Reserved words that can lead a simple command (Project review 3, round 8, Neon: `! UID=1`,
+// `{ UID=1; }`, `if true; then UID=1; fi`, `while UID=1; do :; done`, `time -p UID=1`).
+const LEAD_ASSIGN = new Set(["if", "then", "elif", "else", "do", "while", "until", "!", "{"]);
+function afterLeads(argv: string[]): string[] {
+  let k = 0;
+  while (k < argv.length) {
+    const w = argv[k];
+    if (w === "time") {
+      k++;
+      while (k < argv.length && (argv[k] === "-p" || argv[k] === "--")) {
+        if (argv[k++] === "--") break;
+      }
+    } else if (LEAD_ASSIGN.has(w)) k++;
+    else break;
+  }
+  return argv.slice(k);
+}
+// A word bash may expand into several words (glob, brace expansion, unquoted expansion).
+const MAY_EXPAND = /[*?[\]{}$`]/;
 
 export function parse(command: string, depth = 0): Parsed {
   const result: Parsed = { cmds: [], opaque: depth > 4, grouped: false };
   if (result.opaque) return result;
-  const state: ParseState = { depth, result, arith: new Set() };
+  const state: ParseState = { depth, result, arith: new Set(), aborts: { n: 0 } };
   parseList(command, 0, false, false, state);
   if (state.arith.size && !arithmeticSafe(command, state.arith)) result.opaque = true;
   return result;
@@ -734,6 +782,11 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
   // Open case statements: reading a pattern (up to its `)`) or the commands of a branch.
   const cases: ("pattern" | "body")[] = [];
   const heredocs: { delimiter: string; quoted: boolean; strip: boolean; owner: Simple }[] = [];
+  // An `&&` or `||` that followed nothing listed, for the command after it (Simple.after).
+  let unlisted: "&&" | "||" | undefined;
+  // The last command this list pushed, and the count of ParseState.aborts when it did.
+  let last: Simple | undefined;
+  let mark = st.aborts.n;
 
   // An empty quote (`''`, `""`) leaves EMPTY_QUOTE, tagged `Q`, where it stood: brace expansion
   // keeps a word it makes empty only when that word holds a quote (`''{,x}`, not `{,'x'}`). The
@@ -816,9 +869,18 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
     }
     if (cur.argv.length || cur.out.length) {
       cur.next = op;
+      if (unlisted) cur.after = unlisted;
+      unlisted = undefined;
       if (sub) cur.subshell = cur.nested = true;
+      // (Project review 3, round 6, Mythos: an expansion read since the last command, its own or
+      // one of a command that is not listed, `(( $((1/0)) ))`; or words that only assign, one of
+      // them to a variable bash keeps read-only, `UID=1`, including after leading keywords.)
+      const own = afterLeads(cur.argv);
+      if (st.aborts.n !== mark || (own.length > 0 && own.every((w) => ASSIGNMENT.test(w)) && own.some((w) => READONLY.test(w)))) cur.aborts = true;
+      mark = st.aborts.n;
+      last = cur;
       result.cmds.push(cur);
-    }
+    } else if (op === "&&" || op === "||") unlisted = op;
     cur = { argv: [], out: [], dyn: [] };
   };
 
@@ -827,6 +889,7 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
     const n = s[i + 1];
     const tag = dq ? "E" : "e";
     if (n === "(" && s[i + 2] === "(") {
+      st.aborts.n++;
       const end = readArith(s, i + 3, "))", inner);
       if (end < 0) return (opaque(), s.length);
       add("$()", tag.repeat(3));
@@ -839,6 +902,7 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
       return end;
     }
     if (n === "[") {
+      st.aborts.n++;
       const end = readArith(s, i + 2, "]", inner);
       if (end < 0) return (opaque(), s.length);
       add("$()", tag.repeat(3));
@@ -1009,6 +1073,7 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
     } else if (c === " " || c === "\t") {
       pushWord();
     } else if (c === "\n") {
+      result.lines = true;
       pushCmd("\n");
       if (heredocs.length) i = readBodies(i);
     } else if (c === ";") {
@@ -1030,6 +1095,11 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
       // `|`, `|&` and a single `&` fork: both sides of a pipe, and the background job.
       cur.subshell = true;
       if (c === "|" && next === "&") i++;
+      // (Project review 3, round 6, Mythos: the job is the whole list, `x=foo && true &`. Where
+      // the `&` stands behind a command that is not listed, `x=foo && ((1)) &`, the last one
+      // listed, which an `&&`, an `||` or a `|` joins to it, is told.)
+      pushWord();
+      if (c === "&" && !cur.argv.length && !cur.out.length && last && ["&&", "||", "|"].includes(last.next ?? "")) last.ends = "&";
       pushCmd(c);
       if (c === "|") cur.subshell = cur.piped = true;
     } else if (c === "(" && cases.at(-1) === "pattern" && !hasWord && cur.argv.length === 0) {
@@ -1128,7 +1198,16 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
       }
       if (!doc.quoted) {
         if (/[$`]/.test(body)) doc.owner.expands = true;
+        const before = st.aborts.n;
         scanExpansions(body, inner);
+        // (Project review 3, round 6, Mythos: bash expands the body when the heredoc's command
+        // runs, before the commands written after that one on its line: `: <<E; x=foo`. A heredoc
+        // on no command is not listed, so it has nothing to mark: not modelled.)
+        if (st.aborts.n !== before) {
+          if (!result.cmds.includes(doc.owner)) opaque();
+          doc.owner.aborts = true;
+          if (mark === before) mark = st.aborts.n;
+        }
       }
     }
     return pos - 1;
@@ -1140,12 +1219,18 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
 function readDollar(s: string, j: number, st: ParseState): number {
   const n = s[j + 1];
   let end = -1;
+  // (Project review 3, round 6, Mythos: an arithmetic expansion that fails ends the line it is
+  // on, wherever it stands: a word, a heredoc's body, another expansion, an arithmetic command.)
   if (n === "(" && s[j + 2] === "(") {
+    st.aborts.n++;
     end = readArith(s, j + 3, "))", st);
     if (end >= 0) end++;
   } else if (n === "(") end = parseList(s, j + 2, true, true, st);
   else if (n === "{") end = readParam(s, j + 2, st);
-  else if (n === "[") end = readArith(s, j + 2, "]", st);
+  else if (n === "[") {
+    st.aborts.n++;
+    end = readArith(s, j + 2, "]", st);
+  }
   return end >= s.length ? -1 : end;
 }
 
@@ -1221,6 +1306,22 @@ function readParam(s: string, start: number, st: ParseState): number {
   const offsets = /^:(?![-=?+])(.*)$/s.exec(rest);
   if (m && !m[1] && offsets) for (const part of offsets[1].split(":")) checkArith(part, st);
   const assigns = /^:?=/.test(rest) && !!m && /^[A-Za-z_]/.test(m[2]);
+  if (assigns) (st.result.assigns ??= new Set()).add(m![2]);
+  // (Project review 3, round 6, Mythos: the expansions that can fail and end their line, beside
+  // arithmetic itself. A subscript or an offset that is not a plain number is evaluated, and what
+  // it evaluates can be an error; a length below zero is one (`${y:0:-5}` of a short value, of
+  // `$@` or of an array always), so a length passes only as digits. `${FUNCNAME:=x}` ends the
+  // line without a word: bash refuses the assignment to a variable it keeps for itself.)
+  // (Project review 3, round 8, Neon: a leading 0 followed by more digits is octal in bash, where
+  // 8 or 9 fails and aborts the line (`${y:0:08}`, `${y:08}`, `${y: -08}`); empty `${y:}` and >2
+  // parts abort too.)
+  const parts = m && !m[1] && offsets ? offsets[1].split(":") : [];
+  const plainDec = (p: string, signed: boolean) => (signed ? /^\s*(?:-?(?:0|[1-9]\d*))?\s*$/ : /^\s*(?:0|[1-9]\d*)?\s*$/).test(p);
+  if (
+    (m?.[4] !== undefined && !/^(?:0|[1-9]\d*|[@*])$/.test(m[4])) ||
+    (m && !m[1] && offsets && (offsets[1] === "" || parts.length > 2 || parts.some((part, k) => !plainDec(part, k === 0)))) ||
+    (assigns && (BASH_SETS.test(m![2]) || READONLY.test(`${m![2]}=`)))
+  ) st.aborts.n++;
   const plain =
     !!m &&
     (rest === "" ||
@@ -1268,6 +1369,10 @@ function checkArith(text: string, st: ParseState) {
     .replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, " $1 ")
     .replace(/\$[#?$!]/g, " 0 ")
     .replace(/\b\d+#[A-Za-z0-9@_]+/g, " 0 ");
+  // (Project review 3, round 5, Mythos: a name arithmetic assigns, by `=`, a compound assignment,
+  // `++` or `--` on either side, is assigned again, and the words keep none of the arithmetic's
+  // text: after `x=foo; : $((x=5))`, `$x` is `5`. Kept with the names a `${x:=word}` assigns.)
+  for (const m of t.matchAll(/([A-Za-z_]\w*)\s*(?:=(?!=)|(?:[-+*/%&^|]|<<|>>)=|\+\+|--)|(?:\+\+|--)\s*([A-Za-z_]\w*)/g)) (st.result.assigns ??= new Set()).add(m[1] ?? m[2]);
   // Positional parameters, quotes, subscripts and anything else: not modelled.
   if (/[^\w\s+\-*/%<>=!&|^~?:,();]/.test(t)) {
     st.result.opaque = true;
@@ -1749,6 +1854,8 @@ function variablesSet(cmd: Simple, argv: string[]): [string, string | undefined,
   } else if (name === "getopts") {
     out.push([operands(args)[1] ?? "", undefined, "set"]);
   } else if (name === "wait") {
+    // (Project review 3, round 5, Mythos: `-p` among other letters, or with its name on it.)
+    if (args.some((a) => /^-[a-zA-Z]*p./.test(a) || /^-[a-zA-Z]+p$/.test(a))) return "wait -p in a spelling the rules do not model";
     const p = args.indexOf("-p");
     if (p >= 0) out.push([args[p + 1] ?? "", undefined, "set"]);
   }
@@ -2180,7 +2287,9 @@ export function rsyncReading(args: string[]) {
   // all of them for a version query.
   const helpAt = order.findIndex((e) => e.help);
   const opensBeforeExit = (helpAt >= 0 ? order.slice(0, helpAt) : order).flatMap((e) => (e.opens !== undefined ? [e.opens] : []));
-  return { longs, letters, shorts, operands, dryRun, listOnly, batch, server, prints, help, opensBeforeExit, daemon: prefixed("daemon"), copiesNothing: prints || (!server && (dryRun || listOnly || (!batch && operands.length < 2))), values: (name: string) => {
+  // (Project review 3, round 8, Neon: one operand that bash may expand into several words,
+  // `rsync sub/*`, `rsync ../*`, has an unknown operand count and may copy.)
+  return { longs, letters, shorts, operands, dryRun, listOnly, batch, server, prints, help, opensBeforeExit, daemon: prefixed("daemon"), copiesNothing: prints || (!server && (dryRun || listOnly || (!batch && operands.length < 2 && !operands.some((o) => MAY_EXPAND.test(o))))), values: (name: string) => {
       // (Round 48, Sol: the last `--log-file` is the one rsync opens, and an empty one none.)
       // A help word stops the reading where it stands: a log named after it is never opened.
       const all = (firstHelp >= 0 ? longs.slice(0, firstHelp) : longs).filter(([h]) => h === `--${name}`).map(([, v]) => v ?? "");
@@ -2838,6 +2947,15 @@ function psPlain(args: string[]): boolean {
   return true;
 }
 // Undefined when the call is spelled plainly; otherwise why it asks.
+// cloc counts lines, but some options write files (`--out`, `--report-file`, `--strip-comments`,
+// `--sql`, `--write-lang-def`) or run a program (`--vcs=<command>`): only its listing options are
+// read (project review 3, round 2, Mythos: `cloc --out=package.json .` was allowed unrecorded).
+const CLOC_PLAIN: Plain = {
+  short: "",
+  shortValued: "",
+  flags: "by-file by-file-by-lang json yaml csv md xml quiet hide-rate fullpath follow-links skip-uniqueness no-autogen".split(" "),
+  valued: "exclude-dir exclude-ext exclude-lang include-lang include-ext match-f not-match-f match-d not-match-d timeout processes".split(" "),
+};
 export function unreadSpelling(name: string, args: string[]): string | undefined {
   if (args.length === 1 && /^--(help|version)$/.test(args[0])) return undefined;
   const plain =
@@ -2847,6 +2965,7 @@ export function unreadSpelling(name: string, args: string[]): string | undefined
     : name === "sort" ? optionsPlain(args, SORT_PLAIN)
     : name === "ps" ? psPlain(args)
     : Object.hasOwn(COMPRESSORS, name) ? optionsPlain(args, COMPRESSOR_PLAIN)
+    : name === "cloc" ? optionsPlain(args, CLOC_PLAIN)
     : true;
   return plain ? undefined : `${name} with an option or spelling the rules do not read`;
 }
@@ -2894,6 +3013,12 @@ function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = 
       note(dest && intoDir ? path.join(dest, path.basename(source)) : dest, kept === "authored" || kept === "fetched" ? kept : "other", scope);
       if (cmd === "mv") note(from, "other", scope);
     }
+  } else if (COPIERS.has(cmd) && paths.length === 1 && MAY_EXPAND.test(paths[0])) {
+    // (Project review 3, round 8, Neon: one operand bash may expand into several words may supply
+    // both source and destination, unless `-t`/`--target-directory` or `install -d` already does.)
+    const hasTargetDir = cmd !== "rsync" && head.some((a) => shortIn(a, "t", cmd === "install" ? "Sgmo" : "S") || (a.startsWith("--target") && longIs(a, "target-directory")));
+    const installDir = cmd === "install" && head.some((a) => shortIn(a, "d", "Stgmo") || (a.length >= 5 && longIs(a, "directory")));
+    if (!hasTargetDir && !installDir) return ask(`${cmd} with one expanding operand (${paths[0]}): bash may expand it into both source and destination`);
   } else if (CONTENT_WRITERS.has(cmd)) {
     const literal = cmd === "tee" && literalInput;
     // Appending literal text to a file of the project makes it one the session wrote; any other
@@ -3055,7 +3180,7 @@ function gitConfig(opts: string[], rest: string[], dir: Scope, scope: Scope): Ve
   const newRead = action === "get" || action === "list";
   const newWrite = ["set", "unset", "rename-section", "remove-section", "edit"].includes(action ?? "");
   const reads = newRead || opt("get") || opt("get-all") || opt("get-regexp") || opt("get-urlmatch") || opt("get-color") || opt("get-colorbool") || opt("list", "l");
-  const writes = newWrite || opt("unset") || opt("unset-all") || opt("add") || opt("replace-all") || opt("rename-section") || opt("remove-section") || opt("edit", "e") || (!reads && words.length >= 2);
+  const writes = newWrite || opt("unset") || opt("unset-all") || opt("add") || opt("replace-all") || opt("rename-section") || opt("remove-section") || opt("edit", "e") || (!reads && (words.length >= 2 || (words.length === 1 && MAY_EXPAND.test(words[0]))));
   if (!writes) return ALLOW;
   if (opt("global") || opt("system")) return ask("changes git config outside the repository");
   const file = opts.flatMap((a, k) => (longIs(a, "file") ? [a.includes("=") ? a.slice(a.indexOf("=") + 1) : (opts[k + 1] ?? "")] : a === "-f" ? [opts[k + 1] ?? ""] : []));
@@ -3551,7 +3676,7 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
     const removes = r.longs.some(([h]) => /^--remove-(source|sent)-files$/.test(h) || (h.length >= 9 && "--remove-source-files".startsWith(h)));
     const deletes = r.longs.some(([h]) => /^--del/.test(h));
     let gone = ALLOW;
-    if (removes) for (const src of r.operands.slice(0, -1)) gone = worst(gone, deletion(src, scope));
+    if (removes) for (const src of r.operands.length === 1 ? r.operands : r.operands.slice(0, -1)) gone = worst(gone, deletion(src, scope));
     if (deletes) gone = worst(gone, deletion(r.operands.at(-1)!, scope));
     if (gone.action !== "allow") return worst(verdict, gone);
   }
@@ -3668,6 +3793,38 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
         if (names.some((n) => path.basename(z.outputName(n) ?? "") === ".git")) return worst(verdict, ask(`${name} -d writes a file named .git`));
       }
     }
+    // (Project review 3, round 3, Mythos: what a compressor writes in place, read with the call's
+    // own variables, `x=AGENTS.md.gz; gunzip $x`; a name with no known suffix is written as given.
+    // Only a word with an expansion: a plain one is read where the whole command is checked
+    // (guard.ts, secondNames), and a plain glob there too, each name less its suffix, so that
+    // `gunzip *.gz` beside an AGENTS.md does not ask. A glob after the variable is the names it
+    // matches here, `x=sub; gunzip $x/*.gz`; a name the rules cannot resolve asks.)
+    if (z && z.inPlace && !z.reads) {
+      for (const a of z.operands) {
+        if (!/[$`]/.test(a)) continue;
+        const word = expandVars(a, scope);
+        if (/[$`]/.test(word)) return worst(verdict, ask(`${name} writes beside a file whose name is built at run time: ${a}`));
+        const names = /[*?[]/.test(word) ? globNames(word, scope) : [word];
+        if (names === undefined) return worst(verdict, ask(`${name} of a glob the rules cannot list: ${a}`));
+        for (const n of names) {
+          if (isPiFile(resolveWord(z.decompress ? (z.outputName(n) ?? n) : n, scope), scope)) return worst(verdict, piAsk(`${name} writes Pi's own files: ${a}`));
+        }
+      }
+    }
+    // (Project review 3, round 4, Mythos: the directory an extraction writes in, `tar -C` and
+    // `unzip -d`, where the word holds an expansion: read with the call's own variables and held
+    // to the protected names, `x=git; unzip -o a.zip -d sub/.$x`. A plain word or a glob is read
+    // where the whole command is checked (guard.ts, writesOf). unzip's options are not read
+    // here, so every operand of it is held to the test, and an option word that holds an
+    // expansion, `-d$x`, is not followed, nor is a word the call's variables make an option,
+    // `x=-d; unzip -o a.zip $x sub/.git`.)
+    if (name === "unzip" && args.some((a) => /[$`]/.test(a) && (a.startsWith("-") || expandVars(a, scope).startsWith("-")))) return worst(verdict, classify("unzip with an option built at run time"));
+    const extracts = !!t && (t.has("extract") || t.has("get") || t.letter("x")) && !(t.has("to-stdout") || t.letter("O"));
+    for (const a of name === "unzip" ? operands(args) : extracts ? t!.dirs : []) {
+      const p = /[$`]/.test(a) ? resolveWord(a, scope) : undefined;
+      if (p && /(^|\/)\.git(\/|$)/.test(p)) return worst(verdict, ask(`${name} writes in a .git directory`));
+      if (isPiFile(p, scope)) return worst(verdict, piAsk(`${name} writes Pi's own files: ${a}`));
+    }
     for (const a of operands(args)) {
       if (!isLocal(resolveWord(a, scope), scope)) return worst(verdict, classify(`${name} with a path outside the working directory`));
     }
@@ -3726,6 +3883,27 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
   if ((name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) && args.some((a) => /python_(functions|classes|files)=/.test(a))) return worst(verdict, classify("pytest collecting functions the call names"));
   if ((name === "pytest" || (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "pytest")) && args.some((a) => /(^|[\s=])--(pdb|trace)/.test(a))) return worst(verdict, classify("pytest's debugger, which reads commands from standard input"));
   if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "mypy" && args.some((a) => (longIs(a, "install-types") || longIs(a, "python-executable")) && a.split("=")[0].length > 4)) return worst(verdict, classify("mypy that installs packages or runs another interpreter"));
+  // (Project review 3, round 8, Neon: `uniq`, `xxd` and `python3 -m json.tool` take `[IN [OUT]]`,
+  // so one operand that bash may expand into several words can overwrite the second match.)
+  const twoOpOperands = (tool: string, list: string[]): string[] => {
+    const out: string[] = [];
+    for (let k = 0; k < list.length; k++) {
+      const a = list[k];
+      if (a === "--") {
+        out.push(...list.slice(k + 1));
+        break;
+      }
+      if (a === "-" || !a.startsWith("-")) out.push(a);
+      else if (tool === "uniq" && (/^-[a-zA-Z]*[fsw]$/.test(a) || /^--(skip-fields|skip-chars|check-chars)$/.test(a))) k++;
+      else if (tool === "xxd" && /^-(c|cols|g|groupsize|l|len|n|name|o|s|seek|R)$/.test(a)) k++;
+      else if (tool === "json.tool" && a === "--indent") k++;
+    }
+    return out;
+  };
+  if (name === "uniq" || name === "xxd") {
+    const ops = twoOpOperands(name, args);
+    if (ops.length === 1 && MAY_EXPAND.test(ops[0])) return worst(verdict, ask(`${name} with one expanding operand (${ops[0]}): bash may expand it into both input and output`));
+  }
   if (READ_ONLY.has(name) || DEV_TOOLS.has(name)) return verdict;
   // (Council project review 2, round 34, Mythos: unittest imports and calls any name it is given,
   // `python3 -m unittest code.interact` then runs standard input as Python; its names must be the
@@ -3736,6 +3914,10 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
   // (Round 38, Mythos: venv writes its directory, and --clear empties it first.)
   // (`--upgrade-deps` runs pip install in the new environment.)
   if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "venv") return worst(verdict, args.some((a) => longIs(a, "upgrade-deps") && a.length > 4) ? classify("venv --upgrade-deps installs packages") : ALLOW, venvTargets(args.slice(2), ["--prompt"], scope));
+  if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "json.tool") {
+    const ops = twoOpOperands("json.tool", args.slice(2));
+    if (ops.length === 1 && MAY_EXPAND.test(ops[0])) return worst(verdict, ask(`${name} -m json.tool with one expanding operand (${ops[0]}): bash may expand it into both input and output`));
+  }
   if (/^python3?$/.test(name) && args[0] === "-m" && PY_MODULES.has(args[1]) && !cmd.heredoc && (args[1] !== "unittest" || unittestNamesOwn(args.slice(2), scope))) return verdict;
   // `node --test`: the test runner over the project's test files, as `npm test` runs it.
   if (name === "node" && args[0] === "--test" && !cmd.heredoc) {
@@ -3799,6 +3981,87 @@ const FORK_BOMB = /:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/;
 // `curl ... | python3 -c "..."` is not one: the download is the program's input.
 const PIPE_TO_SHELL = /\b(curl|wget)\b[^|;&\n]*\|\s*(sudo\s+)?(env\s+)?(ba|z|da|k)?sh\b|\b(curl|wget)\b[^|;&\n]*\|\s*(python3?|node|perl|ruby)\s*(-\s*)?($|[|;&\n)])/;
 
+// The variables bash sets or computes by itself (bash 5.2, "Bash Variables"): what one expands to
+// is not the text a command assigned to it.
+const BASH_SETS = /^(_|BASH\w*|COMP_\w+|COMPREPLY|COPROC|DIRSTACK|EPOCH\w+|E?UID|FUNCNAME|GROUPS|HISTCMD|LINENO|LINES|COLUMNS|MAPFILE|OLDPWD|OPT(ARG|IND|ERR)|PIPESTATUS|PPID|PWD|RANDOM|READLINE_\w+|REPLY|SECONDS|SHELLOPTS|SHLVL|SRANDOM)$/;
+// The builtins that set a variable they are given the name of.
+const SETS_NAMES = /(^|[^\w.-])(printf|read|wait|mapfile|readarray|getopts|compgen|unset|let|declare|typeset|local|export|readonly)(?![\w.-])/;
+// The reserved words a compound command opens and closes with, and those another may follow.
+const OPENS = new Set(["{", "if", "while", "until", "for", "select"]);
+const CLOSES = new Set(["}", "fi", "done"]);
+const LEADS = new Set(["{", "if", "while", "until", "then", "else", "elif", "do", "!", "time", "}", "fi", "done"]);
+// The compound commands open once a command's leading reserved words are read, from the count
+// before it. A `case`, a `function` or a `coproc`, whose ends the count does not read, leaves it
+// open for the rest of the call, and so does a `[[` whose `]]` is not in the same command.
+function opened(inside: number, argv: string[]): number {
+  for (let i = 0; i < argv.length; i++) {
+    const w = argv[i];
+    if (w === "time") {
+      while (i + 1 < argv.length && (argv[i + 1] === "-p" || argv[i + 1] === "--")) {
+        if (argv[++i] === "--") break;
+      }
+      continue;
+    }
+    if (OPENS.has(w)) inside++;
+    else if (CLOSES.has(w)) inside--;
+    else if (["case", "function", "coproc"].includes(w) || (w === "[[" && argv.at(-1) !== "]]")) inside = Infinity;
+    if (!LEADS.has(w)) break;
+  }
+  return inside;
+}
+// The builtins that make a variable read-only, or give it an attribute that changes what an
+// assignment to it does, named as a word of the call or in text it runs (`eval 'readonly y'`).
+const FIXES_NAMES = /(^|[\s;&|(){}'"`])(readonly|declare|typeset)(?=$|[\s;&|(){}'"`])/;
+
+// (Project review 3, round 6, Mythos.) Two things the place of a command in the text does not
+// say, for the commands outside substitutions:
+//
+// `background`: the list the command stands in ends with `&`. Bash runs the whole list as a job
+// in a shell of its own, so an assignment or a `cd` at its head reaches nothing after it:
+// `x=foo && true & wait; echo hi > AGENTS.md$x` writes `AGENTS.md`. The list is read back from
+// its end: the first operator after the command, outside every compound command, that is not an
+// `&&`, an `||` or a `|`. A list that runs on into commands where the count of compound commands
+// is lost (`opened`) is taken for a job; those commands themselves are read as before.
+//
+// `skipped`: an earlier command of the same line (the command itself, for its own assignments)
+// can fail in a way that ends the line: an arithmetic expansion (`$((1/0))`, `$((08))`), a
+// substring's length, a subscript or an offset bash evaluates, an assignment to a read-only
+// variable (Simple.aborts). In a shell that reads its commands from a string, bash then drops
+// what is left of the line and runs the next one: `: $((1/0)); x=foo⏎echo hi > AGENTS.md$x`
+// writes `AGENTS.md`, and after `: $((1/0)); cd sub⏎` the shell is where it was. A line ends at a
+// newline that follows a command outside every compound command; in a call with parentheses,
+// whose ends the commands do not show, nowhere. A call of one line has no next line to run: there
+// nothing is skipped that anything after it could miss, and no command is marked. (bash 5.2.37:
+// an arithmetic command's own error, `((1/0))`, a builtin's (`readonly y; export y=1`) and one in
+// a subshell do not end the line; `${y?}` and `set -u` end the shell.)
+function reach(parsed: Parsed): { background: Set<Simple>; skipped: Set<Simple> } {
+  const top = parsed.cmds.filter((c) => !c.nested);
+  const levels: number[] = [];
+  let inside = 0;
+  for (const c of top) levels.push((inside = opened(inside, c.argv)));
+  const background = new Set<Simple>();
+  let end: string | undefined;
+  for (let k = top.length - 1; k >= 0; k--) {
+    const op = top[k].ends ?? top[k].next ?? "";
+    if (levels[k] === Infinity) end = "&";
+    else if (levels[k] === 0 && !["&&", "||", "|"].includes(op)) end = op;
+    if (end === "&" && levels[k] !== Infinity) background.add(top[k]);
+  }
+  const skipped = new Set<Simple>();
+  let aborted = false;
+  for (const [k, c] of parsed.lines ? top.entries() : []) {
+    if (c.aborts) aborted = true;
+    if (aborted) skipped.add(c);
+    if (c.next === "\n" && levels[k] === 0 && !parsed.grouped) aborted = false;
+  }
+  return { background, skipped };
+}
+// The commands of a call that bash may skip though it runs the line they stand on (`reach`), for
+// the checks that read the text that runs: the text the rules are given holds no arithmetic.
+export function skippable(command: string): Simple[] {
+  return [...reach(parse(command)).skipped];
+}
+
 // `NAME=value` words of a command that only sets variables (or exports them).
 function assignments(argv: string[]): [string, string][] | undefined {
   const words = argv[0] === "export" ? argv.slice(1) : argv;
@@ -3816,8 +4079,19 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
   // top level: a branch, a loop, `read` or a second assignment could give it another value. A
   // nested shell does not see unexported variables, so it starts with none.
   const words = parsed.cmds.flatMap((c) => [...c.argv, ...c.out, ...(c.in ?? [])]).join(" ");
-  const namedOnce = (name: string) => (words.match(new RegExp(`(^|[^$\\w{])${name}(?!\\w)`, "g")) ?? []).length === 1;
-  local.unassigned = (name: string) => !new RegExp(`(^|[^$\\w{])${name}(?!\\w)|\\$\\{${name}:?=`).test(words);
+  // (Project review 3, round 4, Mythos: an expansion that assigns is a second assignment, which
+  // the count of bare names does not see: after `x=; : "${x:=.md}"`, `AGENTS$x` is `AGENTS.md`.
+  // Read where the parser reads every expansion, a heredoc's body and `${x[0]:=.md}` included,
+  // and by the text of the words, which is what an `eval` runs.)
+  // (Round 5, Mythos: arithmetic that assigns is another, kept by the parser with these. And a
+  // builtin takes the name it sets on its option's letter, where the count of bare names passes
+  // it by: `x=foo; printf -vx ''` and `wait -px` leave `$x` empty. In a command that names such a
+  // builtin, a word of options that ends in the name names it.)
+  const setters = parsed.cmds.map((c) => c.argv.join(" ")).filter((text) => SETS_NAMES.test(text)).join(" ");
+  const attached = (name: string) => new RegExp(`(^|[^\\w$])-[A-Za-z]*${name}(?!\\w)`).test(setters);
+  const defaulted = (name: string) => !!parsed.assigns?.has(name) || !!scope.reassigned?.has(name) || new RegExp(`\\$\\{${name}(\\[[^\\]]*\\])?:?=`).test(words) || attached(name);
+  const namedOnce = (name: string) => !defaulted(name) && (words.match(new RegExp(`(^|[^$\\w{])${name}(?!\\w)`, "g")) ?? []).length === 1;
+  local.unassigned = (name: string) => !defaulted(name) && !new RegExp(`(^|[^$\\w{])${name}(?!\\w)`).test(words);
   const track = depth === 0 && !parsed.grouped;
   // The patterns of the parts that decide. A prompt offers one only when it covers them all.
   const patterns = new Set<string | undefined>(parsed.opaque ? [undefined] : []);
@@ -3827,12 +4101,29 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
   let failableCd = false;
   let braces = 0;
   let previous: Simple | undefined;
+  // (Project review 3, round 5, Mythos: an assignment is followed as one that ran only where
+  // every run of the call reaches it: `false && x=foo; echo hi > .git$x/hooks/pre-commit` writes
+  // in `.git`, and so does the second command of a branch, a loop or a group, `if false; then :;
+  // x=foo; fi`. `listed`: an `&&` or an `||` stands before the command in its list. `inside`:
+  // the compound commands open around it, counted by the reserved words that lead each command;
+  // a `case`, a `function` or a `coproc`, whose ends the count does not read, leaves it open
+  // for the rest of the call.)
+  let listed = false;
+  let inside = 0;
+  // (Round 6, Mythos: nor where its list is a background job, or a failure earlier on its line
+  // may have ended the line (`reach`); and not at all in a call of several lines that names a
+  // builtin which makes a variable read-only, where any assignment may be the one that fails.)
+  const { background, skipped } = reach(parsed);
+  const fixed = !!parsed.lines && FIXES_NAMES.test(words);
   for (const cmd of parsed.cmds) {
     if (!cmd.nested && failableCd && previous && ((!["&&", "|"].includes(previous.next ?? "") && braces === 0) || braces < 0)) {
       local.cwd = undefined;
       failableCd = false;
     }
     if (!cmd.nested) {
+      if (previous?.next === "&&" || previous?.next === "||" || cmd.after) listed = true;
+      else if (previous?.next !== "|") listed = false;
+      inside = opened(inside, cmd.argv);
       previous = cmd;
       for (const w of cmd.argv) {
         if (w === "{") braces++;
@@ -3847,7 +4138,8 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
     if (part.action === "classify" || part.action === "ask") patterns.add(part.pattern);
     verdict = worst(verdict, part);
     if (verdict.action === "deny") return verdict;
-    if (cmd.subshell) {
+    const apart = cmd.subshell || background.has(cmd) || skipped.has(cmd);
+    if (apart) {
       if (["cd", "pushd", "popd"].includes(cmd.argv[0])) local.cwd = undefined;
     } else if (cmd.argv[0] === "cd" && local.cwd) {
       // `cd -` goes to $OLDPWD, which is not known.
@@ -3860,13 +4152,16 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
       failableCd = !there && local.cwd !== undefined;
       braces = 0;
     } else if (cmd.argv[0] === "pushd" || cmd.argv[0] === "popd") local.cwd = undefined;
-    for (const [name, value] of (track && !cmd.subshell && assignments(cmd.argv)) || []) {
+    for (const [name, value] of (track && !listed && inside === 0 && !apart && !fixed && assignments(cmd.argv)) || []) {
       // The text is kept and resolved where it is used, after any later `cd`, as the shell does.
       // Only one word of plain text is followed: no expansion, blank or glob. `~` at its start is
       // expanded in an assignment.
       const text = expandVars(value, local);
       const i = cmd.argv.findIndex((w) => w.startsWith(`${name}=`));
-      if (namedOnce(name) && /^[\w./~@%+,:=-]*$/.test(text) && !cmd.dyn?.[i]) local.vars!.set(name, text.startsWith("~/") || text === "~" ? HOME + text.slice(1) : text);
+      // (Project review 3, round 3, Mythos: not a name bash gives a value of its own, whatever the
+      // command assigns: `FUNCNAME=x; mkdir sub/.git$FUNCNAME` makes `sub/.git`, `REPLY` is what a
+      // `read` took, `$DIRSTACK` is where the command runs.)
+      if (namedOnce(name) && !BASH_SETS.test(name) && /^[\w./~@%+,:=-]*$/.test(text) && !cmd.dyn?.[i]) local.vars!.set(name, text.startsWith("~/") || text === "~" ? HOME + text.slice(1) : text);
     }
   }
   return verdict.pattern && patterns.size > 1 ? { ...verdict, pattern: undefined } : verdict;

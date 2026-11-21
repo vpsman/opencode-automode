@@ -16,7 +16,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { bare, bashVerdict, compressorReading, copiesNothing, findActions, printsOnly, sortReading, sortRunsCompressor, fileVerdict, parse, readVerdict, rsyncReading, tarReading, within, type Matcher, type Scope, type Simple } from "./rules.ts";
+import { bare, bashVerdict, compressorReading, copiesNothing, findActions, printsOnly, sortReading, sortRunsCompressor, fileVerdict, parse, readVerdict, rsyncReading, skippable, tarReading, within, type Matcher, type Scope, type Simple } from "./rules.ts";
 import { gitArgs, gitEnv } from "./sandbox.ts";
 
 const HOME = os.homedir();
@@ -545,6 +545,12 @@ export function unmodelled(s: string, depth = 0, within?: { variables: Variables
   if (parsed.opaque) return "shell syntax the rules do not model";
   const shell = shellProblem(parsed.cmds);
   if (shell) return shell;
+  // (Project review 3, round 6, Mythos: a `cd` on a line that a failure before it may end, an
+  // arithmetic expansion's or an assignment's to a read-only variable (rules.ts, `reach`): bash
+  // skips the `cd` with the rest of the line and runs the next line where it was, `: $((1/0)); cd
+  // sub⏎echo hi > ../o.txt`. The checks that place each command read every `cd` as one bash
+  // reaches, so such a call asks. Not in a substitution, which ends with the failure.)
+  if (!within && skippable(s).some((c) => c.argv.some((w) => ["cd", "pushd", "popd"].includes(w)))) return "a cd on a line that an expansion or an assignment before it may end (arithmetic, a substring's length, a read-only variable): bash then skips the cd and runs the next line where it was";
   for (const body of nestedBodies(parsed.cmds)) {
     const inner = unmodelled(body, depth + 1, undefined, variables.assigned);
     if (inner) return `${inner}, in a command a nested shell runs`;
@@ -601,9 +607,10 @@ function scan(s: string, depth: number, variables: Variables, offset: number, ki
     variables.uses.add(name);
     return undefined;
   };
-  // A subscript or a substring offset from `from`: a number, or a name that holds an integer.
+  // A subscript or a substring offset from `from`: a number (no leading 0 before more digits, which
+  // bash reads as octal), or a name that holds an integer.
   const index = (expr: string, from: number): string | undefined => {
-    const m = /^(-?\d+)$|^(\$?)([A-Za-z_]\w*)$|^\$\{([A-Za-z_]\w*)\}$/.exec(expr);
+    const m = /^(-?(?:0|[1-9]\d*))$|^(\$?)([A-Za-z_]\w*)$|^\$\{([A-Za-z_]\w*)\}$/.exec(expr);
     if (!m) return "an array subscript or offset that is not a number or a plain variable, which bash evaluates as arithmetic";
     if (m[1] !== undefined) return undefined;
     return m[3] !== undefined ? integer(m[3], from + m[2].length) : integer(m[4], from + 2);
@@ -673,7 +680,7 @@ function scan(s: string, depth: number, variables: Variables, offset: number, ki
     words.push(raw);
 
     // What the word sets: `name=5` and `name=$((...))` give an integer; a subscript is arithmetic.
-    const literal = /^([A-Za-z_]\w*)=-?\d+$/.exec(raw);
+    const literal = /^([A-Za-z_]\w*)=-?(?:0|[1-9]\d*)$/.exec(raw);
     const computed = arithmeticValue && arithmeticValue.begin === begin && arithmeticValue.end === end - 1 ? arithmeticValue.name : undefined;
     arithmeticValue = undefined;
     const name = literal?.[1] ?? computed;
@@ -843,7 +850,9 @@ function scan(s: string, depth: number, variables: Variables, offset: number, ki
       if (close < 0) return "an unterminated ${";
       // `${x:offset}` and `${x:offset:length}`, each a number or a variable that holds one.
       let from = i + 1;
-      for (const part of s.slice(from, close).split(":")) {
+      const parts = s.slice(from, close).split(":");
+      if (parts.length > 2) return "a substring expansion with more than an offset and a length";
+      for (const part of parts) {
         const lead = /^ ?/.exec(part)![0].length;
         const found = index(part.slice(lead), from + lead);
         if (found) return found;
@@ -2312,6 +2321,13 @@ export function globMatcher(segment: string): (name: string) => GlobAnswer {
 // (`cwd`; unknown, it is held to the pattern too). As bash does, `*`, `?` and `[...]` match a
 // leading dot only when the pattern starts with one.
 const ORDINARY_NAMES = ["x", ".x", "x.md", "x.json", "x.jsonc", "x.yml", "x.yaml", "x.toml", "x.txt", "README.md", "x.sh"];
+// Whether a name's segment is a glob that can match an ordinary file's name, as bash matches it
+// (a leading `.` only by a leading `.`).
+export const ordinaryGlob = (segment: string) => {
+  if (!/[*?[]/.test(segment)) return false;
+  const glob = globMatcher(segment);
+  return ORDINARY_NAMES.some((n) => glob(n).match && (segment.startsWith(".") || !n.startsWith(".")));
+};
 export function protectedNameIn(target: string, names: string[], cwd?: string): string | undefined {
   const alternatives = braceWords(target) ?? [target.replace(/\{[^{}]*\}/g, "*")];
   for (const alt of alternatives) {
@@ -5045,7 +5061,7 @@ function compressorWrites(name: string, args: string[]): { files: string[]; dirs
     }
   } else if (name === "lz4" || name === "lz4c") {
     const operands = args.filter((a) => !a.startsWith("-"));
-    if (!args.some((a) => /^(-[a-zA-Z0-9]*m|--multiple)$/.test(a)) && operands.length > 1) files.push(operands[1]);
+    if (!args.some((a) => /^(-[a-zA-Z0-9]*m|--multiple)$/.test(a)) && (operands.length > 1 || (operands.length === 1 && /[*?[\]{}$`]/.test(operands[0])))) files.push(operands.length > 1 ? operands[1] : operands[0]);
   } else if (name === "zip") {
     const VALUED = /^-(b|n|t|tt|O|P|s|sp|Z|ds)$|^--(output-file|temp-path|suffixes|from-date|before-date|password|split-size|compression-method)$/;
     for (let i = 0; i < args.length; i++) {
@@ -5335,6 +5351,118 @@ export interface Unlisted {
 // after, and the status, show. `apply` and the commands that make another work tree or rewrite
 // the index by hand keep the directory mark.
 export const WORKTREE_GIT = new Set(["am", "checkout", "switch", "restore", "reset", "stash", "merge", "pull", "rebase", "cherry-pick", "revert", "mv", "bisect"]);
+// The second name a writer gives a file, which its command line fixes (project review 3, round 2,
+// Mythos): the backup `sed -i<suffix>`, `cp`/`mv`/`ln`/`install -S` and `patch -z`/`-B`/`-Y` make
+// beside a target (`sed -it p sub/.gi` makes `sub/.git`), and what a compressor writes in place:
+// the input less its suffix, or the input it replaces (`gunzip AGENTS.md.gz`, `gzip AGENTS.md`).
+// Held to the protected-name test like every target (decide.ts, writeProblem); not added to the
+// session's write record, where a compressor's copy is no write of content (README).
+// `unknown`: a second name the command line does not show, which the caller asks about (round 3,
+// Opus: `patch -b -z .md -p0 < a.diff` backs up the files the diff names).
+// `ends`: whether a suffix can be the end of a protected name. A backup of a file the command
+// line does not show is that file's name and the suffix, so only such a suffix can make one
+// (`cp -rS t` can make `.git`; `cp -r -S .bak` makes no protected name, whatever it copies).
+// `fresh`: whether another command of the call may make files, which a glob of this one can
+// then match though no listing at decision time shows them.
+export function secondNames(cmd: Simple, writes: Write[], expand: (word: string) => string[] | undefined, ends: (suffix: string) => boolean = () => true, fresh = false): { names: string[]; unknown?: string } {
+  const out: string[] = [];
+  let unknown: string | undefined;
+  const glob = (word: string) => /[*?[]/.test(word);
+  // Round 3, Mythos: a glob is the names it matches here (`sed -i.md p *`); one that cannot be
+  // listed, or a word built at run time, gives backup names nobody can list. The pattern itself
+  // stays in the list: one written to reach a protected name is held to it whatever is on disk
+  // (`echo hi > CLAUDE; sed -i.md p CLAUD?`, where the glob is judged before the file is there).
+  const each = (word: string, why: string, matters = true): string[] => {
+    if (/[$`]/.test(word)) {
+      if (matters) unknown ??= `${why} of a name built at run time (${word})`;
+      return [];
+    }
+    if (!glob(word)) return [word];
+    if (fresh && matters) unknown ??= `${why} of a glob in a call whose other commands may make files, so the names it writes are not known when the call is judged (${word})`;
+    const names = expand(word);
+    if (names === undefined && matters) unknown ??= `${why} of a glob the check cannot list (${word})`;
+    return [word, ...(names ?? [])];
+  };
+  const fixed = (word: string, why: string) => {
+    if (/[$`]/.test(word)) unknown ??= `${why} built at run time (${word})`;
+    return word;
+  };
+  for (const at of programs(cmd.argv)) {
+    const name = path.basename(cmd.argv[at]);
+    const args = cmd.argv.slice(at + 1);
+    if (printsOnly(name, args)) continue;
+    const mine = writes.filter((w) => w.cmd === cmd && w.by === name);
+    if (name === "sed") {
+      for (const a of args) {
+        const suffix = /^-[a-zA-Z]*i(.+)$/s.exec(a)?.[1] ?? /^--i[a-z-]*=(.+)$/s.exec(a)?.[1];
+        if (suffix !== undefined) for (const w of mine) for (const n of each(w.word, "sed -i's backup", ends(suffix))) out.push(n + suffix);
+      }
+    } else if (Object.hasOwn(COPY_OPTIONS, name)) {
+      const got = getopt(args, COPY_OPTIONS[name]);
+      const suffixes = got.opts.filter((o) => o.name === "-S" || o.name === "--suffix").map((o) => fixed(o.value ?? "", `${name}'s backup suffix`));
+      // Round 3, Mythos: a recursive copy backs up files inside the directories it copies.
+      // (cp and rsync only: ln's `-r` is `--relative`, and mv and install copy no directory's files.)
+      if (suffixes.some(ends) && (name === "cp" || name === "rsync") && got.opts.some((o) => ["-r", "-R", "-a", "--recursive", "--archive"].includes(o.name))) unknown ??= `${name} with a backup suffix in a recursive copy backs up files inside the directories it copies, which no command line shows`;
+      for (const s of suffixes) {
+        for (const w of mine) {
+          // A destination may be a directory: the backup is then of the file each source lands on.
+          if (!w.dir) for (const n of each(w.word, `${name}'s backup`, ends(s))) out.push(n + s);
+          for (const src of w.sources ?? []) for (const n of each(src, `${name}'s backup`, ends(s))) out.push(`${w.word.replace(/\/+$/, "")}/${path.basename(n.replace(/\/+$/, ""))}${s}`);
+        }
+      }
+    } else if (name === "patch") {
+      const got = getopt(args, PATCH_OPTIONS);
+      const opts = got.opts;
+      const of = (...names: string[]) => opts.filter((o) => names.includes(o.name)).map((o) => fixed(o.value ?? "", `patch ${o.name}`));
+      const naming = opts.find((o) => ["-z", "--suffix", "-B", "--prefix", "-Y", "--basename-prefix"].includes(o.name));
+      if (naming && !got.operands.length) unknown ??= `patch ${naming.name} names the backups of the files its diff names, which no command line shows`;
+      // GNU patch builds one name from all three: prefix, directory, basename prefix, basename,
+      // suffix (round 3, Mythos: `patch -b -Y .g -z t sub/i a.diff` makes `sub/.git`).
+      const [zs, bs, ys] = [of("-z", "--suffix"), of("-B", "--prefix"), of("-Y", "--basename-prefix")];
+      if (naming) {
+        for (const w of mine) {
+          for (const n of each(w.word, "patch's backup")) {
+            for (const b of ["", ...bs]) for (const y of ["", ...ys]) for (const z of ["", ...zs]) {
+              if (b || y || z) out.push(b + path.join(path.dirname(n), y + path.basename(n)) + z);
+            }
+          }
+        }
+      }
+    } else {
+      const z = compressorReading(name, args);
+      if (!z || !z.inPlace || z.reads) continue;
+      for (const operand of z.operands) {
+        // (Project review 3, closing round, Opus's second and third re-checks: when another
+        // command of the same call may make files, from any directory, by any spelling or in
+        // parallel, background, process-substitution or loop order, a decompression's glob —
+        // including one that also holds a variable — may match one no listing shows: asked.)
+        if (fresh && z.decompress && glob(operand)) unknown ??= `${name} decompresses a glob in a call whose other commands may make files, so the names it writes are not known when the call is judged (${operand})`;
+        // (A word built at run time is the rules' to judge: for gzip, gunzip, xz and zstd it is
+        // resolved from the call's own variables or asked about, rules.ts commandRead; any
+        // other compressor is a command the rules do not know, which goes to the model.)
+        if (/[$`]/.test(operand)) continue;
+        // (Project review 3, closing round, Opus: a glob is also held as written, for a file the
+        // call itself makes before it runs, which no listing at decision time finds:
+        // `gzip -c f > opencode.json.gz; gunzip opencode.json.g?`. The pattern, what the
+        // decompression makes of it, and a decompression's pattern less a last ending that holds
+        // the glob (`.g?`, `.*`); each only where its name cannot be an ordinary file's, so that
+        // `gunzip *.gz` is held to the names on disk alone.)
+        if (glob(operand)) {
+          const stem = operand.replace(/\.[^./]*[*?[][^./]*$/, "");
+          const held = z.decompress ? [operand, z.outputName(operand), stem !== operand ? stem : undefined] : [operand];
+          for (const p of held) if (p !== undefined && !ordinaryGlob(path.basename(p))) out.push(p);
+        }
+        for (const n of glob(operand) ? (expand(operand) ?? [operand]) : [operand]) {
+          // Round 3, Mythos: a name without a known suffix is one gzip completes (`gunzip
+          // AGENTS.md` reads `AGENTS.md.gz`) and writes as given.
+          out.push(z.decompress ? (z.outputName(n) ?? n) : n);
+        }
+      }
+    }
+  }
+  return { names: out, ...(unknown ? { unknown } : {}) };
+}
+
 export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Simple) => boolean): { writes: Write[]; unknown?: string; unlisted: Unlisted[] } {
   const writes: Write[] = [];
   const unlisted: Unlisted[] = [];
@@ -5357,8 +5485,8 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       if (name === "tee" || name === "truncate") files.forEach((f) => add(f, true));
       else if (name === "sed" && args.some((a) => /^(-[a-zA-Z]*i|--in-place)/.test(a))) files.slice(args.some((a) => /^(-[a-zA-Z]*e$|--expression)/.test(a)) ? 0 : 1).forEach((f) => add(f, true));
       else if ((name === "perl" || name === "ruby") && args.some((a) => /^-[a-zA-Z]*i/.test(a))) files.slice(args.some((a) => /^-[a-zA-Z]*e$/.test(a)) ? 1 : 0).forEach((f) => add(f, false));
-      // An rsync that copies nothing (a dry run, a listing, one operand) writes no destination; its
-      // option places are still read below (round 41).
+      // An rsync that copies nothing (a dry run, a listing, one non-expanding operand) writes no
+      // destination; its option places are still read below (round 41).
       else if (["cp", "mv", "ln", "install", "rsync"].includes(name) && !copiesNothing(name, args)) {
         // `-t DIR` / `--target-directory=DIR`: every operand is a source (the rules read the last
         // one as the destination and never look at DIR).
@@ -5367,9 +5495,17 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
         const words = copyWords(name, args);
         const t = words.unknown ? valued(args, "t", "--target-directory").at(-1) : words.target;
         const operands = words.unknown ? files.filter((f) => f !== t && !(name === "install" && valued(args, "m", "--mode").includes(f))) : words.operands;
+        const installsDir = name === "install" && (words.unknown ? args.some((a) => /^-[a-zA-Z]*d/.test(a) || /^--dir/.test(a)) : getopt(args, COPY_OPTIONS.install).opts.some((o) => o.name === "-d" || o.name === "--directory"));
+        const oneExpands = t === undefined && !installsDir && operands.length === 1 && /[*?[\]{}$`]/.test(operands[0]);
         if (t !== undefined) add(t, false, { dir: true, sources: operands });
         else if (operands.length > 1) add(operands.at(-1), true, { sources: operands.slice(0, -1) });
-        else if (name === "ln" && operands.length === 1) add(path.basename(operands[0]), false, { sources: operands });
+        else if (oneExpands) {
+          // (Project review 3, round 8, Neon: one expanding operand may supply both source and destination.)
+          add(operands[0], false, { sources: operands });
+          const why = `${name} ${operands[0]}: one word bash may expand into both source and destination`;
+          unknown ??= why;
+          unlisted.push({ cmd, reason: why, dirs: [undefined] });
+        } else if (name === "ln" && operands.length === 1) add(path.basename(operands[0]), false, { sources: operands });
         // A hard link makes the source the same file as the link: a write through either name
         // writes both, so the source is the session's too.
         if (words.hard) for (const src of t !== undefined || operands.length === 1 ? operands : operands.slice(0, -1)) add(src, false);
@@ -5393,31 +5529,66 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       else if (name === "tree") valued(args, "o", "--never").forEach((f) => add(f, false));
       else if (name === "less") [...valued(args, "o", "--log-file"), ...valued(args, "O", "--LOG-FILE")].forEach((f) => add(f, false));
       // (Round 3: `-` is the input operand, `uniq - out`; the last of two or more operands is the
-      // output, an option's value counted among them, which can only record more.)
+      // output. Project review 3, round 8, Neon: one operand bash may expand into several words
+      // (`uniq sub/*`, `xxd sub/*`, `python3 -m json.tool sub/*`) may supply both input and output.)
       // (Council project review 1, round 6: `python3 -m json.tool IN OUT` writes OUT.)
       else if (/^python[0-9.]*$/.test(name) && args.some((a, k) => (a === "-m" && args[k + 1] === "json.tool") || a === "-mjson.tool")) {
         const at = args.findIndex((a, k) => (a === "-m" && args[k + 1] === "json.tool") || a === "-mjson.tool");
         const rest = args.slice(at + (args[at] === "-m" ? 2 : 1));
-        const end = rest.indexOf("--");
-        const operands = [...(end < 0 ? rest : rest.slice(0, end)).filter((a) => a === "-" || !a.startsWith("-")), ...(end < 0 ? [] : rest.slice(end + 1))];
-        if (operands.length > 1) add(operands[1], true);
+        const operands: string[] = [];
+        for (let k = 0; k < rest.length; k++) {
+          const a = rest[k];
+          if (a === "--") {
+            operands.push(...rest.slice(k + 1));
+            break;
+          }
+          if (a === "-" || !a.startsWith("-")) operands.push(a);
+          else if (a === "--indent") k++;
+        }
+        if (operands.length > 1) add(operands[1], false);
+        else if (operands.length === 1 && /[*?[\]{}$`]/.test(operands[0])) {
+          add(operands[0], false);
+          const why = `${name} -m json.tool ${operands[0]}: one word bash may expand into both input and output`;
+          unknown ??= why;
+          unlisted.push({ cmd, reason: why, dirs: [undefined] });
+        }
       }
       else if (name === "uniq" || name === "xxd") {
         // (Round 41, Mythos: the words after `--` are operands, `-/../x` too.)
-        const end = args.indexOf("--");
-        const operands = [...(end < 0 ? args : args.slice(0, end)).filter((a) => a === "-" || !a.startsWith("-")), ...(end < 0 ? [] : args.slice(end + 1))];
-        add(operands.length > 1 ? operands.at(-1) : undefined, false);
+        const operands: string[] = [];
+        for (let k = 0; k < args.length; k++) {
+          const a = args[k];
+          if (a === "--") {
+            operands.push(...args.slice(k + 1));
+            break;
+          }
+          if (a === "-" || !a.startsWith("-")) operands.push(a);
+          else if (name === "uniq" && (/^-[a-zA-Z]*[fsw]$/.test(a) || /^--(skip-fields|skip-chars|check-chars)$/.test(a))) k++;
+          else if (name === "xxd" && /^-(c|cols|g|groupsize|l|len|n|name|o|s|seek|R)$/.test(a)) k++;
+        }
+        if (operands.length > 1) add(operands.at(-1), false);
+        else if (operands.length === 1 && /[*?[\]{}$`]/.test(operands[0])) {
+          add(operands[0], false);
+          const why = `${name} ${operands[0]}: one word bash may expand into both input and output`;
+          unknown ??= why;
+          unlisted.push({ cmd, reason: why, dirs: [undefined] });
+        }
       }
       else if ((name === "yq" || name === "jq") && args.some((a) => /^(-[a-zA-Z]*i|--inplace)$/.test(a))) files.slice(1).forEach((f) => add(f, false));
       // B7-7: a directory or a file an option names for the program to write in: tar's `-C` and
       // unzip's `-d` when they extract, find's `-fprint0` (the rules ask on `-fprint`, `-fprintf`
       // and `-fls`), rsync's log, batch, backup, temp and partial places. Each is held to the write
       // check for that place (`tar -xf a.tar -C .git/hooks`).
-      // (A place known only when the command runs is the unnamed write's: the project is marked.)
       // Held to the check of protected places alone (decide.ts, writeProblem), which reads every
       // write listed here where it lands: what the rules say of the program's place outside the
       // project stands (`tar -xf a.tar -C /tmp` is the model's, as before).
-      const place = (word: string | undefined, dir: boolean) => void (word !== undefined && plainWord(word) && add(word, true, dir ? { dir: true } : {}));
+      // (Project review 3, round 4, Mythos: a value bash expands is listed as it is written, not
+      // dropped, so that check reads it as it reads every other target: a glob by the names it
+      // can match, `unzip -d pkg/.husk?`, `tar -C sub/.gi?`, and a word built at run time by the
+      // text it shows, `unzip -d .git/$x`. Where such a word leads stays the rules' to say, with
+      // the call's own variables, `x=git; unzip -d sub/.$x` (rules.ts, commandRead), or the
+      // model's, `tar -C "$d"`; the unnamed write marks the project.)
+      const place = (word: string | undefined, dir: boolean) => void add(word, true, dir ? { dir: true } : {});
       if (blind && (name === "tar" || name === "gtar" || name === "bsdtar")) {
         const opts = getopt(tarWords(args), TAR_OPTIONS).opts;
         for (const o of opts) if (o.name === "-C" || o.name === "--directory") place(o.value, true);
@@ -6441,7 +6612,11 @@ function placeAll(command: string, starts: Places, depth: number, out: Located, 
 // that names the directory by another name may be what the program writes (`cp -t/proc/self/cwd`,
 // `sort -o /proc/self/cwd/x`, `echo x > /proc/self/cwd/x` after a `cd .git/hooks`): which word a
 // program writes is its own table, so each such word is held to it, where it lands.
-export function placedReads(where: Located, scope: Scope, judgeAt: (dir: string, words: string[]) => { action: string; reason: string }, landed?: (file: string) => string | undefined): GuardVerdict | undefined {
+// (Project review 3, round 5, Mythos: and a redirect's target is judged with the command in each
+// place, as its words are: after `true || cd sub`, `echo hi > ../o.txt` writes above the project.
+// A target that holds an expansion is judged so only where the command may run in more than one
+// place: in one, the rules read it there with the call's variables, `cd sub && ls > $OUT.txt`.)
+export function placedReads(where: Located, scope: Scope, judgeAt: (dir: string, words: string[], out?: string[]) => { action: string; reason: string }, landed?: (file: string) => string | undefined): GuardVerdict | undefined {
   let verdict: GuardVerdict | undefined;
   const add = (action: "ask" | "classify", reason: string) => void (verdict = stricter(verdict, { action, reason }));
   if (where.moves) {
@@ -6529,15 +6704,17 @@ export function placedReads(where: Located, scope: Scope, judgeAt: (dir: string,
         break;
       }
     }
-    if (!own.length && !named.length) continue;
+    const redirected = where.moves ? cmd.out : [];
+    if (!own.length && !named.length && !redirected.length) continue;
     if (!places) {
       if (named.length) add("classify", `${named[0].word} names the directory a command runs in, which the check cannot tell`);
       continue;
     }
     if (!where.moves && !named.length) continue;
     const distinct = new Map(places.map((p) => [`${p.real}\0${p.logical}\0${p.alt ?? ""}`, p]));
+    const outs = redirected.filter((w) => distinct.size > 1 || !/[$`]/.test(w));
     for (const p of distinct.values()) {
-      const v = own.length ? judgeAt(p.real, own.map((w) => rewrite(w, p))) : undefined;
+      const v = own.length || outs.length ? judgeAt(p.real, own.length ? own.map((w) => rewrite(w, p)) : [":"], outs.map((w) => rewrite(w, p))) : undefined;
       if (v && (v.action === "ask" || v.action === "deny")) add("ask", `${v.reason} (where it runs: ${p.real})`);
       // Each such word as the file it names there, read or written, as the kernel walks it.
       for (const n of named) {
