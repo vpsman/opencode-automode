@@ -3960,20 +3960,23 @@ const PLAIN_TOOLS = new Set(
 );
 // `~+` is the directory the command runs in (round 42, Mythos).
 const herePlus = (word: string) => (word === "~+" ? "." : word.startsWith("~+/") ? `.${word.slice(2)}` : word);
-// Programs that make no file but by a redirect (closing round, Opus's second re-check).
+// Programs that make no file but by a redirect, matched bare (no path): closing round, Opus's
+// second and third re-checks.
 const ONLY_READS = new Set(["", "cd", "pushd", "popd", "pwd", "ls", "cat", "echo", "printf", "true", "false", ":", "test", "[", "grep", "rg", "head", "tail", "wc", "stat", "file", "du", "df", "sleep", "wait", "zcat"]);
+const PURE_ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/;
 function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined, dirsOf?: (cmd: Simple) => string[] | undefined, roots?: string[]): string | undefined {
   // Also every place the guard's own list of writes names (`cp -t`, `sort -o`, git's `--output`).
   const extra = writesOf(cmds).writes;
-  // (Project review 3, closing round, Opus: a glob also matches the files the call's earlier
+  // (Project review 3, closing round, Opus: a glob also matches the files the call's other
   // commands make, which no listing at decision time finds: `gzip -c f > opencode.json.gz;
-  // gunzip ./*.gz`. Each name as its writer spells it, matched segment by segment as bash
-  // matches, a leading `.` only by a leading `.`.)
-  const madeBefore = (cmd: Simple) =>
+  // gunzip ./*.gz`, or in parallel, background, process-substitution or loop order. Each name as
+  // its writer spells it, matched segment by segment as bash matches, a leading `.` only by a
+  // leading `.`.)
+  const madeElsewhere = (cmd: Simple) =>
     cmds
-      .slice(0, cmds.indexOf(cmd))
+      .filter((c) => c !== cmd)
       .flatMap((c) => [...c.out, ...extra.filter((w) => w.cmd === c).map((w) => w.word)])
-      .filter((w) => !/[$`*?[\]{}]/.test(w) && !w.startsWith("&"))
+      .filter((w) => !/[$`*?[\]{}]/.test(w))
       .map((w) => path.normalize(herePlus(w)));
   const matchedBy = (word: string, names: string[]) => {
     const segments = path.normalize(herePlus(word)).split("/");
@@ -3982,11 +3985,18 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       return parts.length === segments.length && segments.every((s, i) => (/[*?[]/.test(s) ? globMatcher(s)(parts[i]).match && (s.startsWith(".") || !parts[i].startsWith(".")) : s === parts[i]));
     });
   };
-  // (Project review 3, closing round, Opus's second re-check: whether a command before this one
-  // may make files: a redirect to anything but a device or a descriptor, a write the guard lists,
-  // or any program but a `cd` and a few that only read or print.)
-  const madesFiles = (cmd: Simple) =>
-    cmds.slice(0, cmds.indexOf(cmd)).some((c) => [...c.out, ...extra.filter((w) => w.cmd === c).map((w) => w.word)].some((w) => !/^(&|\/dev\/)/.test(w)) || !ONLY_READS.has(path.basename(c.argv[0] ?? "")));
+  // (Project review 3, closing round, Opus's second and third re-checks: whether any other
+  // command of the call may make files, in any order — pipelines, subshells, background jobs,
+  // process substitutions, loops and functions run later text beside or before earlier text. A
+  // redirect to anything but a normalised device path, a write the guard lists, or any command
+  // other than a bare read-only program or pure variable assignments.)
+  const makesFiles = (cmd: Simple) =>
+    cmds.some(
+      (c) =>
+        c !== cmd &&
+        ([...c.out, ...extra.filter((w) => w.cmd === c).map((w) => w.word)].some((w) => !(path.isAbsolute(w) && isDevice(w, undefined))) ||
+          (!ONLY_READS.has(c.argv[0] ?? "") && !(c.argv.length > 0 && c.argv.every((w) => PURE_ASSIGN.test(w))))),
+    );
   for (const cmd of cmds) {
     // (Project review 3, round 2, Mythos: with the second names a writer gives, a backup or a
     // compressor's output.)
@@ -3996,11 +4006,11 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       // (Each name as the word spells it from where the command runs: a project kept under a
       // directory of a protected name is not written "into" it by the names a glob matches.)
       const all = dirs.map((dir) => expandNames(word, dir)?.map((name) => path.normalize(name)).map((name) => (within(name, dir) ? path.relative(dir, name) || "." : name)));
-      return all.some((n) => n === undefined) ? undefined : [...all.flatMap((n) => n!), ...matchedBy(word, madeBefore(cmd))];
+      return all.some((n) => n === undefined) ? undefined : [...all.flatMap((n) => n!), ...matchedBy(word, madeElsewhere(cmd))];
     };
     // (A suffix with a `/` puts the backup under another name's directory: not read.)
     const ends = (suffix: string) => suffix === "" || suffix.includes("/") || PROTECTED_NAMES.some((n) => n.length > suffix.length && n.endsWith(suffix));
-    const second = secondNames(cmd, extra, expand, ends, madesFiles(cmd));
+    const second = secondNames(cmd, extra, expand, ends, makesFiles(cmd));
     if (second.unknown) return second.unknown;
     const targets = [...cmd.out, ...extra.filter((w) => w.cmd === cmd).map((w) => w.word), ...second.names];
     // Round 4, N3: the targets that make a file (see NAME_KEEPERS), with the operands after `--`.

@@ -5359,7 +5359,7 @@ export const WORKTREE_GIT = new Set(["am", "checkout", "switch", "restore", "res
 // `ends`: whether a suffix can be the end of a protected name. A backup of a file the command
 // line does not show is that file's name and the suffix, so only such a suffix can make one
 // (`cp -rS t` can make `.git`; `cp -r -S .bak` makes no protected name, whatever it copies).
-// `fresh`: whether a command before this one in the call may make files, which a glob of it can
+// `fresh`: whether another command of the call may make files, which a glob of this one can
 // then match though no listing at decision time shows them.
 export function secondNames(cmd: Simple, writes: Write[], expand: (word: string) => string[] | undefined, ends: (suffix: string) => boolean = () => true, fresh = false): { names: string[]; unknown?: string } {
   const out: string[] = [];
@@ -5375,6 +5375,7 @@ export function secondNames(cmd: Simple, writes: Write[], expand: (word: string)
       return [];
     }
     if (!glob(word)) return [word];
+    if (fresh && matters) unknown ??= `${why} of a glob in a call whose other commands may make files, so the names it writes are not known when the call is judged (${word})`;
     const names = expand(word);
     if (names === undefined && matters) unknown ??= `${why} of a glob the check cannot list (${word})`;
     return [word, ...(names ?? [])];
@@ -5428,14 +5429,15 @@ export function secondNames(cmd: Simple, writes: Write[], expand: (word: string)
       const z = compressorReading(name, args);
       if (!z || !z.inPlace || z.reads) continue;
       for (const operand of z.operands) {
+        // (Project review 3, closing round, Opus's second and third re-checks: when another
+        // command of the same call may make files, from any directory, by any spelling or in
+        // parallel, background, process-substitution or loop order, a decompression's glob —
+        // including one that also holds a variable — may match one no listing shows: asked.)
+        if (fresh && z.decompress && glob(operand)) unknown ??= `${name} decompresses a glob in a call whose other commands may make files, so the names it writes are not known when the call is judged (${operand})`;
         // (A word built at run time is the rules' to judge: for gzip, gunzip, xz and zstd it is
         // resolved from the call's own variables or asked about, rules.ts commandRead; any
         // other compressor is a command the rules do not know, which goes to the model.)
         if (/[$`]/.test(operand)) continue;
-        // (Project review 3, closing round, Opus's second re-check: after a command of the same
-        // call that may make files, from any directory, by any spelling, `cp d/opencode.json.gz
-        // .`, `tar xzf a.tgz`, a decompression's glob may match one no listing shows: asked.)
-        if (fresh && z.decompress && glob(operand)) unknown ??= `${name} decompresses a glob after the call's earlier commands may make files, so the names it writes are not known when the call is judged (${operand})`;
         // (Project review 3, closing round, Opus: a glob is also held as written, for a file the
         // call itself makes before it runs, which no listing at decision time finds:
         // `gzip -c f > opencode.json.gz; gunzip opencode.json.g?`. The pattern, what the

@@ -551,3 +551,49 @@ test("closing round (Opus, second re-check): a decompression's glob after the ca
     "gzip -c f > logs.gz; zcat ./*.gz",
   ]) assert.equal(await decide(command), "allow", command);
 });
+
+test("closing round (Opus, third re-check): a file-making command anywhere in the call makes a decompression or backup glob ask", async () => {
+  for (const command of [
+    // Opus re-check 3: maker appears later in the text but runs beside or before the decompression.
+    "(sleep 1; gunzip ./*.gz) | cp d/opencode.json.gz .",
+    "(sleep 1; gunzip ./*.gz) | gzip -c f > opencode.json.gz",
+    "(sleep 1; gunzip ./*.gz) & cp d/opencode.json.gz .; wait",
+    "echo <(sleep 1; gunzip ./*.gz); cp d/opencode.json.gz .; sleep 2",
+    "sleep 1 | gunzip ./*.gz | cp d/opencode.json.gz .",
+    "cat <(sleep 1; gunzip ./*.gz) & tar xzf a.tgz; wait",
+    // Nearby ordering cases: brace group, bare pipeline/background, loop, function.
+    "{ gunzip ./*.gz; } | cp d/opencode.json.gz .",
+    "gunzip ./*.gz | cp d/opencode.json.gz .",
+    "gunzip ./*.gz & cp d/opencode.json.gz .; wait",
+    "for i in 1 2; do gunzip ./*.gz; cp d/opencode.json.gz .; done",
+    "ls() { gunzip ./*.gz; }; cp d/opencode.json.gz .; ls",
+    // Bare ONLY_READS names and normalised device redirects only.
+    "./ls; gunzip ./*.gz",
+    `cat sub/AGENTS.md.gz > /dev/..${repo}/opencode.json.gz; gunzip ./*.gz`,
+    "cat sub/AGENTS.md.gz > '&/opencode.json.gz'; cd '&'; gunzip ./*.gz",
+    // Variable + glob in a decompression when another command makes files.
+    "x=gz; cp sub/AGENTS.md.gz .; gunzip ./*.$x",
+    "x=g; gzip -c f > opencode.json.gz; gunzip ./opencode.json.${x}?",
+    "x=z; gzip -c f > z/opencode.json.gz; gunzip ./$x/*.gz",
+    // Backup writers with a glob and a protected-ending suffix when another command makes files.
+    "cp a/AGENTS .; sed -i.md p ./*",
+    "echo hi > z/CLAUDE; cd z; sed -i.md p ./*",
+    "tar xzf a.tgz; sed -i.md p ./*",
+    "(sleep 1; sed -i.md p ./*) & echo hi > AGENTS; wait",
+    "cp a/AGENTS z/; cp -b -S .md f z/*",
+    "cp a/AGENTS .; mv -b -S .md f ./*",
+    "echo hi > z/CLAUDE; cd z; patch -b -z .md ./* a.diff",
+  ]) assert.equal(await decide(command), "ask", command);
+  for (const command of [
+    "gunzip *.gz",
+    "gunzip ./*.gz",
+    "cd z && gunzip *.gz",
+    "ls; gunzip ./*.gz",
+    "gunzip *.gz; ls",
+    "gzip -c f > logs.gz; zcat ./*.gz",
+    "gunzip ./*.gz 2>/dev/null; ls",
+    "ls >/dev/null; gunzip ./*.gz",
+    "echo hi > notes.txt; sed -i.bak p ./*",
+    "x=z; gunzip $x/*.gz",
+  ]) assert.equal(await decide(command), "allow", command);
+});
