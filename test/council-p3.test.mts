@@ -1531,3 +1531,32 @@ test("round 23 (Sol, Opus): printf -vNAME attached, and a blank in a directory t
     "for f in *.ts; do [ -f $f ]; done",
   ]) assert.equal(await decide23(command), "allow", command);
 });
+
+test("round 24 (Opus, Sol): a printf option held in a variable, an assignment after a keyword, printf -v\"$x\"", async () => {
+  const repo24 = path.join(base, "repo24");
+  fs.mkdirSync(repo24, { recursive: true });
+  fs.writeFileSync(path.join(repo24, "f"), "a[$(date)]");
+  execFileSync("git", ["init", "-q", "-b", "main", repo24]);
+  const decide24 = async (command: string) => (await decideShell(guard, new SessionState(repo24), repo24, command)).effect;
+  for (const command of [
+    // Sol: an option word held in a variable, and an assignment after `then`.
+    "v=x; op=-vv; printf \"$op\" %s .git; echo x > $v/config",
+    "v=x; op=-vv; printf \"$op\" '%s%s %s' - v 'a[$(date)]'; test $v",
+    "v=x; if true; then v='-v a[$(date)]'; fi; test $v",
+    // Opus: a computed attached name (a regression from round 23).
+    "read x < f; printf \"-v$x\" %s 1",
+    "read -r x < f; printf -v\"$x\" %s 1",
+    "read -r x < f; printf \"-v${x}\" %s 1",
+    "while read -r n; do printf -v\"$n\" %s 1; done < f",
+    "printf -v\"$1\" %s \"$2\"",
+  ]) assert.notEqual(await decide24(command), "allow", command);
+  for (const command of [
+    'printf "$fmt" a b',
+    "x=out; echo hi > $x.txt",
+    "fmt='%s\\n'; printf \"$fmt\" a; echo x > out.txt",
+    "if true; then x=foo; fi; [ $x = foo ]",
+    "sleep 1 & wait $!",
+    'printf -v out "%03d" 3; echo "$out"',
+    'read -r x < f; printf -- "-v$x" %s 1',
+  ]) assert.equal(await decide24(command), "allow", command);
+});

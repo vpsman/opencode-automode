@@ -4966,6 +4966,8 @@ function printfTargets(args: string[], knownVars?: Map<string, string>, allAssig
       break;
     }
     if (/^(?:[$`]|-(?:[$`]|v))/.test(a)) {
+      // (Round 24, Opus: `printf "-v$x" %s 1` names `$x`, a computed name, as round 23 dropped.)
+      if (a.startsWith("-v") && a.length > 2) out.push(a.slice(2));
       for (const v of assignedExpansions(a, allAssigned)) if (v.startsWith("-v") && v.length > 2) out.push(v.slice(2));
       if (i + 1 < args.length) out.push(args[i + 1]);
     }
@@ -7569,7 +7571,9 @@ export function exportProblem(cmds: Simple[], cwd: string | undefined, inProject
   const exported = new Set<string>();
   const note = (name: string, value: string | undefined) => values.set(name, [...(values.get(name) ?? []), value]);
   for (const { argv } of cmds) {
+    // (Round 24, Sol: an assignment after `then`, `do`, `!`, ...: `if true; then v='-v a[...]'; fi`.)
     let i = 0;
+    while (i < argv.length && LOOP_KEYWORDS.has(argv[i])) i++;
     for (; i < argv.length && ASSIGN.test(argv[i]); i++) {
       const m = ASSIGN.exec(argv[i])!;
       note(m[1], argv[i].includes("+=") ? undefined : argv[i].slice(m[0].length));
@@ -8643,7 +8647,9 @@ function collectAssigned(cmds: Simple[]): Map<string, string[]> {
   const map = new Map<string, string[]>();
   const add = (n: string, v: string) => map.set(n, [...(map.get(n) ?? []), v]);
   for (const { argv } of cmds) {
+    // (Round 24, Sol: an assignment after `then`, `do`, `!`, ...: `if true; then v='-v a[...]'; fi`.)
     let i = 0;
+    while (i < argv.length && LOOP_KEYWORDS.has(argv[i])) i++;
     for (; i < argv.length && ASSIGN.test(argv[i]); i++) {
       const m = ASSIGN.exec(argv[i])!;
       add(m[1], argv[i].slice(m[0].length));
@@ -9004,6 +9010,9 @@ function unreadNames(command: string, cmds: Simple[], cwd?: string): Set<string>
     if (name === "getopts" && args[1]) out.add(args[1]);
     // (Round 19, Opus, Sol: `printf -v v '-%s %s' v 'a[...]'; test $v`.)
     if (name === "printf") for (const t of printfTargets(args)) out.add(t.replace(/\[.*$/s, ""));
+    // (Round 24, Sol: an option word held in a variable, `op=-vv; printf "$op" ...`, can name any
+    // variable: then no name's known value is trusted.)
+    if ((name === "printf" && /[$`]/.test(args[0] ?? "")) || (name === "wait" && args.some((a) => /[$`]/.test(a)))) out.add("*");
     if (name === "wait") for (const t of waitTargets(args)) out.add(t.replace(/\[.*$/s, ""));
   }
   for (const m of command.matchAll(/\b(?:for|select)\s+([A-Za-z_]\w*)\s*(?:in\b([^;\n]*))?(?=[;\n]|\s+do\b)/g)) {
@@ -9093,7 +9102,7 @@ export function expansionProblem(command: string, cwd?: string): GuardVerdict | 
           const unread = (unreadValues ??= unreadNames(command, real, cwd));
           const assigned = (assignedValues ??= collectAssigned(real));
           const safeName = (n: string) => {
-            if (unread.has(n)) return false;
+            if (unread.has(n) || unread.has("*")) return false;
             const values = assigned.get(n);
             if (values) return values.every((v) => !/[$`\s]/.test(v.replace(/\$[!$?#]/g, "")));
             return settable(n);
