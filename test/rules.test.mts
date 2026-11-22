@@ -460,6 +460,12 @@ const CASES: [string, string, Want, Record<string, string[]>?][] = [
   ["p3r14 ok grep .env.example", "grep foo .env.example", "allow"],
   ["p3r14 ok awk", "awk '{print $1}' f", "allow"],
   ["p3r14 ok jq", "jq . a.json", "allow"],
+  // Project review 3, round 15 (Neon): yq eval(...) bypass of load/load_*().
+  ["p3r15 yq -n eval", 'yq -n \'eval("lo" + "ad_str(\\\".env\\\")")\'', "ask"],
+  ["p3r15 yq eval(.e)", "yq 'eval(.e)' a.yaml", "ask"],
+  ["p3r15 yq eval space", "yq 'eval ( .e )' a.yaml", "ask"],
+  ["p3r15 ok yq eval subcommand", "yq eval '.a' a.yaml", "allow"],
+  ["p3r15 ok yq .eval field", "yq '.eval' a.yaml", "allow"],
   ["ok cloc", "cloc --by-file --json --exclude-dir=node_modules,dist src", "allow"],
   ["ok sed print", "sed -n '1,5p' f", "allow"],
   ["ok sed -i substitute", "sed -i 's/a/b/g' src/x.ts", "allow"],

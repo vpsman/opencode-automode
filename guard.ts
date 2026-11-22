@@ -3982,11 +3982,46 @@ export function makeFiles(args: string[]): { files: string[]; dirs: string[]; pr
   return { files, dirs, ...(jobs ? { problem: `make ${jobs.name}${jobs.value}: make reads the rest of the word as the number of jobs` } : {}) };
 }
 
+// Build and test tools whose recipe or config file option can read from stdin or a device
+// (project review 3, round 15, Neon).
+const NINJA_OPTIONS: Getopt = {
+  flags: "hnv",
+  values: "Cfjkldtw",
+  long: { version: "flag", verbose: "flag", quiet: "flag", help: "flag" },
+};
+const JUST_OPTIONS: Getopt = {
+  flags: "eghlnquvV",
+  values: "cdEfs",
+  exact: true,
+  long: {
+    justfile: "value", "working-directory": "value", show: "value", command: "value", chooser: "value",
+    color: "value", "command-color": "value", "dotenv-filename": "value", "dotenv-path": "value",
+    "dump-format": "value", "list-heading": "value", "list-prefix": "value", shell: "value",
+    "shell-arg": "value", tempdir: "value", "timestamp-format": "value", ceiling: "value",
+    "alias-style": "value", request: "value", usage: "value",
+  },
+};
+const PYTEST_OPTIONS: Getopt = {
+  flags: "hvqxslV",
+  values: "ckmoprWn",
+  long: {
+    "config-file": "value", confcutdir: "value", "collect-only": "flag", color: "value",
+    "continue-on-collection-errors": "flag", capture: "value", "cache-show": "optional",
+    "cache-clear": "flag", co: "flag", "code-highlight": "value", cov: "optional",
+    basetemp: "value", rootdir: "value", "override-ini": "value", tb: "value",
+    maxfail: "value", junitxml: "value",
+  },
+};
+const isPytestCall = (name: string, args: string[]) =>
+  name === "pytest" || (/^python3?(\.\d+)?$/.test(name) && args[0] === "-m" && args[1] === "pytest");
+
 // The files a program reads as code, where it reads them (round 4, finding 5, second pass): each
 // as the word that names it and the directory it is read from (undefined: not known), for make's
 // makefiles (`-f`, or the default ones, `GNUmakefile`, `makefile` and `Makefile`, where its `-C`
-// options lead), awk's and sed's `-f`, a shell's script and the file `source` reads. `implicit`:
-// a default makefile, named by no word.
+// options lead), ninja's `-f` (and `build.ninja` where `-C` leads), just's `-f`/`--justfile` (and
+// default justfiles), pytest's `-c`/`--config-file` (and `python3 -m pytest`), awk's and sed's
+// `-f`, a shell's script and the file `source` reads. `implicit`: a default recipe file, named by
+// no word.
 export interface CodeFile {
   word: string;
   dir: string | undefined;
@@ -4000,6 +4035,36 @@ export function codeFiles(name: string, args: string[], cwd: string | undefined)
     for (const d of dirs) base = expands(d) ? undefined : path.isAbsolute(tilde(d)) ? tilde(d) : base === undefined ? undefined : `${base}/${d}`;
     if (files.length) return files.map((word) => ({ word, dir: base }));
     return ["GNUmakefile", "makefile", "Makefile"].map((word) => ({ word, dir: base, implicit: true }));
+  }
+  if (name === "ninja") {
+    const got = getopt(args, NINJA_OPTIONS);
+    const dir = got.opts.filter((o) => o.name === "-C").map((o) => o.value ?? "").at(-1);
+    const base = dir === undefined ? cwd : expands(dir) ? undefined : path.isAbsolute(tilde(dir)) ? tilde(dir) : cwd === undefined ? undefined : `${cwd}/${dir}`;
+    const files = got.opts.filter((o) => o.name === "-f").map((o) => o.value ?? "");
+    if (files.length) return files.map((word) => ({ word, dir: base }));
+    return [{ word: "build.ninja", dir: base, implicit: true }];
+  }
+  if (name === "just") {
+    const got = getopt(args, JUST_OPTIONS);
+    const files = got.opts
+      .filter((o) => o.name === "-f" || o.name === "--justfile")
+      .map((o) => {
+        const v = o.value ?? "";
+        return o.name === "-f" && v.startsWith("=") && args[o.at]?.includes("=") ? v.slice(1) : v;
+      });
+    if (files.length) return files.map((word) => ({ word, dir: cwd }));
+    return ["justfile", "Justfile", ".justfile", ".Justfile"].map((word) => ({ word, dir: cwd, implicit: true }));
+  }
+  if (isPytestCall(name, args)) {
+    const pArgs = name === "pytest" ? args : args.slice(2);
+    const got = getopt(pArgs, PYTEST_OPTIONS);
+    return got.opts
+      .filter((o) => o.name === "-c" || o.name === "--config-file")
+      .map((o) => {
+        const v = o.value ?? "";
+        const word = o.name === "-c" && v.startsWith("=") && pArgs[o.at]?.includes("=") ? v.slice(1) : v;
+        return { word, dir: cwd };
+      });
   }
   if (name === "sed" || AWKS.has(name)) return valued(args, "f", "--file").map((word) => ({ word, dir: cwd }));
   if (SHELLS.has(name)) {
@@ -4751,8 +4816,9 @@ function sinkProblem(name: string, args: string[]): string | undefined {
   if (["unset", "read", "mapfile", "readarray", "wait", "getopts", ...DECLARERS].includes(name) && args.some(subscript)) return `${name} with an array subscript, which bash evaluates as arithmetic`;
   if (name === "printf" && valued(args, "v", "--never").some((v) => subscript(v) || /[$`]/.test(v))) return "printf -v with a subscript or a computed name";
   if (name === "test" || name === "[") {
-    const at = args.findIndex((a, i) => (a === "-v" || a === "-R") && i + 1 < args.length);
-    if (at >= 0 && (subscript(args[at + 1]) || /[$`]/.test(args[at + 1]))) return `${name} -v with a subscript or a variable, which bash evaluates as arithmetic`;
+    // Every `-v`/`-R` of an expression, not only the first (project review 3, round 15, Neon:
+    // `test -v a -a -v "$x"`).
+    if (args.some((a, i) => (a === "-v" || a === "-R") && i + 1 < args.length && (subscript(args[i + 1]) || /[$`]/.test(args[i + 1])))) return `${name} -v with a subscript or a variable, which bash evaluates as arithmetic`;
   }
   if (name === "read" && args.some((a) => /[$`]/.test(a) && !a.startsWith("-"))) return "read into a name taken from a variable";
   // Council project review 1, round 2: `export "$x"` with `x=PATH=.` (or `RANDOM=a[$(...)]`) sets
@@ -7509,11 +7575,12 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
     // makefile in such a directory matters only when make's input is redirected.
     for (const code of codeFiles(name, args, ctx.cwdOf?.(cmd))) {
       const { word: f, dir, implicit } = code;
-      const what = implicit ? `its default makefile ${f}` : f;
+      const what = implicit ? `its default ${MAKES.has(name) ? "makefile" : "file"} ${f}` : f;
       if (expands(f) || (!path.isAbsolute(tilde(f)) && dir === undefined)) {
         if (implicit) {
           if (cmd.heredoc || cmd.in?.length || cmd.subshell) add({ action: "classify", reason: `${name} reads ${what} in a directory the check cannot place, with its input redirected` });
         } else if (MAKES.has(name)) ask(`make -f ${f} reads a makefile in a directory the check cannot place, which may be standard input or a device`);
+        else if (name === "ninja" || name === "just" || isPytestCall(name, args)) ask(`${name} reads ${f} in a directory the check cannot place, which may be standard input or a device`);
         else add({ action: "classify", reason: `${name} reads code from ${f}, which is known only when the command runs` });
         continue;
       }
@@ -8550,7 +8617,9 @@ const KEYED: Record<string, Keyed> = {
   ccache: { checked: ["--set-config"], letters: "o", dashDash: false },
   cmake: { checked: ["-E", "-P", "-C", "-D", "--toolchain"], letters: "EPCD" },
   ctest: { checked: ["-S", "--script", "--script-new-process", "--build-and-test", "--test-command"], letters: "S" },
-  just: { checked: ["--command", "--shell", "--shell-command", "--shell-arg", "--chooser"], letters: "c" },
+  just: { checked: ["--command", "--shell", "--shell-command", "--shell-arg", "--chooser", "--justfile"], letters: "cf" },
+  ninja: { values: ["-j", "-k", "-l", "-d", "-t", "-w"], checked: ["-f", "-C"], letters: "fC" },
+  pytest: { values: ["-k", "-m", "-p", "-r", "-W", "-n", "--rootdir", "--tb", "--maxfail", "--junitxml", "--color", "--capture", "--confcutdir"], checked: ["-c", "--config-file", "-o", "--override-ini", "--basetemp", "--pdb", "--trace"], letters: "co" },
   tox: { checked: ["--override", "-x"], letters: "x" },
   meson: { checked: ["--wrapper", "--gdb-path"] },
   mypy: { checked: ["--python-executable"] },

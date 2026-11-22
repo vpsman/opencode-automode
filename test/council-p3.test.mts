@@ -1123,3 +1123,83 @@ test("round 14 (Opus, Neon)", async () => {
     "jq . a.json",
   ]) assert.equal(await decide14(command), "allow", command);
 });
+
+test("round 15 (Neon)", async () => {
+  const repo15 = path.join(base, "repo15");
+  fs.mkdirSync(repo15, { recursive: true });
+  for (const f of ["a.yaml", "b.yaml", ".env", "build.ninja", "justfile", "pytest.ini"]) {
+    fs.writeFileSync(path.join(repo15, f), "hello\n");
+  }
+  fs.symlinkSync("/dev/stdin", path.join(repo15, "stdin-link"));
+  execFileSync("git", ["init", "-q", "-b", "main", repo15]);
+  const decide15 = async (command: string) => (await decideShell(guard, new SessionState(repo15), repo15, command)).effect;
+
+  for (const command of [
+    // #3: yq eval(...) bypasses the load/load_*() expression check.
+    'yq -n \'eval("lo" + "ad_str(\\.env)")\'',
+    'yq -n \'eval("lo" + "ad_str(\\\".env\\\")")\'',
+    "yq 'eval(.e)' a.yaml",
+    "yq e 'eval(.e)' a.yaml",
+    "yq 'eval ( .e )' a.yaml",
+    // Neon's pushback: every `-v` of a test expression is checked, not only the first.
+    'a=1; test -v a -a -v "$x"',
+    '[ -v a -a -v "$x" ]',
+    "test -v a -o -v 'b[1]'",
+    // #4: ninja -f, just -f/--justfile, pytest -c/--config-file (and python3 -m pytest) reading from a device.
+    'printf "rule r\\n  command = id\\nbuild a: r\\n" | ninja -f /dev/stdin',
+    "ninja -f -",
+    "ninja -f/dev/stdin",
+    "ninja -vf /dev/stdin",
+    "ninja -C /dev -f stdin",
+    "ninja -f /proc/self/fd/0",
+    'ninja -f <(printf "x")',
+    'ninja -f "$f"',
+    "ninja -f stdin-link",
+    'printf "default:\\n\\tid\\n" | just -f /dev/stdin',
+    "just -f -",
+    "just -f/dev/stdin",
+    "just -f=/dev/stdin",
+    "just -qf /dev/stdin",
+    "just --justfile /dev/stdin",
+    "just --justfile=/dev/stdin",
+    'just -f <(printf "x")',
+    'just -f "$f"',
+    "just -f stdin-link",
+    "cd /dev && just -f stdin",
+    'printf "[pytest]\\n" | pytest -c /dev/stdin',
+    "pytest -c -",
+    "pytest -c/dev/stdin",
+    "pytest -c=/dev/stdin",
+    "pytest -vc /dev/stdin",
+    "pytest --config-file /dev/stdin",
+    "pytest --config-file=/dev/stdin",
+    "pytest --config=/dev/stdin",
+    'pytest -c <(printf "x")',
+    'pytest -c "$f"',
+    "pytest -c stdin-link",
+    'printf "[pytest]\\n" | python3 -m pytest -c /dev/stdin',
+    "python3 -m pytest --config-file=/dev/stdin",
+    "python -m pytest -c /dev/stdin",
+    'python3 -m pytest -c "$f"',
+  ]) assert.equal(await decide15(command), "ask", command);
+
+  for (const command of [
+    "yq eval '.a' a.yaml",
+    "yq eval-all '.a' a.yaml b.yaml",
+    "yq '.eval' a.yaml",
+    "test -v a -a -v b",
+    "ninja",
+    "ninja -f build.ninja",
+    "ninja -f /dev/null",
+    "just",
+    "just -f justfile test",
+    "just --justfile=justfile test",
+    "pytest",
+    "pytest -c pytest.ini",
+    "pytest -c /dev/null",
+    "pytest -kcheck",
+    "pytest -rc",
+    "python3 -m pytest",
+    "python3 -m pytest -c pytest.ini",
+  ]) assert.equal(await decide15(command), "allow", command);
+});

@@ -3168,8 +3168,8 @@ export function yqReading(args: string[]): YqReading {
     ops.push(w);
   }
   // yq's `load`, `load_str`, `load_props`, `load_base64`, `load_xml` read files from the expression
-  // (project review 3, round 14, Opus, Neon).
-  if ((nullInput ? ops : ops.slice(0, 1)).some((o) => /\bload(?:_\w+)?\s*\(/.test(o))) plain = false;
+  // (project review 3, round 14, Opus, Neon), and `eval(...)` evaluates a built expression (round 15, Neon).
+  if ((nullInput ? ops : ops.slice(0, 1)).some((o) => /\b(?:load(?:_\w+)?|eval)\s*\(/.test(o))) plain = false;
   const files = inPlace ? (ops.length === 1 ? ops : ops.slice(1)) : ops.slice(1);
   return { plain, inPlace, nullInput, operands: ops, files, ...(op0Index !== undefined ? { op0Index } : {}) };
 }
