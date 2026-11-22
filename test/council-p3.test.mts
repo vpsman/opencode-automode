@@ -1056,3 +1056,70 @@ test("round 13 (Opus, Neon)", async () => {
     "yq eval-all '.a' a.yaml b.yaml",
   ]) assert.equal(await decide13(command), "allow", command);
 });
+
+test("round 14 (Opus, Neon)", async () => {
+  const repo14 = path.join(base, "repo14");
+  const outside14 = path.join(base, "outside14.yaml");
+  fs.mkdirSync(path.join(repo14, "src"), { recursive: true });
+  fs.writeFileSync(outside14, "a: 1\n");
+  for (const f of ["a.txt", "f", "a.yaml", "x.yaml", "a.json", "secrets.json", ".env", ".env.example", "pat.txt", "f.jq", "AGENTS.md", "src/a.ts"]) {
+    fs.writeFileSync(path.join(repo14, f), "hello\n");
+  }
+  execFileSync("git", ["init", "-q", "-b", "main", repo14]);
+  const decide14 = async (command: string) => (await decideShell(guard, new SessionState(repo14), repo14, command)).effect;
+
+  for (const command of [
+    // A (Neon 1): GNU sed treats the delimiter literally inside a bracket expression.
+    "sed 's/[/]/p;s#$(echo X > rce.txt)#x#p;s/ew /tmp/p' a.txt",
+    "sed 's/[/]/p;s/w ../outside/p' a.txt",
+    "sed '/[/,/s/p;s/]/w out/p' a.txt",
+    "sed '\\#[#],\\#s#p;s/]/w out/p' a.txt",
+    "sed 's/[^/]*$//' f",
+    // B (Neon 2, Opus 1): mikefarah yq v4 treats an existing first operand as an input file.
+    "yq -o json secrets.json",
+    "yq e .env",
+    "yq -I 2 .env",
+    "yq .env",
+    "yq ~/.kube/config",
+    "yq -P ~/.ssh/id_rsa",
+    "yq -i AGENTS.md x.yaml",
+    `yq -i ${outside14} x.yaml`,
+    'yq -i "$f" x.yaml',
+    "yq -i AGENT* x.yaml",
+    // C (Neon 3): PATTERN_FIRST credentialRead checks every operand when pattern/program comes from an option.
+    "grep --regexp=SECRET .env",
+    "grep -efoo .env",
+    "grep -iefoo .env",
+    "grep -fpat.txt .env",
+    "grep -f.env src/a.ts",
+    "rg -efoo .env",
+    "rg --file=pat.txt .env",
+    "awk -e'1' .env",
+    "awk --source='1' .env",
+    "jq -ff.jq .env",
+    "jq --from-file=f.jq .env",
+    "jq --args .env",
+    // D (Opus 2, Neon 4): yq load/load_* functions read files from the expression.
+    'yq -n \'load_str(".env")\'',
+    'yq \'.a = load_str(".env")\' x.yaml',
+    'yq \'.a = load(".env")\' x.yaml',
+    'yq \'.a = load_props(".env")\' x.yaml',
+    'yq \'.a = load_base64(".env")\' x.yaml',
+    'yq \'.a = load_xml(".env")\' x.yaml',
+  ]) assert.equal(await decide14(command), "ask", command);
+
+  for (const command of [
+    "sed -i 's/[0-9]\\+/N/g' f",
+    "sed 's/[[:space:]]*$//' f",
+    "sed -n '/^[a-z]/p' f",
+    "sed 's/[]a]/x/' f",
+    "yq -i '.a=1' a.yaml",
+    "yq -i '.' a.yaml",
+    "yq '.a' a.yaml",
+    "grep -e foo src/a.ts",
+    "grep -r foo src",
+    "grep foo .env.example",
+    "awk '{print $1}' f",
+    "jq . a.json",
+  ]) assert.equal(await decide14(command), "allow", command);
+});

@@ -451,6 +451,28 @@ const NAMES_ONLY = new Set(
 // The first operand of these is a pattern, filter or script, not a file.
 const PATTERN_FIRST = new Set(["grep", "egrep", "fgrep", "rg", "ag", "ack", "sed", "awk", "gawk", "jq", "yq"]);
 
+// Whether an option word before `--` can supply the pattern or program (project review 3, round 14,
+// Neon): when it can, the first operand is a file rather than the pattern.
+function patternFromOption(name: string, args: string[]): boolean {
+  const dashes = args.indexOf("--");
+  const head = dashes < 0 ? args : args.slice(0, dashes);
+  const longOpt = (a: string, full: string, min = full.length) => {
+    if (!a.startsWith("--")) return false;
+    const opt = a.split("=")[0];
+    return opt.length >= min && full.startsWith(opt);
+  };
+  if (name === "grep" || name === "egrep" || name === "fgrep" || name === "rg") {
+    return head.some((a) => /^-[^-]*[ef]/.test(a) || longOpt(a, "--regexp", 5) || longOpt(a, "--file", 6));
+  }
+  if (name === "awk" || name === "gawk") {
+    return head.some((a) => /^-[^-]*[efE]/.test(a) || longOpt(a, "--source", 4) || longOpt(a, "--file", 5) || longOpt(a, "--exec", 4));
+  }
+  if (name === "jq") {
+    return head.some((a) => /^-[^-]*f/.test(a) || longOpt(a, "--from-file", 4) || a === "--args" || a === "--jsonargs");
+  }
+  return false;
+}
+
 // The credential file a simple command would read, if any.
 function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope): string | undefined {
   if (NAMES_ONLY.has(name)) return undefined;
@@ -535,8 +557,8 @@ function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope)
     words = [...r.files, ...r.scriptFiles];
   } else if (name === "yq") {
     const yq = yqReading(args);
-    words = yq.plain ? yq.files : args;
-  } else if (PATTERN_FIRST.has(name)) words = operands(args).slice(1);
+    words = yq.plain ? (yq.nullInput ? yq.files : yq.operands) : args;
+  } else if (PATTERN_FIRST.has(name)) words = patternFromOption(name, args) ? operands(args) : operands(args).slice(1);
   else if (COPIERS.has(name)) {
     // With `-t DIR` (`--target-directory`) the destination is named first and every operand is a
     // source (round 34, Mythos).
@@ -638,7 +660,7 @@ const FILE_READERS = new Set(`cat bat head tail less more wc rg grep egrep fgrep
 function readsExpansion(name: string, args: string[], dyn: (k: number) => boolean, cmd: Simple, scope: Scope): string | undefined {
   if (!FILE_READERS.has(name)) return undefined;
   let words = args.filter((a, k) => !a.startsWith("-") && dyn(k));
-  if (PATTERN_FIRST.has(name)) words = words.filter((w) => w !== operands(args)[0]);
+  if (PATTERN_FIRST.has(name) && !patternFromOption(name, args) && (name !== "yq" || yqReading(args).nullInput)) words = words.filter((w) => w !== operands(args)[0]);
   for (const w of [...words, ...(cmd.in ?? []).filter((w, k) => cmd.inDyn?.[k] ?? /[$`]/.test(w))]) {
     const text = expandVars(w, scope);
     const loop = /\$\{?([A-Za-z_]\w*)\}?/.exec(text);
@@ -1904,6 +1926,36 @@ function setProblem(args: string[]): string | undefined {
 
 // ---- programs that take code or run programs through their options ----
 
+// POSIX bracket-expression balance in a sed regex part (project review 3, round 14, Neon):
+// GNU sed treats the regex delimiter literally inside `[...]`, so a parsed regex part whose
+// bracket expression is still open means the reader closed the regex earlier than GNU sed does.
+export function sedBracketsClosed(re: string): boolean {
+  for (let i = 0; i < re.length; i++) {
+    if (re[i] === "\\") {
+      i++;
+      continue;
+    }
+    if (re[i] !== "[") continue;
+    i++;
+    if (i < re.length && re[i] === "^") i++;
+    if (i < re.length && re[i] === "]") i++;
+    let closed = false;
+    for (; i < re.length; i++) {
+      if (re[i] === "]") {
+        closed = true;
+        break;
+      }
+      if (re[i] === "[" && (re[i + 1] === ":" || re[i + 1] === "." || re[i + 1] === "=")) {
+        const close = re.indexOf(`${re[i + 1]}]`, i + 2);
+        if (close < 0) return false;
+        i = close + 1;
+      }
+    }
+    if (!closed) return false;
+  }
+  return true;
+}
+
 // A sed script that only prints, deletes and substitutes text. Not: `e` (and the `e` flag of `s`),
 // which runs a command; `w`, `W` (and the `w` flag), which write a file; `r`, `R`, which read one
 // into the output. Anything the reader below does not follow is left to the decider.
@@ -1914,11 +1966,15 @@ function sedScriptSafe(script: string): boolean {
     while (i < s.length && /[ \t]/.test(s[i])) i++;
   };
   // A regex delimited by `d`, from just after the opening delimiter; returns false if unterminated.
-  const delimited = (d: string): boolean => {
+  const delimited = (d: string, regex = false): boolean => {
+    const start = i;
     for (; i < s.length; i++) {
       if (s[i] === "\\") i++;
-      else if (s[i] === d) return (i++, true);
-      else if (s[i] === "\n") return false;
+      else if (s[i] === d) {
+        const body = s.slice(start, i);
+        i++;
+        return !regex || sedBracketsClosed(body);
+      } else if (s[i] === "\n") return false;
     }
     return false;
   };
@@ -1928,13 +1984,13 @@ function sedScriptSafe(script: string): boolean {
     } else if (s[i] === "$") i++;
     else if (s[i] === "/") {
       i++;
-      if (!delimited("/")) return false;
+      if (!delimited("/", true)) return false;
       while (/[IM]/.test(s[i] ?? "")) i++;
     } else if (s[i] === "\\") {
       const d = s[i + 1];
       if (!d || d === "\n" || d === "\\") return false;
       i += 2;
-      if (!delimited(d)) return false;
+      if (!delimited(d, true)) return false;
       while (/[IM]/.test(s[i] ?? "")) i++;
     }
     return true;
@@ -1978,7 +2034,7 @@ function sedScriptSafe(script: string): boolean {
     } else if (c === "s" || c === "y") {
       const d = s[i++];
       if (!d || d === "\\" || d === "\n") return false;
-      if (!delimited(d) || !delimited(d)) return false;
+      if (!delimited(d, c === "s") || !delimited(d)) return false;
       if (c === "s") {
         while (i < s.length && /[gpiImMe\dw]/.test(s[i])) {
           if (s[i] === "e" || s[i] === "w") return false;
@@ -3054,6 +3110,7 @@ const YQ_PLAIN: Plain = {
 export interface YqReading {
   plain: boolean;
   inPlace: boolean;
+  nullInput: boolean;
   operands: string[];
   files: string[];
   op0Index?: number;
@@ -3061,6 +3118,7 @@ export interface YqReading {
 export function yqReading(args: string[]): YqReading {
   let plain = true;
   let inPlace = false;
+  let nullInput = false;
   let seenSub = false;
   const ops: string[] = [];
   let op0Index: number | undefined;
@@ -3078,6 +3136,7 @@ export function yqReading(args: string[]): YqReading {
       const head = w.slice(2, eq < 0 ? undefined : eq);
       if (eq < 0 && YQ_PLAIN.flags.includes(head)) {
         if (head === "inplace") inPlace = true;
+        if (head === "null-input") nullInput = true;
         continue;
       }
       if (!YQ_PLAIN.valued.includes(head)) {
@@ -3096,6 +3155,7 @@ export function yqReading(args: string[]): YqReading {
       for (let j = 1; j < w.length; j++) {
         if (YQ_PLAIN.shortValued.includes(w[j])) break;
         if (w[j] === "i") inPlace = true;
+        if (w[j] === "n") nullInput = true;
       }
       if (next && ++k >= args.length) plain = false;
       continue;
@@ -3107,8 +3167,11 @@ export function yqReading(args: string[]): YqReading {
     if (ops.length === 0) op0Index = k;
     ops.push(w);
   }
+  // yq's `load`, `load_str`, `load_props`, `load_base64`, `load_xml` read files from the expression
+  // (project review 3, round 14, Opus, Neon).
+  if ((nullInput ? ops : ops.slice(0, 1)).some((o) => /\bload(?:_\w+)?\s*\(/.test(o))) plain = false;
   const files = inPlace ? (ops.length === 1 ? ops : ops.slice(1)) : ops.slice(1);
-  return { plain, inPlace, operands: ops, files, ...(op0Index !== undefined ? { op0Index } : {}) };
+  return { plain, inPlace, nullInput, operands: ops, files, ...(op0Index !== undefined ? { op0Index } : {}) };
 }
 export function unreadSpelling(name: string, args: string[]): string | undefined {
   if (args.length === 1 && /^--(help|version)$/.test(args[0])) return undefined;
@@ -4352,9 +4415,37 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
   if (name === "yq") {
     const yq = yqReading(args);
     if (yq.inPlace) {
-      if (yq.files.some((f) => /(^|\/)\.git(\/|$)/.test(resolveWord(f, scope) ?? f))) return worst(verdict, ask("yq writes a file in a .git directory"));
-      if (yq.files.length) {
-        const w = writeTargets("tee", ["--", ...yq.files], scope);
+      let targets = yq.files;
+      // mikefarah yq v4 treats an existing non-directory first operand as an input file (expression
+      // `.`), whatever follows (project review 3, round 14, Neon, Opus).
+      if (yq.operands.length > 1 && yq.op0Index !== undefined) {
+        const op0 = yq.operands[0];
+        const op0Dyn = dyn(yq.op0Index);
+        const op0Glob = !!cmd.glob?.[offset + 1 + yq.op0Index];
+        const op0Tilde = op0.startsWith("~") && !resolveWord(op0, scope);
+        if (op0Dyn || op0Glob || op0Tilde || !scope.cwd) {
+          return worst(verdict, ask(`yq -i with a first operand (${op0}) that may name an existing file`));
+        }
+        const fileExists = (p: string | undefined): boolean | undefined => {
+          if (!p) return false;
+          if (scope.pending.has(p) || scope.links?.has(p)) return true;
+          try {
+            return !fs.statSync(p).isDirectory();
+          } catch (e) {
+            const code = (e as NodeJS.ErrnoException)?.code;
+            return code === "ENOENT" || code === "ENOTDIR" ? false : undefined;
+          }
+        };
+        const resolved = resolveWord(op0, scope);
+        const literal = path.isAbsolute(op0) ? realish(path.normalize(op0)) : realish(path.resolve(scope.cwd, op0));
+        const rEx = fileExists(resolved);
+        const lEx = resolved === literal ? rEx : fileExists(literal);
+        if (rEx === undefined || lEx === undefined) return worst(verdict, ask(`yq -i with a first operand (${op0}) that the rules cannot inspect`));
+        if (rEx || lEx) targets = [op0, ...targets];
+      }
+      if (targets.some((f) => /(^|\/)\.git(\/|$)/.test(resolveWord(f, scope) ?? f))) return worst(verdict, ask("yq writes a file in a .git directory"));
+      if (targets.length) {
+        const w = writeTargets("tee", ["--", ...targets], scope);
         if (w.action !== "allow") return worst(verdict, { ...w, reason: w.reason.replace(/^tee/, "yq") });
       }
     }

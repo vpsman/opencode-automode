@@ -16,7 +16,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { bare, bashVerdict, compressorReading, copiesNothing, copyReading, findActions, printsOnly, sedReading, sortReading, sortRunsCompressor, fileVerdict, parse, readVerdict, rsyncReading, skippable, tarReading, twoOpOperands, within, yqReading, type Matcher, type Scope, type Simple } from "./rules.ts";
+import { bare, bashVerdict, compressorReading, copiesNothing, copyReading, findActions, printsOnly, sedBracketsClosed, sedReading, sortReading, sortRunsCompressor, fileVerdict, parse, readVerdict, rsyncReading, skippable, tarReading, twoOpOperands, within, yqReading, type Matcher, type Scope, type Simple } from "./rules.ts";
 import { gitArgs, gitEnv } from "./sandbox.ts";
 
 const HOME = os.homedir();
@@ -3856,10 +3856,16 @@ function installProblem(manager: string, managerArgs: string[], placeOk?: (dir: 
 
 // A sed script the rules can allow by name: substitutions without the `e` and `w` flags, and
 // the commands that print, delete and quit, each after an optional address. Anything else (the
-// `e`, `r`, `w` commands, blocks, labels, text for `a`/`i`/`c`) is for the model to read.
-const SED_ADDRESS = String.raw`(?:\d+|\$|\/(?:\\.|[^\/\\\n])*\/I?)`;
-const SED_PLAIN = new RegExp(String.raw`^\s*(?:${SED_ADDRESS}(?:\s*,\s*(?:${SED_ADDRESS}|[+~]\d+))?)?\s*!?\s*(?:[pdqQ=DPnNgGhHxl]|\}|s([^\s\\\w])(?:\\.|(?!\1)[^\\\n])*\1(?:\\.|(?!\1)[^\\\n])*\1[gpiIm0-9]*|y([^\s\\\w])(?:\\.|(?!\2)[^\\\n])*\2(?:\\.|(?!\2)[^\\\n])*\2)\s*$`);
-export const plainSed = (script: string) => script.split(/[;\n]/).every((part) => !part.trim() || SED_PLAIN.test(part));
+// `e`, `r`, `w` commands, blocks, labels, text for `a`/`i`/`c`, or a regex part whose bracket
+// expression is still open when the delimiter closes) is for the model to read.
+const SED_ADDRESS = String.raw`(?:\d+|\$|\/((?:\\.|[^\/\\\n])*)\/I?)`;
+const SED_PLAIN = new RegExp(String.raw`^\s*(?:${SED_ADDRESS}(?:\s*,\s*(?:${SED_ADDRESS}|[+~]\d+))?)?\s*!?\s*(?:[pdqQ=DPnNgGhHxl]|\}|s([^\s\\\w])((?:\\.|(?!\3)[^\\\n])*)\3(?:\\.|(?!\3)[^\\\n])*\3[gpiIm0-9]*|y([^\s\\\w])(?:\\.|(?!\5)[^\\\n])*\5(?:\\.|(?!\5)[^\\\n])*\5)\s*$`);
+export const plainSed = (script: string) =>
+  script.split(/[;\n]/).every((part) => {
+    if (!part.trim()) return true;
+    const m = SED_PLAIN.exec(part);
+    return !!m && (!m[1] || sedBracketsClosed(m[1])) && (!m[2] || sedBracketsClosed(m[2])) && (!m[4] || sedBracketsClosed(m[4]));
+  });
 
 function sedProblem(args: string[]): GuardVerdict | undefined {
   const r = sedReading(args);
@@ -5458,7 +5464,11 @@ export function secondNames(cmd: Simple, writes: Write[], expand: (word: string)
   return { names: out, ...(unknown ? { unknown } : {}) };
 }
 
-export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Simple) => boolean): { writes: Write[]; unknown?: string; ask?: string; unlisted: Unlisted[] } {
+export function writesOf(
+  cmds: Simple[],
+  filesOnly?: (sources: string[], cmd: Simple) => boolean,
+  pathExists?: (word: string, cmd: Simple) => boolean | undefined,
+): { writes: Write[]; unknown?: string; ask?: string; unlisted: Unlisted[] } {
   const writes: Write[] = [];
   const unlisted: Unlisted[] = [];
   let unknown: string | undefined;
@@ -5588,7 +5598,29 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
         const yq = yqReading(args);
         if (yq.inPlace) {
           yq.files.forEach((f) => add(f, false));
-          if (yq.operands.length > 1 && yq.op0Index !== undefined && cmd.glob?.[at + 1 + yq.op0Index]) add(yq.operands[0], false);
+          if (yq.operands.length > 1 && yq.op0Index !== undefined) {
+            const op0 = yq.operands[0];
+            const op0Argv = at + 1 + yq.op0Index;
+            const op0Dyn = !!cmd.dyn?.[op0Argv];
+            const op0Glob = !!cmd.glob?.[op0Argv];
+            if (op0Dyn || op0Glob) {
+              add(op0, false);
+              const why = `yq -i ${op0}: first operand holds an expansion and may name an existing file`;
+              unknown ??= why;
+              ask ??= why;
+              unlisted.push({ cmd, reason: why, dirs: [undefined] });
+            } else if (pathExists) {
+              const ex = pathExists(op0, cmd);
+              if (ex === true) add(op0, false);
+              else if (ex === undefined) {
+                add(op0, false);
+                const why = `yq -i ${op0}: cannot tell whether first operand names an existing file`;
+                unknown ??= why;
+                ask ??= why;
+                unlisted.push({ cmd, reason: why, dirs: [undefined] });
+              }
+            }
+          }
         } else if (!yq.plain && (dashes < 0 ? args : args.slice(0, dashes)).some((a) => /^-[a-eg-km-nq-zA-KM-Z]*i|^--in-?p[a-z-]*(?:=|$)/.test(a))) {
           files.forEach((f) => add(f, false));
         }
@@ -5694,7 +5726,16 @@ export function writtenBy(
     if (files === undefined) unlisted?.(word, cmd);
     return files ?? [resolve(word, cmd)];
   };
-  for (const w of writesOf(cmds).writes) {
+  const yqExists = (word: string, cmd: Simple): boolean | undefined => {
+    const p = resolve(word, cmd);
+    if (!p) return false;
+    try {
+      return !fs.statSync(p).isDirectory();
+    } catch {
+      return false;
+    }
+  };
+  for (const w of writesOf(cmds, undefined, yqExists).writes) {
     const targets = named(w.word, w.cmd);
     if (!w.dir) out.push(...targets);
     const p = resolve(w.word, w.cmd);
@@ -6810,7 +6851,7 @@ export function linkedReads(where: Located, scope: Scope, judgeAt: (dir: string,
   const read: { own: string[]; dirs: string[]; argv: string[]; out: string[]; inputs: string[]; cmd: Simple }[] = [];
   // The words each command writes, as the guard lists them (for protectedAt).
   const writeWords = new Map<Simple, Set<string>>();
-  if (protectedAt) for (const w of writesOf(where.cmds).writes) writeWords.set(w.cmd, new Set([...(writeWords.get(w.cmd) ?? []), w.word]));
+  if (protectedAt) for (const w of writesOf(where.cmds, undefined, () => true).writes) writeWords.set(w.cmd, new Set([...(writeWords.get(w.cmd) ?? []), w.word]));
   for (const cmd of where.cmds) {
     const places = where.places.get(cmd);
     if (!places || where.patterns.has(cmd)) continue;

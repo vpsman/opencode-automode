@@ -24,6 +24,7 @@ const rules = await import(process.env.RULES_FILE ? path.resolve(process.env.RUL
 // of the project when it is under it and exists.
 const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "automode-rules-")));
 fs.writeFileSync(path.join(dir, ".env"), "T=x\n");
+fs.writeFileSync(path.join(dir, "AGENTS.md"), "# agents\n");
 fs.mkdirSync(path.join(dir, "src"));
 fs.writeFileSync(path.join(dir, "build.sh"), "echo hi\n");
 const project = (p: string) => p.startsWith(dir + "/") && fs.existsSync(p);
@@ -419,6 +420,46 @@ const CASES: [string, string, Want, Record<string, string[]>?][] = [
   ["p3r13 ok yq -P", "yq -P '.' a.yaml", "allow"],
   ["p3r13 ok yq e", "yq e '.a' a.yaml", "allow"],
   ["p3r13 ok yq piped", "cat a.yaml | yq '.a'", "allow"],
+  // Project review 3, round 14 (Opus, Neon): sed delimiter inside bracket expression, yq operand 0
+  // as existing file / credential read, PATTERN_FIRST option-supplied patterns, and yq load*().
+  ["p3r14 sed [/] e/w", "sed 's/[/]/p;s#$(echo X > rce.txt)#x#p;s/ew /tmp/p' a.txt", "not-allow"],
+  ["p3r14 sed [/] w outside", "sed 's/[/]/p;s/w ../outside/p' a.txt", "not-allow"],
+  ["p3r14 sed address [/]", "sed '/[/,/s/p;s/]/w out/p' a.txt", "not-allow"],
+  ["p3r14 sed \\c address [#]", "sed '\\#[#],\\#s#p;s/]/w out/p' a.txt", "not-allow"],
+  ["p3r14 sed [^/]", "sed 's/[^/]*$//' f", "not-allow"],
+  ["p3r14 yq -o json secrets.json", "yq -o json secrets.json", "ask"],
+  ["p3r14 yq e .env", "yq e .env", "ask"],
+  ["p3r14 yq -I 2 .env", "yq -I 2 .env", "ask"],
+  ["p3r14 yq .env", "yq .env", "ask"],
+  ["p3r14 yq ~/.kube/config", "yq ~/.kube/config", "ask"],
+  ["p3r14 yq -P ~/.ssh/id_rsa", "yq -P ~/.ssh/id_rsa", "ask"],
+  ["p3r14 yq -i AGENTS.md x.yaml", "yq -i AGENTS.md x.yaml", "ask"],
+  ["p3r14 yq -i expansion op0", 'yq -i "$f" x.yaml', "ask"],
+  ["p3r14 grep --regexp= .env", "grep --regexp=SECRET .env", "ask"],
+  ["p3r14 grep -efoo .env", "grep -efoo .env", "ask"],
+  ["p3r14 grep -iefoo .env", "grep -iefoo .env", "ask"],
+  ["p3r14 grep -fpat.txt .env", "grep -fpat.txt .env", "ask"],
+  ["p3r14 rg -efoo .env", "rg -efoo .env", "ask"],
+  ["p3r14 rg --file=pat.txt .env", "rg --file=pat.txt .env", "ask"],
+  ["p3r14 awk -e .env", "awk -e'1' .env", "ask"],
+  ["p3r14 awk --source .env", "awk --source='1' .env", "ask"],
+  ["p3r14 jq -ff.jq .env", "jq -ff.jq .env", "ask"],
+  ["p3r14 jq --from-file= .env", "jq --from-file=f.jq .env", "ask"],
+  ["p3r14 yq -n load_str", 'yq -n \'load_str(".env")\'', "ask"],
+  ["p3r14 yq load_str", 'yq \'.a = load_str(".env")\' x.yaml', "ask"],
+  ["p3r14 yq load_props", 'yq \'.a = load_props(".env")\' x.yaml', "ask"],
+  ["p3r14 ok sed [0-9]", "sed -i 's/[0-9]\\+/N/g' f", "allow"],
+  ["p3r14 ok sed [[:space:]]", "sed 's/[[:space:]]*$//' f", "allow"],
+  ["p3r14 ok sed /^[a-z]/p", "sed -n '/^[a-z]/p' f", "allow"],
+  ["p3r14 ok sed []a]", "sed 's/[]a]/x/' f", "allow"],
+  ["p3r14 ok yq -i '.a=1'", "yq -i '.a=1' a.yaml", "allow"],
+  ["p3r14 ok yq -i '.'", "yq -i '.' a.yaml", "allow"],
+  ["p3r14 ok yq '.a'", "yq '.a' a.yaml", "allow"],
+  ["p3r14 ok grep -e", "grep -e foo src/a.ts", "allow"],
+  ["p3r14 ok grep -r", "grep -r foo src", "allow"],
+  ["p3r14 ok grep .env.example", "grep foo .env.example", "allow"],
+  ["p3r14 ok awk", "awk '{print $1}' f", "allow"],
+  ["p3r14 ok jq", "jq . a.json", "allow"],
   ["ok cloc", "cloc --by-file --json --exclude-dir=node_modules,dist src", "allow"],
   ["ok sed print", "sed -n '1,5p' f", "allow"],
   ["ok sed -i substitute", "sed -i 's/a/b/g' src/x.ts", "allow"],

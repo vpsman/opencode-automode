@@ -3978,8 +3978,24 @@ const herePlus = (word: string) => (word === "~+" ? "." : word.startsWith("~+/")
 const ONLY_READS = new Set(["", "cd", "pushd", "popd", "pwd", "ls", "cat", "echo", "printf", "true", "false", ":", "test", "[", "grep", "rg", "head", "tail", "wc", "stat", "file", "du", "df", "sleep", "wait", "zcat"]);
 const PURE_ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/;
 function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined, dirsOf?: (cmd: Simple) => string[] | undefined, roots?: string[]): string | undefined {
+  const yqExists = (word: string, cmd: Simple): boolean | undefined => {
+    const t = tilde(herePlus(word));
+    if (/^~[^/]/.test(t)) return undefined;
+    const dirs = path.isAbsolute(t) ? ["/"] : (dirsOf?.(cmd) ?? (cwdOf(cmd) ? [cwdOf(cmd)!] : []));
+    if (!dirs.length) return undefined;
+    for (const dir of dirs) {
+      const full = path.isAbsolute(t) ? t : path.resolve(dir, t);
+      try {
+        if (!fs.statSync(full).isDirectory()) return true;
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException)?.code;
+        if (code !== "ENOENT" && code !== "ENOTDIR") return undefined;
+      }
+    }
+    return false;
+  };
   // Also every place the guard's own list of writes names (`cp -t`, `sort -o`, git's `--output`).
-  const extra = writesOf(cmds).writes;
+  const extra = writesOf(cmds, undefined, yqExists).writes;
   // (Project review 3, closing round, Opus: a glob also matches the files the call's other
   // commands make, which no listing at decision time finds: `gzip -c f > opencode.json.gz;
   // gunzip ./*.gz`, or in parallel, background, process-substitution or loop order. Each name as
@@ -5646,7 +5662,24 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
     }
     return true;
   };
-  const found = writesOf(cmds, filesOnly);
+  const yqExists = (word: string, cmd: Simple): boolean | undefined => {
+    const placed = pwdPlaced(word, cmd);
+    const t = tilde(placed);
+    if (/^~[^/]/.test(t)) return undefined;
+    const dirs = path.isAbsolute(t) ? ["/"] : (where.places.get(cmd)?.map((x) => x.real) ?? (where.cwd.get(cmd) ? [where.cwd.get(cmd)!] : []));
+    if (!dirs.length) return undefined;
+    for (const dir of dirs) {
+      const full = path.isAbsolute(t) ? t : path.resolve(dir, t);
+      try {
+        if (!fs.statSync(full).isDirectory()) return true;
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException)?.code;
+        if (code !== "ENOENT" && code !== "ENOTDIR") return undefined;
+      }
+    }
+    return false;
+  };
+  const found = writesOf(cmds, filesOnly, yqExists);
   // (Project review 3, round 9: every current match of a glob write target is held to the same
   // write checks as a literal target — outside the project, guarded files, config dirs, .git — not
   // just the protected names checked in writeProblem. Round 10, Neon: also ask when another command
