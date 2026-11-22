@@ -4898,6 +4898,22 @@ function knownExpansion(word: string, vars?: Map<string, string>): string | unde
   });
   return unknown || expanded.includes("$") ? undefined : expanded;
 }
+// knownExpansion, keeping a value that holds `$` or a backtick as text: every expansion of the
+// word itself is replaced first, so what is left of them came from a value, which bash does not
+// expand again (`v='-v a[$(id)]'`).
+function knownLiteralExpansion(word: string, vars?: Map<string, string>): string | undefined {
+  if (!vars?.size || word.includes("`")) return undefined;
+  let unknown = false;
+  const expanded = word.replace(/\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*)|.)/g, (m, a, b) => {
+    const n = a ?? b;
+    if (!n || !vars.has(n)) {
+      unknown = true;
+      return m;
+    }
+    return vars.get(n)!;
+  });
+  return unknown ? undefined : expanded;
+}
 function assignedExpansions(word: string, allAssigned?: Map<string, string[]>): string[] {
   if (!allAssigned?.size) return [];
   const m = /^([^$`]*)\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))([^$`]*)$/.exec(word);
@@ -4974,8 +4990,21 @@ function waitTargets(args: string[], knownVars?: Map<string, string>, allAssigne
   return out;
 }
 
-function sinkProblem(name: string, args: string[], knownVars?: Map<string, string>, allAssigned?: Map<string, string[]>): string | undefined {
+function sinkProblem(name: string, rawArgs: string[], knownVars?: Map<string, string>, allAssigned?: Map<string, string[]>): string | undefined {
   const subscript = (a: string) => /\w\[/.test(a);
+  // A word whose known value bash splits gives the builtin several words, an option and its
+  // operand among them (project review 3, round 17, Opus, Sol: `v='-v a[$(id)]'; test $v`,
+  // `opts='-v PATH'; printf $opts /tmp`). Read them as bash splits them; a quoted word that
+  // does not split only asks more.
+  const args = ["test", "[", "printf", "wait"].includes(name)
+    ? rawArgs.flatMap((a) => {
+        if (!/[$`]/.test(a)) return [a];
+        const kv = knownLiteralExpansion(a, knownVars);
+        // Not resolved: every value the call assigns the name (a union of their words).
+        const values = kv !== undefined ? [kv] : assignedExpansions(a, allAssigned);
+        return values.some((v) => /\s/.test(v)) ? [a, ...values.flatMap((v) => v.split(/\s+/).filter(Boolean))] : [a];
+      })
+    : rawArgs;
   if (name === "let") return "let evaluates its words as arithmetic";
   if (DECLARERS.has(name) && args.some((a) => /^[-+][a-zA-Z]*i/.test(a))) return `${name} -i evaluates the value as arithmetic`;
   if (["unset", "read", "mapfile", "readarray", "wait", "getopts", ...DECLARERS].includes(name) && args.some(subscript)) return `${name} with an array subscript, which bash evaluates as arithmetic`;
@@ -8969,6 +8998,18 @@ export function expansionProblem(command: string): GuardVerdict | undefined {
       if (found === undefined && RUSTUP_PROXIES.has(name) && args[0] !== undefined && MARKS.test(args[0]) && (args[0].search(MARKS) === 0 || unmark(args[0]).startsWith("+"))) {
         found = unmark(args[0]);
       }
+      // An unquoted expansion bash splits can hand test/[ a `-v`/`-R` and its subscript, or
+      // printf a `-v NAME` (project review 3, round 17, Opus, Sol: `test $(echo '-v a[$(id)]')`,
+      // `test x$op 'a[$(id)]'`, `printf $(echo '-v a[$(id)] x')`). For test/[ that needs a
+      // command substitution's output or a subscript in the expression; for printf, an
+      // unquoted expansion where its first word is. Quoted words do not split.
+      if (found === undefined && (name === "test" || name === "[")) {
+        const unquoted = args.filter((a) => a.includes(MARK_UNQUOTED));
+        const substituted = unquoted.find((a) => a.includes(MARK_UNQUOTED + "$(") || a.includes(MARK_UNQUOTED + "`"));
+        if (substituted !== undefined) found = unmark(substituted);
+        else if (unquoted.length && args.some((a) => /\w\[/.test(unmark(a)))) found = unmark(unquoted[0]);
+      }
+      if (found === undefined && name === "printf" && (args[0] ?? "").includes(MARK_UNQUOTED)) found = unmark(args[0]);
       if (found !== undefined) return { action: "classify", reason: `${name} ${found}: a word that can become an option once bash expands it, and ${name}'s options are checked by name` };
     }
   }

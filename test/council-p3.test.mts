@@ -1305,3 +1305,40 @@ test("round 16 (Opus, Neon)", async () => {
     "tox -c tox.ini",
   ]) assert.equal(await decide16(command), "allow", command);
 });
+
+test("round 17 (Opus, Sol): an unquoted expansion that splits into an option and its operand", async () => {
+  const repo17 = path.join(base, "repo17");
+  fs.mkdirSync(repo17, { recursive: true });
+  for (const f of ["f", "a.ts"]) fs.writeFileSync(path.join(repo17, f), "hello\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo17]);
+  const decide17 = async (command: string) => (await decideShell(guard, new SessionState(repo17), repo17, command)).effect;
+
+  for (const command of [
+    // A known value that splits (Opus 1, Sol 1 and 2).
+    "v='-v a[$(id)]'; test $v",
+    "v='-R a[$(id)]'; test $v",
+    "v='-v a[$(id)]'; [ $v ]",
+    "a=foo; op='-v a[$(touch${IFS}marker)]'; test $op",
+    "opts='-v PATH'; printf $opts /tmp; ls",
+    'op=" -o -v"; test x$op \'a[$(id)]\'',
+    // A value the check cannot know: a command substitution, or an expansion beside a subscript (Opus 1, 2).
+    "test $(echo '-v a[$(id)]')",
+    "printf $(echo '-v a[$(id)] x')",
+    "test x$(echo \" -o -v\") 'a[$(id)]'",
+    "[ x$(printf \" -o -v\") \"a[\\$(id)]\" ]",
+    "test \"$a\" = b$op 'a[$(id)]'",
+  ]) assert.notEqual(await decide17(command), "allow", command);
+
+  for (const command of [
+    '[ "$x" = y ]',
+    "[ -z $x ] && echo empty",
+    "x=foo; [ $x = foo ] && echo same",
+    '[ -n "$(git status --porcelain)" ] && echo dirty',
+    "printf '%s\\n' $x",
+    'printf "$fmt" a b',
+    "for f in *.ts; do [ -f $f ] && echo $f; done",
+    'if [ "$(uname)" = Linux ]; then echo l; fi',
+    'msg="hello world"; printf "%s\\n" "$msg"',
+    'x="a b"; [ "$x" = "a b" ]',
+  ]) assert.equal(await decide17(command), "allow", command);
+});
