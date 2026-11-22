@@ -923,3 +923,73 @@ test("round 11 (Opus, Neon)", async () => {
     "pytest -k 'test_*'",
   ]) assert.equal(await decide11(command), "allow", command);
 });
+
+test("round 12 (Opus, Neon)", async () => {
+  const repo12 = path.join(base, "repo12");
+  const outsideDir = path.join(base, "outside12-dir");
+  for (const d of ["sub", "src", "dst"]) fs.mkdirSync(path.join(repo12, d), { recursive: true });
+  fs.mkdirSync(outsideDir, { recursive: true });
+  fs.writeFileSync(path.join(outsideDir, "f.txt"), "outside\n");
+  fs.writeFileSync(path.join(outsideDir, "a.yaml"), "a: 1\n");
+  for (const f of ["a", "b", "f", "s.yq", "a.yaml", "a.json", "a=b.log", "AGENTS.md", "src/a.ts"]) {
+    fs.writeFileSync(path.join(repo12, f), "hello\n");
+  }
+  execFileSync("git", ["init", "-q", "-b", "main", repo12]);
+  fs.symlinkSync(".", path.join(repo12, "lnk"));
+  fs.symlinkSync(outsideDir, path.join(repo12, "sub", "outdir"));
+  fs.symlinkSync(outsideDir, path.join(repo12, "a=outdir"));
+  fs.symlinkSync(path.join(outsideDir, "f.txt"), path.join(repo12, "src", "extlink"));
+  fs.symlinkSync("../AGENTS.md", path.join(repo12, "sub", "aglink"));
+  const decide12 = async (command: string) => (await decideShell(guard, new SessionState(repo12), repo12, command)).effect;
+
+  for (const command of [
+    // Finding 1 (Neon): ~+/ and other ~word forms in glob checks.
+    "echo hi | tee ~+/sub/outd*/f.txt",
+    "echo hi | tee ~-/sub/outd*/f.txt",
+    "rm -f ~+/sub/outd*/*",
+    "gzip ~+/sub/outd*/*",
+    // Finding 2 (Neon): globCandidates keeps raw word when first path segment has `=`.
+    "gzip a=out*/*",
+    // Finding 3 (Neon): mv --exchange (any prefix) swaps both operands and carries links.
+    "mv --exchange a lnk; echo x | tee a/*.md",
+    "mv --exc a lnk; echo x | tee a/*.md",
+    "mv --exchange a lnk; chmod 644 a/*.md",
+    "mv --exchange a sub; chmod 644 a/ag*",
+    // Finding 4 (Neon): yq/jq in place with -f/--from-file or a single operand.
+    "yq -i --from-file=s.yq ../outside/a.yaml",
+    "yq -i -fs.yq AGENTS.md",
+    "yq -i -o=json ../outside/a.yaml",
+    "yq -if s.yq AGENTS.md",
+    // Finding 5 (Opus): call-level link rule and archive output still ask for git add / tar / zip.
+    "tar czf sub/outd*/a.tgz src/*",
+    "zip -r sub/outd*/a.zip src/*",
+    "zip -rm a.zip src/*",
+    "ln -s /tmp/x src/l; git add src/*",
+    "ln -s /tmp/x src/l; tar czf a.tgz src/*",
+    "ln -s /tmp/x src/l; zip -r a.zip src/*",
+  ]) assert.equal(await decide12(command), "ask", command);
+
+  // Finding 6 (Opus): sed -f/--file credential script asks via rules, not model fallback.
+  for (const command of [
+    "sed -e p -f .env f",
+    "sed -f .env f",
+    "sed --file=.env f",
+    "sed -i -f .env f",
+  ]) {
+    const d = await decideShell(guard, new SessionState(repo12), repo12, command);
+    assert.equal(d.effect, "ask", command);
+    assert.equal(d.by, "rules", `${command}: got ${d.by} (${d.reason})`);
+  }
+
+  for (const command of [
+    "git add src/*",
+    "git add *",
+    "tar czf a.tgz src/*",
+    "zip -r a.zip src/*",
+    "yq -i '.a=1' a.yaml",
+    "jq . a.json",
+    "mv a b",
+    "echo hi | tee ~+/out.log",
+    "gzip a=b.log",
+  ]) assert.equal(await decide12(command), "allow", command);
+});

@@ -4884,7 +4884,7 @@ const COPY_OPTIONS: Record<string, Getopt> = {
 const PLACED_ELSEWHERE = new Set(["--backup-dir", "--temp-dir", "-T", "--partial-dir", "--log-file", "--write-batch", "--only-write-batch", "--compare-dest", "--copy-dest", "--link-dest", "--files-from"]);
 // What a copy, move or link reads from its words: the target directory (`-t`), the operands, and
 // whether it copies directories, makes hard links, or cannot be read.
-function copyWords(name: string, args: string[]): { target?: string; operands: string[]; recursive: boolean; hard: boolean; unknown?: string } {
+function copyWords(name: string, args: string[]): { target?: string; operands: string[]; recursive: boolean; hard: boolean; exchange: boolean; unknown?: string } {
   const got = getopt(args, COPY_OPTIONS[name]);
   const has = (...names: string[]) => got.opts.some((o) => names.includes(o.name));
   const elsewhere = name === "rsync" ? got.opts.find((o) => PLACED_ELSEWHERE.has(o.name))?.name : undefined;
@@ -4893,6 +4893,7 @@ function copyWords(name: string, args: string[]): { target?: string; operands: s
     operands: got.operands.map((o) => o.word),
     recursive: name === "rsync" || has("-r", "-R", "-a", "--recursive", "--archive"),
     hard: (name === "ln" && !has("-s", "--symbolic")) || (name === "cp" && has("-l", "--link")),
+    exchange: name === "mv" && has("--exchange"),
     ...(got.unknown || elsewhere ? { unknown: got.unknown ?? elsewhere } : {}),
   };
 }
@@ -5222,7 +5223,7 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
     if (words.unknown) return `${name} ${words.unknown}: an option the check cannot read, so it cannot list what is written`;
     // A moved directory brings its files with it, change times and all (B4): `mv` is such a
     // write unless every source is known to be a file.
-    const sources = words.target !== undefined ? words.operands : words.operands.slice(0, -1);
+    const sources = words.target !== undefined || words.exchange ? words.operands : words.operands.slice(0, -1);
     if (words.recursive || (name === "mv" && !(sources.length > 0 && filesOnly?.(sources)))) return `${name} writes the files of directories it copies or moves`;
     // (Round 12, Mythos: `--parents` puts each file at the destination plus its whole path.)
     if (name === "cp" && args.some((a) => a.length > 3 && "--parents".startsWith(a))) return "cp --parents writes each file under its whole path below the destination";
@@ -5583,7 +5584,18 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
           unlisted.push({ cmd, reason: why, dirs: [undefined] });
         }
       }
-      else if ((name === "yq" || name === "jq") && (dashes < 0 ? args : args.slice(0, dashes)).some((a) => /^(-[a-zA-Z]*i|--inpl[a-z]*|--in-p[a-z-]*)$/.test(a))) files.slice(1).forEach((f) => add(f, false));
+      else if ((name === "yq" || name === "jq") && (dashes < 0 ? args : args.slice(0, dashes)).some((a) => /^-[a-eg-km-nq-zA-KM-Z]*i|^--in-?p[a-z-]*(?:=|$)/.test(a))) {
+        const head = dashes < 0 ? args : args.slice(0, dashes);
+        const fromFile = head.some((a) => {
+          if (/^-[a-zA-Z]*f/.test(a)) return true;
+          if (a.startsWith("--")) {
+            const opt = a.split("=")[0];
+            if (opt.length >= 3 && ("--from-file".startsWith(opt) || "--file".startsWith(opt))) return true;
+          }
+          return a.startsWith("-") && /[$`]/.test(a);
+        });
+        (fromFile || files.length === 1 ? files : files.slice(1)).forEach((f) => add(f, false));
+      }
       // B7-7: a directory or a file an option names for the program to write in: tar's `-C` and
       // unzip's `-d` when they extract, find's `-fprint0` (the rules ask on `-fprint`, `-fprintf`
       // and `-fls`), rsync's log, batch, backup, temp and partial places. Each is held to the write

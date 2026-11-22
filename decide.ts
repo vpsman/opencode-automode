@@ -35,6 +35,7 @@ import {
   realish,
   sedReading,
   skippable,
+  tarReading,
   within,
   type Action,
   type Matcher,
@@ -5594,10 +5595,10 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   const known = () => new Set([...session.files.keys(), ...scope.pending.keys(), ...session.touched]);
   // The file a word names where `cmd` runs. Where that directory is unknown a relative word
   // cannot be placed: it then stands for any file of that name this session wrote.
-  // B9-5: `$PWD/…` (or `${PWD}`) is the directory the command runs in, where that is known.
+  // B9-5: `$PWD/…` (or `${PWD}` or `~+`) is the directory the command runs in, where that is known.
   const pwdPlaced = (word: string, cmd?: Simple): string => {
     const dir = cmd ? where.cwd.get(cmd) : cwdKnown ? here : undefined;
-    const m = PWD_LEAD.exec(word);
+    const m = PWD_LEAD.exec(word) ?? /^~\+(?=\/|$)/.exec(word);
     return m && dir !== undefined ? `${dir}${word.slice(m[0].length)}` : word;
   };
   const resolve = (raw: string, cmd?: Simple): string | undefined => {
@@ -5663,7 +5664,7 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
       }
       if (tool === "mv") {
         const c = copyReading("mv", args);
-        if (c.unknown) return true;
+        if (c.unknown || c.exchange) return true;
         const srcs = c.target !== undefined || c.operands.length === 1 ? c.operands : c.operands.slice(0, -1);
         const cmdDirs = where.places.get(cmd)?.map((x) => x.real) ?? (where.cwd.get(cmd) ? [where.cwd.get(cmd)!] : []);
         for (const src of srcs) {
@@ -5690,7 +5691,7 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
     const placed = pwdPlaced(word, cmd);
     if (/[$`]/.test(placed)) return `${toolName} writes ${word}: a glob with an expansion the check cannot list`;
     const t = tilde(placed);
-    if (/^~[^/]/.test(t)) return undefined;
+    if (/^~[^/]/.test(t)) return `${toolName} writes ${word}, a tilde path the check cannot list`;
     const dirs = path.isAbsolute(t) ? ["/"] : (where.places.get(cmd)?.map((x) => x.real) ?? (where.cwd.get(cmd) ? [where.cwd.get(cmd)!] : []));
     for (const dir of dirs) {
       const matches = expandWord(t, dir);
@@ -5716,7 +5717,7 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
     const placed = pwdPlaced(word, cmd);
     if (/[$`]/.test(placed)) return `${toolName} ${verb} ${word}: a glob with an expansion the check cannot list`;
     const t = tilde(placed);
-    if (/^~[^/]/.test(t)) return undefined;
+    if (/^~[^/]/.test(t)) return `${toolName} ${verb} ${word}, a tilde path the check cannot list`;
     const dirs = path.isAbsolute(t) ? ["/"] : (where.places.get(cmd)?.map((x) => x.real) ?? (where.cwd.get(cmd) ? [where.cwd.get(cmd)!] : []));
     const hasSymlinkParent = (raw: string, baseDir: string): boolean => {
       const parent = path.dirname(raw);
@@ -6133,16 +6134,16 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
       });
     };
     const globCandidates = (rawWord: string): string[] => {
+      const out = [rawWord];
       const eq = rawWord.indexOf("=");
       if (eq > 0 && !rawWord.slice(0, eq).includes("/")) {
         const val = rawWord.slice(eq + 1);
-        return isGlobWord(val) ? [val] : [rawWord];
-      }
-      if (/^-[A-Za-z]./.test(rawWord) && !rawWord.startsWith("--")) {
+        if (isGlobWord(val)) out.push(val);
+      } else if (/^-[A-Za-z]./.test(rawWord) && !rawWord.startsWith("--")) {
         const after = rawWord.slice(2);
-        return isGlobWord(after) ? [after] : [rawWord];
+        if (isGlobWord(after)) out.push(after);
       }
-      return [rawWord];
+      return out;
     };
     const badTarget = (targetPath: string, toolName: string, rawWord: string): string | undefined => {
       if (/^\/dev\/(null|zero|full|stdout|stderr|tty|fd\/\d+)$/.test(targetPath)) return undefined;
@@ -6215,16 +6216,94 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
       const mainTools = mainProgs.map((at) => path.basename(cmd.argv[at]));
       const toolName = mainTools.at(-1) ?? path.basename(cmd.argv[progs[0]]);
       const unlinksOnly = mainTools.length > 0 && mainTools.every((t) => t === "rm" || t === "rmdir" || t === "unlink");
+      // (Project review 3, round 12, Opus: `git add` and tar/zip in create mode read or record
+      // symlinks given as operands without writing through them; exempt only their operand words
+      // from the per-word symlink check while keeping the archive output and call-level link checks.)
+      const skipSymlink = new Set<number>();
+      if (mainProgs.length === 1) {
+        const progAt = mainProgs[0];
+        const progName = mainTools[0];
+        const progArgs = cmd.argv.slice(progAt + 1);
+        if (progName === "git") {
+          const gc = gitCall(progArgs);
+          if (typeof gc !== "string" && gc.sub === "add") {
+            const restStart = progAt + 1 + (progArgs.length - gc.rest.length);
+            let ended = false;
+            for (let j = 0; j < gc.rest.length; j++) {
+              const a = gc.rest[j];
+              if (ended) {
+                skipSymlink.add(restStart + j);
+                continue;
+              }
+              if (a === "--") {
+                ended = true;
+                continue;
+              }
+              if (a === "--pathspec-from-file" || a === "--chmod") {
+                j++;
+                continue;
+              }
+              if (!a.startsWith("-")) skipSymlink.add(restStart + j);
+            }
+          }
+        } else if (progName === "tar" || progName === "gtar" || progName === "bsdtar") {
+          const tr = tarReading(progArgs);
+          const tarCreate = (tr.has("create") || tr.letter("c")) && !(tr.has("extract") || tr.has("get") || tr.letter("x") || tr.has("delete") || tr.has("remove-files"));
+          if (tarCreate) {
+            for (let j = 0; j < progArgs.length; j++) {
+              const w = progArgs[j];
+              if (tr.members.includes(w) && !tr.archives.includes(w) && !tr.optionValues.includes(w)) skipSymlink.add(progAt + 1 + j);
+            }
+          }
+        } else if (progName === "zip") {
+          const ZIP_VALUED = /^-(b|n|t|tt|O|P|s|sp|Z|ds|x|i|R)$|^--(output-file|temp-path|suffixes|from-date|before-date|password|split-size|compression-method|exclude|include)$/;
+          let zipEnded = false;
+          let seenArchive = false;
+          let zipUnsafe = false;
+          const zipOps: number[] = [];
+          for (let j = 0; j < progArgs.length; j++) {
+            const a = progArgs[j];
+            if (!zipEnded && a === "--") {
+              zipEnded = true;
+              continue;
+            }
+            if (!zipEnded && a.startsWith("-")) {
+              if (ZIP_VALUED.test(a)) {
+                j++;
+                continue;
+              }
+              if (/^--(output-file|temp-path|suffixes|from-date|before-date|password|split-size|compression-method|exclude|include)=/.test(a)) continue;
+              if (a.startsWith("--")) {
+                if (/^--(move|delete|test|fix|fixfix|unzip-command)(=|$)/.test(a)) zipUnsafe = true;
+                continue;
+              }
+              for (let k = 1; k < a.length; k++) {
+                const ch = a[k];
+                if ("bntOPsZ".includes(ch)) {
+                  if (k === a.length - 1) j++;
+                  break;
+                }
+                if ("mdTFU".includes(ch)) zipUnsafe = true;
+              }
+              continue;
+            }
+            if (!seenArchive) seenArchive = true;
+            else zipOps.push(progAt + 1 + j);
+          }
+          if (!zipUnsafe) for (const idx of zipOps) skipSymlink.add(idx);
+        }
+      }
       for (let i = progs[0]; i < cmd.argv.length; i++) {
         const rawWord = cmd.argv[i];
         const hasGlob = cmd.glob ? !!cmd.glob[i] : isGlobWord(rawWord);
         if (!hasGlob) continue;
         if (otherMakesLink(cmd)) return `${toolName} uses glob ${rawWord} in a call whose other command creates or moves a link`;
+        if (skipSymlink.has(i)) continue;
         for (const cand of globCandidates(rawWord)) {
           const placed = expandKnown(cand, cmd);
           if (/[$`]/.test(placed)) return `${toolName} uses glob ${rawWord} with an expansion the check cannot list`;
           const t = tilde(placed);
-          if (/^~[^/]/.test(t)) continue;
+          if (/^~[^/]/.test(t)) return `${toolName} uses glob ${rawWord}, a tilde path the check cannot list`;
           const cmdDirs = path.isAbsolute(t) ? ["/"] : (where.places.get(cmd)?.map((x) => x.real) ?? (where.cwd.get(cmd) ? [where.cwd.get(cmd)!] : []));
           const followLast = !unlinksOnly || cand.endsWith("/");
           for (const dir of cmdDirs) {
@@ -6264,7 +6343,7 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
       const placed = pwdPlaced(w.word, w.cmd);
       if (/[$`]/.test(placed)) continue;
       const t = tilde(placed);
-      if (/^~[^/]/.test(t)) continue;
+      if (/^~[^/]/.test(t)) return `${toolName} writes ${w.word}, a tilde path the check cannot list`;
       const cmdDirs = path.isAbsolute(t) ? ["/"] : (where.places.get(w.cmd)?.map((x) => x.real) ?? (where.cwd.get(w.cmd) ? [where.cwd.get(w.cmd)!] : []));
       for (const dir of cmdDirs) {
         const matches = expandNames(t, dir);

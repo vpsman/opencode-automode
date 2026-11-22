@@ -525,8 +525,14 @@ function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope)
   let words = args;
   if (name === "sed") {
     const r = sedReading(args);
-    if (r.inPlace && !r.debug && !r.unknownLong) return undefined;
-    words = r.files;
+    if (r.inPlace && !r.debug && !r.unknownLong) {
+      for (const f of r.scriptFiles) {
+        const secret = secretIn(f, scope, false, true) ?? globSecret(f, scope);
+        if (secret) return secret;
+      }
+      return undefined;
+    }
+    words = [...r.files, ...r.scriptFiles];
   } else if (PATTERN_FIRST.has(name)) words = operands(args).slice(1);
   else if (COPIERS.has(name)) {
     // With `-t DIR` (`--target-directory`) the destination is named first and every operand is a
@@ -1990,6 +1996,7 @@ export interface SedReading {
   sandbox: boolean;
   debug: boolean;
   scripts: string[];
+  scriptFiles: string[];
   files: string[];
   suffixes: string[];
   loadsFile: boolean;
@@ -1998,6 +2005,7 @@ export interface SedReading {
 }
 export function sedReading(args: string[]): SedReading {
   const scripts: string[] = [];
+  const scriptFiles: string[] = [];
   const pos: string[] = [];
   const suffixes: string[] = [];
   let inPlace = false;
@@ -2028,7 +2036,7 @@ export function sedReading(args: string[]): SedReading {
         if (a.length > 11) suffixes.push(a.slice(11));
       } else if (a === "--file" || a.startsWith("--file=")) {
         loadsFile = true;
-        if (a === "--file") k++;
+        scriptFiles.push(a === "--file" ? (args[++k] ?? "") : a.slice(7));
       } else if (a === "--line-length") k++;
       else if (/^--(quiet|silent|regexp-extended|separate|unbuffered|null-data|posix|follow-symlinks|binary)$/.test(a) || /^--line-length=\d+$/.test(a)) continue;
       else unknownLong ??= a;
@@ -2045,7 +2053,10 @@ export function sedReading(args: string[]): SedReading {
       if (ch === "e" || ch === "l" || ch === "f") {
         const value = j + 1 < a.length ? a.slice(j + 1) : args[++k];
         if (ch === "e") scripts.push(value ?? "");
-        else if (ch === "f") loadsFile = true;
+        else if (ch === "f") {
+          loadsFile = true;
+          scriptFiles.push(value ?? "");
+        }
         break;
       }
       unknownShort ??= `-${ch}`;
@@ -2055,7 +2066,7 @@ export function sedReading(args: string[]): SedReading {
   const hasScriptOpt = scripts.length > 0 || loadsFile;
   const files = hasScriptOpt ? pos : pos.slice(1);
   if (!hasScriptOpt) scripts.push(pos[0] ?? "");
-  return { inPlace, sandbox, debug, scripts, files, suffixes, loadsFile, unknownShort, unknownLong };
+  return { inPlace, sandbox, debug, scripts, scriptFiles, files, suffixes, loadsFile, unknownShort, unknownLong };
 }
 
 function sed(args: string[], scope: Scope): Verdict {
@@ -3086,6 +3097,7 @@ export interface CopyReading {
   symbolic: boolean;
   keepsLinks: boolean;
   installDir: boolean;
+  exchange: boolean;
   unknown?: string;
 }
 export function copyReading(cmd: string, args: string[]): CopyReading {
@@ -3099,6 +3111,7 @@ export function copyReading(cmd: string, args: string[]): CopyReading {
   let deref = false;
   let preserveLinks = false;
   let installDir = false;
+  let exchange = false;
   let unknown: string | undefined;
   let ended = false;
   const names = Object.keys(spec.long);
@@ -3143,6 +3156,7 @@ export function copyReading(cmd: string, args: string[]): CopyReading {
         } else if (full === "link") link = true;
         else if (full === "symbolic" || full === "symbolic-link") symbolic = true;
         else if (full === "directory") installDir = true;
+        else if (full === "exchange") exchange = true;
       } else if (kind === "optional") {
         if (full === "preserve" && attached !== undefined && attached.split(",").some((v) => v === "links" || v === "all")) preserveLinks = true;
       }
@@ -3186,6 +3200,7 @@ export function copyReading(cmd: string, args: string[]): CopyReading {
     symbolic,
     keepsLinks: cmd === "cp" && (noDeref || preserveLinks || (recursive && !deref)),
     installDir: cmd === "install" && installDir,
+    exchange: cmd === "mv" && exchange,
     ...(unknown ? { unknown } : {}),
   };
 }
