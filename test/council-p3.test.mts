@@ -1411,3 +1411,39 @@ test("round 19 (Opus, Sol): printf -v names, numbered parameters and computed ex
     '[ "${v#x}" = y ]',
   ]) assert.equal(await decide19(command), "allow", command);
 });
+
+test("round 20 (Opus, Sol): only names known to be safe pass unquoted into test, printf's first word and wait", async () => {
+  const repo20 = path.join(base, "repo20");
+  fs.mkdirSync(repo20, { recursive: true });
+  fs.writeFileSync(path.join(repo20, "f"), "-v a[$(date)]");
+  fs.writeFileSync(path.join(repo20, "a.ts"), "hello\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo20]);
+  const decide20 = async (command: string) => (await decideShell(guard, new SessionState(repo20), repo20, command)).effect;
+
+  for (const command of [
+    // Sol: concatenated values with blanks.
+    "true && op=-v; arg=' a[foo]'; test $op$arg",
+    "true && op=-v; arg=' a[foo]'; [ $op$arg ]",
+    "v='-v a[foo]'; empty=; test ${v}${empty}",
+    "true && op=-p; arg=' PATH'; wait $op$arg",
+    // Opus: a name bash sets by itself.
+    "read < f; test $REPLY",
+    "while read; do test $REPLY; done < f",
+    "select x in a b; do test $REPLY; done < f",
+    "read < f; test x -a $REPLY",
+    "read -r < f; wait $REPLY",
+  ]) assert.notEqual(await decide20(command), "allow", command);
+
+  for (const command of [
+    "x=foo; [ $x = foo ] && echo same",
+    "[ -z $x ] && echo empty",
+    "for f in *.ts; do [ -f $f ] && echo $f; done",
+    "for f in a b c; do test -n $f; done",
+    "sleep 1 & wait $!",
+    "[ $? -eq 0 ] && echo ok",
+    '[ "$REPLY" = y ]',
+    'read -r ans < f; [ "$ans" = y ]',
+    "n=3; [ $n -gt 2 ] && echo big",
+    "printf '%s\\n' $x",
+  ]) assert.equal(await decide20(command), "allow", command);
+});

@@ -9002,6 +9002,7 @@ export function expansionProblem(command: string): GuardVerdict | undefined {
   const real = pairs.map(([r]) => r);
   const seen = pairs.map(([, m]) => m);
   let unreadValues: Set<string> | undefined;
+  let assignedValues: Map<string, string[]> | undefined;
   for (const [n, cmd] of seen.entries()) {
     const argv = real[n].argv;
     const { at, chain } = traverse(argv);
@@ -9047,8 +9048,21 @@ export function expansionProblem(command: string): GuardVerdict | undefined {
         const positional = (name === "printf" ? args.slice(0, 1) : args).find((a) => /\$\{?[@*]/.test(unmark(a)) || UNQUOTED_COMPUTED.test(a));
         if (positional !== undefined) found = unmark(positional);
         else {
+          // (Round 20, Opus, Sol: list what is safe, not what can set a name. An unquoted
+          // `$NAME` here passes only when the call gives NAME literal values without blanks
+          // (`$!`, `$$`, `$?`, `$#` count as numbers), or when the call never sets it (a `for` over
+          // plain words or globs included) and it is not a name bash sets by itself (`REPLY`,
+          // `OPTARG`, `MAPFILE`, ...: upper case or `_`). Anything else, a concatenation of
+          // values with blanks (`test $op$arg`) included, goes to the model.)
           const unread = (unreadValues ??= unreadNames(command, real));
-          const named = args.find((a) => [...a.matchAll(UNQUOTED_NAME)].some((m) => unread.has(m[1])));
+          const assigned = (assignedValues ??= collectAssigned(real));
+          const safeName = (n: string) => {
+            if (unread.has(n)) return false;
+            const values = assigned.get(n);
+            if (values) return values.every((v) => !/[$`\s]/.test(v.replace(/\$[!$?#]/g, "")));
+            return settable(n);
+          };
+          const named = (name === "printf" ? args.slice(0, 1) : args).find((a) => [...a.matchAll(UNQUOTED_NAME)].some((m) => !safeName(m[1])));
           if (named !== undefined) found = unmark(named);
         }
       }
