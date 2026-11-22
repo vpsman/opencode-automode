@@ -184,7 +184,7 @@ For each shell tool call:
      `git log -p secrets.json` ask, `git log -1 secrets.json` (no patch) does not; and except
      in a call that only prints its help or version (cp/mv/ln/install), and for sort's own
      reading (only its last `--files0-from`, and `--random-source` only in a random sort).
-   - **find, tar, rsync, sort, ps, cloc and the compressors** (gzip, xz, zstd, bzip2 and
+   - **find, tar, rsync, sort, ps, cloc, zip, yq and the compressors** (gzip, xz, zstd, bzip2 and
      their aliases) are read only in their plain spellings: whole long option names, short flags in
      a cluster, and the common valued options in their usual form (`tar -xzf a.tgz -C dst`,
      `sort -t: -k3n`, `ps -eo pid,comm`, `find . -name x -exec cmd {} +`). Any other option or

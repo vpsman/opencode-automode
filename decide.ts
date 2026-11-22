@@ -23,14 +23,20 @@ import {
   fileVerdict,
   isRootLike,
   bare,
+  chmodReading,
   makeScope,
   psEnvironments,
   findActions,
   copiesNothing,
+  copyReading,
   printsOnly,
+  READ_ONLY,
   readVerdict,
   realish,
+  sedReading,
   skippable,
+  tarReading,
+  unreadSpelling,
   within,
   type Action,
   type Matcher,
@@ -3895,9 +3901,16 @@ function optionNamedPath(cmds: Simple[], dirsOf: (cmd: Simple) => string[] | und
     const makers = programs(cmd.argv).filter((at) => Object.hasOwn(PARENT_MAKERS, path.basename(cmd.argv[at])) && cmd.argv.slice(at + 1).some((a) => PARENT_MAKERS[path.basename(cmd.argv[at])].test(a)) && !copiesNothing(path.basename(cmd.argv[at]), cmd.argv.slice(at + 1)));
     for (const at of programs(cmd.argv)) {
       if (path.basename(cmd.argv[at]) !== "sed") continue;
-      for (const arg of cmd.argv.slice(at + 1)) {
-        const suffix = /^-[nrEsuz]*i(.+)$/s.exec(arg)?.[1] ?? /^--i[a-z-]*=(.*)$/s.exec(arg)?.[1];
-        if (suffix !== undefined && /[*\/$`]/.test(suffix)) return { action: "ask", reason: `sed -i with a suffix that names the backup file itself (${suffix}): it can make a file named like an option, which a later glob hands to a program as one` };
+      const args = cmd.argv.slice(at + 1);
+      const r = sedReading(args);
+      const dashes = args.indexOf("--");
+      const suffixes = [...(r.inPlace ? r.suffixes : [])];
+      for (const arg of dashes < 0 ? args : args.slice(0, dashes)) {
+        const m = /^--i[a-z-]*=(.*)$/s.exec(arg);
+        if (m) suffixes.push(m[1]);
+      }
+      for (const suffix of suffixes) {
+        if (/[*\/$`]/.test(suffix)) return { action: "ask", reason: `sed -i with a suffix that names the backup file itself (${suffix}): it can make a file named like an option, which a later glob hands to a program as one` };
       }
     }
     for (const [k, word] of [...cmd.argv, ...cmd.out].entries()) {
@@ -3965,8 +3978,24 @@ const herePlus = (word: string) => (word === "~+" ? "." : word.startsWith("~+/")
 const ONLY_READS = new Set(["", "cd", "pushd", "popd", "pwd", "ls", "cat", "echo", "printf", "true", "false", ":", "test", "[", "grep", "rg", "head", "tail", "wc", "stat", "file", "du", "df", "sleep", "wait", "zcat"]);
 const PURE_ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/;
 function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined, dirsOf?: (cmd: Simple) => string[] | undefined, roots?: string[]): string | undefined {
+  const yqExists = (word: string, cmd: Simple): boolean | undefined => {
+    const t = tilde(herePlus(word));
+    if (/^~[^/]/.test(t)) return undefined;
+    const dirs = path.isAbsolute(t) ? ["/"] : (dirsOf?.(cmd) ?? (cwdOf(cmd) ? [cwdOf(cmd)!] : []));
+    if (!dirs.length) return undefined;
+    for (const dir of dirs) {
+      const full = path.isAbsolute(t) ? t : path.resolve(dir, t);
+      try {
+        if (!fs.statSync(full).isDirectory()) return true;
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException)?.code;
+        if (code !== "ENOENT" && code !== "ENOTDIR") return undefined;
+      }
+    }
+    return false;
+  };
   // Also every place the guard's own list of writes names (`cp -t`, `sort -o`, git's `--output`).
-  const extra = writesOf(cmds).writes;
+  const extra = writesOf(cmds, undefined, yqExists).writes;
   // (Project review 3, closing round, Opus: a glob also matches the files the call's other
   // commands make, which no listing at decision time finds: `gzip -c f > opencode.json.gz;
   // gunzip ./*.gz`, or in parallel, background, process-substitution or loop order. Each name as
@@ -4022,7 +4051,9 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
     // value, `find . -name -exec -o -name cp`.)
     const placed = programs(cmd.argv).filter((p) => !(p > 0 && /^-(exec|execdir|ok|okdir)$/.test(cmd.argv[p - 1]) && !findAction(cmd.argv, p - 1)));
     const quiet = placed.filter((p) => printsOnly(path.basename(cmd.argv[p]), cmd.argv.slice(p + 1)) || copiesNothing(path.basename(cmd.argv[p]), cmd.argv.slice(p + 1)));
+    let early: string | undefined;
     cmd.argv.forEach((word, at) => {
+      if (early) return;
       if (!placed.includes(at) && quiet.some((p) => p < at)) return;
       // (Round 52, Astra: behind a plain file tool, which runs no program, a word named like a
       // writer is an operand: `sort -- cp .git/report` sorts two files. Round 54, Opus: an
@@ -4041,7 +4072,8 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
         // option's value, `git -C nested/cp ls-files`, is none).
         if (at !== sub) return;
       }
-      const how = Object.hasOwn(WRITER_OPERANDS, path.basename(word)) ? WRITER_OPERANDS[path.basename(word)] : undefined;
+      const tool = path.basename(word);
+      const how = Object.hasOwn(WRITER_OPERANDS, tool) ? WRITER_OPERANDS[tool] : undefined;
       // (Round 54, Opus: inside `find -exec`, the command's words end at the `;` or `{} +` that
       // closes it: `find . -exec cp f .git/x \;` writes `.git/x`, not `;/x`.)
       let args = cmd.argv.slice(at + 1);
@@ -4050,36 +4082,40 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
         if (end >= 0) args = args.slice(0, args[end] === "+" ? end - 1 : end);
       }
       // (Round 50, Sol: a copy that copies nothing names no destination and makes no file.)
-      if (how && (copiesNothing(path.basename(word), args) || printsOnly(path.basename(word), args))) return;
+      if (how && (copiesNothing(tool, args) || printsOnly(tool, args))) return;
       // Every word after `--` is a file, one that begins with `-` too (round 40, Opus).
       const dashes = args.indexOf("--");
       const files = [...(dashes < 0 ? args : args.slice(0, dashes)).filter((a) => !a.startsWith("-")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
-      if (path.basename(word) === "sed" && !args.some((a) => /^(-[a-zA-Z]*i|--in-place)/.test(a))) return;
-      if (path.basename(word) === "dd") targets.push(...args.filter((a) => a.startsWith("of=")).map((a) => a.slice(3)));
-      // (Round 45, Sol: a copy that copies nothing writes no destination.)
-      else if (how && !copiesNothing(path.basename(word), args)) targets.push(...(how === "last" ? files.slice(-1) : files));
+      if (tool === "sed") {
+        const r = sedReading(args);
+        if (!r.inPlace) return;
+        targets.push(...r.files);
+        return;
+      }
+      const copy = ["cp", "mv", "ln", "install"].includes(tool) ? copyReading(tool, args) : undefined;
+      if (copy?.unknown) {
+        early = `${tool} ${copy.unknown}: an option the check cannot read, so its destination is not known`;
+        return;
+      }
+      const badT = copy?.targets.find((v) => /[*?[\]{}$`]/.test(v));
+      if (badT !== undefined) {
+        early = `${tool} -t ${badT}: target directory bash may expand into both destination and sources`;
+        return;
+      }
+      const tdir = copy?.target;
+      const opFiles = copy ? copy.operands : files;
+      const installDir = !!copy?.installDir;
+      if (tool === "dd") targets.push(...args.filter((a) => a.startsWith("of=")).map((a) => a.slice(3)));
+      // (Round 45, Sol: a copy that copies nothing writes no destination. Project review 3, round 11:
+      // `install -d`/`--directory` creates every operand.)
+      else if (how && !copiesNothing(tool, args)) targets.push(...(installDir ? (tdir !== undefined ? [...opFiles, tdir] : opFiles) : tdir !== undefined ? (how === "last" ? [tdir] : [...opFiles, tdir]) : how === "last" ? opFiles.slice(-1) : opFiles));
       // (Round 41, Opus: a copy into a directory writes each source's name there: `cp -r ev/.git .`
       // writes `./.git`. Judged by where each lands.)
       // (Round 42, Mythos: `~+` is where it runs. Opus: a copy of a directory's contents, `src/.`,
       // rsync's `src/`, `-T`, brings the `.git` it holds to where the contents land.)
       // (Round 43, Opus: also into a `-t`/`--target-directory` directory, and from the names a glob
       // source expands to; Mythos: a `.git` at any depth of the source, gitIn.)
-      const tool = path.basename(word);
-      let tdir: string | undefined;
-      let tWord: string | undefined;
-      if (how === "last" && tool !== "rsync") {
-        for (let k = 0; k < args.length && args[k] !== "--"; k++) {
-          const a = args[k];
-          if (/^--targ/.test(a) && "--target-directory".startsWith(a.split("=")[0])) {
-            tdir = a.includes("=") ? a.slice(a.indexOf("=") + 1) : (tWord = args[k + 1]);
-          } else if (/^-[^-]/.test(a) && a[a.slice(1).search(/[Sgmot]/) + 1] === "t" && a.slice(1).search(/[Sgmot]/) >= 0) {
-            // (The letter before any other that takes a value: `-St` names the suffix `t`.)
-            const rest = a.slice(a.slice(1).search(/[Sgmot]/) + 2);
-            tdir = rest || (tWord = args[k + 1]);
-          }
-        }
-      }
-      const given = tdir !== undefined ? files.filter((f, k) => !(f === tWord && k === files.indexOf(tWord))) : files.slice(0, -1);
+      const given = tdir !== undefined ? opFiles : opFiles.slice(0, -1);
       // (Round 44, Sol: a copy that copies nothing, an rsync dry run or listing, `cp --version`,
       // brings nothing. Opus: `-L` copies what links lead to, so the walk follows them.)
       // (Round 45, Opus: `--help` after `--` is a file; rsync's `-k`/`--copy-dirlinks` and cp's
@@ -4087,11 +4123,11 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       const nothing = copiesNothing(tool, args);
       const head = args.indexOf("--") < 0 ? args : args.slice(0, args.indexOf("--"));
       const follow = head.some((a) => (a.length >= 5 && "--dereference".startsWith(a)) || a === "--copy-links" || a === "--copy-dirlinks" || a === "--copy-unsafe-links" || (tool === "rsync" ? /^-[a-zA-Z]*[Lk]/.test(a) : /^-[a-zA-Z]*L/.test(a)));
-      if (how === "last" && !nothing && given.length && (tdir !== undefined || files.length > 1)) {
-        const dest = herePlus(tdir ?? files.at(-1)!);
+      if ((how === "last" || tool === "mv") && !installDir && !nothing && given.length && (tdir !== undefined || opFiles.length > 1)) {
+        const dest = herePlus(tdir ?? opFiles.at(-1)!);
         const dir = cwdOf(cmd);
         const asFile = tdir === undefined && tool !== "rsync" && args.some((a) => a === "--no-target-directory" || /^-[a-zA-Z]*T/.test(a));
-        let into = tdir !== undefined || (!asFile && (dest.endsWith("/") || files.length > 2));
+        let into = tdir !== undefined || (!asFile && (dest.endsWith("/") || opFiles.length > 2));
         if (!into && !asFile && dir !== undefined) {
           try {
             into = fs.statSync(path.resolve(dir, tilde(dest))).isDirectory();
@@ -4115,12 +4151,13 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
           }
         }
       }
-      if (how && !NAME_KEEPERS.has(path.basename(word))) {
+      if (how && !NAME_KEEPERS.has(tool)) {
         const end = args.indexOf("--");
-        const operands = end < 0 ? files : [...files.filter((f) => args.indexOf(f) < end), ...args.slice(end + 1)];
-        made.push(...(how === "last" ? operands.slice(-1) : operands));
+        const operands = copy ? copy.operands : end < 0 ? files : [...files.filter((f) => args.indexOf(f) < end), ...args.slice(end + 1)];
+        made.push(...(how === "last" && !installDir ? operands.slice(-1) : operands));
       }
     });
+    if (early) return early;
     // A file whose name begins with `-` is an option to the program a later glob hands it to
     // (round 4, N3: `touch ./--to-command=rec`, then `tar xf a.tar --to*` or `tar xf a.tar *` in
     // this call, where the glob is judged before the file is there). `-` alone is no option, and
@@ -4145,7 +4182,18 @@ function writeProblem(cmds: Simple[], cwdOf: (cmd: Simple) => string | undefined
       const isGlob = /[*?[\]{}]/.test(target);
       for (const dir of path.isAbsolute(t) ? ["/"] : (dirsOf?.(cmd) ?? [])) {
         const landedAll = isGlob
-          ? (expandWord(t, dir) ?? [])
+          ? (() => {
+              const matched = expandWord(t, dir);
+              if (matched === undefined) return [];
+              if (matched.length > 0) return matched;
+              // Empty glob match: bash passes the literal word; check its resolved non-glob
+              // directory prefix so a symlink to an empty `.git/hooks` is still caught without
+              // matching the literal `*` against protected names.
+              const full = path.isAbsolute(t) ? t : `${dir}/${t}`;
+              if (isDevice(full, undefined) || procRelative(full)) return [];
+              const literalPrefix = physical(full).split("/").filter((s) => !/[*?[\]{}]/.test(s)).join("/");
+              return literalPrefix ? [literalPrefix] : [];
+            })()
           : (() => {
               const full = path.isAbsolute(t) ? t : `${dir}/${t}`;
               return isDevice(full, undefined) || procRelative(full) ? [] : [physical(full)];
@@ -5564,10 +5612,10 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   const known = () => new Set([...session.files.keys(), ...scope.pending.keys(), ...session.touched]);
   // The file a word names where `cmd` runs. Where that directory is unknown a relative word
   // cannot be placed: it then stands for any file of that name this session wrote.
-  // B9-5: `$PWD/…` (or `${PWD}`) is the directory the command runs in, where that is known.
+  // B9-5: `$PWD/…` (or `${PWD}` or `~+`) is the directory the command runs in, where that is known.
   const pwdPlaced = (word: string, cmd?: Simple): string => {
     const dir = cmd ? where.cwd.get(cmd) : cwdKnown ? here : undefined;
-    const m = PWD_LEAD.exec(word);
+    const m = PWD_LEAD.exec(word) ?? /^~\+(?=\/|$)/.exec(word);
     return m && dir !== undefined ? `${dir}${word.slice(m[0].length)}` : word;
   };
   const resolve = (raw: string, cmd?: Simple): string | undefined => {
@@ -5614,41 +5662,241 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
     }
     return true;
   };
-  const found = writesOf(cmds, filesOnly);
-  let writeIssue: string | undefined;
+  const yqExists = (word: string, cmd: Simple): boolean | undefined => {
+    const placed = pwdPlaced(word, cmd);
+    const t = tilde(placed);
+    if (/^~[^/]/.test(t)) return undefined;
+    const dirs = path.isAbsolute(t) ? ["/"] : (where.places.get(cmd)?.map((x) => x.real) ?? (where.cwd.get(cmd) ? [where.cwd.get(cmd)!] : []));
+    if (!dirs.length) return undefined;
+    for (const dir of dirs) {
+      const full = path.isAbsolute(t) ? t : path.resolve(dir, t);
+      try {
+        if (!fs.statSync(full).isDirectory()) return true;
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException)?.code;
+        if (code !== "ENOENT" && code !== "ENOTDIR") return undefined;
+      }
+    }
+    return false;
+  };
+  const found = writesOf(cmds, filesOnly, yqExists);
+  // (Project review 3, round 9: every current match of a glob write target is held to the same
+  // write checks as a literal target — outside the project, guarded files, config dirs, .git — not
+  // just the protected names checked in writeProblem. Round 10, Neon: also ask when another command
+  // in the call can create a link, when a glob write/remove target also holds an expansion, or when
+  // a glob on rm/rmdir/unlink or an mv source traverses a symlinked directory or lands outside.)
+  const isGlobWord = (word: string): boolean => /[*?]|\[.*\]/s.test(word);
+  const cmdMakesLink = (cmd: Simple): boolean =>
+    programs(cmd.argv).some((at) => {
+      const tool = path.basename(cmd.argv[at]);
+      const args = cmd.argv.slice(at + 1);
+      if (printsOnly(tool, args) || copiesNothing(tool, args)) return false;
+      if (tool === "ln" || tool === "link" || tool === "rsync") return true;
+      if (tool === "cp") {
+        const c = copyReading("cp", args);
+        return c.symbolic || c.hard || c.keepsLinks || !!c.unknown;
+      }
+      if (tool === "mv") {
+        const c = copyReading("mv", args);
+        if (c.unknown || c.exchange) return true;
+        const srcs = c.target !== undefined || c.operands.length === 1 ? c.operands : c.operands.slice(0, -1);
+        const cmdDirs = where.places.get(cmd)?.map((x) => x.real) ?? (where.cwd.get(cmd) ? [where.cwd.get(cmd)!] : []);
+        for (const src of srcs) {
+          const placed = pwdPlaced(src, cmd);
+          const t = tilde(placed);
+          if (isGlobWord(src) || /[$`]/.test(placed) || /^~[^/]/.test(t)) return true;
+          const candidates = path.isAbsolute(t) ? [t] : cmdDirs.length ? cmdDirs.map((d) => `${d}/${t}`) : undefined;
+          if (!candidates) return true;
+          for (const full of candidates) {
+            const p = full.length > 1 ? full.replace(/\/+$/, "") : full;
+            try {
+              const st = fs.lstatSync(p);
+              if (st.isSymbolicLink() || st.isDirectory()) return true;
+            } catch {}
+          }
+        }
+      }
+      return false;
+    });
+  const otherMakesLink = (cmd: Simple): boolean => cmds.some((c) => c !== cmd && cmdMakesLink(c));
+  const globMatchIssue = (word: string, cmd: Simple, dirFlag: boolean, sources: string[] | undefined, toolName: string): string | undefined => {
+    if (!isGlobWord(word)) return undefined;
+    if (otherMakesLink(cmd)) return `${toolName} writes ${word} in a call whose other command creates a link`;
+    const placed = pwdPlaced(word, cmd);
+    if (/[$`]/.test(placed)) return `${toolName} writes ${word}: a glob with an expansion the check cannot list`;
+    const t = tilde(placed);
+    if (/^~[^/]/.test(t)) return `${toolName} writes ${word}, a tilde path the check cannot list`;
+    const dirs = path.isAbsolute(t) ? ["/"] : (where.places.get(cmd)?.map((x) => x.real) ?? (where.cwd.get(cmd) ? [where.cwd.get(cmd)!] : []));
+    for (const dir of dirs) {
+      const matches = expandWord(t, dir);
+      if (matches === undefined) return `${toolName} writes ${word}, a glob the check cannot list`;
+      for (const m of matches) {
+        if (/^\/dev\/(null|zero|full|stdout|stderr|tty|fd\/\d+)$/.test(m)) continue;
+        let at = [m];
+        try {
+          if (dirFlag || word.endsWith("/") || fs.statSync(m).isDirectory()) at = [m, ...(sources?.length ? sources.map((s) => path.basename(s)) : [".automode-placed-check"]).map((n) => path.join(m, n))];
+        } catch {}
+        for (const q of at) {
+          const v = fileVerdict("edit", q, { ...scope, pending: new Map(scope.pending) });
+          if (v.action !== "allow") return v.reason.replace(/^edit /, `${toolName} writes `);
+        }
+      }
+    }
+    return undefined;
+  };
+  const removeGlobIssue = (word: string, cmd: Simple, toolName: string): string | undefined => {
+    if (!isGlobWord(word)) return undefined;
+    const verb = toolName === "mv" ? "moves" : "removes";
+    if (otherMakesLink(cmd)) return `${toolName} ${verb} ${word} in a call whose other command creates a link`;
+    const placed = pwdPlaced(word, cmd);
+    if (/[$`]/.test(placed)) return `${toolName} ${verb} ${word}: a glob with an expansion the check cannot list`;
+    const t = tilde(placed);
+    if (/^~[^/]/.test(t)) return `${toolName} ${verb} ${word}, a tilde path the check cannot list`;
+    const dirs = path.isAbsolute(t) ? ["/"] : (where.places.get(cmd)?.map((x) => x.real) ?? (where.cwd.get(cmd) ? [where.cwd.get(cmd)!] : []));
+    const hasSymlinkParent = (raw: string, baseDir: string): boolean => {
+      const parent = path.dirname(raw);
+      const anchor = !path.isAbsolute(t) ? baseDir : roots.map(realish).find((r) => within(parent, r));
+      if (anchor === undefined || !within(parent, anchor)) return false;
+      const rel = path.relative(anchor, parent);
+      if (!rel || rel === ".") return false;
+      let cur = anchor;
+      for (const seg of rel.split("/")) {
+        if (!seg || seg === ".") continue;
+        cur = path.join(cur, seg);
+        try {
+          if (fs.lstatSync(cur).isSymbolicLink()) return true;
+        } catch (e) {
+          const code = (e as NodeJS.ErrnoException)?.code;
+          if (code === "ENOENT" || code === "ENOTDIR") return false;
+          return true;
+        }
+      }
+      return false;
+    };
+    const checkDir = (dirEntry: string, baseDir: string): string | undefined => {
+      const norm = path.normalize(dirEntry);
+      if (hasSymlinkParent(path.join(norm, ".automode-placed-check"), baseDir)) return `${toolName} ${verb} ${word} through a symlinked directory`;
+      const realDir = physical(norm);
+      const v = fileVerdict("edit", path.join(realDir, ".automode-placed-check"), { ...scope, pending: new Map(scope.pending) });
+      return v.action !== "allow" ? v.reason.replace(/^edit /, `${toolName} ${verb} `) : undefined;
+    };
+    for (const dir of dirs) {
+      const matches = expandNames(t, dir);
+      if (matches === undefined) return `${toolName} ${verb} ${word}, a glob the check cannot list`;
+      if (matches.length === 0 && t.includes("/")) {
+        const parentPattern = path.dirname(t);
+        const parentMatches = expandNames(parentPattern, dir);
+        if (parentMatches === undefined) return `${toolName} ${verb} ${word}, a glob the check cannot list`;
+        for (const pDir of parentMatches) {
+          const issue = checkDir(pDir, dir);
+          if (issue) return issue;
+        }
+        continue;
+      }
+      for (const raw0 of matches) {
+        const raw = path.normalize(raw0);
+        if (/^\/dev\/(null|zero|full|stdout|stderr|tty|fd\/\d+)$/.test(raw)) continue;
+        if (hasSymlinkParent(raw, dir)) return `${toolName} ${verb} ${word} through a symlinked directory`;
+        const realParent = physical(path.dirname(raw));
+        let isLink = false;
+        try {
+          isLink = fs.lstatSync(raw).isSymbolicLink();
+        } catch {}
+        const checkPath = word.endsWith("/")
+          ? path.join(physical(raw), ".automode-placed-check")
+          : isLink
+            ? path.join(realParent, ".automode-placed-check")
+            : path.join(realParent, path.basename(raw));
+        const v = fileVerdict("edit", checkPath, { ...scope, pending: new Map(scope.pending) });
+        if (v.action !== "allow") return v.reason.replace(/^edit /, `${toolName} ${verb} `);
+      }
+    }
+    return undefined;
+  };
+  let writeIssue: string | undefined = found.ask;
   for (const w of found.writes.filter((x) => !x.checked)) {
     if (writeIssue) break;
+    const toolName = path.basename(w.cmd.argv[0] ?? "");
     const p = resolve(w.word, w.cmd);
     if (p && /^\/dev\/(null|zero|stdout|stderr|fd\/\d+)$/.test(p)) continue;
     if (!p || (!path.isAbsolute(tilde(w.word)) && where.cwd.get(w.cmd) === undefined)) writeIssue = `writes ${w.word}, a place the check cannot tell`;
     else {
       const v = fileVerdict("edit", p, scope);
-      if (v.action !== "allow") writeIssue = v.reason.replace(/^edit /, `${path.basename(w.cmd.argv[0] ?? "")} writes `);
+      if (v.action !== "allow") writeIssue = v.reason.replace(/^edit /, `${toolName} writes `);
     }
   }
   // (Council project review 2, round 39, Mythos: the places the guard reads by a program's own
   // options, which the rules "checked" by their plainer reading of the words, are held to the
   // rules' write test too: `cp f ~/.bashrc -S bak`, `tar -xf a.tar -C../out`, `find -fprint0 ~/x`,
-  // `rsync -aT../out`. Not redirects, tee, truncate, sed -i or dd, which the rules read as bash
-  // does. Tested on a copy of the pending record; a directory by a path inside it. Asked about
-  // after every other check, whose reasons say more.)
+  // `rsync -aT../out`. Project review 3, round 9: `sed -i` is included too now that writesOf
+  // reads sed's permuted options and exact file operands, and every glob write target checks its
+  // resolved matches — checked and unchecked alike, including tee/truncate/dd, after other asks so
+  // rules' own reasons such as ftp URLs win. Tested on a copy of the pending record; a directory
+  // by a path inside it. Asked about after every other check, whose reasons say more.)
   let placedIssue: string | undefined;
-  for (const w of found.writes.filter((x) => x.checked && !["tee", "truncate", "sed", "dd", ">"].includes(x.by ?? ""))) {
+  for (const w of found.writes) {
     if (placedIssue) break;
+    const toolName = path.basename(w.cmd.argv[0] ?? "");
     if (/^\/dev\/(null|zero|full|stdout|stderr|tty|fd\/\d+)$/.test(tilde(w.word))) continue;
-    const p = resolve(w.word, w.cmd);
-    if (!p || (!path.isAbsolute(tilde(w.word)) && where.cwd.get(w.cmd) === undefined)) continue;
-    // A directory is judged by the names that land in it: each source's base name, or, with none,
-    // a name nothing in it has (round 40, Sol: an unrelated link already there is not the write).
-    let at = [p];
-    try {
-      if (w.dir || w.word.endsWith("/") || fs.statSync(p).isDirectory()) at = (w.sources?.length ? w.sources.map((s) => path.basename(s)) : [".automode-placed-check"]).map((n) => path.join(p, n));
-    } catch {}
-    for (const q of at) {
-      const v = fileVerdict("edit", q, { ...scope, pending: new Map(scope.pending) });
-      if (v.action !== "allow") {
-        placedIssue = v.reason.replace(/^edit /, `${path.basename(w.cmd.argv[0] ?? "")} writes `);
-        break;
+    const isGlob = isGlobWord(w.word);
+    if (w.checked && !["tee", "truncate", "dd", ">"].includes(w.by ?? "")) {
+      const p = resolve(w.word, w.cmd);
+      if (p && (path.isAbsolute(tilde(w.word)) || where.cwd.get(w.cmd) !== undefined)) {
+        // A directory is judged by the names that land in it: each source's base name, or, with none,
+        // a name nothing in it has (round 40, Sol: an unrelated link already there is not the write).
+        let at = [p];
+        try {
+          if (w.dir || w.word.endsWith("/") || fs.statSync(p).isDirectory()) at = (w.sources?.length ? w.sources.map((s) => path.basename(s)) : [".automode-placed-check"]).map((n) => path.join(p, n));
+        } catch {}
+        for (const q of at) {
+          const v = fileVerdict("edit", q, { ...scope, pending: new Map(scope.pending) });
+          if (v.action !== "allow") {
+            placedIssue = v.reason.replace(/^edit /, `${toolName} writes `);
+            break;
+          }
+        }
+      }
+    }
+    if (!placedIssue && isGlob && w.by !== "curl" && w.by !== "wget") placedIssue = globMatchIssue(w.word, w.cmd, !!w.dir, w.sources, toolName);
+    if (!placedIssue && w.by === "mv" && w.sources) {
+      for (const src of w.sources) {
+        placedIssue = removeGlobIssue(src, w.cmd, "mv");
+        if (placedIssue) break;
+      }
+    }
+  }
+  if (!placedIssue) {
+    const otherWriters = new Set(["chmod", "chown", "chgrp", "touch", "mkdir", "shred", "setfacl"]);
+    const removers = new Set(["rm", "rmdir", "unlink"]);
+    for (const cmd of cmds) {
+      if (placedIssue) break;
+      for (const at of programs(cmd.argv)) {
+        if (placedIssue) break;
+        const tool = path.basename(cmd.argv[at]);
+        if (!otherWriters.has(tool) && !removers.has(tool)) continue;
+        const args = cmd.argv.slice(at + 1);
+        if (printsOnly(tool, args)) continue;
+        if (tool === "chmod") {
+          const ch = chmodReading(args);
+          if (ch.unknown) {
+            placedIssue = `chmod ${ch.unknown}: an option the check cannot read`;
+            break;
+          }
+          for (const op of ch.files) {
+            placedIssue = globMatchIssue(op, cmd, false, undefined, tool);
+            if (placedIssue) break;
+          }
+          continue;
+        }
+        const dashes = args.indexOf("--");
+        const head = dashes < 0 ? args : args.slice(0, dashes);
+        const ops = [...head.filter((a) => !a.startsWith("-")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
+        const skipFirst = (tool === "chown" || tool === "chgrp") && !head.some((a) => a.startsWith("--ref") && "--reference".startsWith(a.split("=")[0]));
+        const check = removers.has(tool) ? (op: string) => removeGlobIssue(op, cmd, tool) : (op: string) => globMatchIssue(op, cmd, false, undefined, tool);
+        for (const op of skipFirst ? ops.slice(1) : ops) {
+          placedIssue = check(op);
+          if (placedIssue) break;
+        }
       }
     }
   }
@@ -5840,7 +6088,7 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   };
   // B11: what a word reads, judged where it leads, and a link made to a credential location.
   const fromPlaces = stricter(stricter(placedReads(where, scope, judgeAt, landedProtected), inputReads(printed.inputs, text, where, here, scope, printed.judgedInputs)), linkedReads(where, scope, judgeAt, landedProtected));
-  const fromWords = stricter(stricter(stricter(argvGuards(cmds, context), expansionProblem(text)), stricter(runtimeReads(text, where, scope, (c, args, diff) => gitConfigProblem(c, args, diff) === undefined, printed), fromPlaces)), stricter(arithmeticAssignments(arithmeticSets), optionNamedPath(cmds, (c) => where.places.get(c)?.map((p) => p.real))));
+  const fromWords = stricter(stricter(stricter(argvGuards(cmds, context), expansionProblem(text, cwdKnown ? here : undefined)), stricter(runtimeReads(text, where, scope, (c, args, diff) => gitConfigProblem(c, args, diff) === undefined, printed), fromPlaces)), stricter(arithmeticAssignments(arithmeticSets), optionNamedPath(cmds, (c) => where.places.get(c)?.map((p) => p.real))));
   const combined = !fromText ? fromWords : !fromWords ? fromText : fromText.action === "ask" ? fromText : fromWords.action === "ask" ? fromWords : (fromWords.files ? fromWords : fromText);
   // The rules read a quoted `~` as the home directory, bash does not: their verdict is about other
   // paths than the ones bash uses.
@@ -5902,7 +6150,220 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   const spelling = verdict.action === "ask" && !!verdict.spelling;
   if (verdict.action === "ask" && !spelling) return asked(fromRules(verdict));
   if (extra?.action === "ask") return asked(askBy(extra.reason));
+  // (Project review 3, round 11: general glob/link backstop for any non-pure-reader command, run
+  // after the existing per-tool checks. Covers both call-level link creators/movers paired with
+  // globs and per-word glob matches traversing or landing on symlinks to outside, guarded, config,
+  // .git, protected or credential targets, plus globs holding expansions.)
+  const globLinkBackstop = (): string | undefined => {
+    const readOnlyWrites = new Set(["journalctl", "sort", "uniq", "xxd", "tree", "less", "jq", "yq", "cloc"]);
+    const isPureReader = (cmd: Simple): boolean => {
+      const progs = programs(cmd.argv);
+      if (!progs.length) return true;
+      const main = progs.filter((at, idx) => !(idx < progs.length - 1 && RULES_WRAPPERS.has(path.basename(cmd.argv[at]))));
+      if (!main.length) return false;
+      return main.every((at) => {
+        const tool = path.basename(cmd.argv[at]);
+        const args = cmd.argv.slice(at + 1);
+        return (READ_ONLY.has(tool) && !readOnlyWrites.has(tool)) || printsOnly(tool, args) || copiesNothing(tool, args);
+      });
+    };
+    const globCandidates = (rawWord: string): string[] => {
+      const out = [rawWord];
+      const eq = rawWord.indexOf("=");
+      if (eq > 0 && !rawWord.slice(0, eq).includes("/")) {
+        const val = rawWord.slice(eq + 1);
+        if (isGlobWord(val)) out.push(val);
+      } else if (/^-[A-Za-z]./.test(rawWord) && !rawWord.startsWith("--")) {
+        const after = rawWord.slice(2);
+        if (isGlobWord(after)) out.push(after);
+      }
+      return out;
+    };
+    const badTarget = (targetPath: string, toolName: string, rawWord: string): string | undefined => {
+      if (/^\/dev\/(null|zero|full|stdout|stderr|tty|fd\/\d+)$/.test(targetPath)) return undefined;
+      const prot = landedProtected(targetPath);
+      if (prot) return `${toolName} expands ${rawWord} through a symlink to ${targetPath}: ${prot}`;
+      const ev = fileVerdict("edit", targetPath, { ...scope, pending: new Map(scope.pending) });
+      if (ev.action !== "allow") return ev.reason.replace(/^edit /, `${toolName} expands ${rawWord} through a symlink to `);
+      const rv = readVerdict("read", targetPath, scope);
+      if (rv && rv.action !== "allow") return `${toolName} expands ${rawWord} through a symlink to a credential file (${targetPath})`;
+      return undefined;
+    };
+    const symlinkMatchIssue = (rawMatch: string, baseDir: string, followLast: boolean, toolName: string, rawWord: string): string | undefined => {
+      const anchor = rawMatch.startsWith(`${baseDir}/`) || rawMatch === baseDir ? baseDir : "/";
+      const rest = anchor === "/" ? rawMatch : rawMatch.slice(anchor.length);
+      const segs = rest.split("/").filter((s) => s !== "" && s !== ".");
+      let cur = anchor;
+      let sawSymlink = false;
+      for (let idx = 0; idx < segs.length; idx++) {
+        const seg = segs[idx];
+        if (seg === "..") {
+          cur = path.dirname(cur);
+          continue;
+        }
+        const next = path.join(cur, seg);
+        const isLast = idx === segs.length - 1;
+        let isLink = false;
+        try {
+          isLink = fs.lstatSync(next).isSymbolicLink();
+        } catch (e) {
+          const code = (e as NodeJS.ErrnoException)?.code;
+          if (code !== "ENOENT" && code !== "ENOTDIR") return `${toolName} uses glob ${rawWord}, a path the check cannot inspect`;
+        }
+        if (isLink && (!isLast || followLast)) {
+          sawSymlink = true;
+          cur = physical(next);
+          const issue = badTarget(cur, toolName, rawWord);
+          if (issue) return issue;
+        } else {
+          cur = next;
+        }
+      }
+      if (sawSymlink) {
+        const issue = badTarget(cur, toolName, rawWord);
+        if (issue) return issue;
+      }
+      return undefined;
+    };
+    const seenAssigned = new Set<string>();
+    const expandKnown = (word: string, cmd: Simple): string => {
+      const placed = pwdPlaced(word, cmd);
+      if (!scope.resolvedVars?.size || !seenAssigned.size) return placed;
+      return placed.replace(/\$\{(\w+)\}|\$(\w+)/g, (m, a, b) => {
+        const name = a ?? b;
+        return seenAssigned.has(name) ? (scope.resolvedVars!.get(name) ?? m) : m;
+      });
+    };
+    for (const cmd of cmds) {
+      const bareAssign = cmd.argv.length > 0 && cmd.argv.every((w) => /^[A-Za-z_]\w*=/.test(w));
+      if (bareAssign || cmd.argv[0] === "export") {
+        for (const w of cmd.argv[0] === "export" ? cmd.argv.slice(1) : cmd.argv) {
+          const m = /^([A-Za-z_]\w*)=/.exec(w);
+          if (m) seenAssigned.add(m[1]);
+        }
+        continue;
+      }
+      if (where.patterns.has(cmd) || isPureReader(cmd)) continue;
+      const progs = programs(cmd.argv);
+      if (!progs.length) continue;
+      const mainProgs = progs.filter((at, idx) => !(idx < progs.length - 1 && RULES_WRAPPERS.has(path.basename(cmd.argv[at]))));
+      const mainTools = mainProgs.map((at) => path.basename(cmd.argv[at]));
+      const toolName = mainTools.at(-1) ?? path.basename(cmd.argv[progs[0]]);
+      const unlinksOnly = mainTools.length > 0 && mainTools.every((t) => t === "rm" || t === "rmdir" || t === "unlink");
+      // (Project review 3, round 12, Opus: `git add` and tar/zip in create mode read or record
+      // symlinks given as operands without writing through them; exempt only their operand words
+      // from the per-word symlink check while keeping the archive output and call-level link checks.)
+      const skipSymlink = new Set<number>();
+      if (mainProgs.length === 1) {
+        const progAt = mainProgs[0];
+        const progName = mainTools[0];
+        const progArgs = cmd.argv.slice(progAt + 1);
+        if (progName === "git") {
+          const gc = gitCall(progArgs);
+          if (typeof gc !== "string" && gc.sub === "add") {
+            const restStart = progAt + 1 + (progArgs.length - gc.rest.length);
+            let ended = false;
+            for (let j = 0; j < gc.rest.length; j++) {
+              const a = gc.rest[j];
+              if (ended) {
+                skipSymlink.add(restStart + j);
+                continue;
+              }
+              if (a === "--") {
+                ended = true;
+                continue;
+              }
+              if (a === "--pathspec-from-file" || a === "--chmod") {
+                j++;
+                continue;
+              }
+              if (!a.startsWith("-")) skipSymlink.add(restStart + j);
+            }
+          }
+        } else if (progName === "tar" || progName === "gtar" || progName === "bsdtar") {
+          const tr = tarReading(progArgs);
+          const tarCreate = (tr.has("create") || tr.letter("c")) && !(tr.has("extract") || tr.has("get") || tr.letter("x") || tr.has("delete") || tr.has("remove-files"));
+          if (tarCreate) {
+            for (let j = 0; j < progArgs.length; j++) {
+              const w = progArgs[j];
+              if (tr.members.includes(w) && !tr.archives.includes(w) && !tr.optionValues.includes(w)) skipSymlink.add(progAt + 1 + j);
+            }
+          }
+        } else if (progName === "zip" && !unreadSpelling("zip", progArgs)) {
+          let seenArchive = false;
+          for (let j = 0; j < progArgs.length; j++) {
+            if (progArgs[j].startsWith("-")) continue;
+            if (!seenArchive) seenArchive = true;
+            else skipSymlink.add(progAt + 1 + j);
+          }
+        }
+      }
+      for (let i = progs[0]; i < cmd.argv.length; i++) {
+        const rawWord = cmd.argv[i];
+        const hasGlob = cmd.glob ? !!cmd.glob[i] : isGlobWord(rawWord);
+        if (!hasGlob) continue;
+        if (otherMakesLink(cmd)) return `${toolName} uses glob ${rawWord} in a call whose other command creates or moves a link`;
+        if (skipSymlink.has(i)) continue;
+        for (const cand of globCandidates(rawWord)) {
+          const placed = expandKnown(cand, cmd);
+          if (/[$`]/.test(placed)) return `${toolName} uses glob ${rawWord} with an expansion the check cannot list`;
+          const t = tilde(placed);
+          if (/^~[^/]/.test(t)) return `${toolName} uses glob ${rawWord}, a tilde path the check cannot list`;
+          const cmdDirs = path.isAbsolute(t) ? ["/"] : (where.places.get(cmd)?.map((x) => x.real) ?? (where.cwd.get(cmd) ? [where.cwd.get(cmd)!] : []));
+          const followLast = !unlinksOnly || cand.endsWith("/");
+          for (const dir of cmdDirs) {
+            const matches = expandNames(t, dir);
+            if (matches === undefined) return `${toolName} uses glob ${rawWord}, a glob the check cannot list`;
+            if (matches.length > 0) {
+              for (const rawMatch of matches) {
+                const issue = symlinkMatchIssue(rawMatch, dir, followLast, toolName, rawWord);
+                if (issue) return issue;
+              }
+            } else if (t.includes("/")) {
+              let pat = path.dirname(t);
+              while (pat && pat !== "." && pat !== "/") {
+                const parentMatches = expandNames(pat, dir);
+                if (parentMatches === undefined) return `${toolName} uses glob ${rawWord}, a glob the check cannot list`;
+                if (parentMatches.length > 0) {
+                  for (const pMatch of parentMatches) {
+                    const issue = symlinkMatchIssue(pMatch, dir, true, toolName, rawWord);
+                    if (issue) return issue;
+                  }
+                  break;
+                }
+                const up = path.dirname(pat);
+                if (up === pat) break;
+                pat = up;
+              }
+            }
+          }
+        }
+      }
+    }
+    // Also check glob write targets extracted by per-tool option readers (e.g. clustered short
+    // options like `curl -sLosub/outd*/y` or `wget -qPsub/outd*`).
+    for (const w of found.writes) {
+      if (!isGlobWord(w.word)) continue;
+      const toolName = path.basename(w.cmd.argv[0] ?? "");
+      const placed = pwdPlaced(w.word, w.cmd);
+      if (/[$`]/.test(placed)) continue;
+      const t = tilde(placed);
+      if (/^~[^/]/.test(t)) return `${toolName} writes ${w.word}, a tilde path the check cannot list`;
+      const cmdDirs = path.isAbsolute(t) ? ["/"] : (where.places.get(w.cmd)?.map((x) => x.real) ?? (where.cwd.get(w.cmd) ? [where.cwd.get(w.cmd)!] : []));
+      for (const dir of cmdDirs) {
+        const matches = expandNames(t, dir);
+        if (matches === undefined) return `${toolName} writes ${w.word}, a glob the check cannot list`;
+        for (const rawMatch of matches) {
+          const issue = symlinkMatchIssue(rawMatch, dir, true, toolName, w.word);
+          if (issue) return issue;
+        }
+      }
+    }
+    return undefined;
+  };
   if (placedIssue) return asked(askBy(placedIssue));
+  const backstopIssue = globLinkBackstop();
+  if (backstopIssue) return asked(askBy(backstopIssue));
   if (unseen) return asked(askBy(`the project's git layout cannot be checked whole: ${unseen}`));
   if (spelling) return asked(fromRules(verdict));
   if (verdict.action === "allow" && !extra) return allowed(fromRules(verdict));

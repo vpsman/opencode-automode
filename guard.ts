@@ -16,7 +16,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { bare, bashVerdict, compressorReading, copiesNothing, findActions, printsOnly, sortReading, sortRunsCompressor, fileVerdict, parse, readVerdict, rsyncReading, skippable, tarReading, within, type Matcher, type Scope, type Simple } from "./rules.ts";
+import { bare, bashVerdict, compressorReading, copiesNothing, copyReading, findActions, printsOnly, sedBracketsClosed, sedReading, sortReading, sortRunsCompressor, fileVerdict, parse, readVerdict, rsyncReading, skippable, tarReading, twoOpOperands, within, yqReading, type Matcher, type Scope, type Simple } from "./rules.ts";
 import { gitArgs, gitEnv } from "./sandbox.ts";
 
 const HOME = os.homedir();
@@ -608,9 +608,10 @@ function scan(s: string, depth: number, variables: Variables, offset: number, ki
     return undefined;
   };
   // A subscript or a substring offset from `from`: a number (no leading 0 before more digits, which
-  // bash reads as octal), or a name that holds an integer.
+  // bash reads as octal; at most 18 digits, as values past 2^63-1 wrap negative and abort the line),
+  // or a name that holds an integer.
   const index = (expr: string, from: number): string | undefined => {
-    const m = /^(-?(?:0|[1-9]\d*))$|^(\$?)([A-Za-z_]\w*)$|^\$\{([A-Za-z_]\w*)\}$/.exec(expr);
+    const m = /^(-?(?:0|[1-9]\d{0,17}))$|^(\$?)([A-Za-z_]\w*)$|^\$\{([A-Za-z_]\w*)\}$/.exec(expr);
     if (!m) return "an array subscript or offset that is not a number or a plain variable, which bash evaluates as arithmetic";
     if (m[1] !== undefined) return undefined;
     return m[3] !== undefined ? integer(m[3], from + m[2].length) : integer(m[4], from + 2);
@@ -2099,7 +2100,7 @@ const NAMES_ONLY = new Set("ls stat test [ file du find readlink realpath basena
 // Programs that show or copy what is in the files they are given.
 const READERS = new Set(
   `cat bat head tail less more grep egrep fgrep rg ag ack sed awk gawk cut sort uniq tr diff cmp comm nl tac rev fold paste join
-   strings xxd hexdump od base64 base32 jq yq zcat xzcat bzcat zstdcat cp mv ln rsync install tar zip gzip xz zstd dd openssl curl wget`.split(/\s+/),
+   strings xxd hexdump od base64 base32 jq yq zcat xzcat bzcat zstdcat cp mv ln rsync install tar zip gzip gunzip xz unxz lzma unlzma lzcat zstd unzstd zstdmt bzip2 bunzip2 dd openssl curl wget`.split(/\s+/),
 );
 const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh", "source", "."]);
 const INTERPRETERS = new Set(["python", "python3", "node", "perl", "ruby", "php", "lua", "deno", "bun", "tsx", "ts-node"]);
@@ -3855,35 +3856,29 @@ function installProblem(manager: string, managerArgs: string[], placeOk?: (dir: 
 
 // A sed script the rules can allow by name: substitutions without the `e` and `w` flags, and
 // the commands that print, delete and quit, each after an optional address. Anything else (the
-// `e`, `r`, `w` commands, blocks, labels, text for `a`/`i`/`c`) is for the model to read.
-const SED_ADDRESS = String.raw`(?:\d+|\$|\/(?:\\.|[^\/\\\n])*\/I?)`;
-const SED_PLAIN = new RegExp(String.raw`^\s*(?:${SED_ADDRESS}(?:\s*,\s*(?:${SED_ADDRESS}|[+~]\d+))?)?\s*!?\s*(?:[pdqQ=DPnNgGhHxl]|\}|s([^\s\\\w])(?:\\.|(?!\1)[^\\\n])*\1(?:\\.|(?!\1)[^\\\n])*\1[gpiIm0-9]*|y([^\s\\\w])(?:\\.|(?!\2)[^\\\n])*\2(?:\\.|(?!\2)[^\\\n])*\2)\s*$`);
-export const plainSed = (script: string) => script.split(/[;\n]/).every((part) => !part.trim() || SED_PLAIN.test(part));
+// `e`, `r`, `w` commands, blocks, labels, text for `a`/`i`/`c`, or a regex part whose bracket
+// expression is still open when the delimiter closes) is for the model to read.
+const SED_ADDRESS = String.raw`(?:\d+|\$|\/((?:\\.|[^\/\\\n])*)\/I?)`;
+const SED_PLAIN = new RegExp(String.raw`^\s*(?:${SED_ADDRESS}(?:\s*,\s*(?:${SED_ADDRESS}|[+~]\d+))?)?\s*!?\s*(?:[pdqQ=DPnNgGhHxl]|\}|s([^\s\\\w])((?:\\.|(?!\3)[^\\\n])*)\3(?:\\.|(?!\3)[^\\\n])*\3[gpiIm0-9]*|y([^\s\\\w])(?:\\.|(?!\5)[^\\\n])*\5(?:\\.|(?!\5)[^\\\n])*\5)\s*$`);
+export const plainSed = (script: string) =>
+  script.split(/[;\n]/).every((part) => {
+    if (!part.trim()) return true;
+    const m = SED_PLAIN.exec(part);
+    return !!m && (!m[1] || sedBracketsClosed(m[1])) && (!m[2] || sedBracketsClosed(m[2])) && (!m[4] || sedBracketsClosed(m[4]));
+  });
 
 function sedProblem(args: string[]): GuardVerdict | undefined {
-  const scripts: string[] = [];
-  let inPlace = false;
-  const rest: string[] = [];
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === "--") {
-      rest.push(...args.slice(i + 1));
-      break;
-    }
-    if (a === "-e" || a === "--expression") scripts.push(args[++i] ?? "");
-    else if (a.startsWith("--expression=")) scripts.push(a.slice(13));
-    else if (a === "-f" || a === "--file" || a.startsWith("--file=")) return { action: "classify", reason: "sed runs a script from a file" };
-    else if (/^--(in-place|quiet|silent|regexp-extended|separate|null-data|posix|unbuffered|debug|sandbox|line-length)(=|$)/.test(a)) inPlace ||= a.startsWith("--in-place");
-    else if (a.startsWith("--")) return { action: "classify", reason: `sed ${a}` };
-    else if (/^-[nErsuzi]*i/.test(a) && !a.endsWith("e") && !a.includes("f")) inPlace = true; // -i, -i.bak, -ni
-    else if (/^-[nErsuz]*e$/.test(a)) scripts.push(args[++i] ?? "");
-    else if (/^-[nErsuz]+$/.test(a)) continue;
-    else if (a === "-l") i++;
-    else if (a.startsWith("-") && a !== "-") return { action: "classify", reason: `sed ${a}` };
-    else rest.push(a);
-  }
-  if (!scripts.length && rest.length) scripts.push(rest.shift()!);
-  const odd = scripts.find((script) => !plainSed(script));
+  const r = sedReading(args);
+  // Keep unknown long options (like `--in`), `--follow-symlinks`, `--binary` and attached `-eSCRIPT`
+  // classifying here so rules.ts's spelling ask yields to more specific asks (e.g. optionNamedPath
+  // on `sed --in='--to-command=*'`), while still never allowing.
+  if (r.unknownLong) return { action: "classify", reason: `sed ${r.unknownLong}` };
+  if (r.loadsFile) return { action: "classify", reason: "sed runs a script from a file" };
+  if (r.unknownShort) return { action: "classify", reason: `sed ${r.unknownShort}` };
+  const head = args.indexOf("--") < 0 ? args : args.slice(0, args.indexOf("--"));
+  const modelFlag = head.find((a) => a === "--follow-symlinks" || a === "--binary" || /^-[nErsuzb]*e./.test(a));
+  if (modelFlag) return { action: "classify", reason: `sed ${modelFlag}` };
+  const odd = r.scripts.find((script) => !plainSed(script));
   return odd === undefined ? undefined : { action: "classify", reason: "a sed script with more than substitutions, prints and deletes (sed can run commands and write files)" };
 }
 
@@ -3987,11 +3982,83 @@ export function makeFiles(args: string[]): { files: string[]; dirs: string[]; pr
   return { files, dirs, ...(jobs ? { problem: `make ${jobs.name}${jobs.value}: make reads the rest of the word as the number of jobs` } : {}) };
 }
 
+// Build and test tools whose recipe or config file option can read from stdin or a device
+// (project review 3, round 15, Neon).
+const NINJA_OPTIONS: Getopt = {
+  flags: "hnv",
+  values: "Cfjkldtw",
+  long: { version: "flag", verbose: "flag", quiet: "flag", help: "flag" },
+};
+const JUST_OPTIONS: Getopt = {
+  flags: "eghlnquvV",
+  values: "cdEfs",
+  exact: true,
+  long: {
+    justfile: "value", "working-directory": "value", show: "value", command: "value", chooser: "value",
+    color: "value", "command-color": "value", "dotenv-filename": "value", "dotenv-path": "value",
+    "dump-format": "value", "list-heading": "value", "list-prefix": "value", shell: "value",
+    "shell-arg": "value", tempdir: "value", "timestamp-format": "value", ceiling: "value",
+    "alias-style": "value", request: "value", usage: "value",
+    list: "flag", summary: "flag", "dry-run": "flag", verbose: "flag", quiet: "flag",
+    version: "flag", help: "flag", evaluate: "flag", dump: "flag", fmt: "flag", check: "flag",
+    unsorted: "flag", "no-dotenv": "flag", "no-aliases": "flag", "no-highlight": "flag",
+    highlight: "flag", variables: "flag", groups: "flag", explain: "flag", timestamp: "flag",
+    unstable: "flag", yes: "flag", one: "flag", "global-justfile": "flag",
+    "clear-shell-args": "flag", "list-submodules": "flag",
+  },
+};
+const PYTEST_OPTIONS: Getopt = {
+  flags: "hvqxslV",
+  values: "ckmoprWn",
+  long: {
+    "config-file": "value", confcutdir: "value", "collect-only": "flag", color: "value",
+    "continue-on-collection-errors": "flag", capture: "value", "cache-show": "optional",
+    "cache-clear": "flag", co: "flag", "code-highlight": "value", cov: "optional",
+    basetemp: "value", rootdir: "value", "override-ini": "value", tb: "value",
+    maxfail: "value", junitxml: "value",
+    verbose: "flag", quiet: "flag", exitfirst: "flag", version: "flag", help: "flag",
+    showlocals: "flag", "no-header": "flag", "no-summary": "flag",
+    "disable-warnings": "flag", "disable-pytest-warnings": "flag",
+    lf: "flag", "last-failed": "flag", ff: "flag", "failed-first": "flag",
+    nf: "flag", "new-first": "flag", sw: "flag", stepwise: "flag", "stepwise-skip": "flag",
+    "strict-markers": "flag", "strict-config": "flag", strict: "flag",
+    markers: "flag", fixtures: "flag", "fixtures-per-test": "flag",
+    "setup-only": "flag", "setup-plan": "flag", "setup-show": "flag", "full-trace": "flag",
+    durations: "value", "durations-min": "value", "show-capture": "value",
+    ignore: "value", "ignore-glob": "value", deselect: "value", "import-mode": "value",
+    verbosity: "value", "log-level": "value", "log-cli-level": "value", "log-format": "value",
+    "asyncio-mode": "value", lfnf: "value", "last-failed-no-failures": "value",
+    numprocesses: "value", "cov-report": "value", "cov-fail-under": "value",
+    "cov-config": "value", "cov-branch": "flag", "no-cov": "flag", "no-cov-on-fail": "flag",
+    pdb: "flag", trace: "flag", pyargs: "flag",
+  },
+};
+const TOX_OPTIONS: Getopt = {
+  flags: "hvqrlao",
+  values: "cefmpx",
+  long: {
+    conf: "value", env: "value", factor: "value", labels: "value",
+    override: "value", parallel: "optional", "work-dir": "value",
+    root: "value", "result-json": "value", color: "value",
+    help: "flag", version: "flag", verbose: "flag", quiet: "flag",
+    recreate: "flag", "list-envs": "flag", "skip-missing-interpreters": "optional",
+    notest: "flag", "no-provision": "optional", installpkg: "value",
+  },
+};
+const pytestArgs = (name: string, args: string[]): string[] | undefined =>
+  name === "pytest" ? args
+  : /^python3?(\.\d+)?$/.test(name) && args[0] === "-m" && args[1] === "pytest" ? args.slice(2)
+  : /^python3?(\.\d+)?$/.test(name) && args[0] === "-mpytest" ? args.slice(1)
+  : undefined;
+const isPytestCall = (name: string, args: string[]) => pytestArgs(name, args) !== undefined;
+
 // The files a program reads as code, where it reads them (round 4, finding 5, second pass): each
 // as the word that names it and the directory it is read from (undefined: not known), for make's
 // makefiles (`-f`, or the default ones, `GNUmakefile`, `makefile` and `Makefile`, where its `-C`
-// options lead), awk's and sed's `-f`, a shell's script and the file `source` reads. `implicit`:
-// a default makefile, named by no word.
+// options lead), ninja's `-f` (and `build.ninja` where `-C` leads), just's `-f`/`--justfile` (and
+// default justfiles), pytest's `-c`/`--config-file` (and `python3 -m pytest`), awk's and sed's
+// `-f`, a shell's script and the file `source` reads. `implicit`: a default recipe file, named by
+// no word.
 export interface CodeFile {
   word: string;
   dir: string | undefined;
@@ -4005,6 +4072,48 @@ export function codeFiles(name: string, args: string[], cwd: string | undefined)
     for (const d of dirs) base = expands(d) ? undefined : path.isAbsolute(tilde(d)) ? tilde(d) : base === undefined ? undefined : `${base}/${d}`;
     if (files.length) return files.map((word) => ({ word, dir: base }));
     return ["GNUmakefile", "makefile", "Makefile"].map((word) => ({ word, dir: base, implicit: true }));
+  }
+  if (name === "ninja") {
+    const got = getopt(args, NINJA_OPTIONS);
+    const dir = got.opts.filter((o) => o.name === "-C").map((o) => o.value ?? "").at(-1);
+    const base = dir === undefined ? cwd : expands(dir) ? undefined : path.isAbsolute(tilde(dir)) ? tilde(dir) : cwd === undefined ? undefined : `${cwd}/${dir}`;
+    const files = got.opts.filter((o) => o.name === "-f").map((o) => o.value ?? "");
+    if (files.length) return files.map((word) => ({ word, dir: base }));
+    return [{ word: "build.ninja", dir: base, implicit: true }];
+  }
+  if (name === "just") {
+    const got = getopt(args, JUST_OPTIONS);
+    const files = got.opts
+      .filter((o) => o.name === "-f" || o.name === "--justfile")
+      .map((o) => {
+        const v = o.value ?? "";
+        return o.name === "-f" && v.startsWith("=") && args[o.at]?.includes("=") ? v.slice(1) : v;
+      });
+    if (files.length) return files.map((word) => ({ word, dir: cwd }));
+    return ["justfile", "Justfile", ".justfile", ".Justfile"].map((word) => ({ word, dir: cwd, implicit: true }));
+  }
+  const pArgs = pytestArgs(name, args);
+  if (pArgs) {
+    const got = getopt(pArgs, PYTEST_OPTIONS);
+    return got.opts
+      .filter((o) => o.name === "-c" || o.name === "--config-file")
+      .map((o) => {
+        const v = o.value ?? "";
+        const word = o.name === "-c" && v.startsWith("=") && pArgs[o.at]?.includes("=") ? v.slice(1) : v;
+        return { word, dir: cwd };
+      });
+  }
+  if (name === "tox") {
+    const got = getopt(args, TOX_OPTIONS);
+    const fromGot = got.opts
+      .filter((o) => o.name === "-c" || o.name === "--conf")
+      .map((o) => {
+        const v = o.value ?? "";
+        const word = o.name === "-c" && v.startsWith("=") && args[o.at]?.includes("=") ? v.slice(1) : v;
+        return { word, dir: cwd };
+      });
+    if (fromGot.length || !got.unknown) return fromGot;
+    return valued(args, "c", "--conf").map((v) => ({ word: v.startsWith("=") ? v.slice(1) : v, dir: cwd }));
   }
   if (name === "sed" || AWKS.has(name)) return valued(args, "f", "--file").map((word) => ({ word, dir: cwd }));
   if (SHELLS.has(name)) {
@@ -4367,6 +4476,29 @@ function buildToolProblem(name: string, args: string[], cwd?: string): string | 
     const word = own.find((a) => abbreviates(a, ["--python-executable", "--install-types"]));
     if (word) return `mypy ${word.split("=")[0]} runs the python the call names, or installs packages`;
   }
+  const pArgs = pytestArgs(name, args);
+  if (pArgs) {
+    // (Project review 3, round 16, Opus & Neon):
+    // pytest 8.2+ reads options from @FILE; argparse abbreviates checked long options;
+    // -o/--override-ini can set addopts or python_* (with spaces/quotes).
+    if (pArgs.some((a) => a.startsWith("@"))) return `${name} reads arguments from an @file, which the call chose`;
+    const pOwn = pArgs.slice(0, pArgs.includes("--") ? pArgs.indexOf("--") : pArgs.length);
+    const pChecked = ["basetemp", "pdb", "trace", "config-file", "override-ini", "rootdir", "confcutdir", "junitxml", "pyargs"];
+    const abbrev = pOwn.find((a) => {
+      if (!a.startsWith("--")) return false;
+      const head = a.slice(2, a.includes("=") ? a.indexOf("=") : undefined);
+      return head.length >= 3 && pChecked.some((opt) => opt.startsWith(head) && opt !== head);
+    });
+    if (abbrev) return `${name} ${abbrev.split("=")[0]} abbreviates a checked pytest option`;
+    const got = getopt(pArgs, PYTEST_OPTIONS);
+    for (const o of got.opts) {
+      if (o.name !== "-o" && o.name !== "--override-ini") continue;
+      const raw = o.value ?? "";
+      const val = o.name === "-o" && raw.startsWith("=") && pArgs[o.at]?.includes("=") ? raw.slice(1) : raw;
+      const key = val.split("=")[0].trim();
+      if (key === "addopts" || key.startsWith("python_")) return `${name} ${o.name} sets ${key}, which changes pytest options or collection`;
+    }
+  }
   return undefined;
 }
 
@@ -4385,7 +4517,6 @@ function programProblem(name: string, args: string[], cwd?: string, inProject?: 
     if (at >= 0 && args.slice(0, at).every((a) => a.startsWith("-"))) {
       const word = args.slice(at + 1).find((a) => !a.startsWith("-") || a === "-");
       if (word !== undefined) {
-        if (word === "-" || word === "/dev/stdin") return ask("bun run - runs its standard input");
         const scripts = (() => {
           try {
             return Object.keys(JSON.parse(fs.readFileSync(path.join(cwd ?? "", "package.json"), "utf8")).scripts ?? {});
@@ -4393,6 +4524,10 @@ function programProblem(name: string, args: string[], cwd?: string, inProject?: 
             return [];
           }
         })();
+        // (Project review 3, round 16, Neon: check devices/symlinks/stdin via codeFromDevice,
+        // skipping plain package.json script names that happen to match a directory on disk.)
+        const device = word === "-" || word.includes("/") || !scripts.includes(word) ? codeFromDevice(word, cwd) : undefined;
+        if (device) return ask(`bun run ${word} reads code from standard input, a pipe or a device (${device}), which no check has read`);
         const file = cwd !== undefined && fs.existsSync(path.resolve(cwd, word));
         const bin = cwd !== undefined && fs.existsSync(path.join(cwd, "node_modules", ".bin", word));
         if (cwd === undefined || !(scripts.includes(word) || file || bin)) return ask(`bun run ${word}: not a script of package.json, a file or a package's program, so bun runs the system command of that name, which was not judged`);
@@ -4749,15 +4884,175 @@ function builtHost(name: string, args: string[]): string | undefined {
   return built === undefined ? undefined : `git ${call.sub} ${built}: a word built at run time in a call that talks to a remote can carry local data out (in the host name, a ref name or a server option)`;
 }
 
-function sinkProblem(name: string, args: string[]): string | undefined {
+function knownExpansion(word: string, vars?: Map<string, string>): string | undefined {
+  if (!/[$`]/.test(word)) return word;
+  if (!vars?.size || word.includes("`")) return undefined;
+  let unknown = false;
+  const expanded = word.replace(/\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*)|.)/g, (m, a, b) => {
+    const n = a ?? b;
+    if (!n || !vars.has(n)) {
+      unknown = true;
+      return m;
+    }
+    return vars.get(n)!;
+  });
+  return unknown || expanded.includes("$") ? undefined : expanded;
+}
+// knownExpansion, keeping a value that holds `$` or a backtick as text: every expansion of the
+// word itself is replaced first, so what is left of them came from a value, which bash does not
+// expand again (`v='-v a[$(id)]'`).
+function knownLiteralExpansion(word: string, vars?: Map<string, string>): string | undefined {
+  if (!vars?.size || word.includes("`")) return undefined;
+  let unknown = false;
+  const expanded = word.replace(/\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*)|.)/g, (m, a, b) => {
+    const n = a ?? b;
+    if (!n || !vars.has(n)) {
+      unknown = true;
+      return m;
+    }
+    return vars.get(n)!;
+  });
+  return unknown ? undefined : expanded;
+}
+// For test/[, printf and wait: each word whose value the call knows (or, failing that, any value
+// the call assigns the name) and that holds whitespace, also read as the words bash splits it
+// into (a union: a quoted word that does not split only asks more). Rounds 17-18, Opus, Sol.
+function splitKnown(name: string, rawArgs: string[], knownVars?: Map<string, string>, allAssigned?: Map<string, string[]>): string[] {
+  if (!["test", "[", "printf", "wait"].includes(name)) return rawArgs;
+  return rawArgs.flatMap((a) => {
+    if (!/[$`]/.test(a)) return [a];
+    const kv = knownLiteralExpansion(a, knownVars);
+    const values = kv !== undefined ? [kv] : assignedExpansions(a, allAssigned);
+    return values.some((v) => /\s/.test(v)) ? [a, ...values.flatMap((v) => v.split(/\s+/).filter(Boolean))] : [a];
+  });
+}
+function assignedExpansions(word: string, allAssigned?: Map<string, string[]>): string[] {
+  if (!allAssigned?.size) return [];
+  const m = /^([^$`]*)\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))([^$`]*)$/.exec(word);
+  if (!m) return [];
+  const vals = allAssigned.get(m[2] ?? m[3]);
+  return vals ? vals.map((v) => `${m[1]}${v}${m[4]}`) : [];
+}
+function printfTargets(args: string[], knownVars?: Map<string, string>, allAssigned?: Map<string, string[]>): string[] {
+  // printf's one option, read as bash reads it: `-v NAME`, or `-vNAME` attached (round 23, Sol:
+  // `-vv` is `-v v`, not a cluster of flags).
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") break;
+    if (!/[$`]/.test(a)) {
+      if (a === "-v") {
+        if (i + 1 < args.length) out.push(args[i + 1]);
+        i++;
+        continue;
+      }
+      if (a.startsWith("-v")) {
+        out.push(a.slice(2));
+        continue;
+      }
+      break;
+    }
+    const kv = knownExpansion(a, knownVars);
+    if (kv !== undefined) {
+      if (kv === "-v") {
+        if (i + 1 < args.length) out.push(args[i + 1]);
+        i++;
+        continue;
+      }
+      if (kv.startsWith("-v")) {
+        out.push(kv.slice(2));
+        continue;
+      }
+      break;
+    }
+    if (/^(?:[$`]|-(?:[$`]|v))/.test(a)) {
+      // (Round 24, Opus: `printf "-v$x" %s 1` names `$x`, a computed name, as round 23 dropped.)
+      if (a.startsWith("-v") && a.length > 2) out.push(a.slice(2));
+      // (Round 27, Opus, Sol: after a literal option, an unknown word is still in the option area,
+      // where it can be `-vNAME` (the last `-v` wins): a computed name.)
+      else if (i > 0) out.push(a);
+      for (const v of assignedExpansions(a, allAssigned)) if (v.startsWith("-v") && v.length > 2) out.push(v.slice(2));
+      if (i + 1 < args.length) out.push(args[i + 1]);
+    }
+    break;
+  }
+  return out;
+}
+// The words in printf's option area, as bash reads them: each `-v NAME` / `-vNAME`, and the word
+// after them, which is the format unless it too is an option (round 27, Opus, Sol).
+export function printfOptionWords(args: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") break;
+    out.push(a);
+    if (a === "-v") {
+      i++;
+      continue;
+    }
+    if (/^-v./.test(a)) continue;
+    break;
+  }
+  return out;
+}
+function waitTargets(args: string[], knownVars?: Map<string, string>, allAssigned?: Map<string, string[]>): string[] {
+  const out = valued(args, "p", "--never");
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") break;
+    if (!/[$`]/.test(a)) {
+      if (/^-[fn]*p$/.test(a)) {
+        i++;
+        continue;
+      }
+      if (a.startsWith("-")) continue;
+      break;
+    }
+    const kv = knownExpansion(a, knownVars);
+    if (kv !== undefined) {
+      if (/^-[fn]*p$/.test(kv)) {
+        if (i + 1 < args.length) out.push(args[i + 1]);
+        i++;
+        continue;
+      }
+      if (/^-[fn]*p./.test(kv)) {
+        out.push(kv.slice(kv.indexOf("p") + 1));
+        continue;
+      }
+      if (kv.startsWith("-")) continue;
+      break;
+    }
+    if (/^(?:[$`]|-[fn]*(?:[$`]|p))/.test(a)) {
+      for (const v of assignedExpansions(a, allAssigned)) if (/^-[fn]*p./.test(v)) out.push(v.slice(v.indexOf("p") + 1));
+      if (i + 1 < args.length) out.push(args[i + 1]);
+    }
+  }
+  return out;
+}
+
+function sinkProblem(name: string, rawArgs: string[], knownVars?: Map<string, string>, allAssigned?: Map<string, string[]>): string | undefined {
   const subscript = (a: string) => /\w\[/.test(a);
+  // A word whose known value bash splits gives the builtin several words, an option and its
+  // operand among them (project review 3, round 17, Opus, Sol: `v='-v a[$(id)]'; test $v`,
+  // `opts='-v PATH'; printf $opts /tmp`). Read them as bash splits them; a quoted word that
+  // does not split only asks more.
+  const args = splitKnown(name, rawArgs, knownVars, allAssigned);
   if (name === "let") return "let evaluates its words as arithmetic";
   if (DECLARERS.has(name) && args.some((a) => /^[-+][a-zA-Z]*i/.test(a))) return `${name} -i evaluates the value as arithmetic`;
   if (["unset", "read", "mapfile", "readarray", "wait", "getopts", ...DECLARERS].includes(name) && args.some(subscript)) return `${name} with an array subscript, which bash evaluates as arithmetic`;
-  if (name === "printf" && valued(args, "v", "--never").some((v) => subscript(v) || /[$`]/.test(v))) return "printf -v with a subscript or a computed name";
+  if (name === "printf" && printfTargets(args, knownVars, allAssigned).some((v) => subscript(v) || /[$`]/.test(v))) return "printf -v with a subscript or a computed name";
+  if (name === "wait" && waitTargets(args, knownVars, allAssigned).some((v) => subscript(v) || /[$`]/.test(v))) return "wait -p with a subscript or a computed name";
   if (name === "test" || name === "[") {
-    const at = args.findIndex((a, i) => (a === "-v" || a === "-R") && i + 1 < args.length);
-    if (at >= 0 && (subscript(args[at + 1]) || /[$`]/.test(args[at + 1]))) return `${name} -v with a subscript or a variable, which bash evaluates as arithmetic`;
+    // Every `-v`/`-R` of an expression, literal or hidden in an expansion (project review 3,
+    // round 15 & round 16, Neon: `test -v a -a -v "$x"`, `op=-v; test "$op" 'a[$(id)]'`).
+    const mayBeVarOp = (a: string) => {
+      if (a === "-v" || a === "-R") return true;
+      if (!/[$`]/.test(a)) return false;
+      const kv = knownExpansion(a, knownVars);
+      if (kv !== undefined) return kv === "-v" || kv === "-R";
+      return /^(?:[$`]|-[vR]?[$`])/.test(a);
+    };
+    if (args.some((a, i) => mayBeVarOp(a) && i + 1 < args.length && (subscript(args[i + 1]) || /[$`]/.test(args[i + 1])))) return `${name} -v with a subscript or a variable, which bash evaluates as arithmetic`;
   }
   if (name === "read" && args.some((a) => /[$`]/.test(a) && !a.startsWith("-"))) return "read into a name taken from a variable";
   // Council project review 1, round 2: `export "$x"` with `x=PATH=.` (or `RANDOM=a[$(...)]`) sets
@@ -4769,10 +5064,11 @@ function sinkProblem(name: string, args: string[]): string | undefined {
 // Variables set without `NAME=`: the last words of `read` and `mapfile`, the word after
 // `printf -v`, the second word of `getopts`, the operands of `unset`. (`for NAME`, `select`,
 // `coproc NAME` and `declare NAME` are in textGuard.)
-function assignedBy(name: string, args: string[]): string[] {
-  if (name === "printf") return valued(args, "v", "--never");
+function assignedBy(name: string, rawArgs: string[], knownVars?: Map<string, string>, allAssigned?: Map<string, string[]>): string[] {
+  const args = splitKnown(name, rawArgs, knownVars, allAssigned);
+  if (name === "printf") return printfTargets(args, knownVars, allAssigned);
   if (name === "getopts") return args.slice(1, 2);
-  if (name === "wait") return valued(args, "p", "--never");
+  if (name === "wait") return waitTargets(args, knownVars, allAssigned);
   if (name === "read" || name === "mapfile" || name === "readarray") {
     const names: string[] = [];
     const takesValue = name === "read" ? /^-[a-zA-Z]*[adinNptu]$/ : /^-[a-zA-Z]*[dnOsuCc]$/;
@@ -4823,6 +5119,10 @@ export interface ArgvContext extends TextContext {
   // `ask` with the reason, or the model with the reason `model`. `program`: where the program
   // npx is to run stands, when its words name one.
   npx?: (cmd: Simple) => { at: number; program?: number; ask?: string; model?: string } | undefined;
+  // Unambiguous variable values known before this command (from scope.resolvedVars), and all
+  // literal assignments in the call, for checking options hidden in expansions.
+  knownVars?: Map<string, string>;
+  allAssigned?: Map<string, string[]>;
 }
 
 // ---- what a command writes ----
@@ -4895,7 +5195,7 @@ const COPY_OPTIONS: Record<string, Getopt> = {
 const PLACED_ELSEWHERE = new Set(["--backup-dir", "--temp-dir", "-T", "--partial-dir", "--log-file", "--write-batch", "--only-write-batch", "--compare-dest", "--copy-dest", "--link-dest", "--files-from"]);
 // What a copy, move or link reads from its words: the target directory (`-t`), the operands, and
 // whether it copies directories, makes hard links, or cannot be read.
-function copyWords(name: string, args: string[]): { target?: string; operands: string[]; recursive: boolean; hard: boolean; unknown?: string } {
+function copyWords(name: string, args: string[]): { target?: string; operands: string[]; recursive: boolean; hard: boolean; exchange: boolean; unknown?: string } {
   const got = getopt(args, COPY_OPTIONS[name]);
   const has = (...names: string[]) => got.opts.some((o) => names.includes(o.name));
   const elsewhere = name === "rsync" ? got.opts.find((o) => PLACED_ELSEWHERE.has(o.name))?.name : undefined;
@@ -4904,6 +5204,7 @@ function copyWords(name: string, args: string[]): { target?: string; operands: s
     operands: got.operands.map((o) => o.word),
     recursive: name === "rsync" || has("-r", "-R", "-a", "--recursive", "--archive"),
     hard: (name === "ln" && !has("-s", "--symbolic")) || (name === "cp" && has("-l", "--link")),
+    exchange: name === "mv" && has("--exchange"),
     ...(got.unknown || elsewhere ? { unknown: got.unknown ?? elsewhere } : {}),
   };
 }
@@ -5233,7 +5534,7 @@ function unnamedWrite(name: string, args: string[], filesOnly?: (sources: string
     if (words.unknown) return `${name} ${words.unknown}: an option the check cannot read, so it cannot list what is written`;
     // A moved directory brings its files with it, change times and all (B4): `mv` is such a
     // write unless every source is known to be a file.
-    const sources = words.target !== undefined ? words.operands : words.operands.slice(0, -1);
+    const sources = words.target !== undefined || words.exchange ? words.operands : words.operands.slice(0, -1);
     if (words.recursive || (name === "mv" && !(sources.length > 0 && filesOnly?.(sources)))) return `${name} writes the files of directories it copies or moves`;
     // (Round 12, Mythos: `--parents` puts each file at the destination plus its whole path.)
     if (name === "cp" && args.some((a) => a.length > 3 && "--parents".startsWith(a))) return "cp --parents writes each file under its whole path below the destination";
@@ -5393,13 +5694,18 @@ export function secondNames(cmd: Simple, writes: Write[], expand: (word: string)
     if (printsOnly(name, args)) continue;
     const mine = writes.filter((w) => w.cmd === cmd && w.by === name);
     if (name === "sed") {
-      for (const a of args) {
-        const suffix = /^-[a-zA-Z]*i(.+)$/s.exec(a)?.[1] ?? /^--i[a-z-]*=(.+)$/s.exec(a)?.[1];
-        if (suffix !== undefined) for (const w of mine) for (const n of each(w.word, "sed -i's backup", ends(suffix))) out.push(n + suffix);
-      }
+      const r = sedReading(args);
+      // GNU sed replaces `*` in a backup suffix with the input file's base name (and `/` moves the
+      // backup elsewhere); decide.ts optionNamedPath asks on any sed -i suffix containing `*` or `/`.
+      if (r.inPlace) for (const suffix of r.suffixes) for (const w of mine) for (const n of each(w.word, "sed -i's backup", ends(suffix))) out.push(n + suffix);
     } else if (Object.hasOwn(COPY_OPTIONS, name)) {
       const got = getopt(args, COPY_OPTIONS[name]);
       const suffixes = got.opts.filter((o) => o.name === "-S" || o.name === "--suffix").map((o) => fixed(o.value ?? "", `${name}'s backup suffix`));
+      if (suffixes.some(ends) && name !== "rsync") {
+        const badT = got.opts.find((o) => (o.name === "-t" || o.name === "--target-directory") && /[*?[\]{}$`]/.test(o.value ?? ""));
+        if (badT) unknown ??= `${name} with a backup suffix and an expanding target directory (${badT.value})`;
+        else if (got.unknown) unknown ??= `${name} ${got.unknown} with a backup suffix: an option the check cannot read`;
+      }
       // Round 3, Mythos: a recursive copy backs up files inside the directories it copies.
       // (cp and rsync only: ln's `-r` is `--relative`, and mv and install copy no directory's files.)
       if (suffixes.some(ends) && (name === "cp" || name === "rsync") && got.opts.some((o) => ["-r", "-R", "-a", "--recursive", "--archive"].includes(o.name))) unknown ??= `${name} with a backup suffix in a recursive copy backs up files inside the directories it copies, which no command line shows`;
@@ -5463,10 +5769,15 @@ export function secondNames(cmd: Simple, writes: Write[], expand: (word: string)
   return { names: out, ...(unknown ? { unknown } : {}) };
 }
 
-export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Simple) => boolean): { writes: Write[]; unknown?: string; unlisted: Unlisted[] } {
+export function writesOf(
+  cmds: Simple[],
+  filesOnly?: (sources: string[], cmd: Simple) => boolean,
+  pathExists?: (word: string, cmd: Simple) => boolean | undefined,
+): { writes: Write[]; unknown?: string; ask?: string; unlisted: Unlisted[] } {
   const writes: Write[] = [];
   const unlisted: Unlisted[] = [];
   let unknown: string | undefined;
+  let ask: string | undefined;
   for (const cmd of cmds) {
     for (const word of cmd.out) writes.push({ word, cmd, checked: true, by: ">" });
     for (const at of programs(cmd.argv)) {
@@ -5483,27 +5794,47 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       if (blind) unlisted.push({ cmd, reason: blind, dirs: unnamedWriteDirs(name, args), ...(call && typeof call !== "string" && WORKTREE_GIT.has(call.sub ?? "") ? { git: call.dirs } : {}) });
       unknown ??= blind;
       if (name === "tee" || name === "truncate") files.forEach((f) => add(f, true));
-      else if (name === "sed" && args.some((a) => /^(-[a-zA-Z]*i|--in-place)/.test(a))) files.slice(args.some((a) => /^(-[a-zA-Z]*e$|--expression)/.test(a)) ? 0 : 1).forEach((f) => add(f, true));
-      else if ((name === "perl" || name === "ruby") && args.some((a) => /^-[a-zA-Z]*i/.test(a))) files.slice(args.some((a) => /^-[a-zA-Z]*e$/.test(a)) ? 1 : 0).forEach((f) => add(f, false));
+      else if (name === "sed") {
+        const r = sedReading(args);
+        if (r.inPlace) r.files.forEach((f) => add(f, true));
+      } else if ((name === "perl" || name === "ruby") && args.some((a) => /^-[a-zA-Z]*i/.test(a))) files.slice(args.some((a) => /^-[a-zA-Z]*e$/.test(a)) ? 1 : 0).forEach((f) => add(f, false));
       // An rsync that copies nothing (a dry run, a listing, one non-expanding operand) writes no
       // destination; its option places are still read below (round 41).
       else if (["cp", "mv", "ln", "install", "rsync"].includes(name) && !copiesNothing(name, args)) {
         // `-t DIR` / `--target-directory=DIR`: every operand is a source (the rules read the last
         // one as the destination and never look at DIR).
         // Read by the tool's own options (round 4, finding 4, second pass: `--target-dir=`,
-        // `-rt..`, the value of `-S`); one it cannot read lists what the plain reading finds.
+        // `-rt..`, the value of `-S`); one it cannot read asks (project review 3, round 9).
         const words = copyWords(name, args);
+        const copy = name !== "rsync" ? copyReading(name, args) : undefined;
+        const badT = copy?.targets.find((v) => /[*?[\]{}$`]/.test(v));
+        if (copy?.unknown) {
+          const why = `${name} ${copy.unknown}: an option the check cannot read, so its destination is not known`;
+          unknown ??= why;
+          ask ??= why;
+          if (!blind) unlisted.push({ cmd, reason: why, dirs: [undefined] });
+        }
+        if (badT !== undefined) {
+          const why = `${name} -t ${badT}: target directory bash may expand into both destination and sources`;
+          unknown ??= why;
+          ask ??= why;
+          if (!blind) unlisted.push({ cmd, reason: why, dirs: [undefined] });
+        }
         const t = words.unknown ? valued(args, "t", "--target-directory").at(-1) : words.target;
         const operands = words.unknown ? files.filter((f) => f !== t && !(name === "install" && valued(args, "m", "--mode").includes(f))) : words.operands;
-        const installsDir = name === "install" && (words.unknown ? args.some((a) => /^-[a-zA-Z]*d/.test(a) || /^--dir/.test(a)) : getopt(args, COPY_OPTIONS.install).opts.some((o) => o.name === "-d" || o.name === "--directory"));
+        const installsDir = copy ? copy.installDir : false;
         const oneExpands = t === undefined && !installsDir && operands.length === 1 && /[*?[\]{}$`]/.test(operands[0]);
-        if (t !== undefined) add(t, false, { dir: true, sources: operands });
+        if (installsDir) {
+          if (t !== undefined) add(t, false, { dir: true });
+          operands.forEach((d) => add(d, true, { dir: true }));
+        } else if (t !== undefined) add(t, false, { dir: true, sources: operands });
         else if (operands.length > 1) add(operands.at(-1), true, { sources: operands.slice(0, -1) });
         else if (oneExpands) {
           // (Project review 3, round 8, Neon: one expanding operand may supply both source and destination.)
           add(operands[0], false, { sources: operands });
           const why = `${name} ${operands[0]}: one word bash may expand into both source and destination`;
           unknown ??= why;
+          ask ??= why;
           unlisted.push({ cmd, reason: why, dirs: [undefined] });
         } else if (name === "ln" && operands.length === 1) add(path.basename(operands[0]), false, { sources: operands });
         // A hard link makes the source the same file as the link: a write through either name
@@ -5530,51 +5861,87 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       else if (name === "less") [...valued(args, "o", "--log-file"), ...valued(args, "O", "--LOG-FILE")].forEach((f) => add(f, false));
       // (Round 3: `-` is the input operand, `uniq - out`; the last of two or more operands is the
       // output. Project review 3, round 8, Neon: one operand bash may expand into several words
-      // (`uniq sub/*`, `xxd sub/*`, `python3 -m json.tool sub/*`) may supply both input and output.)
+      // (`uniq sub/*`, `xxd sub/*`, `python3 -m json.tool sub/*`) may supply both input and output.
+      // Round 9: any unknown or abbreviated option makes the output unknown.)
       // (Council project review 1, round 6: `python3 -m json.tool IN OUT` writes OUT.)
       else if (/^python[0-9.]*$/.test(name) && args.some((a, k) => (a === "-m" && args[k + 1] === "json.tool") || a === "-mjson.tool")) {
         const at = args.findIndex((a, k) => (a === "-m" && args[k + 1] === "json.tool") || a === "-mjson.tool");
         const rest = args.slice(at + (args[at] === "-m" ? 2 : 1));
-        const operands: string[] = [];
-        for (let k = 0; k < rest.length; k++) {
-          const a = rest[k];
-          if (a === "--") {
-            operands.push(...rest.slice(k + 1));
-            break;
-          }
-          if (a === "-" || !a.startsWith("-")) operands.push(a);
-          else if (a === "--indent") k++;
-        }
-        if (operands.length > 1) add(operands[1], false);
-        else if (operands.length === 1 && /[*?[\]{}$`]/.test(operands[0])) {
-          add(operands[0], false);
-          const why = `${name} -m json.tool ${operands[0]}: one word bash may expand into both input and output`;
+        const parsed = twoOpOperands("json.tool", rest);
+        if (parsed.unknown) {
+          const why = `${name} -m json.tool ${parsed.unknown}: an option the check cannot read, so its output file is not known`;
           unknown ??= why;
+          ask ??= why;
+          unlisted.push({ cmd, reason: why, dirs: [undefined] });
+        } else if (parsed.operands.length > 1) add(parsed.operands[1], false);
+        else if (parsed.operands.length === 1 && /[*?[\]{}$`]/.test(parsed.operands[0])) {
+          add(parsed.operands[0], false);
+          const why = `${name} -m json.tool ${parsed.operands[0]}: one word bash may expand into both input and output`;
+          unknown ??= why;
+          ask ??= why;
           unlisted.push({ cmd, reason: why, dirs: [undefined] });
         }
       }
       else if (name === "uniq" || name === "xxd") {
         // (Round 41, Mythos: the words after `--` are operands, `-/../x` too.)
-        const operands: string[] = [];
-        for (let k = 0; k < args.length; k++) {
-          const a = args[k];
-          if (a === "--") {
-            operands.push(...args.slice(k + 1));
-            break;
-          }
-          if (a === "-" || !a.startsWith("-")) operands.push(a);
-          else if (name === "uniq" && (/^-[a-zA-Z]*[fsw]$/.test(a) || /^--(skip-fields|skip-chars|check-chars)$/.test(a))) k++;
-          else if (name === "xxd" && /^-(c|cols|g|groupsize|l|len|n|name|o|s|seek|R)$/.test(a)) k++;
-        }
-        if (operands.length > 1) add(operands.at(-1), false);
-        else if (operands.length === 1 && /[*?[\]{}$`]/.test(operands[0])) {
-          add(operands[0], false);
-          const why = `${name} ${operands[0]}: one word bash may expand into both input and output`;
+        const parsed = twoOpOperands(name, args);
+        if (parsed.unknown) {
+          const why = `${name} ${parsed.unknown}: an option the check cannot read, so its output file is not known`;
           unknown ??= why;
+          ask ??= why;
+          unlisted.push({ cmd, reason: why, dirs: [undefined] });
+        } else if (parsed.operands.length > 1) add(parsed.operands.at(-1), false);
+        else if (parsed.operands.length === 1 && /[*?[\]{}$`]/.test(parsed.operands[0])) {
+          add(parsed.operands[0], false);
+          const why = `${name} ${parsed.operands[0]}: one word bash may expand into both input and output`;
+          unknown ??= why;
+          ask ??= why;
           unlisted.push({ cmd, reason: why, dirs: [undefined] });
         }
       }
-      else if ((name === "yq" || name === "jq") && args.some((a) => /^(-[a-zA-Z]*i|--inplace)$/.test(a))) files.slice(1).forEach((f) => add(f, false));
+      else if (name === "yq") {
+        const yq = yqReading(args);
+        if (yq.inPlace) {
+          yq.files.forEach((f) => add(f, false));
+          if (yq.operands.length > 1 && yq.op0Index !== undefined) {
+            const op0 = yq.operands[0];
+            const op0Argv = at + 1 + yq.op0Index;
+            const op0Dyn = !!cmd.dyn?.[op0Argv];
+            const op0Glob = !!cmd.glob?.[op0Argv];
+            if (op0Dyn || op0Glob) {
+              add(op0, false);
+              const why = `yq -i ${op0}: first operand holds an expansion and may name an existing file`;
+              unknown ??= why;
+              ask ??= why;
+              unlisted.push({ cmd, reason: why, dirs: [undefined] });
+            } else if (pathExists) {
+              const ex = pathExists(op0, cmd);
+              if (ex === true) add(op0, false);
+              else if (ex === undefined) {
+                add(op0, false);
+                const why = `yq -i ${op0}: cannot tell whether first operand names an existing file`;
+                unknown ??= why;
+                ask ??= why;
+                unlisted.push({ cmd, reason: why, dirs: [undefined] });
+              }
+            }
+          }
+        } else if (!yq.plain && (dashes < 0 ? args : args.slice(0, dashes)).some((a) => /^-[a-eg-km-nq-zA-KM-Z]*i|^--in-?p[a-z-]*(?:=|$)/.test(a))) {
+          files.forEach((f) => add(f, false));
+        }
+      }
+      else if (name === "jq" && (dashes < 0 ? args : args.slice(0, dashes)).some((a) => /^-[a-eg-km-nq-zA-KM-Z]*i|^--in-?p[a-z-]*(?:=|$)/.test(a))) {
+        const head = dashes < 0 ? args : args.slice(0, dashes);
+        const fromFile = head.some((a) => {
+          if (/^-[a-zA-Z]*f/.test(a)) return true;
+          if (a.startsWith("--")) {
+            const opt = a.split("=")[0];
+            if (opt.length >= 3 && ("--from-file".startsWith(opt) || "--file".startsWith(opt))) return true;
+          }
+          return a.startsWith("-") && /[$`]/.test(a);
+        });
+        (fromFile || files.length === 1 ? files : files.slice(1)).forEach((f) => add(f, false));
+      }
       // B7-7: a directory or a file an option names for the program to write in: tar's `-C` and
       // unzip's `-d` when they extract, find's `-fprint0` (the rules ask on `-fprint`, `-fprintf`
       // and `-fls`), rsync's log, batch, backup, temp and partial places. Each is held to the write
@@ -5640,7 +6007,7 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
       else if (name === "git") for (const [word, dir] of gitWrites(args)) add(word, false, { dir });
     }
   }
-  return { writes, ...(unknown ? { unknown } : {}), unlisted };
+  return { writes, ...(unknown ? { unknown } : {}), ...(ask ? { ask } : {}), unlisted };
 }
 
 // The files this command would write, append to or edit in place, as the rules cannot always
@@ -5664,7 +6031,16 @@ export function writtenBy(
     if (files === undefined) unlisted?.(word, cmd);
     return files ?? [resolve(word, cmd)];
   };
-  for (const w of writesOf(cmds).writes) {
+  const yqExists = (word: string, cmd: Simple): boolean | undefined => {
+    const p = resolve(word, cmd);
+    if (!p) return false;
+    try {
+      return !fs.statSync(p).isDirectory();
+    } catch {
+      return false;
+    }
+  };
+  for (const w of writesOf(cmds, undefined, yqExists).writes) {
     const targets = named(w.word, w.cmd);
     if (!w.dir) out.push(...targets);
     const p = resolve(w.word, w.cmd);
@@ -6780,7 +7156,7 @@ export function linkedReads(where: Located, scope: Scope, judgeAt: (dir: string,
   const read: { own: string[]; dirs: string[]; argv: string[]; out: string[]; inputs: string[]; cmd: Simple }[] = [];
   // The words each command writes, as the guard lists them (for protectedAt).
   const writeWords = new Map<Simple, Set<string>>();
-  if (protectedAt) for (const w of writesOf(where.cmds).writes) writeWords.set(w.cmd, new Set([...(writeWords.get(w.cmd) ?? []), w.word]));
+  if (protectedAt) for (const w of writesOf(where.cmds, undefined, () => true).writes) writeWords.set(w.cmd, new Set([...(writeWords.get(w.cmd) ?? []), w.word]));
   for (const cmd of where.cmds) {
     const places = where.places.get(cmd);
     if (!places || where.patterns.has(cmd)) continue;
@@ -7215,7 +7591,9 @@ export function exportProblem(cmds: Simple[], cwd: string | undefined, inProject
   const exported = new Set<string>();
   const note = (name: string, value: string | undefined) => values.set(name, [...(values.get(name) ?? []), value]);
   for (const { argv } of cmds) {
+    // (Round 24, Sol: an assignment after `then`, `do`, `!`, ...: `if true; then v='-v a[...]'; fi`.)
     let i = 0;
+    while (i < argv.length && LOOP_KEYWORDS.has(argv[i])) i++;
     for (; i < argv.length && ASSIGN.test(argv[i]); i++) {
       const m = ASSIGN.exec(argv[i])!;
       note(m[1], argv[i].includes("+=") ? undefined : argv[i].slice(m[0].length));
@@ -7391,14 +7769,18 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
 
     add(programProblem(name, args, ctx.cwdOf?.(cmd), ctx.inProject));
     if (MAKES.has(name) && getopt(args, MAKE_OPTIONS).unknown) add({ action: "classify", reason: `${name} has an option the check cannot read` });
-    ask(sinkProblem(name, args));
+    if (name === "ninja" && getopt(args, NINJA_OPTIONS).unknown) ask(`${name} has an option the check cannot read`);
+    if (name === "just" && getopt(args, JUST_OPTIONS).unknown) ask(`${name} has an option the check cannot read`);
+    const pArgs = pytestArgs(name, args);
+    if (pArgs && getopt(pArgs, PYTEST_OPTIONS).unknown) ask(`${name} has an option the check cannot read`);
+    ask(sinkProblem(name, args, ctx.knownVars, ctx.allAssigned));
     if (name === "curl" || name === "wget") ask(fetcherOptionProblem(name, args));
     if (name === "curl") add(fileUrlProblem(args, ctx.scope));
     const built = builtHost(name, args);
     if (built) add({ action: "classify", reason: built });
     const batch = lookupFileProblem(name, args);
     if (batch) add({ action: "classify", reason: batch });
-    for (const variable of assignedBy(name, args)) {
+    for (const variable of assignedBy(name, args, ctx.knownVars, ctx.allAssigned)) {
       if (anyDangerous(variable)) ask(dangerous(variable));
       else if (inherited(variable)) add({ action: "classify", reason: `sets ${variable}, which the environment exports, for the programs that follow` });
     }
@@ -7438,11 +7820,12 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
     // makefile in such a directory matters only when make's input is redirected.
     for (const code of codeFiles(name, args, ctx.cwdOf?.(cmd))) {
       const { word: f, dir, implicit } = code;
-      const what = implicit ? `its default makefile ${f}` : f;
+      const what = implicit ? `its default ${MAKES.has(name) ? "makefile" : "file"} ${f}` : f;
       if (expands(f) || (!path.isAbsolute(tilde(f)) && dir === undefined)) {
         if (implicit) {
           if (cmd.heredoc || cmd.in?.length || cmd.subshell) add({ action: "classify", reason: `${name} reads ${what} in a directory the check cannot place, with its input redirected` });
         } else if (MAKES.has(name)) ask(`make -f ${f} reads a makefile in a directory the check cannot place, which may be standard input or a device`);
+        else if (name === "ninja" || name === "just" || name === "tox" || isPytestCall(name, args)) ask(`${name} reads ${f} in a directory the check cannot place, which may be standard input or a device`);
         else add({ action: "classify", reason: `${name} reads code from ${f}, which is known only when the command runs` });
         continue;
       }
@@ -8280,6 +8663,28 @@ function traceProblem(cmds: Simple[]): string | undefined {
   return undefined;
 }
 
+function collectAssigned(cmds: Simple[]): Map<string, string[]> {
+  const map = new Map<string, string[]>();
+  const add = (n: string, v: string) => map.set(n, [...(map.get(n) ?? []), v]);
+  for (const { argv } of cmds) {
+    // (Round 24, Sol: an assignment after `then`, `do`, `!`, ...: `if true; then v='-v a[...]'; fi`.)
+    let i = 0;
+    while (i < argv.length && LOOP_KEYWORDS.has(argv[i])) i++;
+    for (; i < argv.length && ASSIGN.test(argv[i]); i++) {
+      const m = ASSIGN.exec(argv[i])!;
+      add(m[1], argv[i].slice(m[0].length));
+    }
+    const name = path.basename(argv[i] ?? "");
+    if (DECLARERS.has(name)) {
+      for (const a of argv.slice(i + 1).filter((w) => !w.startsWith("-"))) {
+        const m = ASSIGN.exec(a);
+        if (m) add(m[1], a.slice(m[0].length));
+      }
+    }
+  }
+  return map;
+}
+
 export function argvGuards(cmds: Simple[], ctx: ArgvContext): GuardVerdict | undefined {
   let verdict: GuardVerdict | undefined;
   // What this call links, moves or copies into place (round 4, finding 5, second pass).
@@ -8296,7 +8701,29 @@ export function argvGuards(cmds: Simple[], ctx: ArgvContext): GuardVerdict | und
     for (const s of w.sources ?? []) placed.push(path.join(p, path.basename(s)));
   }
   ctx = { ...ctx, placed, ...(placedUnknown ? { placedUnknown: `writes ${placedUnknown}` } : {}) };
-  for (const cmd of cmds) verdict = stricter(verdict, argvGuard(cmd, ctx));
+  const allAssigned = collectAssigned(cmds);
+  const seen = new Set<string>();
+  const resolved = ctx.scope?.resolvedVars;
+  for (const cmd of cmds) {
+    let knownVars: Map<string, string> | undefined;
+    if (resolved?.size && seen.size) {
+      knownVars = new Map();
+      for (const n of seen) if (resolved.has(n)) knownVars.set(n, resolved.get(n)!);
+    }
+    verdict = stricter(verdict, argvGuard(cmd, { ...ctx, knownVars, allAssigned }));
+    const bareAssign = cmd.argv.length > 0 && cmd.argv.every((w) => ASSIGN.test(w));
+    if (bareAssign) {
+      for (const w of cmd.argv) {
+        const m = ASSIGN.exec(w);
+        if (m) seen.add(m[1]);
+      }
+    } else if (DECLARERS.has(path.basename(cmd.argv[0] ?? ""))) {
+      for (const w of cmd.argv.slice(1).filter((a) => !a.startsWith("-"))) {
+        const m = ASSIGN.exec(w);
+        if (m) seen.add(m[1]);
+      }
+    }
+  }
   const trace = traceProblem(cmds);
   if (trace) verdict = stricter(verdict, { action: "ask", reason: trace });
   return stricter(verdict, exportProblem(cmds, ctx.cwdKnown ? ctx.cwd : undefined, ctx.inProject));
@@ -8479,17 +8906,24 @@ const KEYED: Record<string, Keyed> = {
   ccache: { checked: ["--set-config"], letters: "o", dashDash: false },
   cmake: { checked: ["-E", "-P", "-C", "-D", "--toolchain"], letters: "EPCD" },
   ctest: { checked: ["-S", "--script", "--script-new-process", "--build-and-test", "--test-command"], letters: "S" },
-  just: { checked: ["--command", "--shell", "--shell-command", "--shell-arg", "--chooser"], letters: "c" },
-  tox: { checked: ["--override", "-x"], letters: "x" },
+  just: { checked: ["--command", "--shell", "--shell-command", "--shell-arg", "--chooser", "--justfile"], letters: "cf" },
+  ninja: { values: ["-j", "-k", "-l", "-d", "-t", "-w"], checked: ["-f", "-C"], letters: "fC" },
+  pytest: { values: ["-k", "-m", "-p", "-r", "-W", "-n", "--rootdir", "--tb", "--maxfail", "--junitxml", "--color", "--capture", "--confcutdir"], checked: ["-c", "--config-file", "-o", "--override-ini", "--basetemp", "--pdb", "--trace"], letters: "co" },
+  tox: { checked: ["--override", "-x", "-c", "--conf"], letters: "xc" },
   meson: { checked: ["--wrapper", "--gdb-path"] },
-  mypy: { checked: ["--python-executable"] },
+  mypy: { checked: ["--python-executable", "--install-types"] },
+  venv: { checked: ["--upgrade-deps", "--clear", "--prompt"] },
+  cloc: { values: ["--exclude-dir", "--exclude-ext", "--exclude-lang", "--include-lang", "--include-ext", "--match-f", "--not-match-f", "--match-d", "--not-match-d", "--timeout", "--processes"], checked: ["--out", "--report-file", "--vcs", "--list-file", "--exclude-list-file", "--read-lang-def", "--force-lang-def", "--write-lang-def", "--write-lang-def-incl-dup", "--script-lang", "--sql", "--sql-append", "--strip-comments", "--strip-str-comments", "--config", "--diff", "--git-diff-rel", "--git-diff-all"] },
+  tree: { values: ["-L", "-P", "-I", "-T", "-H", "--filelimit", "--timefmt", "--charset", "--sort"], checked: ["-o"], letters: "o" },
+  rustfmt: { values: ["--edition", "--color", "--emit", "--files-with-diff"], checked: ["--config-path", "--config"] },
+  gzip: { checked: ["-S", "--suffix", "-o", "--output", "--output-dir-flat", "--output-dir-mirror", "--files", "--files0", "--filelist", "--patch-from"], letters: "So" },
   gh: { values: ["-R", "--repo", "-q", "--jq", "-t", "--template"], checked: ["-X", "--method", "-f", "-F", "--field", "--raw-field", "--input", "-H", "--header"], letters: "XfFH" },
   sysctl: {},
   llamastash: {},
   docker: {},
   systemctl: {},
 };
-for (const [alias, name] of [["cc", "gcc"], ["g++", "gcc"], ["c++", "gcc"], ["clang", "gcc"], ["clang++", "gcc"], ["gmake", "make"], ["gtar", "tar"], ["bsdtar", "tar"], ["fdfind", "fd"], ["gawk", "awk"], ["mawk", "awk"], ["nawk", "awk"], ["pnpm", "npm"], ["yarn", "npm"], ["bun", "npm"], ["pip", "npm"], ["pip3", "npm"], ["gem", "npm"], ["uv", "npm"], ["poetry", "npm"], ["pipenv", "npm"], ["pdm", "npm"], ["hatch", "npm"], ["bundle", "npm"]]) KEYED[alias] = KEYED[name];
+for (const [alias, name] of [["cc", "gcc"], ["g++", "gcc"], ["c++", "gcc"], ["clang", "gcc"], ["clang++", "gcc"], ["gmake", "make"], ["gtar", "tar"], ["bsdtar", "tar"], ["fdfind", "fd"], ["gawk", "awk"], ["mawk", "awk"], ["nawk", "awk"], ["pnpm", "npm"], ["yarn", "npm"], ["bun", "npm"], ["pip", "npm"], ["pip3", "npm"], ["gem", "npm"], ["uv", "npm"], ["poetry", "npm"], ["pipenv", "npm"], ["pdm", "npm"], ["hatch", "npm"], ["bundle", "npm"], ["gunzip", "gzip"], ["zcat", "gzip"], ["xz", "gzip"], ["unxz", "gzip"], ["xzcat", "gzip"], ["lzma", "gzip"], ["unlzma", "gzip"], ["lzcat", "gzip"], ["zstd", "gzip"], ["unzstd", "gzip"], ["zstdcat", "gzip"], ["zstdmt", "gzip"], ["bzip2", "gzip"], ["bunzip2", "gzip"], ["bzcat", "gzip"]]) KEYED[alias] = KEYED[name];
 const GIT_VALUES: Record<string, string[]> = {
   commit: ["-m", "-F", "-C", "-c", "-t", "--message", "--file", "--author", "--date", "--template", "--reuse-message", "--reedit-message", "--fixup", "--squash", "--trailer", "--cleanup"],
   tag: ["-m", "-F", "--message", "--file"],
@@ -8567,12 +9001,79 @@ function markedCommands(command: string, depth = 0, globs = false): [Simple, Sim
   return out;
 }
 
-export function expansionProblem(command: string): GuardVerdict | undefined {
+// An unquoted `$NAME` / `${NAME...}` in a marked word.
+const UNQUOTED_NAME = new RegExp(`${MARK_UNQUOTED}\\$\\{?([A-Za-z_]\\w*)`, "g");
+// An unquoted numbered parameter, or a parameter expansion with an operator or `!` (not `${#x}`).
+const UNQUOTED_COMPUTED = new RegExp(`${MARK_UNQUOTED}\\$(?:\\d|\\{\\d|\\{!|\\{[A-Za-z_]\\w*[^}\\w])`);
+// Names this call may set to a value no check reads: an assignment whose value holds an
+// expansion (other than `$!`, `$$`, `$?`, `$#`, which are numbers), the names `read`, `mapfile`,
+// `readarray` and `getopts` set, and a `for` name over a list that is not plain words or globs
+// (or over the positional parameters). Over-approximated: an extra name only asks more.
+function unreadNames(command: string, cmds: Simple[], cwd?: string): Set<string> {
+  const out = new Set<string>();
+  // (Round 21, Sol: a name bash sets by itself, REPLY, MAPFILE, OPTARG, DIRSTACK, BASH_REMATCH,
+  // ..., is unread wherever the call runs something that sets one without naming it, a literal
+  // assignment before it notwithstanding: `REPLY=x; read -r < f; test $REPLY`.)
+  // (Round 22, Opus: the program word comes after `while`, `if`, `!`, `do`... and `builtin`/`command`:
+  // `while read v; do [ -n $v ]; done < f`.)
+  const programOf = (argv: string[]): { name: string; args: string[] } => {
+    let k = 0;
+    // (Round 25, Sol: and leading assignments, `LC_ALL=C printf -v v ...`.)
+    while (k < argv.length && (LOOP_KEYWORDS.has(argv[k]) || argv[k] === "builtin" || argv[k] === "command" || ASSIGN.test(argv[k]))) k++;
+    return { name: path.basename(argv[k] ?? ""), args: argv.slice(k + 1) };
+  };
+  const implicit = cmds.some(({ argv }) => ["read", "select", "mapfile", "readarray", "getopts", "cd", "pushd", "popd", "coproc", "[["].includes(programOf(argv).name)) || /\bselect\s|\[\[|=~/.test(command);
+  if (implicit) for (const n of ["REPLY", "MAPFILE", "OPTARG", "OPTIND", "DIRSTACK", "BASH_REMATCH", "COPROC", "PWD", "OLDPWD", "_"]) out.add(n);
+  for (const [n, values] of collectAssigned(cmds)) if (values.some((v) => /[$`]/.test(v.replace(/\$[!$?#]/g, "")))) out.add(n);
+  for (const { argv } of cmds) {
+    const { name, args } = programOf(argv);
+    if (["read", "mapfile", "readarray"].includes(name)) for (const w of args) if (/^[A-Za-z_]\w*$/.test(w)) out.add(w);
+    if (name === "getopts" && args[1]) out.add(args[1]);
+    // (Round 19, Opus, Sol: `printf -v v '-%s %s' v 'a[...]'; test $v`.)
+    if (name === "printf") for (const t of printfTargets(args)) out.add(t.replace(/\[.*$/s, ""));
+    // (Round 24, Sol: an option word held in a variable, `op=-vv; printf "$op" ...`, can name any
+    // variable: then no name's known value is trusted.)
+    // (Round 25, Opus: only a first word that begins with an expansion can turn into an option;
+    // `$!`, `$$`, `$?` and `$#` are numbers.)
+    // (Round 26, Opus, Sol: or a word that begins with `-` and holds an expansion, `printf "-$op"`.)
+    const dynamic = (w: string) => { const v = w.replace(/\$[!$?#]/g, ""); return /^[$`]/.test(v) || (v.startsWith("-") && /[$`]/.test(v)); };
+    if ((name === "printf" && printfOptionWords(args).some(dynamic)) || (name === "wait" && args.some(dynamic))) out.add("*");
+    if (name === "wait") for (const t of waitTargets(args)) out.add(t.replace(/\[.*$/s, ""));
+  }
+  for (const m of command.matchAll(/\b(?:for|select)\s+([A-Za-z_]\w*)\s*(?:in\b([^;\n]*))?(?=[;\n]|\s+do\b)/g)) {
+    const list = m[2];
+    if (list === undefined || /[$`'"\\]/.test(list)) out.add(m[1]);
+    // (Round 21, Opus, Sol: a glob in the list takes file names, which can hold blanks: safe only
+    // where each glob lists here with no match holding one, and no other command of the call may
+    // make files meanwhile.)
+    else if (/[*?[]/.test(list)) {
+      // (Round 25, Opus: `~+` is the working directory; another `~word` the check cannot list.)
+      const globs = list.trim().split(/\s+/).filter((w) => /[*?[]/.test(w)).map((w) => (cwd !== undefined && /^~\+(\/|$)/.test(w) ? cwd + w.slice(2) : w));
+      const listed = cwd === undefined || globs.some((g) => /^~[^/]/.test(g)) ? undefined : globs.map((g) => expandNames(g, cwd));
+      const makes = cmds.some((c) => {
+        if (c.out.length > 0) return true;
+        if (["for", "select"].includes(c.argv[0] ?? "")) return false;
+        const words = c.argv.slice(c.argv.findIndex((w) => !LOOP_KEYWORDS.has(w)));
+        if (!words.length || c.argv.every((w) => LOOP_KEYWORDS.has(w))) return false;
+        return !(LOOP_SAFE.has(path.basename(words[0])) || words.every((w) => ASSIGN.test(w)));
+      });
+      if (!listed || listed.some((l) => l === undefined || l.some((f) => { const raw = f.replace(/^\/+/, "/"); const prefix = cwd!.replace(/\/+$/, "") + "/"; return /\s/.test(raw.startsWith(prefix) ? raw.slice(prefix.length) : raw); })) || makes) out.add(m[1]);
+    }
+  }
+  return out;
+}
+// Programs that make no file, for the glob-loop rule above (the loop's own body included).
+const LOOP_KEYWORDS = new Set(["do", "done", "then", "else", "elif", "fi", "if", "while", "until", "{", "}", "!", "time"]);
+const LOOP_SAFE = new Set(["test", "[", "echo", "printf", "true", "false", ":", "ls", "cat", "wc", "head", "tail", "grep", "stat", "file", "du", "basename", "dirname", "wait"]);
+
+export function expansionProblem(command: string, cwd?: string): GuardVerdict | undefined {
   if (!/[$`]/.test(command)) return undefined;
   const pairs = markedCommands(command);
   if (!pairs) return { action: "classify", reason: "words with expansions the guard could not line up with the rules' reading" };
   const real = pairs.map(([r]) => r);
   const seen = pairs.map(([, m]) => m);
+  let unreadValues: Set<string> | undefined;
+  let assignedValues: Map<string, string[]> | undefined;
   for (const [n, cmd] of seen.entries()) {
     const argv = real[n].argv;
     const { at, chain } = traverse(argv);
@@ -8592,7 +9093,57 @@ export function expansionProblem(command: string): GuardVerdict | undefined {
         const sub = args[i] ?? "";
         if (MARKS.test(sub)) found ??= unmark(sub);
         found ??= riskyWord({ values: GIT_VALUES[unmark(sub)] ?? [], checked: GIT_CHECKED, letters: ["format-patch", "archive"].includes(unmark(sub)) ? "o" : "" }, args.slice(i + 1));
+      } else if (/^python3?(\.\d+)?$/.test(name)) {
+        const m0 = unmark(args[0] ?? "");
+        const mod = m0 === "-m" ? unmark(args[1] ?? "") : m0.startsWith("-m") && m0.length > 2 ? m0.slice(2) : undefined;
+        const rest = m0 === "-m" ? args.slice(2) : args.slice(1);
+        if (mod && Object.hasOwn(KEYED, mod)) found = riskyWord(KEYED[mod], rest);
       } else if (Object.hasOwn(KEYED, name)) found = riskyWord(KEYED[name], args);
+      if (found === undefined && RUSTUP_PROXIES.has(name) && args[0] !== undefined && MARKS.test(args[0]) && (args[0].search(MARKS) === 0 || unmark(args[0]).startsWith("+"))) {
+        found = unmark(args[0]);
+      }
+      // An unquoted expansion bash splits can hand test/[ a `-v`/`-R` and its subscript, or
+      // printf a `-v NAME` (project review 3, round 17, Opus, Sol: `test $(echo '-v a[$(id)]')`,
+      // `test x$op 'a[$(id)]'`, `printf $(echo '-v a[$(id)] x')`). For test/[ that needs a
+      // command substitution's output or a subscript in the expression; for printf, an
+      // unquoted expansion where its first word is. Quoted words do not split.
+      // (Round 18, Opus, Sol: the positional parameters, which `"$@"` hands over as separate
+      // words, and an unquoted variable the call sets to a value no check reads (a command's
+      // output, `read`, a `for` list that is not plain words) can carry the option and its
+      // operand too; and wait's `-p` the same way.)
+      if (found === undefined && ["test", "[", "printf", "wait"].includes(name)) {
+        // printf takes `-v` only as its first word.
+        // (Round 19, Sol: also an unquoted numbered parameter, `set -- '-v a[...]'; test $1`, and an
+        // unquoted `${NAME<operator>...}` or `${!NAME}`, whose value the check does not compute:
+        // `v='x-p PATH'; wait ${v#x}`.)
+        const positional = (name === "printf" ? args.slice(0, 1) : args).find((a) => /\$\{?[@*]/.test(unmark(a)) || UNQUOTED_COMPUTED.test(a));
+        if (positional !== undefined) found = unmark(positional);
+        else {
+          // (Round 20, Opus, Sol: list what is safe, not what can set a name. An unquoted
+          // `$NAME` here passes only when the call gives NAME literal values without blanks
+          // (`$!`, `$$`, `$?`, `$#` count as numbers), or when the call never sets it (a `for` over
+          // plain words or globs included) and it is not a name bash sets by itself (`REPLY`,
+          // `OPTARG`, `MAPFILE`, ...: upper case or `_`). Anything else, a concatenation of
+          // values with blanks (`test $op$arg`) included, goes to the model.)
+          const unread = (unreadValues ??= unreadNames(command, real, cwd));
+          const assigned = (assignedValues ??= collectAssigned(real));
+          const safeName = (n: string) => {
+            if (unread.has(n) || unread.has("*")) return false;
+            const values = assigned.get(n);
+            if (values) return values.every((v) => !/[$`\s]/.test(v.replace(/\$[!$?#]/g, "")));
+            return settable(n);
+          };
+          const named = (name === "printf" ? args.slice(0, 1) : args).find((a) => [...a.matchAll(UNQUOTED_NAME)].some((m) => !safeName(m[1])));
+          if (named !== undefined) found = unmark(named);
+        }
+      }
+      if (found === undefined && (name === "test" || name === "[" || name === "wait")) {
+        const unquoted = args.filter((a) => a.includes(MARK_UNQUOTED));
+        const substituted = unquoted.find((a) => a.includes(MARK_UNQUOTED + "$(") || a.includes(MARK_UNQUOTED + "`"));
+        if (substituted !== undefined) found = unmark(substituted);
+        else if (name !== "wait" && unquoted.length && args.some((a) => /\w\[/.test(unmark(a)))) found = unmark(unquoted[0]);
+      }
+      if (found === undefined && name === "printf" && (args[0] ?? "").includes(MARK_UNQUOTED)) found = unmark(args[0]);
       if (found !== undefined) return { action: "classify", reason: `${name} ${found}: a word that can become an option once bash expands it, and ${name}'s options are checked by name` };
     }
   }

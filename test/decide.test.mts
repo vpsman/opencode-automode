@@ -5714,13 +5714,13 @@ describe("r4 N3c-3: what it closes", () => {
     "python3 -m venv new/../--files0-from=.env/x && wc --f*",
     "python3 -m venv new/../--checkpoint=1 && python3 -m venv new/../--checkpoint-action=exec=rec && tar cf b.tar * f",
   ]);
-  // (Council project review 2, round 62: a spelling the rules do not read (`unreadSpelling`) asks.)
-  expectN3c("N3c-3", "n3c", "ask", ["tar xf dash.tar && tar cf b.tar --check* f"]);
+  // (Council project review 2, round 62: a spelling the rules do not read (`unreadSpelling`) asks.
+  // Project review 3, round 11: `cp -r` keeps links, so a non-reader's glob beside it asks.)
+  expectN3c("N3c-3", "n3c", "ask", ["tar xf dash.tar && tar cf b.tar --check* f", "cp -r tpl/. . && tar cf b.tar * f"]);
   expectN3c("N3c-3", "linked", ["ask", "classify"], ["tar cf link/../--checkpoint=1 f && tar cf link/../--checkpoint-action=exec=rec f && cd sub && tar cf ../b.tar * f"]);
   // Making commands the checks do not see, before, after or beside the glob (all rule allows before).
   expectN3c("N3c-3", "n3c", "classify", [
     "tar xf dash.tar && tar cf b.tar * f",
-    "cp -r tpl/. . && tar cf b.tar * f",
     "cp -a tpl/. ./ && wc --f*",
     "git checkout other && tar cf b.tar * f",
     "cp tpl/* . && tar cf b.tar * f",
@@ -8898,8 +8898,9 @@ describe("r4 B10", () => {
   });
 
   describe("B10-10: the small points", () => {
-    b7Each("B10-10", "ask", ["zip -OAGENTS.md a.zip f", "zip -qOAGENTS.md a.zip f", "zip -O.git/hooks/pre-commit a.zip f", "zip -qO AGENTS.md a.zip f", "zip --output-file=AGENTS.md a.zip f"], one);
-    b7Each("B10-10", "allow", ["zip -Oout.zip a.zip f", "zip -r b10.zip src"], one);
+    // (Project review 3, round 13: zip is read only in its plain spellings, so `-O` asks too.)
+    b7Each("B10-10", "ask", ["zip -OAGENTS.md a.zip f", "zip -qOAGENTS.md a.zip f", "zip -O.git/hooks/pre-commit a.zip f", "zip -qO AGENTS.md a.zip f", "zip --output-file=AGENTS.md a.zip f", "zip -Oout.zip a.zip f"], one);
+    b7Each("B10-10", "allow", ["zip -r b10.zip src"], one);
     test("r4 B10-10: an include of a file that is not there holds no keys; a link that leads nowhere still goes to the model", async () => {
       const f = b10Fixture();
       f.g("config", "includeIf.onbranch:nothing.path", "missing.cfg");
