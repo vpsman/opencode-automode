@@ -5714,13 +5714,13 @@ describe("r4 N3c-3: what it closes", () => {
     "python3 -m venv new/../--files0-from=.env/x && wc --f*",
     "python3 -m venv new/../--checkpoint=1 && python3 -m venv new/../--checkpoint-action=exec=rec && tar cf b.tar * f",
   ]);
-  // (Council project review 2, round 62: a spelling the rules do not read (`unreadSpelling`) asks.)
-  expectN3c("N3c-3", "n3c", "ask", ["tar xf dash.tar && tar cf b.tar --check* f"]);
+  // (Council project review 2, round 62: a spelling the rules do not read (`unreadSpelling`) asks.
+  // Project review 3, round 11: `cp -r` keeps links, so a non-reader's glob beside it asks.)
+  expectN3c("N3c-3", "n3c", "ask", ["tar xf dash.tar && tar cf b.tar --check* f", "cp -r tpl/. . && tar cf b.tar * f"]);
   expectN3c("N3c-3", "linked", ["ask", "classify"], ["tar cf link/../--checkpoint=1 f && tar cf link/../--checkpoint-action=exec=rec f && cd sub && tar cf ../b.tar * f"]);
   // Making commands the checks do not see, before, after or beside the glob (all rule allows before).
   expectN3c("N3c-3", "n3c", "classify", [
     "tar xf dash.tar && tar cf b.tar * f",
-    "cp -r tpl/. . && tar cf b.tar * f",
     "cp -a tpl/. ./ && wc --f*",
     "git checkout other && tar cf b.tar * f",
     "cp tpl/* . && tar cf b.tar * f",

@@ -5508,7 +5508,10 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
         const operands = words.unknown ? files.filter((f) => f !== t && !(name === "install" && valued(args, "m", "--mode").includes(f))) : words.operands;
         const installsDir = copy ? copy.installDir : false;
         const oneExpands = t === undefined && !installsDir && operands.length === 1 && /[*?[\]{}$`]/.test(operands[0]);
-        if (t !== undefined) add(t, false, { dir: true, sources: operands });
+        if (installsDir) {
+          if (t !== undefined) add(t, false, { dir: true });
+          operands.forEach((d) => add(d, true, { dir: true }));
+        } else if (t !== undefined) add(t, false, { dir: true, sources: operands });
         else if (operands.length > 1) add(operands.at(-1), true, { sources: operands.slice(0, -1) });
         else if (oneExpands) {
           // (Project review 3, round 8, Neon: one expanding operand may supply both source and destination.)

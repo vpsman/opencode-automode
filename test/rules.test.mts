@@ -369,6 +369,18 @@ const CASES: [string, string, Want, Record<string, string[]>?][] = [
   ["p3r10 ok chmod -v 644 a", "chmod -v 644 a", "allow"],
   ["p3r10 ok sed -bi.bak", "sed -bi.bak s/a/b/ f", "allow"],
   ["p3r10 ok xxd -c 8 f out.hex", "xxd -c 8 f out.hex", "allow"],
+  // Project review 3, round 11 (Neon): install -d/--directory checks every operand; sed -i --debug
+  // prints input lines so credential reads are not skipped.
+  ["p3r11 install -d outside first", "install -d /etc/outside/x local", "ask"],
+  ["p3r11 install --directory outside first", "install --directory /etc/outside/x local", "ask"],
+  ["p3r11 install -d single outside", "install -d /etc/outside/x", "ask"],
+  ["p3r11 sed -i --debug .env", "sed -i --debug s/a/b/ .env", "ask"],
+  ["p3r11 sed -i --debug -e .env", "sed -i --debug -e s/a/b/ .env", "ask"],
+  ["p3r11 sed -i --debug -es .env", "sed -i --debug -es/a/b/ .env", "ask"],
+  ["p3r11 sed --debug -i .env", "sed --debug -i s/a/b/ .env", "ask"],
+  ["p3r11 ok install -d local", "install -d local1 local2", "allow"],
+  ["p3r11 ok install --directory local", "install --directory local1 local2", "allow"],
+  ["p3r11 ok sed -i --debug local", "sed -i --debug s/a/b/ f", "allow"],
   ["ok cloc", "cloc --by-file --json --exclude-dir=node_modules,dist src", "allow"],
   ["ok sed print", "sed -n '1,5p' f", "allow"],
   ["ok sed -i substitute", "sed -i 's/a/b/g' src/x.ts", "allow"],

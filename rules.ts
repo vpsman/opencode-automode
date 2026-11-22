@@ -165,6 +165,8 @@ export interface Scope {
   chatDecider?: boolean;
   // Shell variables the command set to known literal text before this point.
   vars?: Map<string, string>;
+  // Single-assignment constant variables resolved during bashVerdict (depth 0), for decide.ts.
+  resolvedVars?: Map<string, string>;
   // Variables of a `for` loop over literal words, so they only ever hold one of those words.
   loopVars?: Set<string>;
   // The words, globs included, that the variable of a `for` loop takes in turn.
@@ -519,10 +521,13 @@ function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope)
       patchLong.some((name) => longIs(a, name));
     if (["log", "shortlog", "rev-list", "whatchanged"].includes(sub ?? "") && !args.some(shows)) return undefined;
   }
-  // An in-place edit shows nothing, and a destination is written, not read.
-  if (name === "sed" && sedReading(args).inPlace) return undefined;
+  // An in-place edit shows nothing unless `--debug` prints every input line.
   let words = args;
-  if (PATTERN_FIRST.has(name)) words = operands(args).slice(1);
+  if (name === "sed") {
+    const r = sedReading(args);
+    if (r.inPlace && !r.debug && !r.unknownLong) return undefined;
+    words = r.files;
+  } else if (PATTERN_FIRST.has(name)) words = operands(args).slice(1);
   else if (COPIERS.has(name)) {
     // With `-t DIR` (`--target-directory`) the destination is named first and every operand is a
     // source (round 34, Mythos).
@@ -668,6 +673,8 @@ export interface Simple {
   // Per word of argv: true when the shell expands something in it (a variable, a substitution,
   // arithmetic) before the program sees it, so the text here is not the text that runs.
   dyn?: boolean[];
+  // Per word of argv: true when the word holds an unquoted glob character (`*`, `?`, or `[...]`).
+  glob?: boolean[];
   // The operator that follows the command: `;`, a newline, `&&`, `||`, `|`, `&`, `(` or `)`.
   next?: string;
   // `&&` or `||` where that joins the command to one that is not listed: an arithmetic command,
@@ -773,7 +780,7 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
     opaque();
     return s.length;
   }
-  let cur: Simple = { argv: [], out: [], dyn: [] };
+  let cur: Simple = { argv: [], out: [], dyn: [], glob: [] };
   let word = "";
   let mask = "";
   let hasWord = false;
@@ -836,6 +843,15 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
       else {
         cur.argv.push(text);
         cur.dyn!.push(/[eE]/.test(m));
+        let unquotedGlob = false;
+        for (let k = 0; k < w.length; k++) {
+          if (m[k] !== "u") continue;
+          if (w[k] === "*" || w[k] === "?" || (w[k] === "[" && w.indexOf("]", k + 1) >= 0)) {
+            unquotedGlob = true;
+            break;
+          }
+        }
+        cur.glob!.push(unquotedGlob);
       }
       if (kind === "append") (cur.append ??= []).push(text);
     }
@@ -881,7 +897,7 @@ function parseList(s: string, start: number, closer: boolean, sub: boolean, st: 
       last = cur;
       result.cmds.push(cur);
     } else if (op === "&&" || op === "||") unlisted = op;
-    cur = { argv: [], out: [], dyn: [] };
+    cur = { argv: [], out: [], dyn: [], glob: [] };
   };
 
   // `$` at s[i]: an expansion or a plain dollar sign. Returns the index of its last character.
@@ -1525,7 +1541,7 @@ function ansiC(raw: string): string {
 
 // ---- command tables ----
 
-const READ_ONLY = new Set(
+export const READ_ONLY = new Set(
   `ls cat bat head tail less more wc rg grep egrep fgrep fd tree stat file du df pwd echo printf
    which whereis type whoami id groups date cal uname hostname uptime printenv ps pgrep free nproc
    lscpu lsblk lsusb lspci lsmod findmnt readlink realpath basename dirname sort uniq cut tr jq yq
@@ -1972,6 +1988,7 @@ function sedScriptSafe(script: string): boolean {
 export interface SedReading {
   inPlace: boolean;
   sandbox: boolean;
+  debug: boolean;
   scripts: string[];
   files: string[];
   suffixes: string[];
@@ -1985,6 +2002,7 @@ export function sedReading(args: string[]): SedReading {
   const suffixes: string[] = [];
   let inPlace = false;
   let sandbox = false;
+  let debug = false;
   let loadsFile = false;
   let unknownShort: string | undefined;
   let unknownLong: string | undefined;
@@ -2001,6 +2019,7 @@ export function sedReading(args: string[]): SedReading {
     }
     if (a.startsWith("--")) {
       if (a === "--sandbox") sandbox = true;
+      else if (a === "--debug") debug = true;
       else if (a === "--expression") scripts.push(args[++k] ?? "");
       else if (a.startsWith("--expression=")) scripts.push(a.slice(13));
       else if (a === "--in-place") inPlace = true;
@@ -2011,7 +2030,7 @@ export function sedReading(args: string[]): SedReading {
         loadsFile = true;
         if (a === "--file") k++;
       } else if (a === "--line-length") k++;
-      else if (/^--(quiet|silent|regexp-extended|separate|unbuffered|null-data|posix|debug|follow-symlinks|binary)$/.test(a) || /^--line-length=\d+$/.test(a)) continue;
+      else if (/^--(quiet|silent|regexp-extended|separate|unbuffered|null-data|posix|follow-symlinks|binary)$/.test(a) || /^--line-length=\d+$/.test(a)) continue;
       else unknownLong ??= a;
       continue;
     }
@@ -2036,7 +2055,7 @@ export function sedReading(args: string[]): SedReading {
   const hasScriptOpt = scripts.length > 0 || loadsFile;
   const files = hasScriptOpt ? pos : pos.slice(1);
   if (!hasScriptOpt) scripts.push(pos[0] ?? "");
-  return { inPlace, sandbox, scripts, files, suffixes, loadsFile, unknownShort, unknownLong };
+  return { inPlace, sandbox, debug, scripts, files, suffixes, loadsFile, unknownShort, unknownLong };
 }
 
 function sed(args: string[], scope: Scope): Verdict {
@@ -3065,6 +3084,7 @@ export interface CopyReading {
   recursive: boolean;
   hard: boolean;
   symbolic: boolean;
+  keepsLinks: boolean;
   installDir: boolean;
   unknown?: string;
 }
@@ -3075,6 +3095,9 @@ export function copyReading(cmd: string, args: string[]): CopyReading {
   let recursive = false;
   let link = false;
   let symbolic = false;
+  let noDeref = false;
+  let deref = false;
+  let preserveLinks = false;
   let installDir = false;
   let unknown: string | undefined;
   let ended = false;
@@ -3106,10 +3129,22 @@ export function copyReading(cmd: string, args: string[]): CopyReading {
         if (full === "target-directory") targets.push(val);
       } else if (kind === "flag") {
         if (attached !== undefined) unknown ??= w;
-        if (full === "recursive" || full === "archive") recursive = true;
-        else if (full === "link") link = true;
+        if (full === "recursive") recursive = true;
+        else if (full === "archive") {
+          recursive = true;
+          noDeref = true;
+          deref = false;
+        } else if (full === "no-dereference") {
+          noDeref = true;
+          deref = false;
+        } else if (full === "dereference") {
+          deref = true;
+          noDeref = false;
+        } else if (full === "link") link = true;
         else if (full === "symbolic" || full === "symbolic-link") symbolic = true;
         else if (full === "directory") installDir = true;
+      } else if (kind === "optional") {
+        if (full === "preserve" && attached !== undefined && attached.split(",").some((v) => v === "links" || v === "all")) preserveLinks = true;
       }
       continue;
     }
@@ -3122,10 +3157,20 @@ export function copyReading(cmd: string, args: string[]): CopyReading {
         break;
       }
       if (spec.flags.includes(c)) {
-        if (c === "r" || c === "R" || c === "a") recursive = true;
-        else if (c === "l") link = true;
+        if (c === "r" || c === "R") recursive = true;
+        else if (c === "a") {
+          recursive = true;
+          noDeref = true;
+          deref = false;
+        } else if (c === "P" || c === "d") {
+          noDeref = true;
+          deref = false;
+          if (c === "d") installDir = true;
+        } else if (c === "L") {
+          deref = true;
+          noDeref = false;
+        } else if (c === "l") link = true;
         else if (c === "s") symbolic = true;
-        else if (c === "d") installDir = true;
       } else {
         unknown ??= `-${c}`;
         break;
@@ -3139,6 +3184,7 @@ export function copyReading(cmd: string, args: string[]): CopyReading {
     recursive,
     hard: (cmd === "ln" && !symbolic) || (cmd === "cp" && link),
     symbolic,
+    keepsLinks: cmd === "cp" && (noDeref || preserveLinks || (recursive && !deref)),
     installDir: cmd === "install" && installDir,
     ...(unknown ? { unknown } : {}),
   };
@@ -3275,14 +3321,16 @@ function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = 
   const words = reference >= 0 && !head[reference].includes("=") ? args.filter((_, k) => k !== reference + 1) : args;
   const paths = copy ? copy.operands : chmod ? chmod.files : (FIRST_OPERAND_NOT_PATH.has(cmd) && reference < 0 ? operands(words).slice(1) : operands(words));
   const hasTarget = copy?.target !== undefined;
+  const installDir = !!copy?.installDir;
   const sources = hasTarget ? paths : paths.slice(0, -1);
   const destWord = hasTarget ? copy!.target! : paths.length > 1 ? paths.at(-1)! : undefined;
   const dest = destWord !== undefined ? resolveWord(destWord, scope) : undefined;
-  const intoDir = hasTarget || (COPIERS.has(cmd) && paths.length > 1 && (sources.length > 1 || paths.at(-1)!.endsWith("/") || (!!dest && isDirectory(dest))));
+  const intoDir = !installDir && (hasTarget || (COPIERS.has(cmd) && paths.length > 1 && (sources.length > 1 || paths.at(-1)!.endsWith("/") || (!!dest && isDirectory(dest)))));
   // With `-t`/`--target-directory`, guard.ts + decide.ts check the literal destination directory
   // (including `/proc/self/cwd/..` and >4096-char option words); rules.ts still checks `mv` sources
-  // and rejects expanding `-t` values above.
-  const targets = hasTarget ? (WRITERS[cmd] === "all" ? paths : []) : WRITERS[cmd] === "last" ? paths.slice(-1) : paths;
+  // and rejects expanding `-t` values above. With `install -d`/`--directory`, every operand is a
+  // directory to create.
+  const targets = installDir ? paths : hasTarget ? (WRITERS[cmd] === "all" ? paths : []) : WRITERS[cmd] === "last" ? paths.slice(-1) : paths;
   for (const t of targets) {
     // Copied into a directory, the files land inside it: `cp a.rs /tmp` writes /tmp/a.rs.
     const written = intoDir && t === destWord && dest && sources.length ? sources.map((s) => path.join(dest, path.basename(s))) : [resolveWord(t, scope)];
@@ -3303,7 +3351,7 @@ function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = 
       if (link && target) (scope.links ??= new Map()).set(link, target);
     }
   }
-  if (COPIERS.has(cmd) && (hasTarget ? paths.length >= 1 : paths.length > 1)) {
+  if (COPIERS.has(cmd) && !installDir && (hasTarget ? paths.length >= 1 : paths.length > 1)) {
     for (const source of sources) {
       const from = resolveWord(source, scope);
       const kept = from && originOf(from, scope);
@@ -4460,6 +4508,7 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
       if (namedOnce(name) && !BASH_SETS.test(name) && /^[\w./~@%+,:=-]*$/.test(text) && !cmd.dyn?.[i]) local.vars!.set(name, text.startsWith("~/") || text === "~" ? HOME + text.slice(1) : text);
     }
   }
+  if (depth === 0) scope.resolvedVars = local.vars;
   return verdict.pattern && patterns.size > 1 ? { ...verdict, pattern: undefined } : verdict;
 }
 

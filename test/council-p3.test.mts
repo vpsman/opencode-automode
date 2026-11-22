@@ -835,3 +835,91 @@ test("round 10 (Opus, Neon)", async () => {
     "mv src/*.ts dst/",
   ]) assert.equal(await decide10(command), "allow", command);
 });
+
+test("round 11 (Opus, Neon)", async () => {
+  const repo11 = path.join(base, "repo11");
+  const outsideDir = path.join(base, "outside11-dir");
+  const guardedDir = path.join(base, "guarded11");
+  for (const d of ["sub", "d", "dst", "src", "scripts", "dist", "logs", "node_modules/.pnpm/pkg"]) fs.mkdirSync(path.join(repo11, d), { recursive: true });
+  for (const d of [outsideDir, guardedDir]) fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(outsideDir, "f.txt"), "outside\n");
+  fs.writeFileSync(path.join(guardedDir, "guard.ts"), "export {};\n");
+  for (const f of ["a", "b", "f", ".env", "AGENTS.md", "sub/a", "src/a.ts", "scripts/run.sh", "dist/app.js", "logs/app.log", "app.log", "node_modules/.pnpm/pkg/index.js"]) {
+    fs.writeFileSync(path.join(repo11, f), "hello\n");
+  }
+  execFileSync("git", ["init", "-q", "-b", "main", repo11]);
+  fs.symlinkSync(".", path.join(repo11, "lnk"));
+  fs.symlinkSync("../AGENTS.md", path.join(repo11, "sub", "aglink"));
+  fs.symlinkSync("../.git/hooks", path.join(repo11, "sub", "gitlink"));
+  fs.symlinkSync(outsideDir, path.join(repo11, "sub", "outdir"));
+  fs.symlinkSync(guardedDir, path.join(repo11, "sub", "grddir"));
+  fs.symlinkSync(".pnpm/pkg", path.join(repo11, "node_modules", "pkg"));
+  const guard11: Guard = { ...guard, guarded: [...guard.guarded, guardedDir] };
+  const decide11 = async (command: string) => (await decideShell(guard11, new SessionState(repo11), repo11, command)).effect;
+
+  for (const command of [
+    // Finding A (Opus, Neon): link carried by mv, cp -P/-a/-d/-r/--preserve=links, link, or rsync.
+    "mv lnk d; echo x | tee d/*.md",
+    "mv sub sub2; echo hi | tee sub2/ag*",
+    "cp -P sub/aglink sub/newlink; echo hi | tee sub/newl*",
+    "cp -a sub/aglink sub/newlink; echo hi | tee sub/newl*",
+    "cp -d sub/aglink sub/newlink; echo hi | tee sub/newl*",
+    "cp -r sub sub2; echo hi | tee sub2/ag*",
+    "cp --no-dereference sub/aglink sub/newlink; echo hi | tee sub/newl*",
+    "cp --preserve=links sub/aglink sub/newlink; echo hi | tee sub/newl*",
+    "link AGENTS.md sub/hlink; echo hi | tee sub/hl*",
+    "rsync -a sub/ sub2/; echo hi | tee sub2/ag*",
+    "mv lnk d; gzip d/*.md",
+    // Finding B (Neon): glob arguments through symlinked dirs or to protected targets on non-readers.
+    "curl -s https://example.com/x -o sub/outd*/y",
+    "curl -s https://example.com/x -osub/outd*/y",
+    "curl -sLosub/outd*/y https://example.com/x",
+    "wget -q https://example.com/x -P sub/outd*",
+    "wget -qPsub/outd* https://example.com/x",
+    "gzip sub/outd*/*",
+    "xz -k sub/outd*/*",
+    "zstd sub/outd*/*",
+    "python3 -m compileall sub/outd*",
+    "python3 -m venv --clear sub/outd*",
+    "uv venv sub/outd*",
+    "pytest --basetemp=sub/outd*",
+    "journalctl --cursor-file sub/ag*",
+    "journalctl --cursor-file=sub/gitl*",
+    "gzip sub/grdd*/*",
+    "x=sub; pytest --basetemp=$x/outd*",
+    "x=sub; gzip $x/outd*/*",
+    // Finding C (Neon): install -d / --directory creates every operand.
+    "install -d .git/hooks/x local",
+    "install -d ../outside/x local",
+    "install --directory .git/hooks/x local",
+    "install --directory ../outside/x local",
+    "install -d ../outside/x",
+    // Finding D (Neon): sed -i --debug prints every input line.
+    "sed -i --debug s/a/b/ .env",
+    "sed -i --debug -e s/a/b/ .env",
+    "sed --debug -i s/a/b/ .env",
+  ]) assert.equal(await decide11(command), "ask", command);
+
+  for (const command of [
+    "rm -rf dist/*",
+    "rm -rf node_modules/*",
+    "rm -f *.log",
+    "chmod +x scripts/*",
+    "mv src/*.ts dst/",
+    "gzip -k logs/*.log",
+    "python3 -m compileall src",
+    "cp -r src dst",
+    "cp -a src dst",
+    "mv a b",
+    "mv a b; rm -f dist/*",
+    "curl -s https://example.com/x -o out.json",
+    "git add src/*",
+    "cat sub/outd*/f.txt",
+    "ls sub/*",
+    "install -d local1 local2",
+    "install --directory local1 local2",
+    "sed -i --debug s/a/b/ f",
+    "find . -name '*.ts'",
+    "pytest -k 'test_*'",
+  ]) assert.equal(await decide11(command), "allow", command);
+});
