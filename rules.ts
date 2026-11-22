@@ -4654,7 +4654,10 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
     const at = c.argv.findIndex((w) => w === "printf" || w === "wait");
     if (at < 0) return false;
     const rest = c.argv.slice(at + 1);
-    return c.argv[at] === "printf" ? /[$`]/.test(rest[0] ?? "") : rest.some((w) => /[$`]/.test(w));
+    // (Round 25, Opus: only a word that begins with an expansion can become an option; `$!`,
+    // `$$`, `$?`, `$#` are numbers.)
+    const dynamic = (w: string) => { const v = w.replace(/\$[!$?#]/g, ""); return /^[$`]/.test(v); };
+    return c.argv[at] === "printf" ? dynamic(rest[0] ?? "") : rest.some(dynamic);
   });
   const attached = (name: string) => dynamicSetter || new RegExp(`(^|[^\\w$])-[A-Za-z]*${name}(?!\\w)`).test(setters);
   const defaulted = (name: string) => !!parsed.assigns?.has(name) || !!scope.reassigned?.has(name) || new RegExp(`\\$\\{${name}(\\[[^\\]]*\\])?:?=`).test(words) || attached(name);

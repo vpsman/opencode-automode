@@ -8998,7 +8998,8 @@ function unreadNames(command: string, cmds: Simple[], cwd?: string): Set<string>
   // `while read v; do [ -n $v ]; done < f`.)
   const programOf = (argv: string[]): { name: string; args: string[] } => {
     let k = 0;
-    while (k < argv.length && (LOOP_KEYWORDS.has(argv[k]) || argv[k] === "builtin" || argv[k] === "command")) k++;
+    // (Round 25, Sol: and leading assignments, `LC_ALL=C printf -v v ...`.)
+    while (k < argv.length && (LOOP_KEYWORDS.has(argv[k]) || argv[k] === "builtin" || argv[k] === "command" || ASSIGN.test(argv[k]))) k++;
     return { name: path.basename(argv[k] ?? ""), args: argv.slice(k + 1) };
   };
   const implicit = cmds.some(({ argv }) => ["read", "select", "mapfile", "readarray", "getopts", "cd", "pushd", "popd", "coproc", "[["].includes(programOf(argv).name)) || /\bselect\s|\[\[|=~/.test(command);
@@ -9012,7 +9013,10 @@ function unreadNames(command: string, cmds: Simple[], cwd?: string): Set<string>
     if (name === "printf") for (const t of printfTargets(args)) out.add(t.replace(/\[.*$/s, ""));
     // (Round 24, Sol: an option word held in a variable, `op=-vv; printf "$op" ...`, can name any
     // variable: then no name's known value is trusted.)
-    if ((name === "printf" && /[$`]/.test(args[0] ?? "")) || (name === "wait" && args.some((a) => /[$`]/.test(a)))) out.add("*");
+    // (Round 25, Opus: only a first word that begins with an expansion can turn into an option;
+    // `$!`, `$$`, `$?` and `$#` are numbers.)
+    const dynamic = (w: string) => /^[$`]/.test(w.replace(/\$[!$?#]/g, "")) && /[$`]/.test(w.replace(/\$[!$?#]/g, ""));
+    if ((name === "printf" && dynamic(args[0] ?? "")) || (name === "wait" && args.some(dynamic))) out.add("*");
     if (name === "wait") for (const t of waitTargets(args)) out.add(t.replace(/\[.*$/s, ""));
   }
   for (const m of command.matchAll(/\b(?:for|select)\s+([A-Za-z_]\w*)\s*(?:in\b([^;\n]*))?(?=[;\n]|\s+do\b)/g)) {
@@ -9022,8 +9026,9 @@ function unreadNames(command: string, cmds: Simple[], cwd?: string): Set<string>
     // where each glob lists here with no match holding one, and no other command of the call may
     // make files meanwhile.)
     else if (/[*?[]/.test(list)) {
-      const globs = list.trim().split(/\s+/).filter((w) => /[*?[]/.test(w));
-      const listed = cwd === undefined ? undefined : globs.map((g) => expandNames(g, cwd));
+      // (Round 25, Opus: `~+` is the working directory; another `~word` the check cannot list.)
+      const globs = list.trim().split(/\s+/).filter((w) => /[*?[]/.test(w)).map((w) => (cwd !== undefined && /^~\+(\/|$)/.test(w) ? cwd + w.slice(2) : w));
+      const listed = cwd === undefined || globs.some((g) => /^~[^/]/.test(g)) ? undefined : globs.map((g) => expandNames(g, cwd));
       const makes = cmds.some((c) => {
         if (c.out.length > 0) return true;
         if (["for", "select"].includes(c.argv[0] ?? "")) return false;

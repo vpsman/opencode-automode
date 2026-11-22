@@ -1560,3 +1560,24 @@ test("round 24 (Opus, Sol): a printf option held in a variable, an assignment af
     'read -r x < f; printf -- "-v$x" %s 1',
   ]) assert.equal(await decide24(command), "allow", command);
 });
+
+test("round 25 (Sol, Opus): an assignment before printf, a ~+ glob loop, and printf text that cannot be an option", async () => {
+  const repo25 = path.join(base, "repo25");
+  fs.mkdirSync(path.join(repo25, "src"), { recursive: true });
+  fs.writeFileSync(path.join(repo25, "x -o -v b[$(date)] -o y.ts"), "");
+  execFileSync("git", ["init", "-q", "-b", "main", repo25]);
+  const decide25 = async (command: string) => (await decideShell(guard, new SessionState(repo25), repo25, command)).effect;
+  for (const command of [
+    "v=x; LC_ALL=C printf -v v %s '-v a[$(date)]'; test $v",
+    "v=x; LC_ALL=C printf -vv '%s%s %s' - v 'a[$(date)]'; test $v",
+    "for f in ~+/*.ts; do [ -f $f ]; done",
+    "for f in ~+/*; do [ -d $f ] && echo $f; done",
+    "v=x; op=-vv; printf \"$op\" %s .git; echo x > $v/config",
+  ]) assert.notEqual(await decide25(command), "allow", command);
+  for (const command of [
+    'out=build/report.txt; n=3; mkdir -p build; printf "Total: $n\\n" > $out',
+    'f=notes.txt; printf "Writing $f\\n"; echo hi > $f',
+    'x=foo; printf "x=$x\\n"; [ $x = foo ]',
+    "x=src; sleep 1 & wait $!; echo hi > $x/out.txt",
+  ]) assert.equal(await decide25(command), "allow", command);
+});
