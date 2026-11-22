@@ -3151,10 +3151,14 @@ export function twoOpOperands(tool: "uniq" | "xxd" | "json.tool", list: string[]
   const out: string[] = [];
   for (let k = 0; k < list.length; k++) {
     const a = list[k];
+    // (Project review 3, round 10, Neon: xxd stops option parsing at the first operand, so any
+    // later `-` word other than `-` is the output file; uniq accepts obsolete `+N` before `--`.)
+    if (tool === "xxd" && out.length > 0 && a.startsWith("-") && a !== "-") return { operands: out, unknown: a };
     if (a === "--") {
       out.push(...list.slice(k + 1));
       break;
     }
+    if (tool === "uniq" && a.startsWith("+")) return { operands: out, unknown: a };
     if (a === "-" || !a.startsWith("-")) {
       out.push(a);
       continue;
@@ -3194,20 +3198,82 @@ export function twoOpOperands(tool: "uniq" | "xxd" | "json.tool", list: string[]
   return { operands: out };
 }
 
+// (Project review 3, round 10, Neon: GNU chmod takes modes starting with `-`, including `-u`,
+// `-g`, `-o`, and any-length octal `-00644`. Only chmod's own short options `c f v R` are
+// options; a `-` word matching the octal or symbolic mode set is the mode; any other `-` word
+// is unknown and asks.)
+export interface ChmodReading {
+  files: string[];
+  recursive: boolean;
+  modeAsOption: boolean;
+  reference: boolean;
+  unknown?: string;
+}
+export function chmodReading(args: string[]): ChmodReading {
+  const ops: string[] = [];
+  let recursive = false;
+  let modeAsOption = false;
+  let reference = false;
+  let unknown: string | undefined;
+  let ended = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (ended || a === "-" || !a.startsWith("-")) {
+      ops.push(a);
+      continue;
+    }
+    if (a === "--") {
+      ended = true;
+      continue;
+    }
+    if (a.startsWith("--")) {
+      const eq = a.indexOf("=");
+      const head = eq < 0 ? a : a.slice(0, eq);
+      if (head === "--reference") {
+        reference = true;
+        if (eq < 0) i++;
+        continue;
+      }
+      if (eq < 0 && /^--(changes|silent|quiet|verbose|dereference|no-dereference|no-preserve-root|preserve-root|recursive|help|version)$/.test(head)) {
+        if (head === "--recursive") recursive = true;
+        continue;
+      }
+      if (eq < 0 && head.length >= 5 && "--recursive".startsWith(head)) recursive = true;
+      if (head.length >= 4 && "--reference".startsWith(head)) {
+        reference = true;
+        if (eq < 0) i++;
+      }
+      unknown ??= a;
+      continue;
+    }
+    if (/^-[cfvR]+$/.test(a)) {
+      if (a.includes("R")) recursive = true;
+      continue;
+    }
+    if (/^-[0-7]+$/.test(a) || /^-[rwxXstugoa+=,-]+$/.test(a)) {
+      modeAsOption = true;
+      continue;
+    }
+    unknown ??= a;
+  }
+  const files = reference || modeAsOption ? ops : ops.slice(1);
+  return { files, recursive, modeAsOption, reference, ...(unknown ? { unknown } : {}) };
+}
+
 function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = false): Verdict {
   const copy = Object.hasOwn(COPY_SPEC, cmd) ? copyReading(cmd, args) : undefined;
   if (copy?.unknown) return ask(`${cmd} ${copy.unknown}: an option the rules do not read, so its destination is not known`);
   const badTarget = copy?.targets.find((t) => MAY_EXPAND.test(t));
   if (badTarget !== undefined) return ask(`${cmd} -t with an expanding target directory (${badTarget}): bash may expand it into both target directory and sources`);
+  const chmod = cmd === "chmod" ? chmodReading(args) : undefined;
+  if (chmod?.unknown) return ask(`chmod ${chmod.unknown}: an option the rules do not read`);
   // (Round 39, Mythos: with `--reference=FILE` chmod/chown/chgrp take no mode or owner operand.)
   // (Round 40: a mode can look like an option, `chmod -w f`, and `--reference` is matched by any
   // prefix; its value, as a separate word, is the file read, not a target.)
   const head = args.indexOf("--") < 0 ? args : args.slice(0, args.indexOf("--"));
   const reference = head.findIndex((a) => longIs(a, "reference") && a.split("=")[0].length >= 4);
-  // (Round 41, Mythos: an octal mode after a dash too, `chmod -700 f`.)
-  const modeAsOption = cmd === "chmod" && head.some((a) => (/^-[rwxXstugoa+=,-]+$/.test(a) && /[rwxXst]/.test(a)) || /^-[0-7]{1,4}$/.test(a));
   const words = reference >= 0 && !head[reference].includes("=") ? args.filter((_, k) => k !== reference + 1) : args;
-  const paths = copy ? copy.operands : (FIRST_OPERAND_NOT_PATH.has(cmd) && reference < 0 && !modeAsOption ? operands(words).slice(1) : operands(words));
+  const paths = copy ? copy.operands : chmod ? chmod.files : (FIRST_OPERAND_NOT_PATH.has(cmd) && reference < 0 ? operands(words).slice(1) : operands(words));
   const hasTarget = copy?.target !== undefined;
   const sources = hasTarget ? paths : paths.slice(0, -1);
   const destWord = hasTarget ? copy!.target! : paths.length > 1 ? paths.at(-1)! : undefined;
@@ -3954,9 +4020,11 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
     return worst(verdict, isLocal(p, scope) || (!!p && DEV_SINKS.test(p)) ? classify("dd") : outside(`dd writes outside the working directory: ${of}`, p));
   }
   if (name === "chmod" || name === "chown" || name === "chgrp") {
+    const ch = name === "chmod" ? chmodReading(args) : undefined;
     const head = args.indexOf("--") < 0 ? args : args.slice(0, args.indexOf("--"));
-    if (hasFlag(head, "R", "--recursive") || head.some((a) => longIs(a, "recursive") && a.split("=")[0].length >= 5)) {
-      for (const t of operands(args).slice(1)) {
+    const recursive = ch ? ch.recursive : hasFlag(head, "R", "--recursive") || head.some((a) => longIs(a, "recursive") && a.split("=")[0].length >= 5);
+    if (recursive) {
+      for (const t of ch ? ch.files : operands(args).slice(1)) {
         const p = resolveWord(t, scope);
         if (p && isRootLike(p)) return deny(`${name} -R on ${t} would change a home or system directory`);
       }

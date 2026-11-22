@@ -762,3 +762,76 @@ test("round 9 (Opus, Neon)", async () => {
     "cp f dir/",
   ]) assert.equal(await decide9(command), "allow", command);
 });
+
+test("round 10 (Opus, Neon)", async () => {
+  const repo10 = path.join(base, "repo10");
+  const outsideDir = path.join(base, "outside10-dir");
+  const nodeModTarget = path.join(base, "nm10-target");
+  for (const d of ["sub", "sub2", "dist", "build", "scripts", "src", "dst", "node_modules"]) fs.mkdirSync(path.join(repo10, d), { recursive: true });
+  for (const d of [outsideDir, nodeModTarget]) fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(outsideDir, "plain.txt"), "outside\n");
+  fs.writeFileSync(path.join(nodeModTarget, "index.js"), "export {};\n");
+  for (const f of ["md", "f", "a", "b", "in", "AGENTS.md", "dist/app.js", "build/a.o", "scripts/run.sh", "src/a.ts", "sub2/a", "sub2/b"]) fs.writeFileSync(path.join(repo10, f), "hello\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo10]);
+  fs.symlinkSync("../AGENTS.md", path.join(repo10, "sub", "aglink"));
+  fs.symlinkSync(outsideDir, path.join(repo10, "sub", "outdir"));
+  fs.symlinkSync(os.homedir(), path.join(repo10, "sub", "homedir"));
+  fs.symlinkSync(nodeModTarget, path.join(repo10, "node_modules", "extpkg"));
+  const decide10 = async (command: string) => (await decideShell(guard, new SessionState(repo10), repo10, command)).effect;
+
+  assert.equal(await decide10("chmod -R -u /"), "deny", "chmod -R -u /");
+
+  for (const command of [
+    // Finding 1 (Opus, regression): sed -bi with `*` backup suffix (leading or trailing).
+    "sed -bi'AGENTS.*' s/a/b/ md",
+    "sed s/a/b/ md -bi'AGENTS.*'",
+    // Finding 2 (Neon): same-call symlink/hardlink creator + glob write/remove/move target.
+    "ln -s AGENTS.md aglink; echo evil | tee agl*",
+    "cp -s AGENTS.md aglink; echo evil | tee agl*",
+    "cp -l AGENTS.md aglink; echo evil | tee agl*",
+    "cp --symbolic-link AGENTS.md aglink; echo evil | tee agl*",
+    "cp --link AGENTS.md aglink; echo evil | tee agl*",
+    `ln -s ${outsideDir} sub/newout; rm -rf sub/newo*/*`,
+    // Finding 3 (Neon): chmod modes that look like options (`-u`, `-00644`, unknown `-z`).
+    "chmod -u ../outside.txt",
+    "chmod -00644 ../o.txt",
+    "chmod -z a",
+    // Finding 4 (Neon): globs through a symlinked directory on removers and mv sources.
+    "rm -f sub/outd*/*",
+    "rm -rf sub/homed*/*",
+    "mv sub/outd*/* dst/",
+    // Finding 5 (Neon): write/remove targets combining expansion and glob characters.
+    "x=sub; echo hi | tee $x/ag*",
+    "x=sub; truncate -s 0 $x/ag*",
+    "x=sub; shred $x/ag*",
+    "x=sub; unlink $x/ag*",
+    "x=sub; rm -f $x/ag*",
+    "x=sub; touch $x/ag*",
+    "x=sub; mkdir $x/ag*",
+    "x=sub; rmdir $x/ag*",
+    // Finding 6 (Neon): uniq obsolete +N and xxd trailing `-` word after first operand.
+    "uniq +1 sub2/*",
+    "xxd sub2/a -o",
+    "xxd sub2/a -c 8",
+  ]) assert.equal(await decide10(command), "ask", command);
+
+  for (const command of [
+    "rm -rf dist/*",
+    "rm -rf node_modules/*",
+    "rm -f build/*.o",
+    "chmod +x scripts/*",
+    "chmod 644 a",
+    "chmod -R u+w sub",
+    "chmod -v 644 a",
+    "ln -s a b",
+    "ln -sf a b; cat b",
+    "tee out.log",
+    "sed -i.bak s/a/b/ f",
+    "sed -bi.bak s/a/b/ f",
+    "uniq -c in out",
+    "xxd f",
+    "xxd -c 8 f out.hex",
+    "mv a b",
+    "mv src/*.ts dst/",
+  ]) assert.equal(await decide10(command), "allow", command);
+});

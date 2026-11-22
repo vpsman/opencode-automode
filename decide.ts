@@ -23,6 +23,7 @@ import {
   fileVerdict,
   isRootLike,
   bare,
+  chmodReading,
   makeScope,
   psEnvironments,
   findActions,
@@ -3897,9 +3898,16 @@ function optionNamedPath(cmds: Simple[], dirsOf: (cmd: Simple) => string[] | und
     const makers = programs(cmd.argv).filter((at) => Object.hasOwn(PARENT_MAKERS, path.basename(cmd.argv[at])) && cmd.argv.slice(at + 1).some((a) => PARENT_MAKERS[path.basename(cmd.argv[at])].test(a)) && !copiesNothing(path.basename(cmd.argv[at]), cmd.argv.slice(at + 1)));
     for (const at of programs(cmd.argv)) {
       if (path.basename(cmd.argv[at]) !== "sed") continue;
-      for (const arg of cmd.argv.slice(at + 1)) {
-        const suffix = /^-[nrEsuz]*i(.+)$/s.exec(arg)?.[1] ?? /^--i[a-z-]*=(.*)$/s.exec(arg)?.[1];
-        if (suffix !== undefined && /[*\/$`]/.test(suffix)) return { action: "ask", reason: `sed -i with a suffix that names the backup file itself (${suffix}): it can make a file named like an option, which a later glob hands to a program as one` };
+      const args = cmd.argv.slice(at + 1);
+      const r = sedReading(args);
+      const dashes = args.indexOf("--");
+      const suffixes = [...(r.inPlace ? r.suffixes : [])];
+      for (const arg of dashes < 0 ? args : args.slice(0, dashes)) {
+        const m = /^--i[a-z-]*=(.*)$/s.exec(arg);
+        if (m) suffixes.push(m[1]);
+      }
+      for (const suffix of suffixes) {
+        if (/[*\/$`]/.test(suffix)) return { action: "ask", reason: `sed -i with a suffix that names the backup file itself (${suffix}): it can make a file named like an option, which a later glob hands to a program as one` };
       }
     }
     for (const [k, word] of [...cmd.argv, ...cmd.out].entries()) {
@@ -5636,11 +5644,30 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   const found = writesOf(cmds, filesOnly);
   // (Project review 3, round 9: every current match of a glob write target is held to the same
   // write checks as a literal target — outside the project, guarded files, config dirs, .git — not
-  // just the protected names checked in writeProblem.)
+  // just the protected names checked in writeProblem. Round 10, Neon: also ask when another command
+  // in the call can create a link, when a glob write/remove target also holds an expansion, or when
+  // a glob on rm/rmdir/unlink or an mv source traverses a symlinked directory or lands outside.)
+  const isGlobWord = (word: string): boolean => /[*?]|\[.*\]/s.test(word);
+  const cmdMakesLink = (cmd: Simple): boolean =>
+    programs(cmd.argv).some((at) => {
+      const tool = path.basename(cmd.argv[at]);
+      const args = cmd.argv.slice(at + 1);
+      if (printsOnly(tool, args) || copiesNothing(tool, args)) return false;
+      if (tool === "ln") return true;
+      if (tool === "cp") {
+        const c = copyReading("cp", args);
+        return c.symbolic || c.hard;
+      }
+      return false;
+    });
+  const otherMakesLink = (cmd: Simple): boolean => cmds.some((c) => c !== cmd && cmdMakesLink(c));
   const globMatchIssue = (word: string, cmd: Simple, dirFlag: boolean, sources: string[] | undefined, toolName: string): string | undefined => {
+    if (!isGlobWord(word)) return undefined;
+    if (otherMakesLink(cmd)) return `${toolName} writes ${word} in a call whose other command creates a link`;
     const placed = pwdPlaced(word, cmd);
+    if (/[$`]/.test(placed)) return `${toolName} writes ${word}: a glob with an expansion the check cannot list`;
     const t = tilde(placed);
-    if (/[$`]/.test(placed) || /^~[^/]/.test(t) || !/[*?]|\[.*\]/s.test(word)) return undefined;
+    if (/^~[^/]/.test(t)) return undefined;
     const dirs = path.isAbsolute(t) ? ["/"] : (where.places.get(cmd)?.map((x) => x.real) ?? (where.cwd.get(cmd) ? [where.cwd.get(cmd)!] : []));
     for (const dir of dirs) {
       const matches = expandWord(t, dir);
@@ -5655,6 +5682,75 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
           const v = fileVerdict("edit", q, { ...scope, pending: new Map(scope.pending) });
           if (v.action !== "allow") return v.reason.replace(/^edit /, `${toolName} writes `);
         }
+      }
+    }
+    return undefined;
+  };
+  const removeGlobIssue = (word: string, cmd: Simple, toolName: string): string | undefined => {
+    if (!isGlobWord(word)) return undefined;
+    const verb = toolName === "mv" ? "moves" : "removes";
+    if (otherMakesLink(cmd)) return `${toolName} ${verb} ${word} in a call whose other command creates a link`;
+    const placed = pwdPlaced(word, cmd);
+    if (/[$`]/.test(placed)) return `${toolName} ${verb} ${word}: a glob with an expansion the check cannot list`;
+    const t = tilde(placed);
+    if (/^~[^/]/.test(t)) return undefined;
+    const dirs = path.isAbsolute(t) ? ["/"] : (where.places.get(cmd)?.map((x) => x.real) ?? (where.cwd.get(cmd) ? [where.cwd.get(cmd)!] : []));
+    const hasSymlinkParent = (raw: string, baseDir: string): boolean => {
+      const parent = path.dirname(raw);
+      const anchor = !path.isAbsolute(t) ? baseDir : roots.map(realish).find((r) => within(parent, r));
+      if (anchor === undefined || !within(parent, anchor)) return false;
+      const rel = path.relative(anchor, parent);
+      if (!rel || rel === ".") return false;
+      let cur = anchor;
+      for (const seg of rel.split("/")) {
+        if (!seg || seg === ".") continue;
+        cur = path.join(cur, seg);
+        try {
+          if (fs.lstatSync(cur).isSymbolicLink()) return true;
+        } catch (e) {
+          const code = (e as NodeJS.ErrnoException)?.code;
+          if (code === "ENOENT" || code === "ENOTDIR") return false;
+          return true;
+        }
+      }
+      return false;
+    };
+    const checkDir = (dirEntry: string, baseDir: string): string | undefined => {
+      const norm = path.normalize(dirEntry);
+      if (hasSymlinkParent(path.join(norm, ".automode-placed-check"), baseDir)) return `${toolName} ${verb} ${word} through a symlinked directory`;
+      const realDir = physical(norm);
+      const v = fileVerdict("edit", path.join(realDir, ".automode-placed-check"), { ...scope, pending: new Map(scope.pending) });
+      return v.action !== "allow" ? v.reason.replace(/^edit /, `${toolName} ${verb} `) : undefined;
+    };
+    for (const dir of dirs) {
+      const matches = expandNames(t, dir);
+      if (matches === undefined) return `${toolName} ${verb} ${word}, a glob the check cannot list`;
+      if (matches.length === 0 && t.includes("/")) {
+        const parentPattern = path.dirname(t);
+        const parentMatches = expandNames(parentPattern, dir);
+        if (parentMatches === undefined) return `${toolName} ${verb} ${word}, a glob the check cannot list`;
+        for (const pDir of parentMatches) {
+          const issue = checkDir(pDir, dir);
+          if (issue) return issue;
+        }
+        continue;
+      }
+      for (const raw0 of matches) {
+        const raw = path.normalize(raw0);
+        if (/^\/dev\/(null|zero|full|stdout|stderr|tty|fd\/\d+)$/.test(raw)) continue;
+        if (hasSymlinkParent(raw, dir)) return `${toolName} ${verb} ${word} through a symlinked directory`;
+        const realParent = physical(path.dirname(raw));
+        let isLink = false;
+        try {
+          isLink = fs.lstatSync(raw).isSymbolicLink();
+        } catch {}
+        const checkPath = word.endsWith("/")
+          ? path.join(physical(raw), ".automode-placed-check")
+          : isLink
+            ? path.join(realParent, ".automode-placed-check")
+            : path.join(realParent, path.basename(raw));
+        const v = fileVerdict("edit", checkPath, { ...scope, pending: new Map(scope.pending) });
+        if (v.action !== "allow") return v.reason.replace(/^edit /, `${toolName} ${verb} `);
       }
     }
     return undefined;
@@ -5684,7 +5780,7 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
     if (placedIssue) break;
     const toolName = path.basename(w.cmd.argv[0] ?? "");
     if (/^\/dev\/(null|zero|full|stdout|stderr|tty|fd\/\d+)$/.test(tilde(w.word))) continue;
-    const isGlob = /[*?]|\[.*\]/s.test(w.word);
+    const isGlob = isGlobWord(w.word);
     if (w.checked && !["tee", "truncate", "dd", ">"].includes(w.by ?? "")) {
       const p = resolve(w.word, w.cmd);
       if (p && (path.isAbsolute(tilde(w.word)) || where.cwd.get(w.cmd) !== undefined)) {
@@ -5704,23 +5800,43 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
       }
     }
     if (!placedIssue && isGlob && w.by !== "curl" && w.by !== "wget") placedIssue = globMatchIssue(w.word, w.cmd, !!w.dir, w.sources, toolName);
+    if (!placedIssue && w.by === "mv" && w.sources) {
+      for (const src of w.sources) {
+        placedIssue = removeGlobIssue(src, w.cmd, "mv");
+        if (placedIssue) break;
+      }
+    }
   }
   if (!placedIssue) {
-    const otherWriters = new Set(["chmod", "chown", "chgrp", "touch", "mkdir", "rmdir", "shred", "unlink", "setfacl"]);
+    const otherWriters = new Set(["chmod", "chown", "chgrp", "touch", "mkdir", "shred", "setfacl"]);
+    const removers = new Set(["rm", "rmdir", "unlink"]);
     for (const cmd of cmds) {
       if (placedIssue) break;
       for (const at of programs(cmd.argv)) {
         if (placedIssue) break;
         const tool = path.basename(cmd.argv[at]);
-        if (!otherWriters.has(tool)) continue;
+        if (!otherWriters.has(tool) && !removers.has(tool)) continue;
         const args = cmd.argv.slice(at + 1);
         if (printsOnly(tool, args)) continue;
+        if (tool === "chmod") {
+          const ch = chmodReading(args);
+          if (ch.unknown) {
+            placedIssue = `chmod ${ch.unknown}: an option the check cannot read`;
+            break;
+          }
+          for (const op of ch.files) {
+            placedIssue = globMatchIssue(op, cmd, false, undefined, tool);
+            if (placedIssue) break;
+          }
+          continue;
+        }
         const dashes = args.indexOf("--");
         const head = dashes < 0 ? args : args.slice(0, dashes);
         const ops = [...head.filter((a) => !a.startsWith("-")), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
-        const skipFirst = (tool === "chmod" || tool === "chown" || tool === "chgrp") && !head.some((a) => a.startsWith("--ref") && "--reference".startsWith(a.split("=")[0])) && !(tool === "chmod" && head.some((a) => (/^-[rwxXstugoa+=,-]+$/.test(a) && /[rwxXst]/.test(a)) || /^-[0-7]{1,4}$/.test(a)));
+        const skipFirst = (tool === "chown" || tool === "chgrp") && !head.some((a) => a.startsWith("--ref") && "--reference".startsWith(a.split("=")[0]));
+        const check = removers.has(tool) ? (op: string) => removeGlobIssue(op, cmd, tool) : (op: string) => globMatchIssue(op, cmd, false, undefined, tool);
         for (const op of skipFirst ? ops.slice(1) : ops) {
-          placedIssue = globMatchIssue(op, cmd, false, undefined, tool);
+          placedIssue = check(op);
           if (placedIssue) break;
         }
       }

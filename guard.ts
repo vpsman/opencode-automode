@@ -5383,6 +5383,8 @@ export function secondNames(cmd: Simple, writes: Write[], expand: (word: string)
     const mine = writes.filter((w) => w.cmd === cmd && w.by === name);
     if (name === "sed") {
       const r = sedReading(args);
+      // GNU sed replaces `*` in a backup suffix with the input file's base name (and `/` moves the
+      // backup elsewhere); decide.ts optionNamedPath asks on any sed -i suffix containing `*` or `/`.
       if (r.inPlace) for (const suffix of r.suffixes) for (const w of mine) for (const n of each(w.word, "sed -i's backup", ends(suffix))) out.push(n + suffix);
     } else if (Object.hasOwn(COPY_OPTIONS, name)) {
       const got = getopt(args, COPY_OPTIONS[name]);
