@@ -16,7 +16,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { bare, bashVerdict, compressorReading, copiesNothing, copyReading, findActions, printsOnly, sedReading, sortReading, sortRunsCompressor, fileVerdict, parse, readVerdict, rsyncReading, skippable, tarReading, twoOpOperands, within, type Matcher, type Scope, type Simple } from "./rules.ts";
+import { bare, bashVerdict, compressorReading, copiesNothing, copyReading, findActions, printsOnly, sedReading, sortReading, sortRunsCompressor, fileVerdict, parse, readVerdict, rsyncReading, skippable, tarReading, twoOpOperands, within, yqReading, type Matcher, type Scope, type Simple } from "./rules.ts";
 import { gitArgs, gitEnv } from "./sandbox.ts";
 
 const HOME = os.homedir();
@@ -5584,7 +5584,16 @@ export function writesOf(cmds: Simple[], filesOnly?: (sources: string[], cmd: Si
           unlisted.push({ cmd, reason: why, dirs: [undefined] });
         }
       }
-      else if ((name === "yq" || name === "jq") && (dashes < 0 ? args : args.slice(0, dashes)).some((a) => /^-[a-eg-km-nq-zA-KM-Z]*i|^--in-?p[a-z-]*(?:=|$)/.test(a))) {
+      else if (name === "yq") {
+        const yq = yqReading(args);
+        if (yq.inPlace) {
+          yq.files.forEach((f) => add(f, false));
+          if (yq.operands.length > 1 && yq.op0Index !== undefined && cmd.glob?.[at + 1 + yq.op0Index]) add(yq.operands[0], false);
+        } else if (!yq.plain && (dashes < 0 ? args : args.slice(0, dashes)).some((a) => /^-[a-eg-km-nq-zA-KM-Z]*i|^--in-?p[a-z-]*(?:=|$)/.test(a))) {
+          files.forEach((f) => add(f, false));
+        }
+      }
+      else if (name === "jq" && (dashes < 0 ? args : args.slice(0, dashes)).some((a) => /^-[a-eg-km-nq-zA-KM-Z]*i|^--in-?p[a-z-]*(?:=|$)/.test(a))) {
         const head = dashes < 0 ? args : args.slice(0, dashes);
         const fromFile = head.some((a) => {
           if (/^-[a-zA-Z]*f/.test(a)) return true;

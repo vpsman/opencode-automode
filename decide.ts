@@ -36,6 +36,7 @@ import {
   sedReading,
   skippable,
   tarReading,
+  unreadSpelling,
   within,
   type Action,
   type Matcher,
@@ -6255,42 +6256,13 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
               if (tr.members.includes(w) && !tr.archives.includes(w) && !tr.optionValues.includes(w)) skipSymlink.add(progAt + 1 + j);
             }
           }
-        } else if (progName === "zip") {
-          const ZIP_VALUED = /^-(b|n|t|tt|O|P|s|sp|Z|ds|x|i|R)$|^--(output-file|temp-path|suffixes|from-date|before-date|password|split-size|compression-method|exclude|include)$/;
-          let zipEnded = false;
+        } else if (progName === "zip" && !unreadSpelling("zip", progArgs)) {
           let seenArchive = false;
-          let zipUnsafe = false;
-          const zipOps: number[] = [];
           for (let j = 0; j < progArgs.length; j++) {
-            const a = progArgs[j];
-            if (!zipEnded && a === "--") {
-              zipEnded = true;
-              continue;
-            }
-            if (!zipEnded && a.startsWith("-")) {
-              if (ZIP_VALUED.test(a)) {
-                j++;
-                continue;
-              }
-              if (/^--(output-file|temp-path|suffixes|from-date|before-date|password|split-size|compression-method|exclude|include)=/.test(a)) continue;
-              if (a.startsWith("--")) {
-                if (/^--(move|delete|test|fix|fixfix|unzip-command)(=|$)/.test(a)) zipUnsafe = true;
-                continue;
-              }
-              for (let k = 1; k < a.length; k++) {
-                const ch = a[k];
-                if ("bntOPsZ".includes(ch)) {
-                  if (k === a.length - 1) j++;
-                  break;
-                }
-                if ("mdTFU".includes(ch)) zipUnsafe = true;
-              }
-              continue;
-            }
+            if (progArgs[j].startsWith("-")) continue;
             if (!seenArchive) seenArchive = true;
-            else zipOps.push(progAt + 1 + j);
+            else skipSymlink.add(progAt + 1 + j);
           }
-          if (!zipUnsafe) for (const idx of zipOps) skipSymlink.add(idx);
         }
       }
       for (let i = progs[0]; i < cmd.argv.length; i++) {

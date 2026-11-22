@@ -993,3 +993,66 @@ test("round 12 (Opus, Neon)", async () => {
     "gzip a=b.log",
   ]) assert.equal(await decide12(command), "allow", command);
 });
+
+test("round 13 (Opus, Neon)", async () => {
+  const repo13 = path.join(base, "repo13");
+  const outsideDir = path.join(base, "outside13-dir");
+  for (const d of ["d", "src", "dist", "docs", "sub"]) fs.mkdirSync(path.join(repo13, d), { recursive: true });
+  fs.mkdirSync(outsideDir, { recursive: true });
+  fs.writeFileSync(path.join(outsideDir, "f.txt"), "outside\n");
+  for (const f of ["a", "b", "f", "d/a", "src/a.ts", "dist/app.js", "docs/readme.md", "a.yaml", "b.yaml", "s.yq", "AGENTS.md", ".env", "package.json"]) {
+    fs.writeFileSync(path.join(repo13, f), "hello\n");
+  }
+  execFileSync("git", ["init", "-q", "-b", "main", repo13]);
+  fs.symlinkSync(outsideDir, path.join(repo13, "sub", "outdir"));
+  const decide13 = async (command: string) => (await decideShell(guard, new SessionState(repo13), repo13, command)).effect;
+
+  for (const command of [
+    // Opus: zip -lf / --logfile-path takes a value and shifts the archive operand.
+    "zip -lf z.log AGENTS.md d/a",
+    "zip -lf z.log .git/hooks/pre-commit d/a",
+    "zip --logfile-path z.log AGENTS.md d/a",
+    // Neon 1: zip --out / -O after archive or --out= and glob in --out.
+    "zip -r a.zip --out sub/outd*/f.txt src/a.ts",
+    "zip -r /tmp/a.zip --out package.json src/a.ts && npm test",
+    "zip -r a.zip --out=AGENTS.md src/a.ts",
+    "zip -r a.zip -O AGENTS.md src/a.ts",
+    // Neon 3: zip -m / --move deletes sources, and -lf after archive.
+    "zip -r a.zip -m AGENTS.md",
+    "zip -r a.zip --move AGENTS.md",
+    "zip -r a.zip -lf AGENTS.md src/a.ts",
+    "zip -r - a.zip src/a.ts",
+    "zip -r -y a.zip src/a.ts",
+    // Neon 2: yq -i with a trailing valued plain option after a single file operand.
+    "yq -i AGENTS.md --indent 2",
+    "yq -i AGENTS.md -o json",
+    "yq -i AGENTS.md -I 2",
+    "yq -i eval AGENTS.md --indent 2",
+    "yq -i ../outside13.yaml -o json",
+    // Neon 4: yq -s / --split-exp / --split-exp-file writes files named by the expression.
+    'yq -s \'"AGENTS.md"\' a.yaml',
+    'yq --split-exp \'"AGENTS.md"\' a.yaml',
+    "yq --split-exp-file s.yq a.yaml",
+    // Neon 5: yq -f / --from-file reads a script file.
+    "yq -f .env a.yaml",
+    "yq --from-file=.env a.yaml",
+    "yq --from-file .env a.yaml",
+  ]) assert.equal(await decide13(command), "ask", command);
+
+  for (const command of [
+    "zip -r a.zip src",
+    "zip -rq build.zip dist",
+    "zip -9 a.zip f",
+    "zip a.zip a b",
+    "zip -r archive.zip docs/",
+    "yq '.a' a.yaml",
+    "yq -i '.a=1' a.yaml",
+    "yq -o json '.' a.yaml",
+    "yq -P '.' a.yaml",
+    "yq e '.a' a.yaml",
+    "cat a.yaml | yq '.a'",
+    "yq -i '.a=1' a.yaml --indent 2",
+    "yq -i a.yaml -o json",
+    "yq eval-all '.a' a.yaml b.yaml",
+  ]) assert.equal(await decide13(command), "allow", command);
+});

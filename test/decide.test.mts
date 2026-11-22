@@ -8898,8 +8898,9 @@ describe("r4 B10", () => {
   });
 
   describe("B10-10: the small points", () => {
-    b7Each("B10-10", "ask", ["zip -OAGENTS.md a.zip f", "zip -qOAGENTS.md a.zip f", "zip -O.git/hooks/pre-commit a.zip f", "zip -qO AGENTS.md a.zip f", "zip --output-file=AGENTS.md a.zip f"], one);
-    b7Each("B10-10", "allow", ["zip -Oout.zip a.zip f", "zip -r b10.zip src"], one);
+    // (Project review 3, round 13: zip is read only in its plain spellings, so `-O` asks too.)
+    b7Each("B10-10", "ask", ["zip -OAGENTS.md a.zip f", "zip -qOAGENTS.md a.zip f", "zip -O.git/hooks/pre-commit a.zip f", "zip -qO AGENTS.md a.zip f", "zip --output-file=AGENTS.md a.zip f", "zip -Oout.zip a.zip f"], one);
+    b7Each("B10-10", "allow", ["zip -r b10.zip src"], one);
     test("r4 B10-10: an include of a file that is not there holds no keys; a link that leads nowhere still goes to the model", async () => {
       const f = b10Fixture();
       f.g("config", "includeIf.onbranch:nothing.path", "missing.cfg");

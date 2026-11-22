@@ -533,6 +533,9 @@ function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope)
       return undefined;
     }
     words = [...r.files, ...r.scriptFiles];
+  } else if (name === "yq") {
+    const yq = yqReading(args);
+    words = yq.plain ? yq.files : args;
   } else if (PATTERN_FIRST.has(name)) words = operands(args).slice(1);
   else if (COPIERS.has(name)) {
     // With `-t DIR` (`--target-directory`) the destination is named first and every operand is a
@@ -3025,6 +3028,88 @@ const CLOC_PLAIN: Plain = {
   flags: "by-file by-file-by-lang json yaml csv md xml quiet hide-rate fullpath follow-links skip-uniqueness no-autogen".split(" "),
   valued: "exclude-dir exclude-ext exclude-lang include-lang include-ext match-f not-match-f match-d not-match-d timeout processes".split(" "),
 };
+// zip: only short flag clusters of `r q j X D 0-9` and `ARCHIVE FILE...` operands; every other
+// option (`-m`, `-lf`, `-O`/`--out`, `-T`, `-x`/`-i`, `-@`, `-b`, `-u`/`-f`/`-d`/`-U`, `-y`, `-e`,
+// any long option, `-` alone) asks (project review 3, round 13, Opus, Neon).
+function zipPlain(args: string[]): boolean {
+  let ops = 0;
+  for (const w of args) {
+    if (w.startsWith("-")) {
+      if (!/^-[rqjXD0-9]+$/.test(w)) return false;
+    } else ops++;
+  }
+  return ops >= 2;
+}
+// yq: expression then file operands (after an optional `eval`/`e`/`eval-all`/`ea` subcommand),
+// with only the common formatting/in-place options; `-f`/`--from-file`, `-s`/`--split-exp*` and
+// every other option ask (project review 3, round 13, Neon).
+const YQ_SUBS = new Set(["eval", "e", "eval-all", "ea"]);
+const YQ_PLAIN: Plain = {
+  short: "iPernNMC",
+  shortValued: "opI",
+  attached: "opI",
+  flags: ["inplace", "prettyPrint", "exit-status", "unwrapScalar", "null-input", "no-doc"],
+  valued: ["output-format", "input-format", "indent"],
+};
+export interface YqReading {
+  plain: boolean;
+  inPlace: boolean;
+  operands: string[];
+  files: string[];
+  op0Index?: number;
+}
+export function yqReading(args: string[]): YqReading {
+  let plain = true;
+  let inPlace = false;
+  let seenSub = false;
+  const ops: string[] = [];
+  let op0Index: number | undefined;
+  for (let k = 0; k < args.length; k++) {
+    const w = args[k];
+    if (w === "--") {
+      for (let j = k + 1; j < args.length; j++) {
+        if (ops.length === 0) op0Index = j;
+        ops.push(args[j]);
+      }
+      break;
+    }
+    if (w.startsWith("--")) {
+      const eq = w.indexOf("=");
+      const head = w.slice(2, eq < 0 ? undefined : eq);
+      if (eq < 0 && YQ_PLAIN.flags.includes(head)) {
+        if (head === "inplace") inPlace = true;
+        continue;
+      }
+      if (!YQ_PLAIN.valued.includes(head)) {
+        plain = false;
+        continue;
+      }
+      if (eq < 0 && ++k >= args.length) plain = false;
+      continue;
+    }
+    if (w.startsWith("-") && w !== "-") {
+      const next = cluster(w, YQ_PLAIN.short, YQ_PLAIN.shortValued, 1, YQ_PLAIN.attached);
+      if (next === undefined) {
+        plain = false;
+        continue;
+      }
+      for (let j = 1; j < w.length; j++) {
+        if (YQ_PLAIN.shortValued.includes(w[j])) break;
+        if (w[j] === "i") inPlace = true;
+      }
+      if (next && ++k >= args.length) plain = false;
+      continue;
+    }
+    if (!seenSub && ops.length === 0 && YQ_SUBS.has(w)) {
+      seenSub = true;
+      continue;
+    }
+    if (ops.length === 0) op0Index = k;
+    ops.push(w);
+  }
+  const files = inPlace ? (ops.length === 1 ? ops : ops.slice(1)) : ops.slice(1);
+  return { plain, inPlace, operands: ops, files, ...(op0Index !== undefined ? { op0Index } : {}) };
+}
 export function unreadSpelling(name: string, args: string[]): string | undefined {
   if (args.length === 1 && /^--(help|version)$/.test(args[0])) return undefined;
   const plain =
@@ -3035,6 +3120,8 @@ export function unreadSpelling(name: string, args: string[]): string | undefined
     : name === "ps" ? psPlain(args)
     : Object.hasOwn(COMPRESSORS, name) ? optionsPlain(args, COMPRESSOR_PLAIN)
     : name === "cloc" ? optionsPlain(args, CLOC_PLAIN)
+    : name === "zip" ? zipPlain(args)
+    : name === "yq" ? yqReading(args).plain
     : true;
   return plain ? undefined : `${name} with an option or spelling the rules do not read`;
 }
@@ -4261,6 +4348,16 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
     const ops = twoOpOperands(name, args);
     if (ops.unknown) return worst(verdict, ask(`${name} ${ops.unknown}: an option the rules do not read, so its output file is not known`));
     if (ops.operands.length === 1 && MAY_EXPAND.test(ops.operands[0])) return worst(verdict, ask(`${name} with one expanding operand (${ops.operands[0]}): bash may expand it into both input and output`));
+  }
+  if (name === "yq") {
+    const yq = yqReading(args);
+    if (yq.inPlace) {
+      if (yq.files.some((f) => /(^|\/)\.git(\/|$)/.test(resolveWord(f, scope) ?? f))) return worst(verdict, ask("yq writes a file in a .git directory"));
+      if (yq.files.length) {
+        const w = writeTargets("tee", ["--", ...yq.files], scope);
+        if (w.action !== "allow") return worst(verdict, { ...w, reason: w.reason.replace(/^tee/, "yq") });
+      }
+    }
   }
   if (READ_ONLY.has(name) || DEV_TOOLS.has(name)) return verdict;
   // (Council project review 2, round 34, Mythos: unittest imports and calls any name it is given,
