@@ -4934,16 +4934,22 @@ function assignedExpansions(word: string, allAssigned?: Map<string, string[]>): 
   return vals ? vals.map((v) => `${m[1]}${v}${m[4]}`) : [];
 }
 function printfTargets(args: string[], knownVars?: Map<string, string>, allAssigned?: Map<string, string[]>): string[] {
-  const out = valued(args, "v", "--never");
+  // printf's one option, read as bash reads it: `-v NAME`, or `-vNAME` attached (round 23, Sol:
+  // `-vv` is `-v v`, not a cluster of flags).
+  const out: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--") break;
     if (!/[$`]/.test(a)) {
       if (a === "-v") {
+        if (i + 1 < args.length) out.push(args[i + 1]);
         i++;
         continue;
       }
-      if (a.startsWith("-v")) continue;
+      if (a.startsWith("-v")) {
+        out.push(a.slice(2));
+        continue;
+      }
       break;
     }
     const kv = knownExpansion(a, knownVars);
@@ -9016,7 +9022,7 @@ function unreadNames(command: string, cmds: Simple[], cwd?: string): Set<string>
         if (!words.length || c.argv.every((w) => LOOP_KEYWORDS.has(w))) return false;
         return !(LOOP_SAFE.has(path.basename(words[0])) || words.every((w) => ASSIGN.test(w)));
       });
-      if (!listed || listed.some((l) => l === undefined || l.some((f) => /\s/.test(path.relative(cwd!, f.replace(/^\/+/, "/"))))) || makes) out.add(m[1]);
+      if (!listed || listed.some((l) => l === undefined || l.some((f) => { const raw = f.replace(/^\/+/, "/"); const prefix = cwd!.replace(/\/+$/, "") + "/"; return /\s/.test(raw.startsWith(prefix) ? raw.slice(prefix.length) : raw); })) || makes) out.add(m[1]);
     }
   }
   return out;

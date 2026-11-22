@@ -1513,3 +1513,21 @@ test("round 22 (Opus, Sol): read behind a keyword, and a glob match's directorie
     'while read -r line; do [ -n "$line" ] && echo "$line"; done < f',
   ]) assert.equal(await decideIn(clean, command), "allow", command);
 });
+
+test("round 23 (Sol, Opus): printf -vNAME attached, and a blank in a directory that .. steps back out of", async () => {
+  const repo23 = path.join(base, "repo23");
+  fs.mkdirSync(path.join(repo23, "x -o -v a[$(date)] -o y"), { recursive: true });
+  fs.writeFileSync(path.join(repo23, "ok.ts"), "");
+  execFileSync("git", ["init", "-q", "-b", "main", repo23]);
+  const decide23 = async (command: string) => (await decideShell(guard, new SessionState(repo23), repo23, command)).effect;
+  for (const command of [
+    "printf -vv '%s%s %s' - v 'a[$(date)]'; test $v",
+    "printf -vvarv '%s%s %s' - v 'a[$(date)]'; test $varv",
+    "for f in */../*.ts; do [ -f $f ]; done",
+  ]) assert.notEqual(await decide23(command), "allow", command);
+  for (const command of [
+    'printf -v out "%03d" 3; echo "$out"',
+    'printf -vout %s x; [ "$out" = x ]',
+    "for f in *.ts; do [ -f $f ]; done",
+  ]) assert.equal(await decide23(command), "allow", command);
+});
