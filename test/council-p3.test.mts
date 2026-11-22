@@ -1447,3 +1447,33 @@ test("round 20 (Opus, Sol): only names known to be safe pass unquoted into test,
     "printf '%s\\n' $x",
   ]) assert.equal(await decide20(command), "allow", command);
 });
+
+test("round 21 (Opus, Sol): glob-fed loop names whose files hold blanks, and names bash sets by itself", async () => {
+  const hostile = path.join(base, "repo21h");
+  fs.mkdirSync(hostile, { recursive: true });
+  fs.writeFileSync(path.join(hostile, "f"), "-v a[$(date)]\n");
+  for (const f of ["x -o -v a[$(date)] -o y.ts", " a[$(date)]", "b.ts"]) fs.writeFileSync(path.join(hostile, f), "");
+  execFileSync("git", ["init", "-q", "-b", "main", hostile]);
+  const clean = path.join(base, "repo21c");
+  fs.mkdirSync(path.join(clean, "d"), { recursive: true });
+  for (const f of ["a.ts", "b.ts"]) fs.writeFileSync(path.join(clean, f), "");
+  execFileSync("git", ["init", "-q", "-b", "main", clean]);
+  const decideIn = async (repo: string, command: string) => (await decideShell(guard, new SessionState(repo), repo, command)).effect;
+
+  for (const command of [
+    "for f in *.ts; do [ -f $f ] && echo $f; done",
+    "for f in *; do [ -e $f ]; done",
+    "for f in */; do [ -d $f ] && ls $f; done",
+    "for f in *; do wait $f; done",
+    "for arg in *; do test -v$arg; done",
+    "REPLY=x; read -r < f; test $REPLY",
+    "REPLY=x; read -r < f; [ $REPLY ]",
+  ]) assert.notEqual(await decideIn(hostile, command), "allow", command);
+
+  for (const command of [
+    "for f in *.ts; do [ -f $f ] && echo $f; done",
+    "for f in */; do [ -d $f ] && ls $f; done",
+    "REPLY=x; [ $REPLY = x ]",
+    "for f in a b; do test -n $f; done",
+  ]) assert.equal(await decideIn(clean, command), "allow", command);
+});

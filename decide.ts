@@ -6088,7 +6088,7 @@ async function decidePrinted(guard: Guard, session: SessionState, cwd: string, p
   };
   // B11: what a word reads, judged where it leads, and a link made to a credential location.
   const fromPlaces = stricter(stricter(placedReads(where, scope, judgeAt, landedProtected), inputReads(printed.inputs, text, where, here, scope, printed.judgedInputs)), linkedReads(where, scope, judgeAt, landedProtected));
-  const fromWords = stricter(stricter(stricter(argvGuards(cmds, context), expansionProblem(text)), stricter(runtimeReads(text, where, scope, (c, args, diff) => gitConfigProblem(c, args, diff) === undefined, printed), fromPlaces)), stricter(arithmeticAssignments(arithmeticSets), optionNamedPath(cmds, (c) => where.places.get(c)?.map((p) => p.real))));
+  const fromWords = stricter(stricter(stricter(argvGuards(cmds, context), expansionProblem(text, cwdKnown ? here : undefined)), stricter(runtimeReads(text, where, scope, (c, args, diff) => gitConfigProblem(c, args, diff) === undefined, printed), fromPlaces)), stricter(arithmeticAssignments(arithmeticSets), optionNamedPath(cmds, (c) => where.places.get(c)?.map((p) => p.real))));
   const combined = !fromText ? fromWords : !fromWords ? fromText : fromText.action === "ask" ? fromText : fromWords.action === "ask" ? fromWords : (fromWords.files ? fromWords : fromText);
   // The rules read a quoted `~` as the home directory, bash does not: their verdict is about other
   // paths than the ones bash uses.

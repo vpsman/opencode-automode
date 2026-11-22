@@ -8977,8 +8977,13 @@ const UNQUOTED_COMPUTED = new RegExp(`${MARK_UNQUOTED}\\$(?:\\d|\\{\\d|\\{!|\\{[
 // expansion (other than `$!`, `$$`, `$?`, `$#`, which are numbers), the names `read`, `mapfile`,
 // `readarray` and `getopts` set, and a `for` name over a list that is not plain words or globs
 // (or over the positional parameters). Over-approximated: an extra name only asks more.
-function unreadNames(command: string, cmds: Simple[]): Set<string> {
+function unreadNames(command: string, cmds: Simple[], cwd?: string): Set<string> {
   const out = new Set<string>();
+  // (Round 21, Sol: a name bash sets by itself, REPLY, MAPFILE, OPTARG, DIRSTACK, BASH_REMATCH,
+  // ..., is unread wherever the call runs something that sets one without naming it, a literal
+  // assignment before it notwithstanding: `REPLY=x; read -r < f; test $REPLY`.)
+  const implicit = cmds.some(({ argv }) => ["read", "select", "mapfile", "readarray", "getopts", "cd", "pushd", "popd", "coproc", "[["].includes(path.basename(argv[0] ?? ""))) || /\bselect\s|\[\[|=~/.test(command);
+  if (implicit) for (const n of ["REPLY", "MAPFILE", "OPTARG", "OPTIND", "DIRSTACK", "BASH_REMATCH", "COPROC", "PWD", "OLDPWD", "_"]) out.add(n);
   for (const [n, values] of collectAssigned(cmds)) if (values.some((v) => /[$`]/.test(v.replace(/\$[!$?#]/g, "")))) out.add(n);
   for (const { argv } of cmds) {
     const name = path.basename(argv[0] ?? "");
@@ -8991,11 +8996,29 @@ function unreadNames(command: string, cmds: Simple[]): Set<string> {
   for (const m of command.matchAll(/\b(?:for|select)\s+([A-Za-z_]\w*)\s*(?:in\b([^;\n]*))?(?=[;\n]|\s+do\b)/g)) {
     const list = m[2];
     if (list === undefined || /[$`'"\\]/.test(list)) out.add(m[1]);
+    // (Round 21, Opus, Sol: a glob in the list takes file names, which can hold blanks: safe only
+    // where each glob lists here with no match holding one, and no other command of the call may
+    // make files meanwhile.)
+    else if (/[*?[]/.test(list)) {
+      const globs = list.trim().split(/\s+/).filter((w) => /[*?[]/.test(w));
+      const listed = cwd === undefined ? undefined : globs.map((g) => expandNames(g, cwd));
+      const makes = cmds.some((c) => {
+        if (c.out.length > 0) return true;
+        if (["for", "select"].includes(c.argv[0] ?? "")) return false;
+        const words = c.argv.slice(c.argv.findIndex((w) => !LOOP_KEYWORDS.has(w)));
+        if (!words.length || c.argv.every((w) => LOOP_KEYWORDS.has(w))) return false;
+        return !(LOOP_SAFE.has(path.basename(words[0])) || words.every((w) => ASSIGN.test(w)));
+      });
+      if (!listed || listed.some((l) => l === undefined || l.some((f) => /\s/.test(path.basename(f)))) || makes) out.add(m[1]);
+    }
   }
   return out;
 }
+// Programs that make no file, for the glob-loop rule above (the loop's own body included).
+const LOOP_KEYWORDS = new Set(["do", "done", "then", "else", "elif", "fi", "if", "while", "until", "{", "}", "!", "time"]);
+const LOOP_SAFE = new Set(["test", "[", "echo", "printf", "true", "false", ":", "ls", "cat", "wc", "head", "tail", "grep", "stat", "file", "du", "basename", "dirname", "wait"]);
 
-export function expansionProblem(command: string): GuardVerdict | undefined {
+export function expansionProblem(command: string, cwd?: string): GuardVerdict | undefined {
   if (!/[$`]/.test(command)) return undefined;
   const pairs = markedCommands(command);
   if (!pairs) return { action: "classify", reason: "words with expansions the guard could not line up with the rules' reading" };
@@ -9054,7 +9077,7 @@ export function expansionProblem(command: string): GuardVerdict | undefined {
           // plain words or globs included) and it is not a name bash sets by itself (`REPLY`,
           // `OPTARG`, `MAPFILE`, ...: upper case or `_`). Anything else, a concatenation of
           // values with blanks (`test $op$arg`) included, goes to the model.)
-          const unread = (unreadValues ??= unreadNames(command, real));
+          const unread = (unreadValues ??= unreadNames(command, real, cwd));
           const assigned = (assignedValues ??= collectAssigned(real));
           const safeName = (n: string) => {
             if (unread.has(n)) return false;
