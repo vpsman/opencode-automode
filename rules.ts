@@ -4656,7 +4656,8 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
     const rest = c.argv.slice(at + 1);
     // (Round 25, Opus: only a word that begins with an expansion can become an option; `$!`,
     // `$$`, `$?`, `$#` are numbers.)
-    const dynamic = (w: string) => { const v = w.replace(/\$[!$?#]/g, ""); return /^[$`]/.test(v); };
+    // (Round 26, Opus, Sol: or a word that begins with `-` and holds an expansion, `printf "-$op"`.)
+    const dynamic = (w: string) => { const v = w.replace(/\$[!$?#]/g, ""); return /^[$`]/.test(v) || (v.startsWith("-") && /[$`]/.test(v)); };
     return c.argv[at] === "printf" ? dynamic(rest[0] ?? "") : rest.some(dynamic);
   });
   const attached = (name: string) => dynamicSetter || new RegExp(`(^|[^\\w$])-[A-Za-z]*${name}(?!\\w)`).test(setters);

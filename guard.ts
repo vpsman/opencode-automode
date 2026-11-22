@@ -9015,7 +9015,8 @@ function unreadNames(command: string, cmds: Simple[], cwd?: string): Set<string>
     // variable: then no name's known value is trusted.)
     // (Round 25, Opus: only a first word that begins with an expansion can turn into an option;
     // `$!`, `$$`, `$?` and `$#` are numbers.)
-    const dynamic = (w: string) => /^[$`]/.test(w.replace(/\$[!$?#]/g, "")) && /[$`]/.test(w.replace(/\$[!$?#]/g, ""));
+    // (Round 26, Opus, Sol: or a word that begins with `-` and holds an expansion, `printf "-$op"`.)
+    const dynamic = (w: string) => { const v = w.replace(/\$[!$?#]/g, ""); return /^[$`]/.test(v) || (v.startsWith("-") && /[$`]/.test(v)); };
     if ((name === "printf" && dynamic(args[0] ?? "")) || (name === "wait" && args.some(dynamic))) out.add("*");
     if (name === "wait") for (const t of waitTargets(args)) out.add(t.replace(/\[.*$/s, ""));
   }
