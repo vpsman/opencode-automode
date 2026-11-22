@@ -4658,7 +4658,16 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
     // `$$`, `$?`, `$#` are numbers.)
     // (Round 26, Opus, Sol: or a word that begins with `-` and holds an expansion, `printf "-$op"`.)
     const dynamic = (w: string) => { const v = w.replace(/\$[!$?#]/g, ""); return /^[$`]/.test(v) || (v.startsWith("-") && /[$`]/.test(v)); };
-    return c.argv[at] === "printf" ? dynamic(rest[0] ?? "") : rest.some(dynamic);
+    if (c.argv[at] !== "printf") return rest.some(dynamic);
+    // (Round 27, Opus, Sol: every word in printf's option area, `printf -v line "$op"` too.)
+    for (let i = 0; i < rest.length; i++) {
+      const a = rest[i];
+      if (a === "--") return false;
+      if (dynamic(a)) return true;
+      if (a === "-v") i++;
+      else if (!/^-v./.test(a)) return false;
+    }
+    return false;
   });
   const attached = (name: string) => dynamicSetter || new RegExp(`(^|[^\\w$])-[A-Za-z]*${name}(?!\\w)`).test(setters);
   const defaulted = (name: string) => !!parsed.assigns?.has(name) || !!scope.reassigned?.has(name) || new RegExp(`\\$\\{${name}(\\[[^\\]]*\\])?:?=`).test(words) || attached(name);

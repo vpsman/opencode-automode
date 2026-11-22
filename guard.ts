@@ -4968,9 +4968,29 @@ function printfTargets(args: string[], knownVars?: Map<string, string>, allAssig
     if (/^(?:[$`]|-(?:[$`]|v))/.test(a)) {
       // (Round 24, Opus: `printf "-v$x" %s 1` names `$x`, a computed name, as round 23 dropped.)
       if (a.startsWith("-v") && a.length > 2) out.push(a.slice(2));
+      // (Round 27, Opus, Sol: after a literal option, an unknown word is still in the option area,
+      // where it can be `-vNAME` (the last `-v` wins): a computed name.)
+      else if (i > 0) out.push(a);
       for (const v of assignedExpansions(a, allAssigned)) if (v.startsWith("-v") && v.length > 2) out.push(v.slice(2));
       if (i + 1 < args.length) out.push(args[i + 1]);
     }
+    break;
+  }
+  return out;
+}
+// The words in printf's option area, as bash reads them: each `-v NAME` / `-vNAME`, and the word
+// after them, which is the format unless it too is an option (round 27, Opus, Sol).
+export function printfOptionWords(args: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") break;
+    out.push(a);
+    if (a === "-v") {
+      i++;
+      continue;
+    }
+    if (/^-v./.test(a)) continue;
     break;
   }
   return out;
@@ -9017,7 +9037,7 @@ function unreadNames(command: string, cmds: Simple[], cwd?: string): Set<string>
     // `$!`, `$$`, `$?` and `$#` are numbers.)
     // (Round 26, Opus, Sol: or a word that begins with `-` and holds an expansion, `printf "-$op"`.)
     const dynamic = (w: string) => { const v = w.replace(/\$[!$?#]/g, ""); return /^[$`]/.test(v) || (v.startsWith("-") && /[$`]/.test(v)); };
-    if ((name === "printf" && dynamic(args[0] ?? "")) || (name === "wait" && args.some(dynamic))) out.add("*");
+    if ((name === "printf" && printfOptionWords(args).some(dynamic)) || (name === "wait" && args.some(dynamic))) out.add("*");
     if (name === "wait") for (const t of waitTargets(args)) out.add(t.replace(/\[.*$/s, ""));
   }
   for (const m of command.matchAll(/\b(?:for|select)\s+([A-Za-z_]\w*)\s*(?:in\b([^;\n]*))?(?=[;\n]|\s+do\b)/g)) {

@@ -1600,3 +1600,26 @@ test("round 26 (Opus, Sol): a printf option word that begins with a literal dash
     "x=src; mkdir -p src; sleep 1 & wait $!; echo hi > $x/out.txt",
   ]) assert.equal(await decide26(command), "allow", command);
 });
+
+test("round 27 (Opus, Sol): a dynamic printf option after a literal -v NAME", async () => {
+  const repo27 = path.join(base, "repo27");
+  fs.mkdirSync(path.join(repo27, "src"), { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "main", repo27]);
+  const decide27 = async (command: string) => (await decideShell(guard, new SessionState(repo27), repo27, command)).effect;
+  for (const command of [
+    'dest=x; op=-vdest; printf -va "$op" %s .git; echo x > $dest/config',
+    "dest=x; op=-vdest; printf -va \"$op\" '%s%s %s' - v 'a[$(date)]'; test $dest",
+    "o=x; op=-vo; printf -v line \"$op\" '%s %s' -v 'a[$(date)]'; test $o",
+    'o=x; op=-vo; printf -v line "$op" %s .git; echo hi > $o/config',
+    'o=notes.md; op=-vo; printf -v line "$op" %s AGENTS.md; echo evil > $o',
+    'o=x; op=-vo; printf -vline "$op" %s .git; echo hi > $o/config',
+  ]) assert.notEqual(await decide27(command), "allow", command);
+  for (const command of [
+    'printf "$fmt" a b',
+    "printf -v line '%s' x; echo \"$line\"",
+    'out=o.txt; n=3; printf "Total: $n\\n" > $out',
+    'printf -v line "%s-%s" "$a" "$b"; echo "$line"',
+    'printf -- "- $x\\n" >> o.txt',
+    "x=src; sleep 1 & wait $!; echo hi > $x/out.txt",
+  ]) assert.equal(await decide27(command), "allow", command);
+});
