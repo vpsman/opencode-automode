@@ -1477,3 +1477,39 @@ test("round 21 (Opus, Sol): glob-fed loop names whose files hold blanks, and nam
     "for f in a b; do test -n $f; done",
   ]) assert.equal(await decideIn(clean, command), "allow", command);
 });
+
+test("round 22 (Opus, Sol): read behind a keyword, and a glob match's directories holding blanks", async () => {
+  const hostile = path.join(base, "repo22h");
+  const n = "x -o -v a[$(date)] -o y";
+  fs.mkdirSync(path.join(hostile, n), { recursive: true });
+  fs.mkdirSync(path.join(hostile, "src a"), { recursive: true });
+  fs.writeFileSync(path.join(hostile, n, "z.ts"), "");
+  fs.writeFileSync(path.join(hostile, "src a", "b.ts"), "");
+  fs.writeFileSync(path.join(hostile, "f"), `${n}\n`);
+  execFileSync("git", ["init", "-q", "-b", "main", hostile]);
+  const clean = path.join(base, "repo22c");
+  fs.mkdirSync(path.join(clean, "src", "a"), { recursive: true });
+  fs.writeFileSync(path.join(clean, "src", "a", "b.ts"), "");
+  fs.writeFileSync(path.join(clean, "a.ts"), "");
+  fs.writeFileSync(path.join(clean, "f"), "x\n");
+  execFileSync("git", ["init", "-q", "-b", "main", clean]);
+  const decideIn = async (repo: string, command: string) => (await decideShell(guard, new SessionState(repo), repo, command)).effect;
+
+  for (const command of [
+    "while read -r line; do [ -n $line ]; done < f",
+    "while read v; do test -n $v; done < f",
+    "if read v < f; then [ -n $v ]; fi",
+    "REPLY=x; if read -r < f; then :; fi; test -n $REPLY",
+    "REPLY=x; ! read -r < f; test -n $REPLY",
+    "REPLY=x; while read; do :; done < f; test -n $REPLY",
+    "for f in */*.ts; do [ -f $f ]; done",
+    "for f in src*/*.ts; do [ -f $f ]; done",
+  ]) assert.notEqual(await decideIn(hostile, command), "allow", command);
+
+  for (const command of [
+    "for f in */*/*.ts; do [ -f $f ] && echo $f; done",
+    "for f in *.ts; do [ -f $f ]; done",
+    'while read -r line; do echo "$line"; done < f',
+    'while read -r line; do [ -n "$line" ] && echo "$line"; done < f',
+  ]) assert.equal(await decideIn(clean, command), "allow", command);
+});

@@ -8982,16 +8982,23 @@ function unreadNames(command: string, cmds: Simple[], cwd?: string): Set<string>
   // (Round 21, Sol: a name bash sets by itself, REPLY, MAPFILE, OPTARG, DIRSTACK, BASH_REMATCH,
   // ..., is unread wherever the call runs something that sets one without naming it, a literal
   // assignment before it notwithstanding: `REPLY=x; read -r < f; test $REPLY`.)
-  const implicit = cmds.some(({ argv }) => ["read", "select", "mapfile", "readarray", "getopts", "cd", "pushd", "popd", "coproc", "[["].includes(path.basename(argv[0] ?? ""))) || /\bselect\s|\[\[|=~/.test(command);
+  // (Round 22, Opus: the program word comes after `while`, `if`, `!`, `do`... and `builtin`/`command`:
+  // `while read v; do [ -n $v ]; done < f`.)
+  const programOf = (argv: string[]): { name: string; args: string[] } => {
+    let k = 0;
+    while (k < argv.length && (LOOP_KEYWORDS.has(argv[k]) || argv[k] === "builtin" || argv[k] === "command")) k++;
+    return { name: path.basename(argv[k] ?? ""), args: argv.slice(k + 1) };
+  };
+  const implicit = cmds.some(({ argv }) => ["read", "select", "mapfile", "readarray", "getopts", "cd", "pushd", "popd", "coproc", "[["].includes(programOf(argv).name)) || /\bselect\s|\[\[|=~/.test(command);
   if (implicit) for (const n of ["REPLY", "MAPFILE", "OPTARG", "OPTIND", "DIRSTACK", "BASH_REMATCH", "COPROC", "PWD", "OLDPWD", "_"]) out.add(n);
   for (const [n, values] of collectAssigned(cmds)) if (values.some((v) => /[$`]/.test(v.replace(/\$[!$?#]/g, "")))) out.add(n);
   for (const { argv } of cmds) {
-    const name = path.basename(argv[0] ?? "");
-    if (["read", "mapfile", "readarray"].includes(name)) for (const w of argv.slice(1)) if (/^[A-Za-z_]\w*$/.test(w)) out.add(w);
-    if (name === "getopts" && argv[2]) out.add(argv[2]);
+    const { name, args } = programOf(argv);
+    if (["read", "mapfile", "readarray"].includes(name)) for (const w of args) if (/^[A-Za-z_]\w*$/.test(w)) out.add(w);
+    if (name === "getopts" && args[1]) out.add(args[1]);
     // (Round 19, Opus, Sol: `printf -v v '-%s %s' v 'a[...]'; test $v`.)
-    if (name === "printf") for (const t of printfTargets(argv.slice(1))) out.add(t.replace(/\[.*$/s, ""));
-    if (name === "wait") for (const t of waitTargets(argv.slice(1))) out.add(t.replace(/\[.*$/s, ""));
+    if (name === "printf") for (const t of printfTargets(args)) out.add(t.replace(/\[.*$/s, ""));
+    if (name === "wait") for (const t of waitTargets(args)) out.add(t.replace(/\[.*$/s, ""));
   }
   for (const m of command.matchAll(/\b(?:for|select)\s+([A-Za-z_]\w*)\s*(?:in\b([^;\n]*))?(?=[;\n]|\s+do\b)/g)) {
     const list = m[2];
@@ -9009,7 +9016,7 @@ function unreadNames(command: string, cmds: Simple[], cwd?: string): Set<string>
         if (!words.length || c.argv.every((w) => LOOP_KEYWORDS.has(w))) return false;
         return !(LOOP_SAFE.has(path.basename(words[0])) || words.every((w) => ASSIGN.test(w)));
       });
-      if (!listed || listed.some((l) => l === undefined || l.some((f) => /\s/.test(path.basename(f)))) || makes) out.add(m[1]);
+      if (!listed || listed.some((l) => l === undefined || l.some((f) => /\s/.test(path.relative(cwd!, f.replace(/^\/+/, "/"))))) || makes) out.add(m[1]);
     }
   }
   return out;
