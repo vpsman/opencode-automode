@@ -8971,6 +8971,8 @@ function markedCommands(command: string, depth = 0, globs = false): [Simple, Sim
 
 // An unquoted `$NAME` / `${NAME...}` in a marked word.
 const UNQUOTED_NAME = new RegExp(`${MARK_UNQUOTED}\\$\\{?([A-Za-z_]\\w*)`, "g");
+// An unquoted numbered parameter, or a parameter expansion with an operator or `!` (not `${#x}`).
+const UNQUOTED_COMPUTED = new RegExp(`${MARK_UNQUOTED}\\$(?:\\d|\\{\\d|\\{!|\\{[A-Za-z_]\\w*[^}\\w])`);
 // Names this call may set to a value no check reads: an assignment whose value holds an
 // expansion (other than `$!`, `$$`, `$?`, `$#`, which are numbers), the names `read`, `mapfile`,
 // `readarray` and `getopts` set, and a `for` name over a list that is not plain words or globs
@@ -8982,6 +8984,9 @@ function unreadNames(command: string, cmds: Simple[]): Set<string> {
     const name = path.basename(argv[0] ?? "");
     if (["read", "mapfile", "readarray"].includes(name)) for (const w of argv.slice(1)) if (/^[A-Za-z_]\w*$/.test(w)) out.add(w);
     if (name === "getopts" && argv[2]) out.add(argv[2]);
+    // (Round 19, Opus, Sol: `printf -v v '-%s %s' v 'a[...]'; test $v`.)
+    if (name === "printf") for (const t of printfTargets(argv.slice(1))) out.add(t.replace(/\[.*$/s, ""));
+    if (name === "wait") for (const t of waitTargets(argv.slice(1))) out.add(t.replace(/\[.*$/s, ""));
   }
   for (const m of command.matchAll(/\b(?:for|select)\s+([A-Za-z_]\w*)\s*(?:in\b([^;\n]*))?(?=[;\n]|\s+do\b)/g)) {
     const list = m[2];
@@ -9036,7 +9041,10 @@ export function expansionProblem(command: string): GuardVerdict | undefined {
       // operand too; and wait's `-p` the same way.)
       if (found === undefined && ["test", "[", "printf", "wait"].includes(name)) {
         // printf takes `-v` only as its first word.
-        const positional = (name === "printf" ? args.slice(0, 1) : args).find((a) => /\$\{?[@*]/.test(unmark(a)));
+        // (Round 19, Sol: also an unquoted numbered parameter, `set -- '-v a[...]'; test $1`, and an
+        // unquoted `${NAME<operator>...}` or `${!NAME}`, whose value the check does not compute:
+        // `v='x-p PATH'; wait ${v#x}`.)
+        const positional = (name === "printf" ? args.slice(0, 1) : args).find((a) => /\$\{?[@*]/.test(unmark(a)) || UNQUOTED_COMPUTED.test(a));
         if (positional !== undefined) found = unmark(positional);
         else {
           const unread = (unreadValues ??= unreadNames(command, real));

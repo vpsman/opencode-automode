@@ -1383,3 +1383,31 @@ test("round 18 (Opus, Sol): positional parameters, for lists and unread values t
     "[ -z $x ] && echo empty",
   ]) assert.equal(await decide18(command), "allow", command);
 });
+
+test("round 19 (Opus, Sol): printf -v names, numbered parameters and computed expansions that split", async () => {
+  const repo19 = path.join(base, "repo19");
+  fs.mkdirSync(repo19, { recursive: true });
+  fs.writeFileSync(path.join(repo19, "a.ts"), "hello\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo19]);
+  const decide19 = async (command: string) => (await decideShell(guard, new SessionState(repo19), repo19, command)).effect;
+
+  for (const command of [
+    "printf -v v '%s %s%s' -v x '[a]'; printf -v a '%s%s%s' y '[$(date)' ']'; test $v",
+    "a='y[$(date)]'; printf -v v '%s %s%s' -v x '[a]'; test $v",
+    "printf -v v '%s %s%s' -v x '[a]'; [ $v ]",
+    "printf -v v '-%s %s' v 'a[$(date)]'; test $v",
+    "set -- '-v a[$(date)]'; test $1",
+    "set -- '-v a[$(date)]'; test ${1}",
+    "v='x-p PATH'; wait ${v#x}",
+    "v='x-p PATH'; wait ${v:1}",
+  ]) assert.notEqual(await decide19(command), "allow", command);
+
+  for (const command of [
+    '[ "$1" = x ] && echo one',
+    '[ -n "$1" ]',
+    "x=abc; [ ${#x} -gt 2 ] && echo long",
+    'v=3; printf -v out "%03d" "$v"; [ "$out" = 003 ]',
+    '[ -z "${x:-}" ] && echo unset',
+    '[ "${v#x}" = y ]',
+  ]) assert.equal(await decide19(command), "allow", command);
+});
