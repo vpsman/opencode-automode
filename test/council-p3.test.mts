@@ -1342,3 +1342,44 @@ test("round 17 (Opus, Sol): an unquoted expansion that splits into an option and
     'x="a b"; [ "$x" = "a b" ]',
   ]) assert.equal(await decide17(command), "allow", command);
 });
+
+test("round 18 (Opus, Sol): positional parameters, for lists and unread values that split into an option", async () => {
+  const repo18 = path.join(base, "repo18");
+  fs.mkdirSync(repo18, { recursive: true });
+  fs.writeFileSync(path.join(repo18, "f"), "-v a[$(date)]");
+  fs.writeFileSync(path.join(repo18, "a.ts"), "hello\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo18]);
+  const decide18 = async (command: string) => (await decideShell(guard, new SessionState(repo18), repo18, command)).effect;
+
+  for (const command of [
+    // Opus: the positional parameters and a for list.
+    "set -- -v 'a[$(date>P)]'; test \"$@\"",
+    "set -- -v 'a[$(date>P)]'; test $@",
+    "set -- -v 'a[$(date>P)]'; [ \"$@\" ]",
+    "set -- -v 'a[$(date>P)]'; test $*",
+    "set -- -v 'a[$(date>P)]'; test \"${@:1}\"",
+    "for v in '-v a[$(date>P)]'; do test $v; done",
+    "set -- -v 'a[$(date>P)]' x; printf \"$@\"",
+    "set -- -p 'a[$(date>P)]'; wait \"$@\"",
+    "set -- -v PATH .; printf \"$@\"; git status",
+    // Sol: a value no check reads, wait's -p from a substitution, and a known split value.
+    "v=$(echo '-v a[$(touch marker)]'); test $v",
+    "v=$(cat f); test $v",
+    "read v < f; test $v",
+    "wait $(echo '-p a[$(touch marker)]')",
+    "opts='-p PATH'; wait $opts",
+  ]) assert.notEqual(await decide18(command), "allow", command);
+
+  for (const command of [
+    '[ "$x" = y ]',
+    "x=foo; [ $x = foo ] && echo same",
+    "for f in *.ts; do [ -f $f ] && echo $f; done",
+    "for f in a b c; do test -n $f; done",
+    "sleep 1 & wait $!",
+    'x=$(git rev-parse HEAD); [ -n "$x" ]',
+    'read -r line < f; [ "$line" = x ]',
+    "printf '%s\\n' \"$@\"",
+    'for f in "$@"; do echo "$f"; done',
+    "[ -z $x ] && echo empty",
+  ]) assert.equal(await decide18(command), "allow", command);
+});

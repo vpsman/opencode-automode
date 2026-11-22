@@ -4914,6 +4914,18 @@ function knownLiteralExpansion(word: string, vars?: Map<string, string>): string
   });
   return unknown ? undefined : expanded;
 }
+// For test/[, printf and wait: each word whose value the call knows (or, failing that, any value
+// the call assigns the name) and that holds whitespace, also read as the words bash splits it
+// into (a union: a quoted word that does not split only asks more). Rounds 17-18, Opus, Sol.
+function splitKnown(name: string, rawArgs: string[], knownVars?: Map<string, string>, allAssigned?: Map<string, string[]>): string[] {
+  if (!["test", "[", "printf", "wait"].includes(name)) return rawArgs;
+  return rawArgs.flatMap((a) => {
+    if (!/[$`]/.test(a)) return [a];
+    const kv = knownLiteralExpansion(a, knownVars);
+    const values = kv !== undefined ? [kv] : assignedExpansions(a, allAssigned);
+    return values.some((v) => /\s/.test(v)) ? [a, ...values.flatMap((v) => v.split(/\s+/).filter(Boolean))] : [a];
+  });
+}
 function assignedExpansions(word: string, allAssigned?: Map<string, string[]>): string[] {
   if (!allAssigned?.size) return [];
   const m = /^([^$`]*)\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))([^$`]*)$/.exec(word);
@@ -4996,15 +5008,7 @@ function sinkProblem(name: string, rawArgs: string[], knownVars?: Map<string, st
   // operand among them (project review 3, round 17, Opus, Sol: `v='-v a[$(id)]'; test $v`,
   // `opts='-v PATH'; printf $opts /tmp`). Read them as bash splits them; a quoted word that
   // does not split only asks more.
-  const args = ["test", "[", "printf", "wait"].includes(name)
-    ? rawArgs.flatMap((a) => {
-        if (!/[$`]/.test(a)) return [a];
-        const kv = knownLiteralExpansion(a, knownVars);
-        // Not resolved: every value the call assigns the name (a union of their words).
-        const values = kv !== undefined ? [kv] : assignedExpansions(a, allAssigned);
-        return values.some((v) => /\s/.test(v)) ? [a, ...values.flatMap((v) => v.split(/\s+/).filter(Boolean))] : [a];
-      })
-    : rawArgs;
+  const args = splitKnown(name, rawArgs, knownVars, allAssigned);
   if (name === "let") return "let evaluates its words as arithmetic";
   if (DECLARERS.has(name) && args.some((a) => /^[-+][a-zA-Z]*i/.test(a))) return `${name} -i evaluates the value as arithmetic`;
   if (["unset", "read", "mapfile", "readarray", "wait", "getopts", ...DECLARERS].includes(name) && args.some(subscript)) return `${name} with an array subscript, which bash evaluates as arithmetic`;
@@ -5032,7 +5036,8 @@ function sinkProblem(name: string, rawArgs: string[], knownVars?: Map<string, st
 // Variables set without `NAME=`: the last words of `read` and `mapfile`, the word after
 // `printf -v`, the second word of `getopts`, the operands of `unset`. (`for NAME`, `select`,
 // `coproc NAME` and `declare NAME` are in textGuard.)
-function assignedBy(name: string, args: string[], knownVars?: Map<string, string>, allAssigned?: Map<string, string[]>): string[] {
+function assignedBy(name: string, rawArgs: string[], knownVars?: Map<string, string>, allAssigned?: Map<string, string[]>): string[] {
+  const args = splitKnown(name, rawArgs, knownVars, allAssigned);
   if (name === "printf") return printfTargets(args, knownVars, allAssigned);
   if (name === "getopts") return args.slice(1, 2);
   if (name === "wait") return waitTargets(args, knownVars, allAssigned);
@@ -8964,12 +8969,34 @@ function markedCommands(command: string, depth = 0, globs = false): [Simple, Sim
   return out;
 }
 
+// An unquoted `$NAME` / `${NAME...}` in a marked word.
+const UNQUOTED_NAME = new RegExp(`${MARK_UNQUOTED}\\$\\{?([A-Za-z_]\\w*)`, "g");
+// Names this call may set to a value no check reads: an assignment whose value holds an
+// expansion (other than `$!`, `$$`, `$?`, `$#`, which are numbers), the names `read`, `mapfile`,
+// `readarray` and `getopts` set, and a `for` name over a list that is not plain words or globs
+// (or over the positional parameters). Over-approximated: an extra name only asks more.
+function unreadNames(command: string, cmds: Simple[]): Set<string> {
+  const out = new Set<string>();
+  for (const [n, values] of collectAssigned(cmds)) if (values.some((v) => /[$`]/.test(v.replace(/\$[!$?#]/g, "")))) out.add(n);
+  for (const { argv } of cmds) {
+    const name = path.basename(argv[0] ?? "");
+    if (["read", "mapfile", "readarray"].includes(name)) for (const w of argv.slice(1)) if (/^[A-Za-z_]\w*$/.test(w)) out.add(w);
+    if (name === "getopts" && argv[2]) out.add(argv[2]);
+  }
+  for (const m of command.matchAll(/\b(?:for|select)\s+([A-Za-z_]\w*)\s*(?:in\b([^;\n]*))?(?=[;\n]|\s+do\b)/g)) {
+    const list = m[2];
+    if (list === undefined || /[$`'"\\]/.test(list)) out.add(m[1]);
+  }
+  return out;
+}
+
 export function expansionProblem(command: string): GuardVerdict | undefined {
   if (!/[$`]/.test(command)) return undefined;
   const pairs = markedCommands(command);
   if (!pairs) return { action: "classify", reason: "words with expansions the guard could not line up with the rules' reading" };
   const real = pairs.map(([r]) => r);
   const seen = pairs.map(([, m]) => m);
+  let unreadValues: Set<string> | undefined;
   for (const [n, cmd] of seen.entries()) {
     const argv = real[n].argv;
     const { at, chain } = traverse(argv);
@@ -9003,11 +9030,25 @@ export function expansionProblem(command: string): GuardVerdict | undefined {
       // `test x$op 'a[$(id)]'`, `printf $(echo '-v a[$(id)] x')`). For test/[ that needs a
       // command substitution's output or a subscript in the expression; for printf, an
       // unquoted expansion where its first word is. Quoted words do not split.
-      if (found === undefined && (name === "test" || name === "[")) {
+      // (Round 18, Opus, Sol: the positional parameters, which `"$@"` hands over as separate
+      // words, and an unquoted variable the call sets to a value no check reads (a command's
+      // output, `read`, a `for` list that is not plain words) can carry the option and its
+      // operand too; and wait's `-p` the same way.)
+      if (found === undefined && ["test", "[", "printf", "wait"].includes(name)) {
+        // printf takes `-v` only as its first word.
+        const positional = (name === "printf" ? args.slice(0, 1) : args).find((a) => /\$\{?[@*]/.test(unmark(a)));
+        if (positional !== undefined) found = unmark(positional);
+        else {
+          const unread = (unreadValues ??= unreadNames(command, real));
+          const named = args.find((a) => [...a.matchAll(UNQUOTED_NAME)].some((m) => unread.has(m[1])));
+          if (named !== undefined) found = unmark(named);
+        }
+      }
+      if (found === undefined && (name === "test" || name === "[" || name === "wait")) {
         const unquoted = args.filter((a) => a.includes(MARK_UNQUOTED));
         const substituted = unquoted.find((a) => a.includes(MARK_UNQUOTED + "$(") || a.includes(MARK_UNQUOTED + "`"));
         if (substituted !== undefined) found = unmark(substituted);
-        else if (unquoted.length && args.some((a) => /\w\[/.test(unmark(a)))) found = unmark(unquoted[0]);
+        else if (name !== "wait" && unquoted.length && args.some((a) => /\w\[/.test(unmark(a)))) found = unmark(unquoted[0]);
       }
       if (found === undefined && name === "printf" && (args[0] ?? "").includes(MARK_UNQUOTED)) found = unmark(args[0]);
       if (found !== undefined) return { action: "classify", reason: `${name} ${found}: a word that can become an option once bash expands it, and ${name}'s options are checked by name` };
