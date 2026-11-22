@@ -466,6 +466,12 @@ const CASES: [string, string, Want, Record<string, string[]>?][] = [
   ["p3r15 yq eval space", "yq 'eval ( .e )' a.yaml", "ask"],
   ["p3r15 ok yq eval subcommand", "yq eval '.a' a.yaml", "allow"],
   ["p3r15 ok yq .eval field", "yq '.eval' a.yaml", "allow"],
+  // Project review 3, round 16 (Neon): compileall stops filtering option values after `--`.
+  ["p3r16 compileall -- -d /outside", "python3 -m compileall -- -d /outside", "ask"],
+  ["p3r16 compileall -d -d /outside", "python3 -m compileall -d -d /outside", "ask"],
+  ["p3r16 compileall -- .git", "python3 -m compileall -- .git", "ask"],
+  ["p3r16 ok compileall src", "python3 -m compileall src", "allow"],
+  ["p3r16 ok compileall -d /outside src", "python3 -m compileall -d /outside src", "allow"],
   ["ok cloc", "cloc --by-file --json --exclude-dir=node_modules,dist src", "allow"],
   ["ok sed print", "sed -n '1,5p' f", "allow"],
   ["ok sed -i substitute", "sed -i 's/a/b/g' src/x.ts", "allow"],

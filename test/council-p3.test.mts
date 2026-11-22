@@ -115,11 +115,13 @@ test("round 3 (Mythos): names built from the call's variables, composed patch na
     "cp -S .md a/* b/a",
     "mv -S .md a/* b/a/",
     "cp -rS t c b",
+    // Round 16 (Neon #3): gunzip is now in READERS/KEYED (matching gzip), so an expanding
+    // operand classifies (asks with model off).
+    "x=f.gz; gunzip $x",
   ]) assert.equal(await decide(command), "ask", command);
   for (const command of [
     "x=out; echo hi > $x.txt",
     "x=build; mkdir -p $x/a",
-    "x=f.gz; gunzip $x",
     "gunzip f",
     "sed -i p *",
     "cp -r a b",
@@ -132,6 +134,9 @@ test("round 3 (Mythos, on the fixes): a variable before a glob, a name the rules
     "x=sub; gunzip $x/*.gz",
     "x=sub; gunzip $x/A*",
     "x=z; gzip $x/*",
+    // Round 16 (Neon #3): gunzip is now in READERS/KEYED (matching gzip).
+    "x=z; gunzip $x/*.gz",
+    "x=sub; gunzip $x/a*.gz",
     // A backup's pattern is held to the test where the file is made by the same call.
     "echo hi > CLAUDE; sed -i.md p CLAUD?",
     "cp f CLAUDE; cp -S .md f CLAUD?",
@@ -157,8 +162,6 @@ test("round 3 (Mythos, on the fixes): a variable before a glob, a name the rules
   for (const command of [
     // The names a glob matches, each less its suffix: not every name beside them.
     "gunzip z/*.gz",
-    "x=z; gunzip $x/*.gz",
-    "x=sub; gunzip $x/a*.gz",
     "sed -i.bak p src/*.ts",
     "OUT=sub; echo hi > $OUT/o.txt",
     // ln's -r is --relative.
@@ -583,6 +586,8 @@ test("closing round (Opus, third re-check): a file-making command anywhere in th
     "cp a/AGENTS z/; cp -b -S .md f z/*",
     "cp a/AGENTS .; mv -b -S .md f ./*",
     "echo hi > z/CLAUDE; cd z; patch -b -z .md ./* a.diff",
+    // Round 16 (Neon #3): gunzip is now in READERS/KEYED (matching gzip).
+    "x=z; gunzip $x/*.gz",
   ]) assert.equal(await decide(command), "ask", command);
   for (const command of [
     "gunzip *.gz",
@@ -594,7 +599,6 @@ test("closing round (Opus, third re-check): a file-making command anywhere in th
     "gunzip ./*.gz 2>/dev/null; ls",
     "ls >/dev/null; gunzip ./*.gz",
     "echo hi > notes.txt; sed -i.bak p ./*",
-    "x=z; gunzip $x/*.gz",
   ]) assert.equal(await decide(command), "allow", command);
 });
 
@@ -1202,4 +1206,102 @@ test("round 15 (Neon)", async () => {
     "python3 -m pytest",
     "python3 -m pytest -c pytest.ini",
   ]) assert.equal(await decide15(command), "allow", command);
+});
+
+test("round 16 (Opus, Neon)", async () => {
+  const repo16 = path.join(base, "repo16");
+  fs.mkdirSync(path.join(repo16, "src"), { recursive: true });
+  fs.mkdirSync(path.join(repo16, "tests"), { recursive: true });
+  fs.mkdirSync(path.join(repo16, "build"), { recursive: true });
+  fs.writeFileSync(path.join(repo16, "package.json"), JSON.stringify({ scripts: { build: "echo ok" } }) + "\n");
+  for (const f of ["src/main.rs", "a.gz", "pytest.ini", "tox.ini", "build.ninja", "justfile"]) {
+    fs.writeFileSync(path.join(repo16, f), "hello\n");
+  }
+  fs.symlinkSync("/dev/stdin", path.join(repo16, "stdin-link"));
+  execFileSync("git", ["init", "-q", "-b", "main", repo16]);
+  const decide16 = async (command: string) => (await decideShell(guard, new SessionState(repo16), repo16, command)).effect;
+
+  for (const command of [
+    // #1 (Neon): option hidden in a variable for test/[, printf, wait.
+    'op=-v; test "$op" \'a[$(id)]\'',
+    'op=-v; [ "$op" \'a[$(id)]\' ]',
+    'op=-R; test "$op" \'a[$(id)]\'',
+    'op=-v; printf "$op" \'a[$(id)]\' 1',
+    'op=-v; printf "$op" PATH /tmp',
+    'op=-vPATH; printf "$op" /tmp',
+    'op=-v; v=GIT_SSH_COMMAND; printf "$op" "$v" "sh -c id"',
+    'op=-p; wait "$op" PATH',
+    'op=-pPATH; wait "$op"',
+    // #2 (Neon): python -m MOD expansionProblem lookup + venv KEYED entry.
+    'python3 -m pytest "$opt"',
+    'python -m pytest "$opt"',
+    'python3 -m mypy "$opt" .',
+    'python3 -m venv "$opt" venv',
+    'opt=--upgrade-deps; python3 -m venv "$opt" venv',
+    // #3 (Neon): KEYED entries for cloc, tree, rustfmt, gunzip/compressor siblings.
+    'opt=--out=AGENTS.md; cloc "$opt" src',
+    'opt=-oAGENTS.md; tree "$opt" src',
+    'opt=+/tmp/x; rustfmt "$opt" src/main.rs',
+    'tc=/tmp/x; rustfmt "+$tc" src/main.rs',
+    'opt=-S; gunzip "$opt" a.gz',
+    // #4 (Neon, Opus): pytest abbreviated checked long opts, -o addopts/python_*, unknown flags, @FILE.
+    "pytest --basetem=/outside",
+    "python3 -m pytest --basetem=/outside",
+    "pytest --trac",
+    "pytest -o 'addopts=--basetemp=\"/outside\"'",
+    'pytest -o "python_functions = interact"',
+    'pytest --override-ini "addopts = --pdb"',
+    "pytest -o python_files=test_*.py",
+    "pytest -dc /dev/stdin",
+    "ninja -z -f /dev/stdin",
+    "just -z -f /dev/stdin",
+    "pytest @<(echo --trace) <<'EOF'\nimport os\nEOF",
+    "echo --basetemp=.claude | pytest @/dev/stdin",
+    "python3 -m pytest @/dev/stdin",
+    // #5 (Neon): bun run codeFromDevice + tox -c/--conf device check.
+    "bun run /dev/fd/0",
+    "bun run //dev/stdin",
+    "bun run /dev/./stdin",
+    "bun run stdin-link",
+    "tox -c /dev/stdin",
+    "tox --conf=/dev/stdin",
+    "tox --conf /dev/stdin",
+    "tox -c -",
+    "tox -c stdin-link",
+    'tox -c "$f"',
+    // #6 (Neon): compileall stops filtering option values after `--`.
+    "python3 -m compileall -- -d /outside",
+    "python3 -m compileall -d -d /outside",
+    "python3 -m compileall -- .git",
+  ]) assert.equal(await decide16(command), "ask", command);
+
+  for (const command of [
+    '[ "$x" = y ]',
+    '[ "$x" = "$y" ]',
+    '[ -n "$x" ]',
+    'test -f "$f"',
+    "printf '%s\\n' \"$x\"",
+    'printf "$fmt" a b',
+    'wait "$pid"',
+    "tree",
+    "tree src",
+    "cloc src",
+    "gunzip a.gz",
+    "rustfmt src/main.rs",
+    "pytest",
+    "pytest -x",
+    "pytest -k foo tests/",
+    "pytest --cov=src",
+    "pytest --maxfail=1",
+    "pytest --no-header -v tests/",
+    "python3 -m pytest",
+    "python3 -m pytest -k foo",
+    "python3 -m mypy .",
+    "python3 -m venv venv",
+    "python3 -m compileall src",
+    "python3 -m compileall -d /outside src",
+    "bun run build",
+    "tox",
+    "tox -c tox.ini",
+  ]) assert.equal(await decide16(command), "allow", command);
 });

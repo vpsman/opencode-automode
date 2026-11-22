@@ -2100,7 +2100,7 @@ const NAMES_ONLY = new Set("ls stat test [ file du find readlink realpath basena
 // Programs that show or copy what is in the files they are given.
 const READERS = new Set(
   `cat bat head tail less more grep egrep fgrep rg ag ack sed awk gawk cut sort uniq tr diff cmp comm nl tac rev fold paste join
-   strings xxd hexdump od base64 base32 jq yq zcat xzcat bzcat zstdcat cp mv ln rsync install tar zip gzip xz zstd dd openssl curl wget`.split(/\s+/),
+   strings xxd hexdump od base64 base32 jq yq zcat xzcat bzcat zstdcat cp mv ln rsync install tar zip gzip gunzip xz unxz lzma unlzma lzcat zstd unzstd zstdmt bzip2 bunzip2 dd openssl curl wget`.split(/\s+/),
 );
 const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh", "source", "."]);
 const INTERPRETERS = new Set(["python", "python3", "node", "perl", "ruby", "php", "lua", "deno", "bun", "tsx", "ts-node"]);
@@ -3999,6 +3999,12 @@ const JUST_OPTIONS: Getopt = {
     "dump-format": "value", "list-heading": "value", "list-prefix": "value", shell: "value",
     "shell-arg": "value", tempdir: "value", "timestamp-format": "value", ceiling: "value",
     "alias-style": "value", request: "value", usage: "value",
+    list: "flag", summary: "flag", "dry-run": "flag", verbose: "flag", quiet: "flag",
+    version: "flag", help: "flag", evaluate: "flag", dump: "flag", fmt: "flag", check: "flag",
+    unsorted: "flag", "no-dotenv": "flag", "no-aliases": "flag", "no-highlight": "flag",
+    highlight: "flag", variables: "flag", groups: "flag", explain: "flag", timestamp: "flag",
+    unstable: "flag", yes: "flag", one: "flag", "global-justfile": "flag",
+    "clear-shell-args": "flag", "list-submodules": "flag",
   },
 };
 const PYTEST_OPTIONS: Getopt = {
@@ -4010,10 +4016,41 @@ const PYTEST_OPTIONS: Getopt = {
     "cache-clear": "flag", co: "flag", "code-highlight": "value", cov: "optional",
     basetemp: "value", rootdir: "value", "override-ini": "value", tb: "value",
     maxfail: "value", junitxml: "value",
+    verbose: "flag", quiet: "flag", exitfirst: "flag", version: "flag", help: "flag",
+    showlocals: "flag", "no-header": "flag", "no-summary": "flag",
+    "disable-warnings": "flag", "disable-pytest-warnings": "flag",
+    lf: "flag", "last-failed": "flag", ff: "flag", "failed-first": "flag",
+    nf: "flag", "new-first": "flag", sw: "flag", stepwise: "flag", "stepwise-skip": "flag",
+    "strict-markers": "flag", "strict-config": "flag", strict: "flag",
+    markers: "flag", fixtures: "flag", "fixtures-per-test": "flag",
+    "setup-only": "flag", "setup-plan": "flag", "setup-show": "flag", "full-trace": "flag",
+    durations: "value", "durations-min": "value", "show-capture": "value",
+    ignore: "value", "ignore-glob": "value", deselect: "value", "import-mode": "value",
+    verbosity: "value", "log-level": "value", "log-cli-level": "value", "log-format": "value",
+    "asyncio-mode": "value", lfnf: "value", "last-failed-no-failures": "value",
+    numprocesses: "value", "cov-report": "value", "cov-fail-under": "value",
+    "cov-config": "value", "cov-branch": "flag", "no-cov": "flag", "no-cov-on-fail": "flag",
+    pdb: "flag", trace: "flag", pyargs: "flag",
   },
 };
-const isPytestCall = (name: string, args: string[]) =>
-  name === "pytest" || (/^python3?(\.\d+)?$/.test(name) && args[0] === "-m" && args[1] === "pytest");
+const TOX_OPTIONS: Getopt = {
+  flags: "hvqrlao",
+  values: "cefmpx",
+  long: {
+    conf: "value", env: "value", factor: "value", labels: "value",
+    override: "value", parallel: "optional", "work-dir": "value",
+    root: "value", "result-json": "value", color: "value",
+    help: "flag", version: "flag", verbose: "flag", quiet: "flag",
+    recreate: "flag", "list-envs": "flag", "skip-missing-interpreters": "optional",
+    notest: "flag", "no-provision": "optional", installpkg: "value",
+  },
+};
+const pytestArgs = (name: string, args: string[]): string[] | undefined =>
+  name === "pytest" ? args
+  : /^python3?(\.\d+)?$/.test(name) && args[0] === "-m" && args[1] === "pytest" ? args.slice(2)
+  : /^python3?(\.\d+)?$/.test(name) && args[0] === "-mpytest" ? args.slice(1)
+  : undefined;
+const isPytestCall = (name: string, args: string[]) => pytestArgs(name, args) !== undefined;
 
 // The files a program reads as code, where it reads them (round 4, finding 5, second pass): each
 // as the word that names it and the directory it is read from (undefined: not known), for make's
@@ -4055,8 +4092,8 @@ export function codeFiles(name: string, args: string[], cwd: string | undefined)
     if (files.length) return files.map((word) => ({ word, dir: cwd }));
     return ["justfile", "Justfile", ".justfile", ".Justfile"].map((word) => ({ word, dir: cwd, implicit: true }));
   }
-  if (isPytestCall(name, args)) {
-    const pArgs = name === "pytest" ? args : args.slice(2);
+  const pArgs = pytestArgs(name, args);
+  if (pArgs) {
     const got = getopt(pArgs, PYTEST_OPTIONS);
     return got.opts
       .filter((o) => o.name === "-c" || o.name === "--config-file")
@@ -4065,6 +4102,18 @@ export function codeFiles(name: string, args: string[], cwd: string | undefined)
         const word = o.name === "-c" && v.startsWith("=") && pArgs[o.at]?.includes("=") ? v.slice(1) : v;
         return { word, dir: cwd };
       });
+  }
+  if (name === "tox") {
+    const got = getopt(args, TOX_OPTIONS);
+    const fromGot = got.opts
+      .filter((o) => o.name === "-c" || o.name === "--conf")
+      .map((o) => {
+        const v = o.value ?? "";
+        const word = o.name === "-c" && v.startsWith("=") && args[o.at]?.includes("=") ? v.slice(1) : v;
+        return { word, dir: cwd };
+      });
+    if (fromGot.length || !got.unknown) return fromGot;
+    return valued(args, "c", "--conf").map((v) => ({ word: v.startsWith("=") ? v.slice(1) : v, dir: cwd }));
   }
   if (name === "sed" || AWKS.has(name)) return valued(args, "f", "--file").map((word) => ({ word, dir: cwd }));
   if (SHELLS.has(name)) {
@@ -4427,6 +4476,29 @@ function buildToolProblem(name: string, args: string[], cwd?: string): string | 
     const word = own.find((a) => abbreviates(a, ["--python-executable", "--install-types"]));
     if (word) return `mypy ${word.split("=")[0]} runs the python the call names, or installs packages`;
   }
+  const pArgs = pytestArgs(name, args);
+  if (pArgs) {
+    // (Project review 3, round 16, Opus & Neon):
+    // pytest 8.2+ reads options from @FILE; argparse abbreviates checked long options;
+    // -o/--override-ini can set addopts or python_* (with spaces/quotes).
+    if (pArgs.some((a) => a.startsWith("@"))) return `${name} reads arguments from an @file, which the call chose`;
+    const pOwn = pArgs.slice(0, pArgs.includes("--") ? pArgs.indexOf("--") : pArgs.length);
+    const pChecked = ["basetemp", "pdb", "trace", "config-file", "override-ini", "rootdir", "confcutdir", "junitxml", "pyargs"];
+    const abbrev = pOwn.find((a) => {
+      if (!a.startsWith("--")) return false;
+      const head = a.slice(2, a.includes("=") ? a.indexOf("=") : undefined);
+      return head.length >= 3 && pChecked.some((opt) => opt.startsWith(head) && opt !== head);
+    });
+    if (abbrev) return `${name} ${abbrev.split("=")[0]} abbreviates a checked pytest option`;
+    const got = getopt(pArgs, PYTEST_OPTIONS);
+    for (const o of got.opts) {
+      if (o.name !== "-o" && o.name !== "--override-ini") continue;
+      const raw = o.value ?? "";
+      const val = o.name === "-o" && raw.startsWith("=") && pArgs[o.at]?.includes("=") ? raw.slice(1) : raw;
+      const key = val.split("=")[0].trim();
+      if (key === "addopts" || key.startsWith("python_")) return `${name} ${o.name} sets ${key}, which changes pytest options or collection`;
+    }
+  }
   return undefined;
 }
 
@@ -4445,7 +4517,6 @@ function programProblem(name: string, args: string[], cwd?: string, inProject?: 
     if (at >= 0 && args.slice(0, at).every((a) => a.startsWith("-"))) {
       const word = args.slice(at + 1).find((a) => !a.startsWith("-") || a === "-");
       if (word !== undefined) {
-        if (word === "-" || word === "/dev/stdin") return ask("bun run - runs its standard input");
         const scripts = (() => {
           try {
             return Object.keys(JSON.parse(fs.readFileSync(path.join(cwd ?? "", "package.json"), "utf8")).scripts ?? {});
@@ -4453,6 +4524,10 @@ function programProblem(name: string, args: string[], cwd?: string, inProject?: 
             return [];
           }
         })();
+        // (Project review 3, round 16, Neon: check devices/symlinks/stdin via codeFromDevice,
+        // skipping plain package.json script names that happen to match a directory on disk.)
+        const device = word === "-" || word.includes("/") || !scripts.includes(word) ? codeFromDevice(word, cwd) : undefined;
+        if (device) return ask(`bun run ${word} reads code from standard input, a pipe or a device (${device}), which no check has read`);
         const file = cwd !== undefined && fs.existsSync(path.resolve(cwd, word));
         const bin = cwd !== undefined && fs.existsSync(path.join(cwd, "node_modules", ".bin", word));
         if (cwd === undefined || !(scripts.includes(word) || file || bin)) return ask(`bun run ${word}: not a script of package.json, a file or a package's program, so bun runs the system command of that name, which was not judged`);
@@ -4809,16 +4884,114 @@ function builtHost(name: string, args: string[]): string | undefined {
   return built === undefined ? undefined : `git ${call.sub} ${built}: a word built at run time in a call that talks to a remote can carry local data out (in the host name, a ref name or a server option)`;
 }
 
-function sinkProblem(name: string, args: string[]): string | undefined {
+function knownExpansion(word: string, vars?: Map<string, string>): string | undefined {
+  if (!/[$`]/.test(word)) return word;
+  if (!vars?.size || word.includes("`")) return undefined;
+  let unknown = false;
+  const expanded = word.replace(/\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*)|.)/g, (m, a, b) => {
+    const n = a ?? b;
+    if (!n || !vars.has(n)) {
+      unknown = true;
+      return m;
+    }
+    return vars.get(n)!;
+  });
+  return unknown || expanded.includes("$") ? undefined : expanded;
+}
+function assignedExpansions(word: string, allAssigned?: Map<string, string[]>): string[] {
+  if (!allAssigned?.size) return [];
+  const m = /^([^$`]*)\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))([^$`]*)$/.exec(word);
+  if (!m) return [];
+  const vals = allAssigned.get(m[2] ?? m[3]);
+  return vals ? vals.map((v) => `${m[1]}${v}${m[4]}`) : [];
+}
+function printfTargets(args: string[], knownVars?: Map<string, string>, allAssigned?: Map<string, string[]>): string[] {
+  const out = valued(args, "v", "--never");
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") break;
+    if (!/[$`]/.test(a)) {
+      if (a === "-v") {
+        i++;
+        continue;
+      }
+      if (a.startsWith("-v")) continue;
+      break;
+    }
+    const kv = knownExpansion(a, knownVars);
+    if (kv !== undefined) {
+      if (kv === "-v") {
+        if (i + 1 < args.length) out.push(args[i + 1]);
+        i++;
+        continue;
+      }
+      if (kv.startsWith("-v")) {
+        out.push(kv.slice(2));
+        continue;
+      }
+      break;
+    }
+    if (/^(?:[$`]|-(?:[$`]|v))/.test(a)) {
+      for (const v of assignedExpansions(a, allAssigned)) if (v.startsWith("-v") && v.length > 2) out.push(v.slice(2));
+      if (i + 1 < args.length) out.push(args[i + 1]);
+    }
+    break;
+  }
+  return out;
+}
+function waitTargets(args: string[], knownVars?: Map<string, string>, allAssigned?: Map<string, string[]>): string[] {
+  const out = valued(args, "p", "--never");
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") break;
+    if (!/[$`]/.test(a)) {
+      if (/^-[fn]*p$/.test(a)) {
+        i++;
+        continue;
+      }
+      if (a.startsWith("-")) continue;
+      break;
+    }
+    const kv = knownExpansion(a, knownVars);
+    if (kv !== undefined) {
+      if (/^-[fn]*p$/.test(kv)) {
+        if (i + 1 < args.length) out.push(args[i + 1]);
+        i++;
+        continue;
+      }
+      if (/^-[fn]*p./.test(kv)) {
+        out.push(kv.slice(kv.indexOf("p") + 1));
+        continue;
+      }
+      if (kv.startsWith("-")) continue;
+      break;
+    }
+    if (/^(?:[$`]|-[fn]*(?:[$`]|p))/.test(a)) {
+      for (const v of assignedExpansions(a, allAssigned)) if (/^-[fn]*p./.test(v)) out.push(v.slice(v.indexOf("p") + 1));
+      if (i + 1 < args.length) out.push(args[i + 1]);
+    }
+  }
+  return out;
+}
+
+function sinkProblem(name: string, args: string[], knownVars?: Map<string, string>, allAssigned?: Map<string, string[]>): string | undefined {
   const subscript = (a: string) => /\w\[/.test(a);
   if (name === "let") return "let evaluates its words as arithmetic";
   if (DECLARERS.has(name) && args.some((a) => /^[-+][a-zA-Z]*i/.test(a))) return `${name} -i evaluates the value as arithmetic`;
   if (["unset", "read", "mapfile", "readarray", "wait", "getopts", ...DECLARERS].includes(name) && args.some(subscript)) return `${name} with an array subscript, which bash evaluates as arithmetic`;
-  if (name === "printf" && valued(args, "v", "--never").some((v) => subscript(v) || /[$`]/.test(v))) return "printf -v with a subscript or a computed name";
+  if (name === "printf" && printfTargets(args, knownVars, allAssigned).some((v) => subscript(v) || /[$`]/.test(v))) return "printf -v with a subscript or a computed name";
+  if (name === "wait" && waitTargets(args, knownVars, allAssigned).some((v) => subscript(v) || /[$`]/.test(v))) return "wait -p with a subscript or a computed name";
   if (name === "test" || name === "[") {
-    // Every `-v`/`-R` of an expression, not only the first (project review 3, round 15, Neon:
-    // `test -v a -a -v "$x"`).
-    if (args.some((a, i) => (a === "-v" || a === "-R") && i + 1 < args.length && (subscript(args[i + 1]) || /[$`]/.test(args[i + 1])))) return `${name} -v with a subscript or a variable, which bash evaluates as arithmetic`;
+    // Every `-v`/`-R` of an expression, literal or hidden in an expansion (project review 3,
+    // round 15 & round 16, Neon: `test -v a -a -v "$x"`, `op=-v; test "$op" 'a[$(id)]'`).
+    const mayBeVarOp = (a: string) => {
+      if (a === "-v" || a === "-R") return true;
+      if (!/[$`]/.test(a)) return false;
+      const kv = knownExpansion(a, knownVars);
+      if (kv !== undefined) return kv === "-v" || kv === "-R";
+      return /^(?:[$`]|-[vR]?[$`])/.test(a);
+    };
+    if (args.some((a, i) => mayBeVarOp(a) && i + 1 < args.length && (subscript(args[i + 1]) || /[$`]/.test(args[i + 1])))) return `${name} -v with a subscript or a variable, which bash evaluates as arithmetic`;
   }
   if (name === "read" && args.some((a) => /[$`]/.test(a) && !a.startsWith("-"))) return "read into a name taken from a variable";
   // Council project review 1, round 2: `export "$x"` with `x=PATH=.` (or `RANDOM=a[$(...)]`) sets
@@ -4830,10 +5003,10 @@ function sinkProblem(name: string, args: string[]): string | undefined {
 // Variables set without `NAME=`: the last words of `read` and `mapfile`, the word after
 // `printf -v`, the second word of `getopts`, the operands of `unset`. (`for NAME`, `select`,
 // `coproc NAME` and `declare NAME` are in textGuard.)
-function assignedBy(name: string, args: string[]): string[] {
-  if (name === "printf") return valued(args, "v", "--never");
+function assignedBy(name: string, args: string[], knownVars?: Map<string, string>, allAssigned?: Map<string, string[]>): string[] {
+  if (name === "printf") return printfTargets(args, knownVars, allAssigned);
   if (name === "getopts") return args.slice(1, 2);
-  if (name === "wait") return valued(args, "p", "--never");
+  if (name === "wait") return waitTargets(args, knownVars, allAssigned);
   if (name === "read" || name === "mapfile" || name === "readarray") {
     const names: string[] = [];
     const takesValue = name === "read" ? /^-[a-zA-Z]*[adinNptu]$/ : /^-[a-zA-Z]*[dnOsuCc]$/;
@@ -4884,6 +5057,10 @@ export interface ArgvContext extends TextContext {
   // `ask` with the reason, or the model with the reason `model`. `program`: where the program
   // npx is to run stands, when its words name one.
   npx?: (cmd: Simple) => { at: number; program?: number; ask?: string; model?: string } | undefined;
+  // Unambiguous variable values known before this command (from scope.resolvedVars), and all
+  // literal assignments in the call, for checking options hidden in expansions.
+  knownVars?: Map<string, string>;
+  allAssigned?: Map<string, string[]>;
 }
 
 // ---- what a command writes ----
@@ -7528,14 +7705,18 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
 
     add(programProblem(name, args, ctx.cwdOf?.(cmd), ctx.inProject));
     if (MAKES.has(name) && getopt(args, MAKE_OPTIONS).unknown) add({ action: "classify", reason: `${name} has an option the check cannot read` });
-    ask(sinkProblem(name, args));
+    if (name === "ninja" && getopt(args, NINJA_OPTIONS).unknown) ask(`${name} has an option the check cannot read`);
+    if (name === "just" && getopt(args, JUST_OPTIONS).unknown) ask(`${name} has an option the check cannot read`);
+    const pArgs = pytestArgs(name, args);
+    if (pArgs && getopt(pArgs, PYTEST_OPTIONS).unknown) ask(`${name} has an option the check cannot read`);
+    ask(sinkProblem(name, args, ctx.knownVars, ctx.allAssigned));
     if (name === "curl" || name === "wget") ask(fetcherOptionProblem(name, args));
     if (name === "curl") add(fileUrlProblem(args, ctx.scope));
     const built = builtHost(name, args);
     if (built) add({ action: "classify", reason: built });
     const batch = lookupFileProblem(name, args);
     if (batch) add({ action: "classify", reason: batch });
-    for (const variable of assignedBy(name, args)) {
+    for (const variable of assignedBy(name, args, ctx.knownVars, ctx.allAssigned)) {
       if (anyDangerous(variable)) ask(dangerous(variable));
       else if (inherited(variable)) add({ action: "classify", reason: `sets ${variable}, which the environment exports, for the programs that follow` });
     }
@@ -7580,7 +7761,7 @@ export function argvGuard(cmd: Simple, ctx: ArgvContext): GuardVerdict | undefin
         if (implicit) {
           if (cmd.heredoc || cmd.in?.length || cmd.subshell) add({ action: "classify", reason: `${name} reads ${what} in a directory the check cannot place, with its input redirected` });
         } else if (MAKES.has(name)) ask(`make -f ${f} reads a makefile in a directory the check cannot place, which may be standard input or a device`);
-        else if (name === "ninja" || name === "just" || isPytestCall(name, args)) ask(`${name} reads ${f} in a directory the check cannot place, which may be standard input or a device`);
+        else if (name === "ninja" || name === "just" || name === "tox" || isPytestCall(name, args)) ask(`${name} reads ${f} in a directory the check cannot place, which may be standard input or a device`);
         else add({ action: "classify", reason: `${name} reads code from ${f}, which is known only when the command runs` });
         continue;
       }
@@ -8418,6 +8599,26 @@ function traceProblem(cmds: Simple[]): string | undefined {
   return undefined;
 }
 
+function collectAssigned(cmds: Simple[]): Map<string, string[]> {
+  const map = new Map<string, string[]>();
+  const add = (n: string, v: string) => map.set(n, [...(map.get(n) ?? []), v]);
+  for (const { argv } of cmds) {
+    let i = 0;
+    for (; i < argv.length && ASSIGN.test(argv[i]); i++) {
+      const m = ASSIGN.exec(argv[i])!;
+      add(m[1], argv[i].slice(m[0].length));
+    }
+    const name = path.basename(argv[i] ?? "");
+    if (DECLARERS.has(name)) {
+      for (const a of argv.slice(i + 1).filter((w) => !w.startsWith("-"))) {
+        const m = ASSIGN.exec(a);
+        if (m) add(m[1], a.slice(m[0].length));
+      }
+    }
+  }
+  return map;
+}
+
 export function argvGuards(cmds: Simple[], ctx: ArgvContext): GuardVerdict | undefined {
   let verdict: GuardVerdict | undefined;
   // What this call links, moves or copies into place (round 4, finding 5, second pass).
@@ -8434,7 +8635,29 @@ export function argvGuards(cmds: Simple[], ctx: ArgvContext): GuardVerdict | und
     for (const s of w.sources ?? []) placed.push(path.join(p, path.basename(s)));
   }
   ctx = { ...ctx, placed, ...(placedUnknown ? { placedUnknown: `writes ${placedUnknown}` } : {}) };
-  for (const cmd of cmds) verdict = stricter(verdict, argvGuard(cmd, ctx));
+  const allAssigned = collectAssigned(cmds);
+  const seen = new Set<string>();
+  const resolved = ctx.scope?.resolvedVars;
+  for (const cmd of cmds) {
+    let knownVars: Map<string, string> | undefined;
+    if (resolved?.size && seen.size) {
+      knownVars = new Map();
+      for (const n of seen) if (resolved.has(n)) knownVars.set(n, resolved.get(n)!);
+    }
+    verdict = stricter(verdict, argvGuard(cmd, { ...ctx, knownVars, allAssigned }));
+    const bareAssign = cmd.argv.length > 0 && cmd.argv.every((w) => ASSIGN.test(w));
+    if (bareAssign) {
+      for (const w of cmd.argv) {
+        const m = ASSIGN.exec(w);
+        if (m) seen.add(m[1]);
+      }
+    } else if (DECLARERS.has(path.basename(cmd.argv[0] ?? ""))) {
+      for (const w of cmd.argv.slice(1).filter((a) => !a.startsWith("-"))) {
+        const m = ASSIGN.exec(w);
+        if (m) seen.add(m[1]);
+      }
+    }
+  }
   const trace = traceProblem(cmds);
   if (trace) verdict = stricter(verdict, { action: "ask", reason: trace });
   return stricter(verdict, exportProblem(cmds, ctx.cwdKnown ? ctx.cwd : undefined, ctx.inProject));
@@ -8620,16 +8843,21 @@ const KEYED: Record<string, Keyed> = {
   just: { checked: ["--command", "--shell", "--shell-command", "--shell-arg", "--chooser", "--justfile"], letters: "cf" },
   ninja: { values: ["-j", "-k", "-l", "-d", "-t", "-w"], checked: ["-f", "-C"], letters: "fC" },
   pytest: { values: ["-k", "-m", "-p", "-r", "-W", "-n", "--rootdir", "--tb", "--maxfail", "--junitxml", "--color", "--capture", "--confcutdir"], checked: ["-c", "--config-file", "-o", "--override-ini", "--basetemp", "--pdb", "--trace"], letters: "co" },
-  tox: { checked: ["--override", "-x"], letters: "x" },
+  tox: { checked: ["--override", "-x", "-c", "--conf"], letters: "xc" },
   meson: { checked: ["--wrapper", "--gdb-path"] },
-  mypy: { checked: ["--python-executable"] },
+  mypy: { checked: ["--python-executable", "--install-types"] },
+  venv: { checked: ["--upgrade-deps", "--clear", "--prompt"] },
+  cloc: { values: ["--exclude-dir", "--exclude-ext", "--exclude-lang", "--include-lang", "--include-ext", "--match-f", "--not-match-f", "--match-d", "--not-match-d", "--timeout", "--processes"], checked: ["--out", "--report-file", "--vcs", "--list-file", "--exclude-list-file", "--read-lang-def", "--force-lang-def", "--write-lang-def", "--write-lang-def-incl-dup", "--script-lang", "--sql", "--sql-append", "--strip-comments", "--strip-str-comments", "--config", "--diff", "--git-diff-rel", "--git-diff-all"] },
+  tree: { values: ["-L", "-P", "-I", "-T", "-H", "--filelimit", "--timefmt", "--charset", "--sort"], checked: ["-o"], letters: "o" },
+  rustfmt: { values: ["--edition", "--color", "--emit", "--files-with-diff"], checked: ["--config-path", "--config"] },
+  gzip: { checked: ["-S", "--suffix", "-o", "--output", "--output-dir-flat", "--output-dir-mirror", "--files", "--files0", "--filelist", "--patch-from"], letters: "So" },
   gh: { values: ["-R", "--repo", "-q", "--jq", "-t", "--template"], checked: ["-X", "--method", "-f", "-F", "--field", "--raw-field", "--input", "-H", "--header"], letters: "XfFH" },
   sysctl: {},
   llamastash: {},
   docker: {},
   systemctl: {},
 };
-for (const [alias, name] of [["cc", "gcc"], ["g++", "gcc"], ["c++", "gcc"], ["clang", "gcc"], ["clang++", "gcc"], ["gmake", "make"], ["gtar", "tar"], ["bsdtar", "tar"], ["fdfind", "fd"], ["gawk", "awk"], ["mawk", "awk"], ["nawk", "awk"], ["pnpm", "npm"], ["yarn", "npm"], ["bun", "npm"], ["pip", "npm"], ["pip3", "npm"], ["gem", "npm"], ["uv", "npm"], ["poetry", "npm"], ["pipenv", "npm"], ["pdm", "npm"], ["hatch", "npm"], ["bundle", "npm"]]) KEYED[alias] = KEYED[name];
+for (const [alias, name] of [["cc", "gcc"], ["g++", "gcc"], ["c++", "gcc"], ["clang", "gcc"], ["clang++", "gcc"], ["gmake", "make"], ["gtar", "tar"], ["bsdtar", "tar"], ["fdfind", "fd"], ["gawk", "awk"], ["mawk", "awk"], ["nawk", "awk"], ["pnpm", "npm"], ["yarn", "npm"], ["bun", "npm"], ["pip", "npm"], ["pip3", "npm"], ["gem", "npm"], ["uv", "npm"], ["poetry", "npm"], ["pipenv", "npm"], ["pdm", "npm"], ["hatch", "npm"], ["bundle", "npm"], ["gunzip", "gzip"], ["zcat", "gzip"], ["xz", "gzip"], ["unxz", "gzip"], ["xzcat", "gzip"], ["lzma", "gzip"], ["unlzma", "gzip"], ["lzcat", "gzip"], ["zstd", "gzip"], ["unzstd", "gzip"], ["zstdcat", "gzip"], ["zstdmt", "gzip"], ["bzip2", "gzip"], ["bunzip2", "gzip"], ["bzcat", "gzip"]]) KEYED[alias] = KEYED[name];
 const GIT_VALUES: Record<string, string[]> = {
   commit: ["-m", "-F", "-C", "-c", "-t", "--message", "--file", "--author", "--date", "--template", "--reuse-message", "--reedit-message", "--fixup", "--squash", "--trailer", "--cleanup"],
   tag: ["-m", "-F", "--message", "--file"],
@@ -8732,7 +8960,15 @@ export function expansionProblem(command: string): GuardVerdict | undefined {
         const sub = args[i] ?? "";
         if (MARKS.test(sub)) found ??= unmark(sub);
         found ??= riskyWord({ values: GIT_VALUES[unmark(sub)] ?? [], checked: GIT_CHECKED, letters: ["format-patch", "archive"].includes(unmark(sub)) ? "o" : "" }, args.slice(i + 1));
+      } else if (/^python3?(\.\d+)?$/.test(name)) {
+        const m0 = unmark(args[0] ?? "");
+        const mod = m0 === "-m" ? unmark(args[1] ?? "") : m0.startsWith("-m") && m0.length > 2 ? m0.slice(2) : undefined;
+        const rest = m0 === "-m" ? args.slice(2) : args.slice(1);
+        if (mod && Object.hasOwn(KEYED, mod)) found = riskyWord(KEYED[mod], rest);
       } else if (Object.hasOwn(KEYED, name)) found = riskyWord(KEYED[name], args);
+      if (found === undefined && RUSTUP_PROXIES.has(name) && args[0] !== undefined && MARKS.test(args[0]) && (args[0].search(MARKS) === 0 || unmark(args[0]).startsWith("+"))) {
+        found = unmark(args[0]);
+      }
       if (found !== undefined) return { action: "classify", reason: `${name} ${found}: a word that can become an option once bash expands it, and ${name}'s options are checked by name` };
     }
   }

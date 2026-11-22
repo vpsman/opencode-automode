@@ -4390,9 +4390,22 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
   }
   if (/^python3?$/.test(name) && args[0] === "-m" && args[1] === "compileall") {
     // (Round 40, Astra: -d, -s, -p, -x, -i, -r, -j, -o and -e take a value, which names no
-    // output; Mythos: a .git target asks.)
+    // output; Mythos: a .git target asks. Project review 3, round 16, Neon: stop filtering
+    // option values after `--`.)
     const rest = args.slice(2);
-    const dirs = operands(rest.filter((a, k) => !/^-[dspxirjoe]$/.test(rest[k - 1] ?? "")));
+    const dirs: string[] = [];
+    for (let k = 0; k < rest.length; k++) {
+      const a = rest[k];
+      if (a === "--") {
+        dirs.push(...rest.slice(k + 1));
+        break;
+      }
+      if (/^-[dspxirjoe]$/.test(a)) {
+        k++;
+        continue;
+      }
+      if (!a.startsWith("-")) dirs.push(a);
+    }
     for (const d of dirs) {
       const p = resolveWord(d, scope);
       if (p && /(^|\/)\.git(\/|$)/.test(p)) return worst(verdict, ask(`compileall writes in a .git directory: ${d}`));
