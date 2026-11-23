@@ -3719,6 +3719,10 @@ function gh(args: string[]): Verdict {
   if (args[0]?.startsWith("-")) return classify("gh with an option before its command");
   const [group, action] = operands(args);
   if (!group) return ALLOW;
+  // (Project review 5, round 5, Mythos: and one between the group and the action could take the
+  // word read as the action for its value: `gh pr --body list comment 123` comments, `gh issue
+  // -c list close 5` closes. A call that would be allowed by its action goes to the decider.)
+  const early = args[1]?.startsWith("-") ? classify(`gh ${group} with an option before its action`) : undefined;
   if (group === "api") {
     // (Project review 5, round 2, Opus: every method the call names, in each form gh reads, the
     // last one deciding (`--method=DELETE`, `-X=DELETE`, `-X GET ... -X DELETE`), and a field
@@ -3755,11 +3759,11 @@ function gh(args: string[]): Verdict {
       else if (!a.startsWith("-") || /^--hostname=/.test(a) || a === "-a" || a === "--active") continue;
       else return criticalAsk(`gh auth status ${a}: an option that may print the token`);
     }
-    return ALLOW;
+    return early ?? ALLOW;
   }
   if (["pr", "issue", "release", "repo", "run", "workflow", "gist", "label", "project", "secret", "variable", "cache"].includes(group)) {
-    if (action && GH_READ.has(action)) return ALLOW;
-    if (group === "repo" && action === "clone") return ALLOW;
+    if (action && GH_READ.has(action)) return early ?? ALLOW;
+    if (group === "repo" && action === "clone") return early ?? ALLOW;
     return ask(`gh ${group} ${action ?? ""} is visible to others`.replace(/\s+/g, " "));
   }
   return subcommand("gh", args);

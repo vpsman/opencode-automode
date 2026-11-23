@@ -2124,3 +2124,88 @@ test("project review 5, round 4 (Opus, Mythos): cargo's optional values, gh's to
     "rm -rf src",
   ]) assert.equal(await decide8(command), "allow", command);
 });
+
+test("project review 5, round 5 (Opus, Mythos): an unquoted expansion bash splits inside an option word, gh options before the action, flags that take no value, setfacl and loginctl words built at run time", async () => {
+  const repo9 = path.join(base, "repo9");
+  fs.mkdirSync(repo9, { recursive: true });
+  for (const f of ["a", "f", "Makefile", "acl.txt"]) fs.writeFileSync(path.join(repo9, f), "x\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo9]);
+  const decide9 = async (command: string) => (await decideShell(guard, new SessionState(repo9), repo9, command)).effect;
+  for (const command of [
+    // Mythos: bash splits the value into words of its own, and the checks read one word.
+    'n="5 rm -rf /"; nice -n$n ls',
+    "timeout --signal=$SIG 30 npm test",
+    "timeout -k$k 30 npm test",
+    "stdbuf -o$x ls",
+    "tee -a$x a",
+    "truncate -s$s a",
+    "install -m$m Makefile",
+    "head -n$n a",
+    "head -n${n:-5} a",
+    "head -n$(cat n) a",
+    "cut -d$d -f1 a",
+    "cat -- -$x",
+    "bash -c 'head -n$n a'",
+    "set -- '5 .env'; head -n$1 a",
+    "chmod $m a",
+    'm="777 ../x"; chmod $m a',
+    "chmod --reference $r a",
+    "chown $o a",
+    "loginctl -n $n list-sessions",
+    // (A loop's variable is not vouched inside an option word; quoted it is one word.)
+    "for i in 5 10; do head -n$i a; done",
+    "for n in 5 10; do nice -n$n ls; done",
+    // Mythos: an option between gh's group and its action may take the next word as its value.
+    "gh pr --body list comment 123",
+    "gh issue -c list close 5",
+    "gh gist -d view create notes.txt",
+    "gh release -D list download v1",
+    "gh auth -h status login",
+    // Opus, Mythos: journalctl takes the word after -n only when it is a number.
+    'journalctl -n "$n"',
+    'journalctl -u app --lines "$n"',
+    'x=--cursor-file=../x; journalctl -n "$x"',
+    // Opus, Mythos: npm reads cargo's and go's value options as flags.
+    'npm audit -p "$x"',
+    'for m in fix; do npm audit -p "$m"; done',
+    'x=--script-shell=./evil.sh; npm test -p "$x"',
+    'npm test --jobs "$x"',
+    // Mythos: setfacl --restore built at run time.
+    'setfacl "--res${u}tore=acl.txt"',
+    "x=--restore=acl.txt; setfacl $x",
+    // (Cross-check, Sol: a value with visible text first after an option npm reads as a flag.)
+    'for s in x; do npm audit -p "fi$s" --force; done',
+    'for s in x; do npm audit --jobs "fi$s" --force; done',
+  ]) assert.notEqual(await decide9(command), "allow", command);
+  for (const command of [
+    "nice -n 10 make",
+    "timeout 30 npm test",
+    "head -n 5 a",
+    "x=5; head -n$x a",
+    "x=5; nice -n$x ls",
+    'head -n"$n" a',
+    'for i in 5 10; do head -n"$i" a; done',
+    "head -n$# a",
+    "make -j$(nproc)",
+    'make -j"$n"',
+    "m=755; chmod $m a",
+    'chmod "$m" a',
+    "command -v $tool",
+    "ls -la $dir",
+    "gh pr view 1",
+    "gh pr list --state open",
+    "gh issue list -L 5",
+    "gh auth status -h github.com",
+    "journalctl -n 50",
+    'journalctl -u "$svc" -n 20',
+    'journalctl -n"$n"',
+    "npm test",
+    "npm run build -w pkg",
+    'npm test -w "packages/$p"',
+    "setfacl -m u:me:rw f",
+    "loginctl list-sessions --no-legend",
+  ]) assert.equal(await decide9(command), "allow", command);
+  // With the sandbox off, a gh download or clone behind an option before the action is not read.
+  for (const command of ["gh release -D list download v1", "gh run -n list download 5", "gh repo -u x clone o/r", "gh -R release run download 5"]) assert.ok(unseenWrites(command), command);
+  for (const command of ["gh pr -R o/r list", "gh issue list -S download", "gh release view v1"]) assert.equal(unseenWrites(command), undefined, command);
+});

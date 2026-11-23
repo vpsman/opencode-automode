@@ -2752,6 +2752,8 @@ export function unknownExpansion(word: string, marked: string | undefined, known
   return false;
 }
 const GLOB_MARKED = /\u0010[*?]|\u0010\[.*\]/s;
+// The writers whose first operand (a mode, an owner) and `--reference` file are no targets.
+const MODE_FIRST = new Set(["chmod", "chown", "chgrp"]);
 
 // N3d: the commands a loop may run more than once (by index in `cmds`, the call's commands as
 // `located` lists them, the top-level `top` first): the head of a `for`, `while`, `until` or
@@ -2947,8 +2949,28 @@ export function runtimeReads(command: string, where: Located, scope: Scope, gitQ
         const found = riskyWord({ letters: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" }, seen, safe);
         if (found !== undefined) add("classify", `${name} ${found}: a word that can become an option once bash expands it, and ${name}'s options are checked by name`);
       }
+      // (Project review 5, round 5, Mythos: bash splits an unquoted expansion into words wherever
+      // it stands, and every check reads the word that holds it as one: `n="5 rm -rf /"; nice
+      // -n$n ls` runs rm, `head -n$n a` with `1 .env` in n reads `.env`, `chmod $m a` with `777
+      // ../x` changes `../x`. An operand built so is judged where it is read (a reader's file
+      // named at run time, a writer's target the check cannot place). These are the words no
+      // check reads for what they may become: a word that begins with `-`, behind `--` too
+      // (`cat -- -$x`); any word a wrapper takes before the program it runs; and any word of
+      // chmod, chown and chgrp, whose mode and `--reference` are no targets. One of them goes to
+      // the model, whatever the program, unless every unquoted expansion in it has a value that
+      // cannot split: a number bash keeps (`$?`, `$#`), or a variable the call plainly sets to a
+      // literal first (Printed.literals: no blank and no glob character; a value with a blank,
+      // `m="777 ../x"`, is followed by no reader, so its word stays unread). A loop's variable
+      // is not vouched here: quoted, `head -n"$n"`, the word is one word and passes.
+      // Not for a program that reads names only and writes nothing (`ls -$x src`, `echo
+      // --zq$x*`, test: N3d-3 holds them as it holds `ls $x`, and more words change nothing).)
+      const wraps = chain.includes(p) && chain.some((q) => q > p);
+      const inert = NAMES_ONLY.has(name) && (QUIET_BUILTINS.has(name) || READS_ONLY.has(name));
       for (let k = p + 1; k < end; k++) {
         const word = cmd.argv[k];
+        if (name !== "case" && !inert && (word.startsWith("-") || wraps || MODE_FIRST.has(name)) && unknownExpansion(word, globs?.[k], (v) => n < top && literals.has(v), n >= top || setsPositionals())) {
+          add("classify", `${word} holds an unquoted expansion, which bash splits into words: ${name} can get words that no check has read`);
+        }
         // Round 4, N3: a glob in any word, one that begins with `-` too, can become an option.
         // (Not the patterns of a `case`, which name no files.)
         // (N3c: a quoted pattern is no glob: `echo '-*'`.)
@@ -8651,9 +8673,14 @@ export function unseenWriter(cmds: Simple[]): string | undefined {
       // (Project review 5, round 3, Opus: what `gh release download`, `gh run download` and
       // `gh repo clone` write, and where, is not read: an asset's or artifact's own names, `-O`,
       // `-D`, the clone's directory. With the sandbox on every gh call asks already.)
-      const [group, action] = args.filter((a) => !a.startsWith("-"));
+      // (Round 5, Mythos: an option before the action may take the word read as the action for
+      // its value, `gh release -D list download v1`: the group and the action are read only
+      // where they are the first two words, and behind an option any `download` or `clone` counts.)
+      const words = args.filter((a) => !a.startsWith("-"));
+      const [group, action] = args.slice(0, 2).some((a) => a.startsWith("-")) ? [] : words;
       if ((group === "release" || group === "run") && action === "download") return why(`gh ${group} download`, "release or the artifact");
       if (group === "repo" && action === "clone") return why("gh repo clone", "repository");
+      if (group === undefined && words.some((w) => w === "download" || w === "clone")) return why("gh with an option before its action, which may be a download or a clone,", "release, the artifact or the repository");
     } else if (name === "git") {
       const call = gitCall(args);
       if (typeof call === "string") continue;
@@ -8967,7 +8994,14 @@ const KEYED: Record<string, Keyed> = {
   awk: { values: ["-v", "-F", "--assign", "--field-separator"], checked: ["--file", "--include", "--load", "--exec", "--source"], letters: "fileEW", operandEnds: true },
   xargs: { values: ["-I", "-n", "-L", "-P", "-s", "-d", "-E", "--max-args", "--max-procs", "--max-chars", "--delimiter", "--eof"], checked: ["--arg-file"], letters: "a" },
   env: { checked: ["--unset", "--chdir", "--split-string", "--argv0"], letters: "uCSa" },
-  npm: PM,
+  // (Project review 5, round 5, Opus and Mythos: the table is shared, and npm reads cargo's and
+  // go's value options (`-p`, `-j`, `--jobs`, `--target`, `--features`, ...) as flags, so the
+  // word after one is an argument or an option of its own: `x=--script-shell=./evil.sh; npm
+  // test -p "$x"`, `for m in fix; do npm audit -p "$m"; done`. Held as cargo is, for npm and
+  // every program read with its table. Cross-check, Sol: a value with visible text first, `npm
+  // audit -p "fi$s"`, is no value either: the npm family lists only the options npm takes a
+  // value for, so the word after any other is read as the word it is.)
+  npm: { ...PM, values: ["-w", "--workspace"], dashValue: true },
   cargo: { ...PM, dashValue: true },
   go: PM,
   // Council project review 2, round 2 (Mythos): the compilers and build tools whose options
@@ -8991,8 +9025,15 @@ const KEYED: Record<string, Keyed> = {
   gh: { values: ["-R", "--repo", "-q", "--jq", "-t", "--template"], checked: ["-X", "--method", "-f", "-F", "--field", "--raw-field", "--input", "-H", "--header"], letters: "XfFH" },
   sysctl: { named: true, dashDash: false },
   // (Project review 5, round 4, Mythos: `journalctl --cursor-file`, `nm --plugin`, read by name.)
-  journalctl: { values: ["-u", "--unit", "--user-unit", "-n", "--lines", "-p", "--priority", "-t", "--identifier", "-S", "--since", "-U", "--until", "-o", "--output", "-g", "--grep"] },
+  // (Round 5, Opus and Mythos: `-n` / `--lines` take the next word only when it is a number, as
+  // make's `-j`: `x=--cursor-file=../x; journalctl -n "$x"`.)
+  journalctl: { optional: ["-n", "--lines"], values: ["-u", "--unit", "--user-unit", "-p", "--priority", "-t", "--identifier", "-S", "--since", "-U", "--until", "-o", "--output", "-g", "--grep"] },
   nm: {},
+  // (Round 5, Mythos: `setfacl "--res${u}tore=acl.txt"`, `x=--restore=acl.txt; setfacl $x`: the
+  // rules read `--restore` by name. And loginctl, whose subcommand they read by position as
+  // systemctl's: `loginctl -n $n list-sessions` with `5 terminate-session` in n.)
+  setfacl: { values: ["-m", "--modify", "-x", "--remove", "--set"] },
+  loginctl: {},
   llamastash: {},
   docker: {},
   systemctl: {},
