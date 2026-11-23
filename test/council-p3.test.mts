@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_ASK, decideShell, SessionState, takeMoment, type Guard } from "../decide.ts";
+import { DEFAULT_ASK, decideShell, SessionState, takeMoment, unseenWrites, type Guard } from "../decide.ts";
 SessionState.moment = takeMoment;
 import { compileRules } from "../rules.ts";
 import { DEFAULT_CLASSIFIER } from "../kev.ts";
@@ -1756,4 +1756,630 @@ test("round 31 (Opus, Mythos): `$!` is no number beside other text in an option 
     "command -v git",
     "time make",
   ]) assert.equal(await decide31(command), "allow", command);
+});
+
+test("project review 5, round 1 (Mythos): a quoted expansion that finishes an option cluster, or a name a check reads", async () => {
+  const repo5 = path.join(base, "repo5");
+  fs.mkdirSync(path.join(repo5, "sub"), { recursive: true });
+  fs.mkdirSync(path.join(repo5, "src"), { recursive: true });
+  for (const f of ["a", "b", "a.c", "w.sh", "src/a.ts", "sub/k"]) fs.writeFileSync(path.join(repo5, f), "x\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo5]);
+  const decide5 = async (command: string) => (await decideShell(guard, new SessionState(repo5), repo5, command)).effect;
+  for (const command of [
+    // 1: a short option word whose letters an expansion can add to, or whose single-dash name
+    // it can finish.
+    'for o in f; do git clean "-d$o"; done',
+    'git clean "-q$(printf f)"',
+    'gcc "-wrap${x:-per}" ./w.sh -c a.c',
+    'gcc -fplug"$x" a.c',
+    'go build -toolexec"$x" .',
+    'go build "-p${x:-kgdir=/tmp/e}" .',
+    'go test "-e${x:-xec}" ./w.sh',
+    'git reset "-q$x"',
+    'git add "-f$x" .',
+    'git commit "-a$x" -m msg',
+    'git commit -am"$x"',
+    'git stash "-q$x"',
+    'git log "-n$n"',
+    'npm run build "-w${x:-C}" /tmp/e',
+    'tree "-P${x:-o}" pat out.txt',
+    'tree -L"$n"',
+    'make "-jf$x"',
+    'cargo build "-q$x"',
+    'clang "-load$x" a.c',
+    // 2: an operand of git, read by name: an action, a name git looks up as a path, a file read.
+    'git checkout "b${x}"',
+    'git stash "dr${c:-op}"',
+    'git stash -q "cl${x}ear"',
+    'git reflog "exp${x:-ire}" --expire=now --all',
+    'git bisect "ru${x:-n}" ./w.sh',
+    'git diff --no-index a "/etc/sh${x:-adow}"',
+    'git show "HEAD:.e${x}nv"',
+    'git add "src/$f"',
+    // npm's script and package words, behind `--` too, and sysctl's names.
+    'npm run "en${x:-v}"',
+    'npm run-script "en${x:-v}"',
+    'npm run -- "en${x:-v}"',
+    'npm run -- "$x"',
+    'npm run --silent "en$x"',
+    'npm --loglevel info run "en$x"',
+    'pnpm run "en${x:-v}"',
+    'yarn run "en${x:-v}"',
+    'npm view "pkg${x:-@git+https://example.com/r.git}" version',
+    'npm pack "pkg$x"',
+    'sysctl "kernel.hostname${x:-=e}"',
+    'sysctl -- "kernel.hostname${x:-=e}"',
+    // 3: a name `git mv` writes, built at run time.
+    'for n in AGENTS; do git mv -f a "sub/$n.md"; done',
+    'git mv b "CLAUDE$(printf .md)"',
+    'git mv a "b$x"',
+    'git mv "a$x" sub',
+    'git mv a -- "sub/$n.md"',
+    "git mv a `echo AGENTS.md`",
+    // As on main.
+    "git stash drop",
+    'cp "$a" b',
+    'tar -czf "out-$v.tgz" src',
+    'git commit -am "$x"',
+    // (Cross-check, Opus: make reads `NAME=` / `NAME!=` operands by name; an `=` bash builds.)
+    'make "X$(printf \'!=\')touch AGENTS.md"',
+    'make "SHELL$(printf =./w.sh)"',
+    'for v in =./w.sh; do make "SHELL$v"; done',
+    'make "CC$(printf =./w.sh)"',
+    'make -- "SHELL$(printf =./w.sh)"',
+    // (Cross-check: the script name of `npm run`, behind `--` or an option's value too.)
+    'npm run -- "$x"',
+    'npm run -w pkg "$x"',
+    'pnpm run "e${x}"',
+    // (Second cross-check, Sol and Opus: the value of an option is not the script's name.)
+    'npm run -w pkg -- "en${x:-v}"',
+    'npm run --workspace pkg -- "en${x:-v}"',
+    'pnpm run --filter pkg -- "en${x:-v}"',
+    // (Second cross-check, Opus: make's directory and makefile inside a cluster.)
+    "make -kC /etc all",
+    'make -kC "/e${x:-tc}" all',
+    "make -kf - all",
+    // (Third cross-check, Sol: a first `run` that is an option's value; Opus: make's `-j` and
+    // `-l` take the next word only when it is a number.)
+    'npm -w run run -- "en${x:-v}"',
+    'pnpm --filter run run -- "en${x:-v}"',
+    'make -j "SHELL$(printf =./w.sh)" all',
+    'make -kj "SHELL$(printf =./w.sh)" all',
+    'make -l "SHELL$(printf =./w.sh)" all',
+    'make --jobs "SHELL$(printf =./w.sh)" all',
+    "n=SHELL=./w.sh; make -j \"$n\" all",
+  ]) assert.notEqual(await decide5(command), "allow", command);
+  for (const command of [
+    "make -j$(nproc)",
+    'make -j"$n"',
+    'git commit -m "msg $x"',
+    'git commit -am "msg $x"',
+    'git commit -m"msg $x"',
+    'git commit --message="msg $x"',
+    'git log --since="$d"',
+    'git log --author="$a" --format="%H $x"',
+    'git log -n 3 --grep="$x"',
+    'git checkout -b "feat/$n"',
+    'git checkout -qb "feat/$n"',
+    'git switch -c "feat/$n"',
+    'git stash push -m "wip $x"',
+    'git tag -a v1 -m "rel $v"',
+    "git add src/a.ts",
+    // (A pathspec behind `--` passes as before: decide.test.mts, r3 5b.)
+    'git log -1 -- "$f"',
+    "git mv a c",
+    "n=README; git mv a \"sub/$n.md\"",
+    'find . -name "*.$ext"',
+    "npm run build",
+    "npm run build -- --grep=x",
+    'npm run build -- --grep="$x"',
+    'npm test -- "tests/$f"',
+    // (Cross-check, Sol and Opus: words after `npm run <script> --` go to the script.)
+    'npm run test -- "$pattern"',
+    'npm run test -- -t "case $x"',
+    'npm run build -- --outDir "dist/$name"',
+    'npm run lint -- --fix "src/$f"',
+    'make -j"$n" all',
+    "make -C sub test",
+    "make -sC sub test",
+    "make -kj4 all",
+    // (Opus: a value option at the end threw in rules.ts subcommand().)
+    "npm -w",
+    "make -j 4 all",
+    "make -l 2.5 all",
+    'make -j "$(nproc)" all',
+    "make -j $(nproc) all",
+    'make -C sub -j"$(nproc)" test',
+    'npm run -w pkg test -- "$pattern"',
+    'npm run test -w pkg -- "$pattern"',
+    "gcc -O2 -o out a.c",
+    "sysctl kernel.hostname",
+    'awk -F"$s" \'{print $1}\' a',
+  ]) assert.equal(await decide5(command), "allow", command);
+});
+
+test("project review 5, round 2 (Opus, Mythos): methods, files and subcommand words the checks read by name", async () => {
+  const repo6 = path.join(base, "repo6");
+  fs.mkdirSync(path.join(repo6, "sub"), { recursive: true });
+  fs.mkdirSync(path.join(repo6, "build"), { recursive: true });
+  for (const f of ["a", "b", "a.c", "w.sh", "sub/k"]) fs.writeFileSync(path.join(repo6, f), "x\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo6]);
+  const decide6 = async (command: string) => (await decideShell(guard, new SessionState(repo6), repo6, command)).effect;
+  for (const command of [
+    // 1 (Opus): every form in which gh api takes a method or a field.
+    "gh api --method=DELETE /repos/a/b",
+    "gh api -X=DELETE /repos/a/b",
+    "gh api -iX DELETE /repos/a/b",
+    "gh api /repos/a/b/issues -ftitle=x",
+    "gh api /repos/a/b/issues -Ftitle=x",
+    "gh api /repos/a/b/issues -if title=x",
+    "gh api graphql -fquery='mutation{deleteIssue(input:{issueId:\"x\"}){clientMutationId}}'",
+    "gh api -X GET /repos/a/b -X DELETE",
+    "gh api -XDELETE /repos/a/b",
+    "gh api /repos/a/b -iXDELETE",
+    "gh api /repos/a/b -X",
+    // (A method word that another option takes as its value does not make the call a GET.)
+    "gh api /repos/a/b/issues -f title=x -t -XGET",
+    "gh api /repos/a/b/issues -f title=x -q -X GET",
+    // 2 (Opus): a long option of git that names a file it reads.
+    'git blame --contents="$(printf .env)" a',
+    'git commit --file "$f"',
+    'git commit --file="$f"',
+    'git commit --fil="$f"',
+    'git tag -a v1 --file "$f"',
+    'git notes add --file="$f"',
+    'git config --file="$f" -l',
+    'git log --mailmap-file="$f"',
+    'git format-patch --signature-file="$f" -1',
+    'git format-patch --cover-letter --description-file="$f" -1 --stdout',
+    'git ls-files --exclude-from="$f"',
+    'git ls-files --exclude-per-directory="$f"',
+    'git blame --ignore-revs-file="$f" a',
+    'git add --pathspec-from-file="$f"',
+    // 3 (Mythos): a subcommand, or the word it reads by name, finished by an expansion.
+    'go tool "test2json$u" ssh host id',
+    'go tool "cg${x:-o}" -- -wrapper sh,-c,id',
+    'go tool -n "test2json$u" ssh host id',
+    'go -C sub tool "test2json$u" ssh host id',
+    'go run "example.com/x/cmd$v"',
+    'go run -race "example.com/x/cmd$v"',
+    'npm audit "fix$u" --force',
+    'npm --loglevel info audit "fix$u"',
+    'npm -s audit "fix$u"',
+    'pnpm audit "fix$u"',
+    'uv pip "install$u" evil',
+    'uv pip -q "install$u" evil',
+    'python3 -m pip "inst$u" evil',
+    'tox "e$u" -- npm install evil',
+    'tox -e a "e$u" -- npm install evil',
+    'meson "devenv$u" -C build sh -c id',
+    // (The same word behind `--`, where the checks read it too.)
+    'npm audit -- "fix$u" --force',
+    'pnpm audit -- "fix$u"',
+    'uv pip -- "install$u" evil',
+    'go tool -- "test2json$u" ssh host id',
+    'go run -- "example.com/x/cmd$v"',
+    // 4 (Mythos): the words `cargo clippy`, `rustc` and `rustdoc` hand rustc after `--`.
+    "cargo clippy -- $CLIPPY_FLAGS",
+    'cargo clippy -- -C "$x"',
+    'cargo clippy -- --emit=link -C "linker$u=/usr/bin/x"',
+    'cargo clippy --fix -- "-C$x"',
+    'cargo rustc -- -C "$x"',
+    'cargo rustdoc -- "--$x"',
+    "cargo --color never clippy -- $F",
+    // 5 (Mythos): a visible option whose value a check reads.
+    'cmake -DCMAKE_C_FLAGS="$CFLAGS" -B build',
+    'clang -fuse-ld="$LD" a.c',
+    'gcc a.c -Wl,-rpath="$x"',
+    'gcc -Wa,"$x" a.c',
+    'ccache gcc -Wl,-rpath="$x" a.c',
+    'ccache clang -fuse-ld="$LD" a.c',
+    // 6 (Mythos): make's long names by any prefix.
+    "make --dir=/etc all",
+    "make --direc /etc all",
+    "make --directory /etc all",
+    "make --mak=- all",
+    "make --fil - all",
+    // 7 (Mythos): the two files `git diff` compares outside its store, behind `--`.
+    'git diff --no-index -- a "/etc/sh${x:-adow}"',
+    'git diff --no-index a -- "$f"',
+    'git diff -- a "/etc/sh${x:-adow}"',
+    'git diff --stat -- a "$f"',
+    // (Cross-check, Sol: an option's separate value before the `--`.)
+    'git diff --src-prefix old/ -- a "../outs${x:-ide.txt}"',
+    'git diff --output out -- a "/etc/sh${x:-adow}"',
+    // (Accepted over-ask: two paths behind `--` after a revision, as git reads them by name.)
+    'git diff HEAD~1 -- "$a" "$b"',
+  ]) assert.notEqual(await decide6(command), "allow", command);
+  for (const command of [
+    "gh api /repos/a/b",
+    "gh api -X GET /x -f q=1",
+    "gh api -XGET /x -fq=1",
+    "gh api --method GET /x",
+    "gh api /x -f q=1 -X GET",
+    "gh api --paginate -X GET /search/issues -f q=x",
+    "gh api --paginate /x",
+    "gh api -H 'Accept: x' /x",
+    "gh api /x -i",
+    "gh api /x --jq '.[].name'",
+    'git commit -m "msg $x"',
+    'git log --format="%H $x"',
+    'git log --grep="$x" --author="$a"',
+    'git branch --contains="$c"',
+    'npm run test -- "$p"',
+    'go test -run "Test$x" ./...',
+    "npm test",
+    "npm audit",
+    "go test ./...",
+    'go run . "arg$x"',
+    'uv run pytest "tests/$f"',
+    "tox -e py311",
+    "meson setup build",
+    "meson compile -C build",
+    'cargo test -- "$filter"',
+    'cargo run -- "$x"',
+    'npm test -- "tests/$f"',
+    "cargo clippy -- -D warnings",
+    'cargo clippy -- -W "clippy::$l"',
+    "gcc -O2 -o out a.c",
+    'gcc -DVERSION="$v" a.c',
+    "gcc -Wl,-rpath,'$ORIGIN' a.c",
+    "clang -fuse-ld=lld a.c",
+    "cmake -B build",
+    'cmake -B "build-$t"',
+    "make --dir=sub all",
+    "make --no-print-directory -C sub all",
+    "make --debug=b all",
+    // (Declined, README Known gaps: a path git reads from its own store.)
+    'git log -p -- "$f"',
+    'git diff -- "$f"',
+    'git show HEAD -- ".env$u"',
+  ]) assert.equal(await decide6(command), "allow", command);
+});
+
+test("project review 5, round 3 (Opus, Mythos): a file a reader takes at run time, and gh's downloads without the sandbox", async () => {
+  const repo7 = path.join(base, "repo7");
+  fs.mkdirSync(repo7, { recursive: true });
+  for (const f of ["a", ".env"]) fs.writeFileSync(path.join(repo7, f), "x\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo7]);
+  const decide7 = async (command: string) => (await decideShell(guard, new SessionState(repo7), repo7, command)).effect;
+  for (const command of [
+    // Mythos: a checked short letter alone, man's file operand, date's and hexdump's long names.
+    'man -l ".en${u}v"',
+    'man -l "./$(printf .env)"',
+    'man "./$(printf .env)"',
+    'date --file="./$(printf .env)"',
+    'date --file ".en${u}v"',
+    'date --fil="$(printf .env)"',
+    'hexdump --format-file "$f" a',
+    // (Cross-check, Sol and Opus: in a cluster, and behind `--`.)
+    'man -al ".en${u}v"',
+    'man -al "./$(printf .env)"',
+    'man -l -- "./.en${u}v"',
+    'man -- "./$(printf .env)"',
+  ]) assert.notEqual(await decide7(command), "allow", command);
+  for (const command of [
+    "man ls",
+    "man -l ./doc/x.1",
+    "date +%s",
+    "date -d tomorrow",
+    // (Cross-check, Opus: a one-letter flag before a loop's own word stays allowed.)
+    'for p in foo bar; do grep -r "$p" .; done',
+    'for p in foo bar; do grep -n -e "$p" a; done',
+    'for f in a b; do wc -l "$f"; done',
+    'for f in a b; do file -b "$f"; done',
+    'for t in 1 2; do date -d "@$t"; done',
+  ]) assert.equal(await decide7(command), "allow", command);
+  // Opus: with the sandbox off, what gh's downloads and clones write is not read.
+  for (const command of ["gh release download v1 -O .git/config", "gh run download 1 -n hooks -D .git/hooks", "gh repo clone a/b .claude", "gh release download v1 -O AGENTS.md"]) {
+    assert.ok(unseenWrites(command), command);
+  }
+  for (const command of ["gh release list", "gh pr view 1", "gh run list"]) assert.equal(unseenWrites(command), undefined, command);
+});
+
+test("project review 5, round 4 (Opus, Mythos): cargo's optional values, gh's token, option words of rm, journalctl and nm built at run time", async () => {
+  const repo8 = path.join(base, "repo8");
+  fs.mkdirSync(path.join(repo8, "src"), { recursive: true });
+  for (const f of ["a.o", "README.md", "src/a.ts"]) fs.writeFileSync(path.join(repo8, f), "x\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo8]);
+  const decide8 = async (command: string) => (await decideShell(guard, new SessionState(repo8), repo8, command)).effect;
+  for (const command of [
+    // Opus: cargo reads a word that begins with `-` after `--bin`/`-p`/`--target` as an option.
+    "b='--config=build.rustc-wrapper=/tmp/w'; cargo build -p app -p \"$b\"",
+    'read -r b < args.txt; cargo build --bin app --bin "$b"',
+    'b=$(cat f); cargo build --package app -p "$b"',
+    'cargo build --target x86_64-unknown-linux-gnu --target "$t"',
+    // (Cross-check, Sol and Opus: any other use of the option, in any spelling or order.)
+    'cargo build -p "$b" -p app',
+    'cargo build --package=app -p "$b"',
+    'cargo build -papp -p "$b"',
+    'cargo run --bin=app --bin "$b"',
+    'cargo test --test "$b" --test t',
+    // (Accepted over-ask: a lone value built at run time.)
+    'cargo build -p "$c"',
+    // Opus: gh auth status prints the token with -t.
+    "gh auth status -t",
+    "gh auth status --show-token",
+    "gh auth -t status",
+    "gh auth --show-token=true status",
+    "gh auth -t=true status",
+    "gh auth --show-token=1 status -h github.com",
+    // Mythos: option words built at run time.
+    'journalctl -n 5 "--cursor-${f:-file}=../x"',
+    "x=--cursor-file=../x; journalctl -n 1 $x",
+    'nm "--plu${x:-gin}" ./evil.so a.o',
+    "x=-rf; rm $x *",
+    'rm "-${x:-r}f" *',
+    'rm "--rec${x:-ursive}" *',
+    'rm "-${x:-r}f" .',
+  ]) assert.notEqual(await decide8(command), "allow", command);
+  for (const command of [
+    "cargo build --release",
+    "cargo test -p app",
+    "gh auth status",
+    "gh auth status -h github.com",
+    "journalctl -n 50 --no-pager",
+    'journalctl -u "$svc" -n 20',
+    "nm a.o",
+    "rm -rf src",
+  ]) assert.equal(await decide8(command), "allow", command);
+});
+
+test("project review 5, round 5 (Opus, Mythos): an unquoted expansion bash splits inside an option word, gh options before the action, flags that take no value, setfacl and loginctl words built at run time", async () => {
+  const repo9 = path.join(base, "repo9");
+  fs.mkdirSync(repo9, { recursive: true });
+  for (const f of ["a", "f", "Makefile", "acl.txt"]) fs.writeFileSync(path.join(repo9, f), "x\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo9]);
+  const decide9 = async (command: string) => (await decideShell(guard, new SessionState(repo9), repo9, command)).effect;
+  for (const command of [
+    // Mythos: bash splits the value into words of its own, and the checks read one word.
+    'n="5 rm -rf /"; nice -n$n ls',
+    "timeout --signal=$SIG 30 npm test",
+    "timeout -k$k 30 npm test",
+    "stdbuf -o$x ls",
+    "tee -a$x a",
+    "truncate -s$s a",
+    "install -m$m Makefile",
+    "head -n$n a",
+    "head -n${n:-5} a",
+    "head -n$(cat n) a",
+    "cut -d$d -f1 a",
+    "cat -- -$x",
+    "bash -c 'head -n$n a'",
+    "set -- '5 .env'; head -n$1 a",
+    "chmod $m a",
+    'm="777 ../x"; chmod $m a',
+    "chmod --reference $r a",
+    "chown $o a",
+    "loginctl -n $n list-sessions",
+    // (A loop's variable is not vouched inside an option word; quoted it is one word.)
+    "for i in 5 10; do head -n$i a; done",
+    "for n in 5 10; do nice -n$n ls; done",
+    // Mythos: an option between gh's group and its action may take the next word as its value.
+    "gh pr --body list comment 123",
+    "gh issue -c list close 5",
+    "gh gist -d view create notes.txt",
+    "gh release -D list download v1",
+    "gh auth -h status login",
+    // Opus, Mythos: journalctl takes the word after -n only when it is a number.
+    'journalctl -n "$n"',
+    'journalctl -u app --lines "$n"',
+    'x=--cursor-file=../x; journalctl -n "$x"',
+    // Opus, Mythos: npm reads cargo's and go's value options as flags.
+    'npm audit -p "$x"',
+    'for m in fix; do npm audit -p "$m"; done',
+    'x=--script-shell=./evil.sh; npm test -p "$x"',
+    'npm test --jobs "$x"',
+    // Mythos: setfacl --restore built at run time.
+    'setfacl "--res${u}tore=acl.txt"',
+    "x=--restore=acl.txt; setfacl $x",
+    // (Cross-check, Sol: a value with visible text first after an option npm reads as a flag.)
+    'for s in x; do npm audit -p "fi$s" --force; done',
+    'for s in x; do npm audit --jobs "fi$s" --force; done',
+  ]) assert.notEqual(await decide9(command), "allow", command);
+  for (const command of [
+    "nice -n 10 make",
+    "timeout 30 npm test",
+    "head -n 5 a",
+    "x=5; head -n$x a",
+    "x=5; nice -n$x ls",
+    'head -n"$n" a',
+    'for i in 5 10; do head -n"$i" a; done',
+    "head -n$# a",
+    "make -j$(nproc)",
+    'make -j"$n"',
+    "m=755; chmod $m a",
+    'chmod "$m" a',
+    "command -v $tool",
+    "ls -la $dir",
+    "gh pr view 1",
+    "gh pr list --state open",
+    "gh issue list -L 5",
+    "gh auth status -h github.com",
+    "journalctl -n 50",
+    'journalctl -u "$svc" -n 20',
+    'journalctl -n"$n"',
+    "npm test",
+    "npm run build -w pkg",
+    'npm test -w "packages/$p"',
+    "setfacl -m u:me:rw f",
+    "loginctl list-sessions --no-legend",
+  ]) assert.equal(await decide9(command), "allow", command);
+  // With the sandbox off, a gh download or clone behind an option before the action is not read.
+  for (const command of ["gh release -D list download v1", "gh run -n list download 5", "gh repo -u x clone o/r", "gh -R release run download 5"]) assert.ok(unseenWrites(command), command);
+  for (const command of ["gh pr -R o/r list", "gh issue list -S download", "gh release view v1"]) assert.equal(unseenWrites(command), undefined, command);
+});
+
+test("project review 5, round 6 (Opus, Sol, Mythos): a quoted \"$@\" is several words, a quoted expansion that finishes an option word, and the variables bash sets itself", async () => {
+  const repo10 = path.join(base, "repo10");
+  fs.mkdirSync(repo10, { recursive: true });
+  for (const f of ["a", "b", "f", "p.diff", "names.txt", "mode"]) fs.writeFileSync(path.join(repo10, f), "x\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo10]);
+  const decide10 = async (command: string) => (await decideShell(guard, new SessionState(repo10), repo10, command)).effect;
+  for (const command of [
+    // A (Opus, Sol): `"$@"` hands the program a word for each positional parameter.
+    "bash -c 'find . -name \"$@\"' _ x -exec rm -rf .. ;",
+    'set -- x -exec touch ../pwned ";"; find . -name "$@"',
+    'set -- 777 ../x; chmod "$@" a',
+    "bash -c 'chmod \"$@\"' _ +x .git/hooks/pre-commit",
+    'set -- x --exec touch ../p; fd -e "$@"',
+    'set -- x -toolexec=./w; go test -run "$@" ./...',
+    'set -- 1 -o ../x; tree -L "$@"',
+    'set -- x --cursor-file=../x; journalctl -u "$@"',
+    'set -- 1 -C ..; ninja -j "$@"',
+    'set -- x -exec touch ../pwned ";"; find . -name "${@}"',
+    'set -- x -exec touch ../pwned ";"; find . -name "${@:1}"',
+    // (And the same list by its other spellings and settings.)
+    'set -- x -exec touch ../p ";"; find . -name "${x:-$@}"',
+    'set -- u+x ../x; chmod -- "$@"',
+    'set -- root ../x; chown "$@" a',
+    "eval 'set -- x -delete'; find . -name \"$@\"",
+    "set -- x -delete; eval 'find . -name \"$@\"'",
+    "sh -c 'find . -name \"$@\"' _ x -delete",
+    'f() { find . -name "$@"; }; f x -delete',
+    'mapfile -t a < f; find . -name "${a[@]}"',
+    'read -ra a < f; chmod "${a[@]}" a',
+    // B (Mythos): a quoted expansion that finishes an option word of a program with no option table.
+    "y='a[$(id)]'; declare \"-$(echo i)\" v=y",
+    'declare "-$(echo n)" p=PATH; p=/tmp/evil',
+    'typeset "-$opt" v=y',
+    'f() { local "-$x" v=PATH; v=/tmp; }; f',
+    'x=$(cat mode); patch "-$x" a < p.diff',
+    'patch -p1 "--$mode" < p.diff',
+    'patch -p1 "--out$x=AGENTS.md" < p.diff',
+    'x=$(echo from-file=.env); diff "--$x" a b',
+    // (The declaring builtins take flags only: an expansion behind a letter adds one.)
+    'declare -r"$(echo i)" v=y',
+    'readonly "-$x" v',
+    'patch -R"$x" a < p.diff',
+    'diff "--from-file$x" a b',
+    // C (Mythos): what bash sets by itself is not the environment's value.
+    'read -r < names.txt; column -t "$REPLY"',
+    'while read -r; do column -t "$REPLY"; done < f',
+    '[[ .env =~ .* ]]; column "$BASH_REMATCH"',
+    'column "$_"',
+    'column "$OLDPWD/config"',
+  ]) assert.notEqual(await decide10(command), "allow", command);
+  for (const command of [
+    // A: at the top level of a call that sets no positional parameters `"$@"` is empty; and a
+    // program that only prints or lists its words, or reads them behind `--`, is as before.
+    'for f in "$@"; do echo "$f"; done',
+    'npm test -- "$@"',
+    "printf '%s\\n' \"$@\"",
+    'echo "$@"',
+    'set -- a b; echo "$@"',
+    "set -- a b; printf '%s\\n' \"$@\"",
+    'set -- a b; for f in "$@"; do echo "$f"; done',
+    'set -- a b; ls -l "$@"; touch c',
+    "bash -c 'echo \"$@\"' _ a b",
+    "bash -c 'npm test -- \"$@\"' _ --watch",
+    'set -- a b; echo "$#"',
+    'echo "${#a[@]}"',
+    // (`"$*"` is one word.)
+    'set -- x; find . -name "$*"',
+    // B: the option shows, or the expansion has a value the call gives it.
+    'head -n"$n" a',
+    'cut -d"$d" -f1 a',
+    'column -t -s"$s" a',
+    'x=5; head "-$x" a',
+    'head "-$#" a',
+    'cat -- "-$x"',
+    'test "-$x" a',
+    'patch -p"$n" < p.diff',
+    "patch -p1 --dry-run < p.diff",
+    "declare -r x=1",
+    // C: a variable of the environment, and a name the call reads into.
+    "column -t a",
+    'column -t "$f"',
+    'column "$HOME/a"',
+    'read -r line < names.txt; echo "$line"',
+    'while read -r; do echo "$REPLY"; done < f',
+  ]) assert.equal(await decide10(command), "allow", command);
+  // B: these ask or go to the model for reasons of their own, as before, and not for this rule.
+  const why10 = async (command: string) => (await decideShell(guard, new SessionState(repo10), repo10, command)).reason ?? "";
+  for (const command of ['curl -H "X: $v" https://example.com', 'curl --header="X: $v" https://example.com', 'mvn -Dversion="$v" test', 'java -Dx="$y" -jar a.jar', 'declare -r x="$v"', 'f() { local v="$1"; echo "$v"; }; f a', 'diff -u a "$b"', 'diff --label="$l" a b']) {
+    assert.doesNotMatch(await why10(command), /an option word that an expansion finishes|so its output file is not known/, command);
+  }
+});
+
+test("project review 5, round 7 (Opus, Sol): `set -` sets the positionals, and a `--` that is an option's value", async () => {
+  const repo10 = path.join(base, "repo10");
+  fs.mkdirSync(repo10, { recursive: true });
+  for (const f of ["a", "b", "opt.txt"]) fs.writeFileSync(path.join(repo10, f), "x\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo10]);
+  const decide10 = async (command: string) => (await decideShell(guard, new SessionState(repo10), repo10, command)).effect;
+  for (const command of [
+    'set - -x -o -delete; find . -name "$@"',
+    'set - -x -delete; find . -name "${@:1}"',
+    'set - -R; chmod "$@" +x .',
+    'x=$(cat opt.txt); diff -I -- "--$x" a b',
+    'x=$(cat opt.txt); diff --label -- "--$x" a b',
+    'while read -r o; do diff -I -- "--$o" a b; done < opt.txt',
+    // (Round 8, Opus: the same in the option tables' reader.)
+    'rg -r -- "--pr$x" abc',
+    'x=e=../evil; rg --context-separator -- "--pr$x" abc',
+    'journalctl --output-fields -- "--cursor-fil$x" -n 1',
+    'x=$(cat f); journalctl --output-fields -- "$x" -n 1',
+    'while read -r o; do journalctl --output-fields -- "$o" -n 1; done < opt.txt',
+    'x=$(cat f); pytest --deselect -- "$x" tests',
+    'x=$(cat f); journalctl --output-fields -- a$x -n 1',
+    'x=$(cat f); pytest --deselect -- a$x tests',
+    'x=$(cat f); git log --grep -- a$x',
+    // (Third cross-check, Opus: git grep reads options after a `--` that was `-e`'s value.)
+    'x=$(cat f); git grep -e -- "$x"',
+    'x=$(cat f); git grep -f -- "$x" src',
+    'read -r x < f; git format-patch --subject-prefix -- "$x" -1',
+    'read -r x < f; git format-patch --to -- "$x" -1',
+    'read -r x < f; git log --decorate-refs -- "$x" -1',
+    'read -r x < f; git show --decorate-refs -- "$x"',
+    'read -r x < f; git log -L -- "$x"',
+    'read -r x < f; git whatchanged --decorate-refs-exclude -- "$x" -1',
+    'read -r x < f; git log -qL -- "$x"',
+    'read -r x < f; git shortlog --grep -- "$x" HEAD',
+    // (Final cross-check, Opus: git's output options behind a `--` that was a value.)
+    "git log --decorate-refs -- --output .git/config --format=%B -1",
+    "git show --decorate-refs -- --output .git/config --format=%B",
+    "git log --decorate-refs -- --output ../outside.txt -1",
+    "git format-patch --to -- -o .git/hooks -1",
+    "git format-patch --to -- --output-directory=../out -1",
+    // (Accepted over-asks: git is read bluntly after a `--` behind a long option.)
+    'git log --oneline -- "$f"',
+    'git diff --cached -- "$f"',
+  ]) assert.notEqual(await decide10(command), "allow", command);
+  for (const command of ["set -euo pipefail; ls", 'set -e; npm test -- "$@"', "diff -u a b", 'diff -I "^#" a b', "rg -n -- --foo src", 'rg -- "-foo$x" src', 'wc -l -- "$f"', 'du -sh -- "$dir"', 'git log -1 -- "$f"', 'git show HEAD -- "$f"', 'git add -A -- "$f"']) {
+    assert.equal(await decide10(command), "allow", command);
+  }
+});
+
+test("project review 5, round 9 (Opus): a list option behind a `--` that was an option's value", async () => {
+  const repo11 = path.join(base, "repo11");
+  fs.mkdirSync(repo11, { recursive: true });
+  for (const f of ["a", ".env"]) fs.writeFileSync(path.join(repo11, f), "x\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo11]);
+  const decide11 = async (command: string) => (await decideShell(guard, new SessionState(repo11), repo11, command)).effect;
+  for (const command of [
+    "du --exclude -- --files0-from=.env",
+    "du -sh --exclude -- --files0-from=.env",
+    "du --time-style -- --files0-from=.env",
+    "file -F -- -f .env",
+    "file --separator -- --files-from=.env",
+  ]) assert.notEqual(await decide11(command), "allow", command);
+  for (const command of ["du -sh -- a", "du -sh .", "file -- a", "file -b a", "wc -l -- a"]) assert.equal(await decide11(command), "allow", command);
+});
+
+test("project review 5, round 10 (Mythos): stash's -m outside push, and go's own value options", async () => {
+  const repo12 = path.join(base, "repo12");
+  fs.mkdirSync(repo12, { recursive: true });
+  fs.writeFileSync(path.join(repo12, "a"), "x\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo12]);
+  const decide12 = async (command: string) => (await decideShell(guard, new SessionState(repo12), repo12, command)).effect;
+  for (const command of [
+    'x=--output=AGENTS.md; git stash list -m "$x"',
+    'x=$(cat f); git stash show -m "$x"',
+    'x=-exec=./evil.sh; go test -w "$x"',
+    'read -r x < flags.txt; go test --jobs "$x"',
+  ]) assert.notEqual(await decide12(command), "allow", command);
+  for (const command of ['git stash push -m "wip $x"', 'git stash -m "wip $x"', "git stash list", 'go test -run "Test$x" ./...', "go test ./..."]) {
+    assert.equal(await decide12(command), "allow", command);
+  }
 });

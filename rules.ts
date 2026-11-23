@@ -2171,9 +2171,15 @@ function make(args: string[], scope: Scope): Verdict {
   for (let k = 0; k < args.length; k++) {
     const a = args[k];
     if (longIs(a, "eval") || shortIn(a, "E", "fCIjlWo")) return classify("make --eval runs text as a makefile");
-    const file = /^(-f|--file|--makefile)$/.test(a) ? args[k + 1] : /^--(file|makefile)=/.test(a) ? a.slice(a.indexOf("=") + 1) : /^-f./.test(a) ? a.slice(2) : undefined;
+    // (Project review 5, round 1, cross-check, Opus: in a cluster, the first letter that takes a
+    // value takes the rest of the word or the next one, `make -kC /etc all`, `make -kf -`.)
+    const at = /^-[^-]/.test(a) ? [...a.slice(1)].findIndex((l) => "fCIjlWo".includes(l)) + 1 : 0;
+    const short = at > 0 ? [a[at], a.slice(at + 1) || args[k + 1]] : [];
+    // (Round 2, Mythos: make takes a long name by any prefix, `--dir=/etc`, `--direc /etc`.)
+    const long = (...names: string[]) => (names.some((n) => longIs(a, n)) ? (a.includes("=") ? a.slice(a.indexOf("=") + 1) : args[k + 1]) : undefined);
+    const file = long("file", "makefile") ?? (short[0] === "f" ? short[1] : undefined);
     if (file !== undefined && (file === "-" || (/^\/dev\/|^\/proc\//.test(file) && file !== "/dev/null") || /[$`]/.test(file))) return classify("make reads its makefile from a stream");
-    const dir = /^(-C|--directory)$/.test(a) ? args[k + 1] : /^--directory=/.test(a) ? a.slice(12) : /^-C./.test(a) ? a.slice(2) : undefined;
+    const dir = long("directory") ?? (short[0] === "C" ? short[1] : undefined);
     if (dir !== undefined && !isLocal(resolveWord(dir, scope), scope)) return classify("make in a directory outside the working directory");
     const m = /^([A-Za-z_.][\w.]*)\+?[:?!]?=(.*)$/s.exec(a);
     if (m && (/^(SHELL|\.SHELLFLAGS|MAKEFLAGS|MFLAGS|MAKE|MAKEFILES|MAKEFILE_LIST|\.RECIPEPREFIX)$/.test(m[1]) || !/^[\w.+,:=%@\/-]*$/.test(m[2]))) {
@@ -3547,17 +3553,21 @@ function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = 
 function rm(args: string[], scope: Scope): Verdict {
   const head = args.indexOf("--") < 0 ? args : args.slice(0, args.indexOf("--"));
   const recursive = hasFlag(head, "r", "--recursive") || hasFlag(head, "R") || head.some((a) => longIs(a, "recursive"));
+  // (Project review 5, round 4, Mythos: an option word bash builds at run time can hold the `-r`,
+  // `x=-rf; rm $x *`, `rm "-${x:-r}f" *`: read as maybe recursive, which asks.)
+  const maybe = recursive || head.some((a) => /[$`]/.test(a) && /^(-|\$|`)/.test(a));
   let verdict = ALLOW;
   for (const t of operands(args)) {
     const p = resolveWord(t, scope);
     const bare = BARE_GLOB.test(path.basename(t));
-    if (recursive && p && (isRootLike(p) || (bare && isRootLike(path.dirname(p))))) {
+    if (maybe && p && (isRootLike(p) || (bare && isRootLike(path.dirname(p))))) {
+      if (!recursive) return ask(`rm of ${t} with an option bash builds at run time, which may wipe a home or system directory`);
       return deny(`rm -r of ${t} would wipe a home or system directory`);
     }
     if (isGuarded(p, scope)) verdict = worst(verdict, guardAsk("rm deletes the auto-mode guard's own files"));
     else if (isPiFile(p, scope)) verdict = worst(verdict, piAsk(`rm deletes Pi's own files: ${t}`));
     else if (!isLocal(p, scope)) verdict = worst(verdict, outside(`rm deletes outside the working directory: ${t}`, p));
-    else if (recursive && scope.root && (p === scope.root || (bare && path.dirname(p!) === scope.root) || /(^|\/)\.git(\/|$)/.test(p!))) {
+    else if (maybe && scope.root && (p === scope.root || (bare && path.dirname(p!) === scope.root) || /(^|\/)\.git(\/|$)/.test(p!))) {
       verdict = worst(verdict, ask(`rm -r of ${t} deletes the whole project or its git data`));
     }
   }
@@ -3625,8 +3635,10 @@ function git(args: string[], scope: Scope): Verdict {
   }
   // Files git writes besides the work tree.
   const outputs: string[] = [];
+  // (Project review 5, round 8, Opus: every word, past a `--` too, which can be an option's value:
+  // `git format-patch --to -- -o .git/hooks -1`.)
   const valueOf = (long: string, letter?: string) =>
-    opts.flatMap((a, k) => (longIs(a, long) ? [a.includes("=") ? a.slice(a.indexOf("=") + 1) : (opts[k + 1] ?? "")] : letter && a === `-${letter}` ? [opts[k + 1] ?? ""] : letter && a.startsWith(`-${letter}`) && a.length > 2 && !a.startsWith("--") ? [a.slice(2)] : []));
+    rest.flatMap((a, k) => (longIs(a, long) ? [a.includes("=") ? a.slice(a.indexOf("=") + 1) : (rest[k + 1] ?? "")] : letter && a === `-${letter}` ? [rest[k + 1] ?? ""] : letter && a.startsWith(`-${letter}`) && a.length > 2 && !a.startsWith("--") ? [a.slice(2)] : []));
   if (["diff", "log", "show", "whatchanged", "range-diff", "format-patch", "diff-tree", "diff-files", "diff-index", "cherry"].includes(sub)) outputs.push(...valueOf("output"));
   if (sub === "format-patch") outputs.push(...valueOf("output-directory", "o"));
   if (sub === "archive") outputs.push(...valueOf("output", "o"));
@@ -3709,17 +3721,51 @@ function gh(args: string[]): Verdict {
   if (args[0]?.startsWith("-")) return classify("gh with an option before its command");
   const [group, action] = operands(args);
   if (!group) return ALLOW;
+  // (Project review 5, round 5, Mythos: and one between the group and the action could take the
+  // word read as the action for its value: `gh pr --body list comment 123` comments, `gh issue
+  // -c list close 5` closes. A call that would be allowed by its action goes to the decider.)
+  const early = args[1]?.startsWith("-") ? classify(`gh ${group} with an option before its action`) : undefined;
   if (group === "api") {
-    const m = args.findIndex((a) => a === "-X" || a === "--method");
-    const method = m >= 0 ? (args[m + 1] ?? "").toUpperCase() : args.find((a) => /^-X\w+$/.test(a))?.slice(2).toUpperCase();
-    const fields = args.some((a) => /^(-f|-F|--field|--raw-field|--input)(=|$)/.test(a));
-    if (method ? method !== "GET" : fields) return ask("gh api call that changes remote data");
+    // (Project review 5, round 2, Opus: every method the call names, in each form gh reads, the
+    // last one deciding (`--method=DELETE`, `-X=DELETE`, `-X GET ... -X DELETE`), and a field
+    // attached to its letter (`-ftitle=x`); any other cluster that holds one of these letters,
+    // `-iX DELETE`, `-if title=x`, is not read and asks. A method word right after an option
+    // that is not one of gh api's flags may be that option's value, `-f title=x -t -XGET`: it
+    // does not make a call with fields a GET.)
+    const methods: string[] = [];
+    let fields = false;
+    let sure = true;
+    for (const [k, a] of args.entries()) {
+      const method = a === "-X" || a === "--method" ? (args[k + 1] ?? "") : a.startsWith("--method=") ? a.slice(9) : /^-X./.test(a) ? a.slice(2).replace(/^=/, "") : undefined;
+      if (method !== undefined) {
+        methods.push(method);
+        const before = args[k - 1];
+        if (before.startsWith("-") && !before.includes("=") && !/^(-i|--include|--paginate|--slurp|--silent|--verbose)$/.test(before)) sure = false;
+      } else if (/^(-[fF].*|--(field|raw-field|input)(=.*)?)$/s.test(a)) fields = true;
+      else if (/^-[^-]/.test(a) && /[XfF]/.test(a)) return ask(`gh api ${a}: an option cluster the check does not read, which may set the method or a field`);
+    }
+    if (methods.some((m) => m.toUpperCase() !== "GET") || (fields && (!methods.length || !sure))) return ask("gh api call that changes remote data");
     return ALLOW;
   }
-  if (group === "auth") return action === "status" ? ALLOW : classify("gh auth");
+  if (group === "auth") {
+    if (action !== "status") return classify("gh auth");
+    // (Project review 5, round 4, Opus: `-t` / `--show-token` prints the token. Only the options
+    // known to print no secret pass.)
+    // (Cross-check, Sol and Opus: gh hands options written before `status` to it as well,
+    // `gh auth -t=true status`: every word after `auth` but `status` itself.)
+    const rest = args.slice(args.indexOf("auth") + 1);
+    rest.splice(rest.indexOf("status"), 1);
+    for (let k = 0; k < rest.length; k++) {
+      const a = rest[k];
+      if (a === "-h" || a === "--hostname") k++;
+      else if (!a.startsWith("-") || /^--hostname=/.test(a) || a === "-a" || a === "--active") continue;
+      else return criticalAsk(`gh auth status ${a}: an option that may print the token`);
+    }
+    return early ?? ALLOW;
+  }
   if (["pr", "issue", "release", "repo", "run", "workflow", "gist", "label", "project", "secret", "variable", "cache"].includes(group)) {
-    if (action && GH_READ.has(action)) return ALLOW;
-    if (group === "repo" && action === "clone") return ALLOW;
+    if (action && GH_READ.has(action)) return early ?? ALLOW;
+    if (group === "repo" && action === "clone") return early ?? ALLOW;
     return ask(`gh ${group} ${action ?? ""} is visible to others`.replace(/\s+/g, " "));
   }
   return subcommand("gh", args);
@@ -3750,7 +3796,8 @@ function subcommand(tool: string, args: string[], scope?: Scope): Verdict {
     const k = leadingOptions(args, lead);
     const unknown = (why: string) => (ASK_BY_DEFAULT[tool] ? ask(`${tool} ${why}`) : classify(`${tool} ${why}`));
     if (k < 0) return unknown("with an option before its subcommand that the rules do not model");
-    for (let j = 0; j < k; j++) {
+    // (Project review 5, round 1, Opus: a value option at the end, `npm -w`, counts past the words.)
+    for (let j = 0; j < Math.min(k, args.length); j++) {
       const a = args[j];
       const flag = a.split("=")[0];
       if (!lead.dirs?.includes(flag)) continue;
@@ -4674,7 +4721,10 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
   const attached = (name: string) => dynamicSetter || new RegExp(`(^|[^\\w$])-[A-Za-z]*${name}(?!\\w)`).test(setters);
   const defaulted = (name: string) => !!parsed.assigns?.has(name) || !!scope.reassigned?.has(name) || new RegExp(`\\$\\{${name}(\\[[^\\]]*\\])?:?=`).test(words) || attached(name);
   const namedOnce = (name: string) => !defaulted(name) && (words.match(new RegExp(`(^|[^$\\w{])${name}(?!\\w)`, "g")) ?? []).length === 1;
-  local.unassigned = (name: string) => !defaulted(name) && !new RegExp(`(^|[^$\\w{])${name}(?!\\w)`).test(words);
+  // (Project review 5, round 6, Mythos: a name bash sets by itself is never the environment's,
+  // whatever the call shows of it: `read -r < names.txt; column -t "$REPLY"`, `[[ .env =~ .* ]];
+  // column "$BASH_REMATCH"`, `column "$_"` after any command.)
+  local.unassigned = (name: string) => !BASH_SETS.test(name) && !defaulted(name) && !new RegExp(`(^|[^$\\w{])${name}(?!\\w)`).test(words);
   const track = depth === 0 && !parsed.grouped;
   // The patterns of the parts that decide. A prompt offers one only when it covers them all.
   const patterns = new Set<string | undefined>(parsed.opaque ? [undefined] : []);
