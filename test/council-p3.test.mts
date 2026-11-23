@@ -1623,3 +1623,37 @@ test("round 27 (Opus, Sol): a dynamic printf option after a literal -v NAME", as
     "x=src; sleep 1 & wait $!; echo hi > $x/out.txt",
   ]) assert.equal(await decide27(command), "allow", command);
 });
+
+test("round 29 (Mythos): a name set by ${NAME:=word}, and a quoted printf or wait word that is the whole option", async () => {
+  const repo29 = path.join(base, "repo29");
+  fs.mkdirSync(repo29, { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "main", repo29]);
+  const decide29 = async (command: string) => (await decideShell(guard, new SessionState(repo29), repo29, command)).effect;
+  for (const command of [
+    "x='a[$(date)]'; : \"${f:=-v $x}\"; test $f",
+    "x='a[$(date)]'; : \"${f=-v $x}\"; [ $f ]",
+    "x=$(cat g); : \"${f:-${h:=-v $x}}\"; test $h",
+    "x='a[$(date)]'; : \"${f:=-v$x}\"; printf \"$f\" x",
+    'f=$(cat g); printf "$f" x',
+    'read -r f < g; printf "$f" x',
+    'for f in $(cat g); do printf "$f" x; done',
+    'printf "$(cat g)" x',
+    'set -- "$(cat g)"; printf "$1" x',
+    'f=$(cat g); printf "${f:-x}" x',
+    'f=$(cat g); printf "-$f" x',
+    'a=-; f=$(cat g); printf "$a$f" x',
+    'x=$(cat g); printf "-va$x]" x',
+    'sleep 0 & f=$(cat g); wait -n "$f"',
+  ]) assert.notEqual(await decide29(command), "allow", command);
+  for (const command of [
+    'printf "$fmt" a b',
+    "fmt='%s\\n'; printf \"$fmt\" a",
+    'msg=$(git log -1 --format=%s); printf "$msg\\n"',
+    "msg=$(git log -1 --format=%s); printf '%s\\n' \"$msg\"",
+    'f=$(cat g); printf -- "$f" x',
+    'f=$(cat g); printf "%s$f" x',
+    'while read -r line; do printf "$line\\n"; done < g',
+    "[ -z $x ]",
+    'sleep 1 & pid=$!; wait "$pid"',
+  ]) assert.equal(await decide29(command), "allow", command);
+});

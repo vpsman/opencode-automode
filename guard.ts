@@ -9040,6 +9040,9 @@ function unreadNames(command: string, cmds: Simple[], cwd?: string): Set<string>
     if ((name === "printf" && printfOptionWords(args).some(dynamic)) || (name === "wait" && args.some(dynamic))) out.add("*");
     if (name === "wait") for (const t of waitTargets(args)) out.add(t.replace(/\[.*$/s, ""));
   }
+  // (Round 29, Mythos: `${NAME:=word}` / `${NAME=word}` assigns too, wherever it stands in the
+  // text: `: "${f:=-v $x}"; test $f`.)
+  for (const m of command.matchAll(/\$\{([A-Za-z_]\w*)(?:\[[^\]]*\])?:?=/g)) out.add(m[1]);
   for (const m of command.matchAll(/\b(?:for|select)\s+([A-Za-z_]\w*)\s*(?:in\b([^;\n]*))?(?=[;\n]|\s+do\b)/g)) {
     const list = m[2];
     if (list === undefined || /[$`'"\\]/.test(list)) out.add(m[1]);
@@ -9135,6 +9138,24 @@ export function expansionProblem(command: string, cwd?: string): GuardVerdict | 
           };
           const named = (name === "printf" ? args.slice(0, 1) : args).find((a) => [...a.matchAll(UNQUOTED_NAME)].some((m) => !safeName(m[1])));
           if (named !== undefined) found = unmark(named);
+          // (Round 29, Mythos: a quoted word does not split, but it can be the whole option with
+          // its name attached: `f=$(cat g); printf "$f" x` with `-va[$(id)]` in g, `wait -n "$f"`
+          // with `-pa[$(id)]`. printf's first word, or any word of wait, that begins with an
+          // expansion (or with `-` and holds one) passes only when every expansion in it is a
+          // plain `$NAME` the call gives literal values or never sets (`printf "$fmt" a`,
+          // `wait "$pid"` after `pid=$!`); a substitution, a positional or computed parameter or
+          // a name set from something no check reads goes to the model. A printf word that ends
+          // in a literal `\n` is a format whatever it begins with: no name ends that way.)
+          else if (name === "printf" || name === "wait") {
+            const trusted = (n: string) => !unread.has(n) && (assigned.has(n) || settable(n));
+            const whole = (name === "printf" ? args.slice(0, 1) : args).find((a) => {
+              const w = unmark(a).replace(/\$[!$?#]/g, "");
+              if (!(/^[$`]/.test(w) || (w.startsWith("-") && /[$`]/.test(w)))) return false;
+              if (name === "printf" && w.endsWith("\\n")) return false;
+              return /[$`]/.test(w.replace(/\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))/g, (m0, b1, b2) => (trusted(b1 ?? b2) ? "" : m0)));
+            });
+            if (whole !== undefined) found = unmark(whole);
+          }
         }
       }
       if (found === undefined && (name === "test" || name === "[" || name === "wait")) {
