@@ -3754,7 +3754,8 @@ function subcommand(tool: string, args: string[], scope?: Scope): Verdict {
     const k = leadingOptions(args, lead);
     const unknown = (why: string) => (ASK_BY_DEFAULT[tool] ? ask(`${tool} ${why}`) : classify(`${tool} ${why}`));
     if (k < 0) return unknown("with an option before its subcommand that the rules do not model");
-    for (let j = 0; j < k; j++) {
+    // (Project review 5, round 1, Opus: a value option at the end, `npm -w`, counts past the words.)
+    for (let j = 0; j < Math.min(k, args.length); j++) {
       const a = args[j];
       const flag = a.split("=")[0];
       if (!lead.dirs?.includes(flag)) continue;

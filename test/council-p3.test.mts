@@ -1883,6 +1883,8 @@ test("project review 5, round 1 (Mythos): a quoted expansion that finishes an op
     "make -C sub test",
     "make -sC sub test",
     "make -kj4 all",
+    // (Opus: a value option at the end threw in rules.ts subcommand().)
+    "npm -w",
     "make -j 4 all",
     "make -l 2.5 all",
     'make -j "$(nproc)" all',
