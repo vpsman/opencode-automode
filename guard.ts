@@ -8415,7 +8415,16 @@ function listOptions(name: string, args: string[]): string[] {
   const rule = (value: string) => void (RSYNC_RULE.test(value) && out.push(RSYNC_RULE.exec(value)![1]));
   for (let i = 0; i < words.length; i++) {
     const a = words[i];
-    if (a === "--" && name !== "find") break;
+    // (Project review 5, round 9, Opus: a `--` right after an option word can be that option's
+    // value, `du --exclude -- --files0-from=.env`: only a `--` after an operand, a long option
+    // with `=`, a count or a cluster of the program's known flag letters ends the reading.)
+    if (a === "--" && name !== "find") {
+      const before = words[i - 1] ?? "";
+      const flags = call ? GIT_DASH_DASH[call.sub ?? ""] : DASH_DASH[name];
+      const ends = !before.startsWith("-") || before === "--" || /^-\d+$/.test(before) || (before.startsWith("--") && before.includes("=")) || (flags !== undefined && /^-[^-]/.test(before) && [...before.slice(1)].every((l) => flags.includes(l)));
+      if (ends) break;
+      continue;
+    }
     if (spec.single?.includes(a)) out.push(words[++i] ?? "");
     else if (a.startsWith("--")) {
       const eq = a.indexOf("=");

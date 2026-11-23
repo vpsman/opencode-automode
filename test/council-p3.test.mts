@@ -2350,3 +2350,19 @@ test("project review 5, round 7 (Opus, Sol): `set -` sets the positionals, and a
     assert.equal(await decide10(command), "allow", command);
   }
 });
+
+test("project review 5, round 9 (Opus): a list option behind a `--` that was an option's value", async () => {
+  const repo11 = path.join(base, "repo11");
+  fs.mkdirSync(repo11, { recursive: true });
+  for (const f of ["a", ".env"]) fs.writeFileSync(path.join(repo11, f), "x\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo11]);
+  const decide11 = async (command: string) => (await decideShell(guard, new SessionState(repo11), repo11, command)).effect;
+  for (const command of [
+    "du --exclude -- --files0-from=.env",
+    "du -sh --exclude -- --files0-from=.env",
+    "du --time-style -- --files0-from=.env",
+    "file -F -- -f .env",
+    "file --separator -- --files-from=.env",
+  ]) assert.notEqual(await decide11(command), "allow", command);
+  for (const command of ["du -sh -- a", "du -sh .", "file -- a", "file -b a", "wc -l -- a"]) assert.equal(await decide11(command), "allow", command);
+});
