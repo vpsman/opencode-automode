@@ -376,7 +376,13 @@ For each shell tool call:
      literal at its start (`name=foo; grep "$name" src` is judged as `grep foo src`; not where
      the assignment heads a list that runs as a background job, `name=foo && true &`); a
      word that could become an option once bash expands it, for a program whose options
-     are checked (`git diff $BASE`, `find "$dir" -name x`, `make $target`), `wc`, `du`,
+     are checked (`git diff $BASE`, `find "$dir" -name x`, `make $target`; also a short
+     option word an expansion can finish, `git clean "-d$o"`, unless its first letter is
+     known to take the rest as its value, `make -j"$n"`), and an operand with an expansion
+     anywhere in it where the checks read a name: an operand of git before any `--`
+     (`git stash "dr$x"`, `git add "src/$f"`; a `git mv` name built at run time asks as a
+     write to a place the check cannot tell), an operand of make (`make "SHELL$v"`), the
+     script name after `npm run`, a spec after `npm view`, a `sysctl` name; `wc`, `du`,
      `file`, `grep` and `jq` among them, which have options that read a file of names
      (`wc -l "$f"`, `wc -l $(git ls-files)`, `du -sh "$dir"`; not behind `--`); a glob, or
      an unquoted expansion, that could match a name that begins with `-`, in a call where

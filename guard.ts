@@ -1890,6 +1890,13 @@ export function gitWrites(args: string[]): [string, boolean][] {
     const words = rest.filter((w) => !w.startsWith("-"));
     if (words[0] === "create" && words[1]) out.push([words[1], false]);
   }
+  // (Project review 5, round 1, Mythos: a move writes each name it is given, and the test of
+  // protected names passes over one bash builds at run time: `git mv -f a "sub/$n.md"` with
+  // n=AGENTS. Such an operand is a write to a place the check cannot tell, as cp's is.)
+  if (sub === "mv") {
+    const end = rest.indexOf("--");
+    for (const [k, w] of rest.entries()) if (/[$`]/.test(w) && ((end >= 0 && k > end) || !w.startsWith("-"))) out.push([w, false]);
+  }
   // git resolves a relative name in the directory `-C` took it to: the whole chain, a later
   // absolute `-C` starting over (second pass). One known only at run time leaves the place
   // unknown: the name keeps the `-C` words, which the caller cannot place.
@@ -4287,10 +4294,14 @@ function makeProblem(args: string[], cwd: string | undefined, inProject: ((p: st
 // `--config.<key>`; cargo's `--config` (`build.rustc-wrapper=...`); go's `-toolexec`, `-exec`
 // and `-vettool`. Words after `--` (and go's `-args`) go to the program, not the manager.
 const PM_PROGRAM_OPTIONS = ["--script-shell", "--node-options", "--userconfig", "--globalconfig", "--init-module"];
+// The words of the npm family after which managerProblem reads a script or a package by name.
+const NPM_FAMILY = ["npm", "pnpm", "yarn", "bun"];
+const NPM_RUN = ["run", "run-script", "rum", "urn"];
+const NPM_SPEC = ["pack", "view", "info", "show", "v"];
 function managerProblem(name: string, args: string[]): string | undefined {
   const end = args.findIndex((a) => a === "--" || (name === "go" && /^--?args$/.test(a)));
   const own = end < 0 ? args : args.slice(0, end);
-  if (["npm", "pnpm", "yarn", "bun"].includes(name)) {
+  if (NPM_FAMILY.includes(name)) {
     const option = own.find((a) => abbreviates(a, PM_PROGRAM_OPTIONS) || /^--(script|node|init)_/.test(a) || /^--config\./.test(a));
     if (option) return `${name} ${option.split("=")[0]} picks the program scripts run with, or a config that does`;
     // (Council project review 2, round 2, Mythos: npm supplies an `env` script of its own where
@@ -4301,7 +4312,7 @@ function managerProblem(name: string, args: string[]): string | undefined {
     // and runs its `prepare` script, as an install does.)
     // (Round 18, Mythos: `view` and `info` fetch the same specs, and a hosted git spec pinned to a
     // commit runs its `prepare` script there too.)
-    const packAt = args.findIndex((a) => ["pack", "view", "info", "show", "v"].includes(a));
+    const packAt = args.findIndex((a) => NPM_SPEC.includes(a));
     // (Round 17: by what may pass, not by what npm reads as git: `x@git+...`, `git@host:path`,
     // `GITHUB:u/r`. A registry name, scoped or not, with a version or tag, and a local path pass.)
     // (Round 22, Astra and Mythos: no `*`, which bash may expand into a git spec, `x@*`.)
@@ -4316,7 +4327,7 @@ function managerProblem(name: string, args: string[]): string | undefined {
     const field = /^[\w.$-]+(\[\d+\])*[\w.$-]*$/;
     const specs = packAt < 0 ? [] : args.slice(packAt + 1).filter((a) => !a.startsWith("-"));
     if (specs.some((a) => !registry.test(a) && !local.test(a) && !field.test(a))) return `${name} ${args[packAt]} of a git repository, a URL or another non-registry spec runs that package's prepare script`;
-    const run = args.findIndex((a) => ["run", "run-script", "rum", "urn"].includes(a));
+    const run = args.findIndex((a) => NPM_RUN.includes(a));
     if (run >= 0 && args.slice(run + 1).includes("env")) return `${name} run env prints the environment, or runs the words after it as a command`;
   }
   if (name === "cargo") {
@@ -8757,8 +8768,15 @@ export function argvGuards(cmds: Simple[], ctx: ArgvContext): GuardVerdict | und
 // anywhere (word splitting can make new words of it), or one that starts with a quoted one. Not
 // risky: a quoted expansion later in a word (`"*.$ext"`), the value of an option that takes the
 // next word as its value (`-m "$msg"`), a visible option with the expansion in its value
-// (`-j$(nproc)`, `--since="$d"`) unless that option's value is itself checked, and words after
+// (`-j"$n"`, `--since="$d"`) unless that option's value is itself checked, and words after
 // `--` for programs that end their options there.
+// (Project review 5, round 1, Mythos: a quoted expansion after visible text can still finish
+// what a check reads by name. A short option word passes only where its first letter is known
+// to take the rest of the word as its value: anything else can grow a letter or finish a
+// single-dash name, `git clean "-d$o"`, `gcc "-wrap${x:-per}" ./w.sh`, `go build
+// -toolexec"$x"`. And an operand a check reads by name is risky wherever the expansion stands
+// in it, Keyed.named: `git stash "dr${c:-op}"`, `git diff --no-index a "/etc/sh$x"`, `npm run
+// "en${x:-v}"`.)
 const MARK_UNQUOTED = "\u000e";
 const MARK_QUOTED = "\u000f";
 const MARKS = /[\u000e\u000f]/;
@@ -8897,15 +8915,28 @@ interface Keyed {
   dashDash?: boolean;
   // awk: after the program text, words are files and assignments, not options.
   operandEnds?: boolean;
+  // false: no short option of `values` takes the rest of its word as its value. go reads a
+  // single-dash word as one long name (`-p"$x"` can be `-pkgdir=...`); npm and tree read it as a
+  // cluster of flags, each taking a later word (`tree "-P${x:-o}" pat out.txt`).
+  attached?: boolean;
+  // The program's operands are read by name, so one with an expansion anywhere in it is risky:
+  // git (an action such as `stash drop`, a name looked up as a path, a file read as a
+  // credential; its pathspecs behind `--` pass as before, `git log -1 -- "$f"`) and sysctl
+  // (`name=value` writes the setting, behind `--` too), and make (`NAME=` / `NAME!=` operands,
+  // `make "SHELL$v"`; cross-check, Opus).
+  named?: boolean;
+  // Options whose value is optional: the rest of their word, or the next word only when it is a
+  // number (make's `-j`, `-l`; third cross-check, Opus: `make -j "SHELL$(printf =./w.sh)"`).
+  optional?: string[];
 }
 const FIND_VALUES = [
   ..."-name -iname -path -ipath -wholename -iwholename -regex -iregex -lname -ilname -type -xtype -maxdepth -mindepth -mtime -mmin -ctime -cmin -atime -amin -used -newer -anewer -cnewer -size -user -group -uid -gid -perm -links -inum -samefile -fstype -context -printf -regextype".split(" "),
   ...[..."aBcm"].flatMap((x) => [..."aBcmt"].map((y) => `-newer${x}${y}`)),
 ];
-const PM: Keyed = { values: ["-w", "--workspace", "--filter", "-F", "-p", "--package", "--bin", "--test", "--example", "--bench", "--features", "--target", "-j", "--jobs", "--profile", "-run", "-bench", "-count", "-timeout", "-tags", "-skip", "-parallel", "-cpu", "-benchtime"], checked: ["--prefix", "--cwd", "--manifest-path", "--config", "--target-dir", ...PM_PROGRAM_OPTIONS, "-toolexec", "-exec", "-vettool", "-ldflags", "--ldflags", "-o", "-C", "-modfile", "-overlay", "-pkgdir", "--toolexec", "--exec", "--vettool"], letters: "CZ" };
+const PM: Keyed = { values: ["-w", "--workspace", "--filter", "-F", "-p", "--package", "--bin", "--test", "--example", "--bench", "--features", "--target", "-j", "--jobs", "--profile", "-run", "-bench", "-count", "-timeout", "-tags", "-skip", "-parallel", "-cpu", "-benchtime"], checked: ["--prefix", "--cwd", "--manifest-path", "--config", "--target-dir", ...PM_PROGRAM_OPTIONS, "-toolexec", "-exec", "-vettool", "-ldflags", "--ldflags", "-o", "-C", "-modfile", "-overlay", "-pkgdir", "--toolexec", "--exec", "--vettool"], letters: "CZ", attached: false };
 const KEYED: Record<string, Keyed> = {
   find: { values: FIND_VALUES, checked: ["-fprint", "-fprintf", "-fls"], dashDash: false },
-  make: { values: ["-j", "-l", "-o", "-W", "--jobs", "--load-average", "--old-file", "--what-if", "--assume-old", "--assume-new", "--new-file"], checked: ["--file", "--makefile", "--include-dir", "--directory", "--eval"], letters: "fCIE", dashDash: false },
+  make: { optional: ["-j", "-l", "--jobs", "--load-average"], values: ["-o", "-W", "--old-file", "--what-if", "--assume-old", "--assume-new", "--new-file"], checked: ["--file", "--makefile", "--include-dir", "--directory", "--eval"], letters: "fCIE", dashDash: false, named: true },
   tar: { checked: ["--file", "--directory", "--files-from", "--exclude-from", "--to-command", "--use-compress-program", "--checkpoint-action", "--info-script", "--new-volume-script", "--rsh-command", "--rmt-command"], letters: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" },
   sort: { values: ["-k", "-t", "-S", "--key", "--field-separator", "--buffer-size", "--parallel"], checked: ["--output", "--compress-program", "--files0-from", "--temporary-directory"], letters: "oT" },
   rg: { values: ["-e", "-g", "-t", "-T", "-m", "-A", "-B", "-C", "-M", "-j", "-d", "--regexp", "--glob", "--iglob", "--type", "--type-not", "--max-count", "--after-context", "--before-context", "--context", "--max-columns", "--threads", "--max-depth"], checked: ["--pre", "--pre-glob", "--ignore-file", "--file", "--hostname-bin"], letters: "f" },
@@ -8933,11 +8964,11 @@ const KEYED: Record<string, Keyed> = {
   mypy: { checked: ["--python-executable", "--install-types"] },
   venv: { checked: ["--upgrade-deps", "--clear", "--prompt"] },
   cloc: { values: ["--exclude-dir", "--exclude-ext", "--exclude-lang", "--include-lang", "--include-ext", "--match-f", "--not-match-f", "--match-d", "--not-match-d", "--timeout", "--processes"], checked: ["--out", "--report-file", "--vcs", "--list-file", "--exclude-list-file", "--read-lang-def", "--force-lang-def", "--write-lang-def", "--write-lang-def-incl-dup", "--script-lang", "--sql", "--sql-append", "--strip-comments", "--strip-str-comments", "--config", "--diff", "--git-diff-rel", "--git-diff-all"] },
-  tree: { values: ["-L", "-P", "-I", "-T", "-H", "--filelimit", "--timefmt", "--charset", "--sort"], checked: ["-o"], letters: "o" },
+  tree: { values: ["-L", "-P", "-I", "-T", "-H", "--filelimit", "--timefmt", "--charset", "--sort"], checked: ["-o"], letters: "o", attached: false },
   rustfmt: { values: ["--edition", "--color", "--emit", "--files-with-diff"], checked: ["--config-path", "--config"] },
   gzip: { checked: ["-S", "--suffix", "-o", "--output", "--output-dir-flat", "--output-dir-mirror", "--files", "--files0", "--filelist", "--patch-from"], letters: "So" },
   gh: { values: ["-R", "--repo", "-q", "--jq", "-t", "--template"], checked: ["-X", "--method", "-f", "-F", "--field", "--raw-field", "--input", "-H", "--header"], letters: "XfFH" },
-  sysctl: {},
+  sysctl: { named: true, dashDash: false },
   llamastash: {},
   docker: {},
   systemctl: {},
@@ -8954,13 +8985,23 @@ const GIT_VALUES: Record<string, string[]> = {
 };
 const GIT_CHECKED = ["--output", "--output-directory", "--upload-pack", "--receive-pack", "--exec", "--template", "--open-files-in-pager", "--extcmd"];
 
-// The first word of `args` (marked) that can become an option of the program at run time.
-function riskyWord(spec: Keyed, args: string[], safe?: (word: string) => boolean): string | undefined {
+// The first word of `args` (marked) that can become an option of the program at run time, or
+// that holds an expansion where the program's checks read a name (`byName` is then called).
+function riskyWord(spec: Keyed, args: string[], safe?: (word: string) => boolean, byName?: () => void): string | undefined {
   let ended = false;
   let operand = false;
+  let cluster = false;
+  const read = (word: string) => {
+    byName?.();
+    return word;
+  };
   for (let i = 0; i < args.length; i++) {
     const w = args[i];
     const plain = unmark(w);
+    // The word after a plain cluster whose last letter, and no letter before it, takes a value
+    // is read as that value (`git commit -am "msg $x"`).
+    const valued = cluster;
+    cluster = false;
     if (!ended && spec.dashDash !== false && plain === "--") {
       ended = true;
       continue;
@@ -8970,7 +9011,7 @@ function riskyWord(spec: Keyed, args: string[], safe?: (word: string) => boolean
     if (at < 0) {
       // A plain option that takes the next word: that word is its value, unless splitting can
       // make more words of it or the value is itself checked.
-      const takes = spec.values?.includes(plain) || spec.checked?.includes(plain);
+      const takes = spec.values?.includes(plain) || spec.checked?.includes(plain) || (spec.optional?.includes(plain) && /^[\d.]+$/.test(args[i + 1] ?? ""));
       if (takes && i + 1 < args.length) {
         const value = args[i + 1];
         if (value.includes(MARK_UNQUOTED) || (spec.checked?.includes(plain) && MARKS.test(value))) return unmark(value);
@@ -8978,6 +9019,7 @@ function riskyWord(spec: Keyed, args: string[], safe?: (word: string) => boolean
         continue;
       }
       if (!plain.startsWith("-")) operand = true;
+      else cluster = /^-[A-Za-z]{2,}$/.test(plain) && [...plain.slice(1)].findIndex((l) => spec.values?.includes(`-${l}`) || spec.letters?.includes(l)) === plain.length - 2;
       continue;
     }
     if (at === 0) return plain;
@@ -8993,11 +9035,14 @@ function riskyWord(spec: Keyed, args: string[], safe?: (word: string) => boolean
         if (eq < 0 || eq > at || spec.checked?.some((c) => c === name || (c.startsWith("--") && name.length >= 3 && c.startsWith(name)))) return plain;
         continue;
       }
-      const letters = w.slice(1, at);
-      if (!letters || [...letters].some((l) => spec.letters?.includes(l))) return plain;
-      continue;
+      // The word passes where its first letter takes the rest of it as a value no check reads
+      // (`-j"$n"`, `-m"fix $x"`). Behind a flag, or a letter the table does not know, the
+      // expansion can add a letter or finish a longer name.
+      const letters = unmark(w.slice(1, at));
+      if (letters && spec.attached !== false && (spec.values?.includes(`-${letters[0]}`) || spec.optional?.includes(`-${letters[0]}`)) && ![...letters].some((l) => spec.letters?.includes(l))) continue;
+      return plain;
     }
-    if (w.includes(MARK_UNQUOTED)) return plain;
+    if (spec.named && !valued) return read(plain);
     operand = true;
   }
   return undefined;
@@ -9127,6 +9172,8 @@ export function expansionProblem(command: string, cwd?: string): GuardVerdict | 
       const end = chain.find((q) => q > p) ?? argv.length;
       const args = cmd.argv.slice(p + 1, end);
       let found: string | undefined;
+      let named = false;
+      const byName = () => void (named = true);
       if (name === "git") {
         let i = 0;
         for (; i < args.length && unmark(args[i]).startsWith("-"); i++) {
@@ -9137,13 +9184,51 @@ export function expansionProblem(command: string, cwd?: string): GuardVerdict | 
         }
         const sub = args[i] ?? "";
         if (MARKS.test(sub)) found ??= unmark(sub);
-        found ??= riskyWord({ values: GIT_VALUES[unmark(sub)] ?? [], checked: GIT_CHECKED, letters: ["format-patch", "archive"].includes(unmark(sub)) ? "o" : "" }, args.slice(i + 1));
+        found ??= riskyWord({ values: GIT_VALUES[unmark(sub)] ?? [], checked: GIT_CHECKED, letters: ["format-patch", "archive"].includes(unmark(sub)) ? "o" : "", named: true }, args.slice(i + 1), undefined, byName);
       } else if (/^python3?(\.\d+)?$/.test(name)) {
         const m0 = unmark(args[0] ?? "");
         const mod = m0 === "-m" ? unmark(args[1] ?? "") : m0.startsWith("-m") && m0.length > 2 ? m0.slice(2) : undefined;
         const rest = m0 === "-m" ? args.slice(2) : args.slice(1);
         if (mod && Object.hasOwn(KEYED, mod)) found = riskyWord(KEYED[mod], rest);
-      } else if (Object.hasOwn(KEYED, name)) found = riskyWord(KEYED[name], args);
+      } else if (Object.hasOwn(KEYED, name)) found = riskyWord(KEYED[name], args, undefined, byName);
+      // (Project review 5, round 1, Mythos: managerProblem reads the script of `npm run` and the
+      // package of `npm pack` / `npm view` by name, wherever they stand after that word, behind
+      // `--` too: `npm run "en${x:-v}"`, `npm run -- "$x"`, `npm view "x${spec}"`. A visible
+      // option is no such name.)
+      if (found === undefined && NPM_FAMILY.includes(name)) {
+        // (Third cross-check, Sol: the first `run` can be an option's value, `npm -w run run --
+        // "en$x"`: the words after each such word are read.)
+        let built: string | undefined;
+        for (const [at, word] of args.entries()) {
+          if (built !== undefined) break;
+          if (!NPM_RUN.includes(unmark(word)) && !NPM_SPEC.includes(unmark(word))) continue;
+          // (Cross-check, Sol and Opus: for `run`, only the script's name is read; the words after
+          // a `--` that follows it go to the script, `npm run test -- "$pattern"`. Every spec of
+          // `pack` / `view` is read.)
+          const run = NPM_RUN.includes(unmark(word));
+          // (Second cross-check, Sol and Opus: a word right after an option can be its value,
+          // `npm run -w pkg -- "en$x"`, so it is not taken for the script's name.)
+          let script = false;
+          let afterOption = false;
+          for (const a of args.slice(at + 1)) {
+            const plain = unmark(a);
+            if (plain === "--" && run && script) break;
+            const option = plain.startsWith("-");
+            const value = afterOption;
+            afterOption = option && !plain.includes("=");
+            if (option) continue;
+            if (MARKS.test(a)) {
+              built = a;
+              break;
+            }
+            if (!value) script = true;
+          }
+        }
+        if (built !== undefined) {
+          found = unmark(built);
+          named = true;
+        }
+      }
       if (found === undefined && RUSTUP_PROXIES.has(name) && args[0] !== undefined && MARKS.test(args[0]) && (args[0].search(MARKS) === 0 || unmark(args[0]).startsWith("+"))) {
         found = unmark(args[0]);
       }
@@ -9224,6 +9309,7 @@ export function expansionProblem(command: string, cwd?: string): GuardVerdict | 
         const split = printfOptionWords(args).find((a) => a.includes(MARK_UNQUOTED));
         if (split !== undefined) found = unmark(split);
       }
+      if (found !== undefined && named) return { action: "classify", reason: `${name} ${found}: a word bash builds when the command runs, where ${name}'s checks read a name` };
       if (found !== undefined) return { action: "classify", reason: `${name} ${found}: a word that can become an option once bash expands it, and ${name}'s options are checked by name` };
     }
   }

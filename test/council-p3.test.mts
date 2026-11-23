@@ -1757,3 +1757,141 @@ test("round 31 (Opus, Mythos): `$!` is no number beside other text in an option 
     "time make",
   ]) assert.equal(await decide31(command), "allow", command);
 });
+
+test("project review 5, round 1 (Mythos): a quoted expansion that finishes an option cluster, or a name a check reads", async () => {
+  const repo5 = path.join(base, "repo5");
+  fs.mkdirSync(path.join(repo5, "sub"), { recursive: true });
+  fs.mkdirSync(path.join(repo5, "src"), { recursive: true });
+  for (const f of ["a", "b", "a.c", "w.sh", "src/a.ts", "sub/k"]) fs.writeFileSync(path.join(repo5, f), "x\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo5]);
+  const decide5 = async (command: string) => (await decideShell(guard, new SessionState(repo5), repo5, command)).effect;
+  for (const command of [
+    // 1: a short option word whose letters an expansion can add to, or whose single-dash name
+    // it can finish.
+    'for o in f; do git clean "-d$o"; done',
+    'git clean "-q$(printf f)"',
+    'gcc "-wrap${x:-per}" ./w.sh -c a.c',
+    'gcc -fplug"$x" a.c',
+    'go build -toolexec"$x" .',
+    'go build "-p${x:-kgdir=/tmp/e}" .',
+    'go test "-e${x:-xec}" ./w.sh',
+    'git reset "-q$x"',
+    'git add "-f$x" .',
+    'git commit "-a$x" -m msg',
+    'git commit -am"$x"',
+    'git stash "-q$x"',
+    'git log "-n$n"',
+    'npm run build "-w${x:-C}" /tmp/e',
+    'tree "-P${x:-o}" pat out.txt',
+    'tree -L"$n"',
+    'make "-jf$x"',
+    'cargo build "-q$x"',
+    'clang "-load$x" a.c',
+    // 2: an operand of git, read by name: an action, a name git looks up as a path, a file read.
+    'git checkout "b${x}"',
+    'git stash "dr${c:-op}"',
+    'git stash -q "cl${x}ear"',
+    'git reflog "exp${x:-ire}" --expire=now --all',
+    'git bisect "ru${x:-n}" ./w.sh',
+    'git diff --no-index a "/etc/sh${x:-adow}"',
+    'git show "HEAD:.e${x}nv"',
+    'git add "src/$f"',
+    // npm's script and package words, behind `--` too, and sysctl's names.
+    'npm run "en${x:-v}"',
+    'npm run-script "en${x:-v}"',
+    'npm run -- "en${x:-v}"',
+    'npm run -- "$x"',
+    'npm run --silent "en$x"',
+    'npm --loglevel info run "en$x"',
+    'pnpm run "en${x:-v}"',
+    'yarn run "en${x:-v}"',
+    'npm view "pkg${x:-@git+https://example.com/r.git}" version',
+    'npm pack "pkg$x"',
+    'sysctl "kernel.hostname${x:-=e}"',
+    'sysctl -- "kernel.hostname${x:-=e}"',
+    // 3: a name `git mv` writes, built at run time.
+    'for n in AGENTS; do git mv -f a "sub/$n.md"; done',
+    'git mv b "CLAUDE$(printf .md)"',
+    'git mv a "b$x"',
+    'git mv "a$x" sub',
+    'git mv a -- "sub/$n.md"',
+    "git mv a `echo AGENTS.md`",
+    // As on main.
+    "git stash drop",
+    'cp "$a" b',
+    'tar -czf "out-$v.tgz" src',
+    'git commit -am "$x"',
+    // (Cross-check, Opus: make reads `NAME=` / `NAME!=` operands by name; an `=` bash builds.)
+    'make "X$(printf \'!=\')touch AGENTS.md"',
+    'make "SHELL$(printf =./w.sh)"',
+    'for v in =./w.sh; do make "SHELL$v"; done',
+    'make "CC$(printf =./w.sh)"',
+    'make -- "SHELL$(printf =./w.sh)"',
+    // (Cross-check: the script name of `npm run`, behind `--` or an option's value too.)
+    'npm run -- "$x"',
+    'npm run -w pkg "$x"',
+    'pnpm run "e${x}"',
+    // (Second cross-check, Sol and Opus: the value of an option is not the script's name.)
+    'npm run -w pkg -- "en${x:-v}"',
+    'npm run --workspace pkg -- "en${x:-v}"',
+    'pnpm run --filter pkg -- "en${x:-v}"',
+    // (Second cross-check, Opus: make's directory and makefile inside a cluster.)
+    "make -kC /etc all",
+    'make -kC "/e${x:-tc}" all',
+    "make -kf - all",
+    // (Third cross-check, Sol: a first `run` that is an option's value; Opus: make's `-j` and
+    // `-l` take the next word only when it is a number.)
+    'npm -w run run -- "en${x:-v}"',
+    'pnpm --filter run run -- "en${x:-v}"',
+    'make -j "SHELL$(printf =./w.sh)" all',
+    'make -kj "SHELL$(printf =./w.sh)" all',
+    'make -l "SHELL$(printf =./w.sh)" all',
+    'make --jobs "SHELL$(printf =./w.sh)" all',
+    "n=SHELL=./w.sh; make -j \"$n\" all",
+  ]) assert.notEqual(await decide5(command), "allow", command);
+  for (const command of [
+    "make -j$(nproc)",
+    'make -j"$n"',
+    'git commit -m "msg $x"',
+    'git commit -am "msg $x"',
+    'git commit -m"msg $x"',
+    'git commit --message="msg $x"',
+    'git log --since="$d"',
+    'git log --author="$a" --format="%H $x"',
+    'git log -n 3 --grep="$x"',
+    'git checkout -b "feat/$n"',
+    'git checkout -qb "feat/$n"',
+    'git switch -c "feat/$n"',
+    'git stash push -m "wip $x"',
+    'git tag -a v1 -m "rel $v"',
+    "git add src/a.ts",
+    // (A pathspec behind `--` passes as before: decide.test.mts, r3 5b.)
+    'git log -1 -- "$f"',
+    "git mv a c",
+    "n=README; git mv a \"sub/$n.md\"",
+    'find . -name "*.$ext"',
+    "npm run build",
+    "npm run build -- --grep=x",
+    'npm run build -- --grep="$x"',
+    'npm test -- "tests/$f"',
+    // (Cross-check, Sol and Opus: words after `npm run <script> --` go to the script.)
+    'npm run test -- "$pattern"',
+    'npm run test -- -t "case $x"',
+    'npm run build -- --outDir "dist/$name"',
+    'npm run lint -- --fix "src/$f"',
+    'make -j"$n" all',
+    "make -C sub test",
+    "make -sC sub test",
+    "make -kj4 all",
+    "make -j 4 all",
+    "make -l 2.5 all",
+    'make -j "$(nproc)" all',
+    "make -j $(nproc) all",
+    'make -C sub -j"$(nproc)" test',
+    'npm run -w pkg test -- "$pattern"',
+    'npm run test -w pkg -- "$pattern"',
+    "gcc -O2 -o out a.c",
+    "sysctl kernel.hostname",
+    'awk -F"$s" \'{print $1}\' a',
+  ]) assert.equal(await decide5(command), "allow", command);
+});

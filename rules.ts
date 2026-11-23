@@ -2171,9 +2171,13 @@ function make(args: string[], scope: Scope): Verdict {
   for (let k = 0; k < args.length; k++) {
     const a = args[k];
     if (longIs(a, "eval") || shortIn(a, "E", "fCIjlWo")) return classify("make --eval runs text as a makefile");
-    const file = /^(-f|--file|--makefile)$/.test(a) ? args[k + 1] : /^--(file|makefile)=/.test(a) ? a.slice(a.indexOf("=") + 1) : /^-f./.test(a) ? a.slice(2) : undefined;
+    // (Project review 5, round 1, cross-check, Opus: in a cluster, the first letter that takes a
+    // value takes the rest of the word or the next one, `make -kC /etc all`, `make -kf -`.)
+    const at = /^-[^-]/.test(a) ? [...a.slice(1)].findIndex((l) => "fCIjlWo".includes(l)) + 1 : 0;
+    const short = at > 0 ? [a[at], a.slice(at + 1) || args[k + 1]] : [];
+    const file = /^(--file|--makefile)$/.test(a) ? args[k + 1] : /^--(file|makefile)=/.test(a) ? a.slice(a.indexOf("=") + 1) : short[0] === "f" ? short[1] : undefined;
     if (file !== undefined && (file === "-" || (/^\/dev\/|^\/proc\//.test(file) && file !== "/dev/null") || /[$`]/.test(file))) return classify("make reads its makefile from a stream");
-    const dir = /^(-C|--directory)$/.test(a) ? args[k + 1] : /^--directory=/.test(a) ? a.slice(12) : /^-C./.test(a) ? a.slice(2) : undefined;
+    const dir = a === "--directory" ? args[k + 1] : /^--directory=/.test(a) ? a.slice(12) : short[0] === "C" ? short[1] : undefined;
     if (dir !== undefined && !isLocal(resolveWord(dir, scope), scope)) return classify("make in a directory outside the working directory");
     const m = /^([A-Za-z_.][\w.]*)\+?[:?!]?=(.*)$/s.exec(a);
     if (m && (/^(SHELL|\.SHELLFLAGS|MAKEFLAGS|MFLAGS|MAKE|MAKEFILES|MAKEFILE_LIST|\.RECIPEPREFIX)$/.test(m[1]) || !/^[\w.+,:=%@\/-]*$/.test(m[2]))) {
