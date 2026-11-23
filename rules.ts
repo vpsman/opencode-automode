@@ -3553,17 +3553,21 @@ function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = 
 function rm(args: string[], scope: Scope): Verdict {
   const head = args.indexOf("--") < 0 ? args : args.slice(0, args.indexOf("--"));
   const recursive = hasFlag(head, "r", "--recursive") || hasFlag(head, "R") || head.some((a) => longIs(a, "recursive"));
+  // (Project review 5, round 4, Mythos: an option word bash builds at run time can hold the `-r`,
+  // `x=-rf; rm $x *`, `rm "-${x:-r}f" *`: read as maybe recursive, which asks.)
+  const maybe = recursive || head.some((a) => /[$`]/.test(a) && /^(-|\$|`)/.test(a));
   let verdict = ALLOW;
   for (const t of operands(args)) {
     const p = resolveWord(t, scope);
     const bare = BARE_GLOB.test(path.basename(t));
-    if (recursive && p && (isRootLike(p) || (bare && isRootLike(path.dirname(p))))) {
+    if (maybe && p && (isRootLike(p) || (bare && isRootLike(path.dirname(p))))) {
+      if (!recursive) return ask(`rm of ${t} with an option bash builds at run time, which may wipe a home or system directory`);
       return deny(`rm -r of ${t} would wipe a home or system directory`);
     }
     if (isGuarded(p, scope)) verdict = worst(verdict, guardAsk("rm deletes the auto-mode guard's own files"));
     else if (isPiFile(p, scope)) verdict = worst(verdict, piAsk(`rm deletes Pi's own files: ${t}`));
     else if (!isLocal(p, scope)) verdict = worst(verdict, outside(`rm deletes outside the working directory: ${t}`, p));
-    else if (recursive && scope.root && (p === scope.root || (bare && path.dirname(p!) === scope.root) || /(^|\/)\.git(\/|$)/.test(p!))) {
+    else if (maybe && scope.root && (p === scope.root || (bare && path.dirname(p!) === scope.root) || /(^|\/)\.git(\/|$)/.test(p!))) {
       verdict = worst(verdict, ask(`rm -r of ${t} deletes the whole project or its git data`));
     }
   }
@@ -3737,7 +3741,22 @@ function gh(args: string[]): Verdict {
     if (methods.some((m) => m.toUpperCase() !== "GET") || (fields && (!methods.length || !sure))) return ask("gh api call that changes remote data");
     return ALLOW;
   }
-  if (group === "auth") return action === "status" ? ALLOW : classify("gh auth");
+  if (group === "auth") {
+    if (action !== "status") return classify("gh auth");
+    // (Project review 5, round 4, Opus: `-t` / `--show-token` prints the token. Only the options
+    // known to print no secret pass.)
+    // (Cross-check, Sol and Opus: gh hands options written before `status` to it as well,
+    // `gh auth -t=true status`: every word after `auth` but `status` itself.)
+    const rest = args.slice(args.indexOf("auth") + 1);
+    rest.splice(rest.indexOf("status"), 1);
+    for (let k = 0; k < rest.length; k++) {
+      const a = rest[k];
+      if (a === "-h" || a === "--hostname") k++;
+      else if (!a.startsWith("-") || /^--hostname=/.test(a) || a === "-a" || a === "--active") continue;
+      else return criticalAsk(`gh auth status ${a}: an option that may print the token`);
+    }
+    return ALLOW;
+  }
   if (["pr", "issue", "release", "repo", "run", "workflow", "gist", "label", "project", "secret", "variable", "cache"].includes(group)) {
     if (action && GH_READ.has(action)) return ALLOW;
     if (group === "repo" && action === "clone") return ALLOW;

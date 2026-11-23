@@ -8936,6 +8936,13 @@ interface Keyed {
   // Options whose value is optional: the rest of their word, or the next word only when it is a
   // number (make's `-j`, `-l`; third cross-check, Opus: `make -j "SHELL$(printf =./w.sh)"`).
   optional?: string[];
+  // A value never begins with `-`: the program reads such a word as an option of its own (cargo's
+  // parser, where `--bin`, `-p`, `--target` take an optional value, and any other use of the
+  // option, before or after, in any spelling, supplies the value cargo requires). A value word
+  // that begins with an expansion can then be an option (project review 5, round 4, Opus:
+  // `b=--config=...; cargo run --bin app --bin "$b"`; cross-check, Sol and Opus: `-p "$b" -p
+  // app`, `--package=app -p "$b"`, `-papp -p "$b"`). It goes to the model, a lone `-p "$c"` too.
+  dashValue?: boolean;
   // How many of the first operands the checks read by name, a subcommand and the word it reads
   // in turn (`npm audit fix`, `uv pip install`, `go tool test2json`, `go run pkg@version`, `tox
   // e`, `meson devenv`): one of them holding an expansion is risky (project review 5, round 2,
@@ -8961,7 +8968,7 @@ const KEYED: Record<string, Keyed> = {
   xargs: { values: ["-I", "-n", "-L", "-P", "-s", "-d", "-E", "--max-args", "--max-procs", "--max-chars", "--delimiter", "--eof"], checked: ["--arg-file"], letters: "a" },
   env: { checked: ["--unset", "--chdir", "--split-string", "--argv0"], letters: "uCSa" },
   npm: PM,
-  cargo: PM,
+  cargo: { ...PM, dashValue: true },
   go: PM,
   // Council project review 2, round 2 (Mythos): the compilers and build tools whose options
   // buildToolProblem reads by name.
@@ -8983,6 +8990,9 @@ const KEYED: Record<string, Keyed> = {
   gzip: { checked: ["-S", "--suffix", "-o", "--output", "--output-dir-flat", "--output-dir-mirror", "--files", "--files0", "--filelist", "--patch-from"], letters: "So" },
   gh: { values: ["-R", "--repo", "-q", "--jq", "-t", "--template"], checked: ["-X", "--method", "-f", "-F", "--field", "--raw-field", "--input", "-H", "--header"], letters: "XfFH" },
   sysctl: { named: true, dashDash: false },
+  // (Project review 5, round 4, Mythos: `journalctl --cursor-file`, `nm --plugin`, read by name.)
+  journalctl: { values: ["-u", "--unit", "--user-unit", "-n", "--lines", "-p", "--priority", "-t", "--identifier", "-S", "--since", "-U", "--until", "-o", "--output", "-g", "--grep"] },
+  nm: {},
   llamastash: {},
   docker: {},
   systemctl: {},
@@ -9040,6 +9050,7 @@ function riskyWord(spec: Keyed, args: string[], safe?: (word: string) => boolean
       if (takes && i + 1 < args.length) {
         const value = args[i + 1];
         if (value.includes(MARK_UNQUOTED) || (spec.checked?.includes(plain) && MARKS.test(value))) return unmark(value);
+        if (spec.dashValue && MARKS.test(value) && (value.search(MARKS) === 0 || unmark(value).startsWith("-"))) return unmark(value);
         i++;
         continue;
       }

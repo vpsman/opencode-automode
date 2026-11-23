@@ -2007,7 +2007,6 @@ test("project review 5, round 2 (Opus, Mythos): methods, files and subcommand wo
     'git log --grep="$x" --author="$a"',
     'git branch --contains="$c"',
     'npm run test -- "$p"',
-    'cargo build -p "$c"',
     'go test -run "Test$x" ./...',
     "npm test",
     "npm audit",
@@ -2076,4 +2075,52 @@ test("project review 5, round 3 (Opus, Mythos): a file a reader takes at run tim
     assert.ok(unseenWrites(command), command);
   }
   for (const command of ["gh release list", "gh pr view 1", "gh run list"]) assert.equal(unseenWrites(command), undefined, command);
+});
+
+test("project review 5, round 4 (Opus, Mythos): cargo's optional values, gh's token, option words of rm, journalctl and nm built at run time", async () => {
+  const repo8 = path.join(base, "repo8");
+  fs.mkdirSync(path.join(repo8, "src"), { recursive: true });
+  for (const f of ["a.o", "README.md", "src/a.ts"]) fs.writeFileSync(path.join(repo8, f), "x\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo8]);
+  const decide8 = async (command: string) => (await decideShell(guard, new SessionState(repo8), repo8, command)).effect;
+  for (const command of [
+    // Opus: cargo reads a word that begins with `-` after `--bin`/`-p`/`--target` as an option.
+    "b='--config=build.rustc-wrapper=/tmp/w'; cargo build -p app -p \"$b\"",
+    'read -r b < args.txt; cargo build --bin app --bin "$b"',
+    'b=$(cat f); cargo build --package app -p "$b"',
+    'cargo build --target x86_64-unknown-linux-gnu --target "$t"',
+    // (Cross-check, Sol and Opus: any other use of the option, in any spelling or order.)
+    'cargo build -p "$b" -p app',
+    'cargo build --package=app -p "$b"',
+    'cargo build -papp -p "$b"',
+    'cargo run --bin=app --bin "$b"',
+    'cargo test --test "$b" --test t',
+    // (Accepted over-ask: a lone value built at run time.)
+    'cargo build -p "$c"',
+    // Opus: gh auth status prints the token with -t.
+    "gh auth status -t",
+    "gh auth status --show-token",
+    "gh auth -t status",
+    "gh auth --show-token=true status",
+    "gh auth -t=true status",
+    "gh auth --show-token=1 status -h github.com",
+    // Mythos: option words built at run time.
+    'journalctl -n 5 "--cursor-${f:-file}=../x"',
+    "x=--cursor-file=../x; journalctl -n 1 $x",
+    'nm "--plu${x:-gin}" ./evil.so a.o',
+    "x=-rf; rm $x *",
+    'rm "-${x:-r}f" *',
+    'rm "--rec${x:-ursive}" *',
+    'rm "-${x:-r}f" .',
+  ]) assert.notEqual(await decide8(command), "allow", command);
+  for (const command of [
+    "cargo build --release",
+    "cargo test -p app",
+    "gh auth status",
+    "gh auth status -h github.com",
+    "journalctl -n 50 --no-pager",
+    'journalctl -u "$svc" -n 20',
+    "nm a.o",
+    "rm -rf src",
+  ]) assert.equal(await decide8(command), "allow", command);
 });
