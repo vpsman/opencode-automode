@@ -8320,9 +8320,10 @@ const GIT_LIST_OPTIONS: Record<string, ListSpec> = {
 const RSYNC_RULE = /^(?:(?:merge|dir-merge)(?:,[^ _]*)?|[.:][^ _]*)[ _]+(.+)$/;
 const LIST_OPTIONS: Record<string, ListSpec> = {
   rsync: { long: ["--files-from", "--exclude-from", "--include-from", "--read-batch", "--password-file"], not: ["--exclude", "--include"], valued: "", rule: { short: "f", long: ["--filter"] } },
-  // (`date --file` and `hexdump --format-file` are words the rules already read as a path.)
-  date: { short: "f", valued: "drsI" },
-  hexdump: { short: "f", valued: "ensL" },
+  // (`date --file` and `hexdump --format-file` are words the rules read as a path when literal;
+  // project review 5, round 3, Mythos: not when bash names them, `date --file="$(printf .env)"`.)
+  date: { short: "f", long: ["--file"], valued: "drsI" },
+  hexdump: { short: "f", long: ["--format-file"], not: ["--format"], valued: "ensL" },
   file: { short: "fm", long: ["--files-from", "--magic-file"], split: ":" },
   grep: { short: "f", long: ["--file", "--exclude-from"], not: ["--exclude"] },
   egrep: { short: "f", long: ["--file", "--exclude-from"], not: ["--exclude"] },
@@ -8646,6 +8647,13 @@ export function unseenWriter(cmds: Simple[]): string | undefined {
     } else if (name === "patch") {
       const got = getopt(args, PATCH_OPTIONS);
       if (got.unknown || !got.opts.some((o) => ["--dry-run", "--help", "--version"].includes(o.name))) return why("patch", "patch");
+    } else if (name === "gh") {
+      // (Project review 5, round 3, Opus: what `gh release download`, `gh run download` and
+      // `gh repo clone` write, and where, is not read: an asset's or artifact's own names, `-O`,
+      // `-D`, the clone's directory. With the sandbox on every gh call asks already.)
+      const [group, action] = args.filter((a) => !a.startsWith("-"));
+      if ((group === "release" || group === "run") && action === "download") return why(`gh ${group} download`, "release or the artifact");
+      if (group === "repo" && action === "clone") return why("gh repo clone", "repository");
     } else if (name === "git") {
       const call = gitCall(args);
       if (typeof call === "string") continue;
@@ -8947,7 +8955,7 @@ const KEYED: Record<string, Keyed> = {
   sort: { values: ["-k", "-t", "-S", "--key", "--field-separator", "--buffer-size", "--parallel"], checked: ["--output", "--compress-program", "--files0-from", "--temporary-directory"], letters: "oT" },
   rg: { values: ["-e", "-g", "-t", "-T", "-m", "-A", "-B", "-C", "-M", "-j", "-d", "--regexp", "--glob", "--iglob", "--type", "--type-not", "--max-count", "--after-context", "--before-context", "--context", "--max-columns", "--threads", "--max-depth"], checked: ["--pre", "--pre-glob", "--ignore-file", "--file", "--hostname-bin"], letters: "f" },
   fd: { values: ["-e", "-t", "-E", "-d", "-S", "--extension", "--type", "--exclude", "--max-depth", "--min-depth", "--size", "--changed-within", "--changed-before"], checked: ["--exec", "--exec-batch", "--base-directory", "--search-path", "--ignore-file"], letters: "xX" },
-  man: { values: ["-S", "-s", "-L", "-m", "-e", "-E", "-R", "-p"], checked: ["--config-file", "--pager", "--html", "--prompt", "--manpath", "--local-file"], letters: "CPHMl" },
+  man: { values: ["-S", "-s", "-L", "-m", "-e", "-E", "-R", "-p"], checked: ["--config-file", "--pager", "--html", "--prompt", "--manpath", "--local-file"], letters: "CPHMl", named: true, dashDash: false },
   sed: { values: ["-l", "--line-length"], checked: ["--file", "--expression"], letters: "fe" },
   awk: { values: ["-v", "-F", "--assign", "--field-separator"], checked: ["--file", "--include", "--load", "--exec", "--source"], letters: "fileEW", operandEnds: true },
   xargs: { values: ["-I", "-n", "-L", "-P", "-s", "-d", "-E", "--max-args", "--max-procs", "--max-chars", "--delimiter", "--eof"], checked: ["--arg-file"], letters: "a" },
@@ -9023,6 +9031,11 @@ function riskyWord(spec: Keyed, args: string[], safe?: (word: string) => boolean
     if (at < 0) {
       // A plain option that takes the next word: that word is its value, unless splitting can
       // make more words of it or the value is itself checked.
+      // (Project review 5, round 3, Mythos: where the checks read names, a short option word
+      // holding a checked letter takes the next word as that letter's value too, `man -l
+      // ".en${u}v"`, `man -al "./$x"`; cross-check, Opus: not a word whose values are known.)
+      const next = args[i + 1] ?? "";
+      if (spec.named && /^-[A-Za-z]+$/.test(plain) && [...plain.slice(1)].some((l) => spec.letters?.includes(l)) && MARKS.test(next) && !safe?.(next)) return unmark(next);
       const takes = spec.values?.includes(plain) || spec.checked?.includes(plain) || (spec.optional?.includes(plain) && /^[\d.]+$/.test(args[i + 1] ?? ""));
       if (takes && i + 1 < args.length) {
         const value = args[i + 1];

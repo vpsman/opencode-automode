@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_ASK, decideShell, SessionState, takeMoment, type Guard } from "../decide.ts";
+import { DEFAULT_ASK, decideShell, SessionState, takeMoment, unseenWrites, type Guard } from "../decide.ts";
 SessionState.moment = takeMoment;
 import { compileRules } from "../rules.ts";
 import { DEFAULT_CLASSIFIER } from "../kev.ts";
@@ -2036,4 +2036,44 @@ test("project review 5, round 2 (Opus, Mythos): methods, files and subcommand wo
     'git diff -- "$f"',
     'git show HEAD -- ".env$u"',
   ]) assert.equal(await decide6(command), "allow", command);
+});
+
+test("project review 5, round 3 (Opus, Mythos): a file a reader takes at run time, and gh's downloads without the sandbox", async () => {
+  const repo7 = path.join(base, "repo7");
+  fs.mkdirSync(repo7, { recursive: true });
+  for (const f of ["a", ".env"]) fs.writeFileSync(path.join(repo7, f), "x\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo7]);
+  const decide7 = async (command: string) => (await decideShell(guard, new SessionState(repo7), repo7, command)).effect;
+  for (const command of [
+    // Mythos: a checked short letter alone, man's file operand, date's and hexdump's long names.
+    'man -l ".en${u}v"',
+    'man -l "./$(printf .env)"',
+    'man "./$(printf .env)"',
+    'date --file="./$(printf .env)"',
+    'date --file ".en${u}v"',
+    'date --fil="$(printf .env)"',
+    'hexdump --format-file "$f" a',
+    // (Cross-check, Sol and Opus: in a cluster, and behind `--`.)
+    'man -al ".en${u}v"',
+    'man -al "./$(printf .env)"',
+    'man -l -- "./.en${u}v"',
+    'man -- "./$(printf .env)"',
+  ]) assert.notEqual(await decide7(command), "allow", command);
+  for (const command of [
+    "man ls",
+    "man -l ./doc/x.1",
+    "date +%s",
+    "date -d tomorrow",
+    // (Cross-check, Opus: a one-letter flag before a loop's own word stays allowed.)
+    'for p in foo bar; do grep -r "$p" .; done',
+    'for p in foo bar; do grep -n -e "$p" a; done',
+    'for f in a b; do wc -l "$f"; done',
+    'for f in a b; do file -b "$f"; done',
+    'for t in 1 2; do date -d "@$t"; done',
+  ]) assert.equal(await decide7(command), "allow", command);
+  // Opus: with the sandbox off, what gh's downloads and clones write is not read.
+  for (const command of ["gh release download v1 -O .git/config", "gh run download 1 -n hooks -D .git/hooks", "gh repo clone a/b .claude", "gh release download v1 -O AGENTS.md"]) {
+    assert.ok(unseenWrites(command), command);
+  }
+  for (const command of ["gh release list", "gh pr view 1", "gh run list"]) assert.equal(unseenWrites(command), undefined, command);
 });
