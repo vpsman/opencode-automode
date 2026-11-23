@@ -9059,7 +9059,9 @@ const KEYED: Record<string, Keyed> = {
   // value for, so the word after any other is read as the word it is.)
   npm: { ...PM, values: ["-w", "--workspace"], dashValue: true },
   cargo: { ...PM, dashValue: true },
-  go: PM,
+  // (Project review 5, round 10, Mythos: go takes none of cargo's or npm's value options, so the
+  // word after one is read as the word it is, `go test -w "$x"`.)
+  go: { ...PM, values: ["-C", "-p", "-run", "-bench", "-count", "-timeout", "-tags", "-skip", "-parallel", "-cpu", "-benchtime"] },
   // Council project review 2, round 2 (Mythos): the compilers and build tools whose options
   // buildToolProblem reads by name.
   gcc: { checked: ["-wrapper", "--prefix", "-specs", "--specs", "-Xclang", "-Xlinker", "--for-linker", "--ld-path", "--gcc-toolchain", "--gcc-install-dir", "-fuse-ld"], letters: "B", dashDash: false },
@@ -9345,7 +9347,12 @@ export function expansionProblem(command: string, cwd?: string): GuardVerdict | 
         }
         const sub = args[i] ?? "";
         if (MARKS.test(sub)) found ??= unmark(sub);
-        found ??= riskyWord({ values: GIT_VALUES[unmark(sub)] ?? [], checked: GIT_CHECKED, letters: ["format-patch", "archive"].includes(unmark(sub)) ? "o" : "", named: true }, args.slice(i + 1), undefined, byName, GIT_DASH_DASH[unmark(sub)], true);
+        // (Round 10, Mythos: stash's `-m` takes a message only for push and store, or the implicit
+        // push; `git stash list` hands its words to log and `show` to diff, where `-m` is a flag:
+        // `git stash list -m "$x"` with x=--output=AGENTS.md.)
+        const next = unmark(args[i + 1] ?? "");
+        const stashOwn = unmark(sub) !== "stash" || next === "" || next.startsWith("-") || next === "push" || next === "store";
+        found ??= riskyWord({ values: stashOwn ? (GIT_VALUES[unmark(sub)] ?? []) : [], checked: GIT_CHECKED, letters: ["format-patch", "archive"].includes(unmark(sub)) ? "o" : "", named: true }, args.slice(i + 1), undefined, byName, GIT_DASH_DASH[unmark(sub)], true);
         // (Project review 5, round 2, Mythos: the two paths of `git diff --no-index` are files
         // outside git's store, behind `--` too, and git takes that reading by itself where two
         // paths follow the options and one lies outside the repository: `git diff --no-index --

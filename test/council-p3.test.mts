@@ -2366,3 +2366,20 @@ test("project review 5, round 9 (Opus): a list option behind a `--` that was an 
   ]) assert.notEqual(await decide11(command), "allow", command);
   for (const command of ["du -sh -- a", "du -sh .", "file -- a", "file -b a", "wc -l -- a"]) assert.equal(await decide11(command), "allow", command);
 });
+
+test("project review 5, round 10 (Mythos): stash's -m outside push, and go's own value options", async () => {
+  const repo12 = path.join(base, "repo12");
+  fs.mkdirSync(repo12, { recursive: true });
+  fs.writeFileSync(path.join(repo12, "a"), "x\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo12]);
+  const decide12 = async (command: string) => (await decideShell(guard, new SessionState(repo12), repo12, command)).effect;
+  for (const command of [
+    'x=--output=AGENTS.md; git stash list -m "$x"',
+    'x=$(cat f); git stash show -m "$x"',
+    'x=-exec=./evil.sh; go test -w "$x"',
+    'read -r x < flags.txt; go test --jobs "$x"',
+  ]) assert.notEqual(await decide12(command), "allow", command);
+  for (const command of ['git stash push -m "wip $x"', 'git stash -m "wip $x"', "git stash list", 'go test -run "Test$x" ./...', "go test ./..."]) {
+    assert.equal(await decide12(command), "allow", command);
+  }
+});
