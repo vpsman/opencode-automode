@@ -8928,12 +8928,18 @@ interface Keyed {
   // Options whose value is optional: the rest of their word, or the next word only when it is a
   // number (make's `-j`, `-l`; third cross-check, Opus: `make -j "SHELL$(printf =./w.sh)"`).
   optional?: string[];
+  // How many of the first operands the checks read by name, a subcommand and the word it reads
+  // in turn (`npm audit fix`, `uv pip install`, `go tool test2json`, `go run pkg@version`, `tox
+  // e`, `meson devenv`): one of them holding an expansion is risky (project review 5, round 2,
+  // Mythos: `npm audit "fix$u" --force`, `go tool "cg${x:-o}" -- ...`). A word right after an
+  // option the table does not know may be its value, and is not counted.
+  subs?: number;
 }
 const FIND_VALUES = [
   ..."-name -iname -path -ipath -wholename -iwholename -regex -iregex -lname -ilname -type -xtype -maxdepth -mindepth -mtime -mmin -ctime -cmin -atime -amin -used -newer -anewer -cnewer -size -user -group -uid -gid -perm -links -inum -samefile -fstype -context -printf -regextype".split(" "),
   ...[..."aBcm"].flatMap((x) => [..."aBcmt"].map((y) => `-newer${x}${y}`)),
 ];
-const PM: Keyed = { values: ["-w", "--workspace", "--filter", "-F", "-p", "--package", "--bin", "--test", "--example", "--bench", "--features", "--target", "-j", "--jobs", "--profile", "-run", "-bench", "-count", "-timeout", "-tags", "-skip", "-parallel", "-cpu", "-benchtime"], checked: ["--prefix", "--cwd", "--manifest-path", "--config", "--target-dir", ...PM_PROGRAM_OPTIONS, "-toolexec", "-exec", "-vettool", "-ldflags", "--ldflags", "-o", "-C", "-modfile", "-overlay", "-pkgdir", "--toolexec", "--exec", "--vettool"], letters: "CZ", attached: false };
+const PM: Keyed = { values: ["-w", "--workspace", "--filter", "-F", "-p", "--package", "--bin", "--test", "--example", "--bench", "--features", "--target", "-j", "--jobs", "--profile", "-run", "-bench", "-count", "-timeout", "-tags", "-skip", "-parallel", "-cpu", "-benchtime"], checked: ["--prefix", "--cwd", "--manifest-path", "--config", "--target-dir", ...PM_PROGRAM_OPTIONS, "-toolexec", "-exec", "-vettool", "-ldflags", "--ldflags", "-o", "-C", "-modfile", "-overlay", "-pkgdir", "--toolexec", "--exec", "--vettool"], letters: "CZ", attached: false, subs: 2 };
 const KEYED: Record<string, Keyed> = {
   find: { values: FIND_VALUES, checked: ["-fprint", "-fprintf", "-fls"], dashDash: false },
   make: { optional: ["-j", "-l", "--jobs", "--load-average"], values: ["-o", "-W", "--old-file", "--what-if", "--assume-old", "--assume-new", "--new-file"], checked: ["--file", "--makefile", "--include-dir", "--directory", "--eval"], letters: "fCIE", dashDash: false, named: true },
@@ -8951,7 +8957,7 @@ const KEYED: Record<string, Keyed> = {
   go: PM,
   // Council project review 2, round 2 (Mythos): the compilers and build tools whose options
   // buildToolProblem reads by name.
-  gcc: { checked: ["-wrapper", "--prefix", "-specs", "--specs", "-Xclang", "-Xlinker", "--for-linker", "--ld-path", "--gcc-toolchain", "--gcc-install-dir"], letters: "B", dashDash: false },
+  gcc: { checked: ["-wrapper", "--prefix", "-specs", "--specs", "-Xclang", "-Xlinker", "--for-linker", "--ld-path", "--gcc-toolchain", "--gcc-install-dir", "-fuse-ld"], letters: "B", dashDash: false },
   rustc: { checked: ["-C", "--codegen", "-Z"], letters: "CZ" },
   ccache: { checked: ["--set-config"], letters: "o", dashDash: false },
   cmake: { checked: ["-E", "-P", "-C", "-D", "--toolchain"], letters: "EPCD" },
@@ -8959,8 +8965,8 @@ const KEYED: Record<string, Keyed> = {
   just: { checked: ["--command", "--shell", "--shell-command", "--shell-arg", "--chooser", "--justfile"], letters: "cf" },
   ninja: { values: ["-j", "-k", "-l", "-d", "-t", "-w"], checked: ["-f", "-C"], letters: "fC" },
   pytest: { values: ["-k", "-m", "-p", "-r", "-W", "-n", "--rootdir", "--tb", "--maxfail", "--junitxml", "--color", "--capture", "--confcutdir"], checked: ["-c", "--config-file", "-o", "--override-ini", "--basetemp", "--pdb", "--trace"], letters: "co" },
-  tox: { checked: ["--override", "-x", "-c", "--conf"], letters: "xc" },
-  meson: { checked: ["--wrapper", "--gdb-path"] },
+  tox: { checked: ["--override", "-x", "-c", "--conf"], letters: "xc", subs: 2 },
+  meson: { checked: ["--wrapper", "--gdb-path"], subs: 2 },
   mypy: { checked: ["--python-executable", "--install-types"] },
   venv: { checked: ["--upgrade-deps", "--clear", "--prompt"] },
   cloc: { values: ["--exclude-dir", "--exclude-ext", "--exclude-lang", "--include-lang", "--include-ext", "--match-f", "--not-match-f", "--match-d", "--not-match-d", "--timeout", "--processes"], checked: ["--out", "--report-file", "--vcs", "--list-file", "--exclude-list-file", "--read-lang-def", "--force-lang-def", "--write-lang-def", "--write-lang-def-incl-dup", "--script-lang", "--sql", "--sql-append", "--strip-comments", "--strip-str-comments", "--config", "--diff", "--git-diff-rel", "--git-diff-all"] },
@@ -8983,7 +8989,9 @@ const GIT_VALUES: Record<string, string[]> = {
   checkout: ["-b", "-B", "--orphan"],
   switch: ["-c", "-C", "--create", "--force-create", "--orphan"],
 };
-const GIT_CHECKED = ["--output", "--output-directory", "--upload-pack", "--receive-pack", "--exec", "--template", "--open-files-in-pager", "--extcmd"];
+// (Project review 5, round 2, Opus: and the long options that name a file git reads, whose name
+// the credential check reads: `git blame --contents="$(printf .env)" a`, `git commit --file "$f"`.)
+const GIT_CHECKED = ["--output", "--output-directory", "--upload-pack", "--receive-pack", "--exec", "--template", "--open-files-in-pager", "--extcmd", "--contents", "--file", "--signature-file", "--mailmap-file", "--exclude-from", "--exclude-per-directory", "--ignore-revs-file", "--pathspec-from-file", "--description-file"];
 
 // The first word of `args` (marked) that can become an option of the program at run time, or
 // that holds an expansion where the program's checks read a name (`byName` is then called).
@@ -8991,6 +8999,8 @@ function riskyWord(spec: Keyed, args: string[], safe?: (word: string) => boolean
   let ended = false;
   let operand = false;
   let cluster = false;
+  let subs = 0;
+  let optionBefore = false;
   const read = (word: string) => {
     byName?.();
     return word;
@@ -9002,6 +9012,8 @@ function riskyWord(spec: Keyed, args: string[], safe?: (word: string) => boolean
     // is read as that value (`git commit -am "msg $x"`).
     const valued = cluster;
     cluster = false;
+    const maybeValue = optionBefore;
+    optionBefore = false;
     if (!ended && spec.dashDash !== false && plain === "--") {
       ended = true;
       continue;
@@ -9018,8 +9030,13 @@ function riskyWord(spec: Keyed, args: string[], safe?: (word: string) => boolean
         i++;
         continue;
       }
-      if (!plain.startsWith("-")) operand = true;
-      else cluster = /^-[A-Za-z]{2,}$/.test(plain) && [...plain.slice(1)].findIndex((l) => spec.values?.includes(`-${l}`) || spec.letters?.includes(l)) === plain.length - 2;
+      if (!plain.startsWith("-")) {
+        operand = true;
+        if (!maybeValue) subs++;
+      } else {
+        cluster = /^-[A-Za-z]{2,}$/.test(plain) && [...plain.slice(1)].findIndex((l) => spec.values?.includes(`-${l}`) || spec.letters?.includes(l)) === plain.length - 2;
+        optionBefore = !plain.includes("=");
+      }
       continue;
     }
     if (at === 0) return plain;
@@ -9032,7 +9049,10 @@ function riskyWord(spec: Keyed, args: string[], safe?: (word: string) => boolean
       const eq = w.indexOf("=");
       if (w.startsWith("--") || (eq > 0 && eq < at)) {
         const name = unmark(w.slice(0, eq < 0 ? at : eq));
-        if (eq < 0 || eq > at || spec.checked?.some((c) => c === name || (c.startsWith("--") && name.length >= 3 && c.startsWith(name)))) return plain;
+        // (Project review 5, round 2, Mythos: a letter whose value a check reads takes the rest
+        // of its word, an `=` in it too: `cmake -DCMAKE_C_FLAGS="$CFLAGS"`.)
+        const letter = !w.startsWith("--") && !!spec.letters?.includes(name[1]);
+        if (eq < 0 || eq > at || letter || spec.checked?.some((c) => c === name || (c.startsWith("--") && name.length >= 3 && c.startsWith(name)))) return plain;
         continue;
       }
       // The word passes where its first letter takes the rest of it as a value no check reads
@@ -9042,7 +9062,7 @@ function riskyWord(spec: Keyed, args: string[], safe?: (word: string) => boolean
       if (letters && spec.attached !== false && (spec.values?.includes(`-${letters[0]}`) || spec.optional?.includes(`-${letters[0]}`)) && ![...letters].some((l) => spec.letters?.includes(l))) continue;
       return plain;
     }
-    if (spec.named && !valued) return read(plain);
+    if ((spec.named && !valued) || subs < (spec.subs ?? 0)) return read(plain);
     operand = true;
   }
   return undefined;
@@ -9185,6 +9205,24 @@ export function expansionProblem(command: string, cwd?: string): GuardVerdict | 
         const sub = args[i] ?? "";
         if (MARKS.test(sub)) found ??= unmark(sub);
         found ??= riskyWord({ values: GIT_VALUES[unmark(sub)] ?? [], checked: GIT_CHECKED, letters: ["format-patch", "archive"].includes(unmark(sub)) ? "o" : "", named: true }, args.slice(i + 1), undefined, byName);
+        // (Project review 5, round 2, Mythos: the two paths of `git diff --no-index` are files
+        // outside git's store, behind `--` too, and git takes that reading by itself where two
+        // paths follow the options and one lies outside the repository: `git diff --no-index --
+        // a "/etc/sh${x:-adow}"`, `git diff -- a "$f"`. One path names what git holds, as before.
+        // (Cross-check, Sol: an option's separate value before the `--` is no revision,
+        // `git diff --src-prefix old/ -- a "../x$u"`: any two paths behind `--` count.)
+        const dashes = args.findIndex((w, k) => k > i && unmark(w) === "--");
+        if (found === undefined && unmark(sub) === "diff" && dashes >= 0) {
+          const before = args.slice(i + 1, dashes).map(unmark);
+          const noIndex = before.some((w) => w.length > 4 && "--no-index".startsWith(w));
+          if (noIndex || args.length - dashes === 3) {
+            const file = args.slice(dashes + 1).find((w) => MARKS.test(w));
+            if (file !== undefined) {
+              found = unmark(file);
+              named = true;
+            }
+          }
+        }
       } else if (/^python3?(\.\d+)?$/.test(name)) {
         const m0 = unmark(args[0] ?? "");
         const mod = m0 === "-m" ? unmark(args[1] ?? "") : m0.startsWith("-m") && m0.length > 2 ? m0.slice(2) : undefined;
@@ -9231,6 +9269,30 @@ export function expansionProblem(command: string, cwd?: string): GuardVerdict | 
       }
       if (found === undefined && RUSTUP_PROXIES.has(name) && args[0] !== undefined && MARKS.test(args[0]) && (args[0].search(MARKS) === 0 || unmark(args[0]).startsWith("+"))) {
         found = unmark(args[0]);
+      }
+      // (Project review 5, round 2, Mythos: `cargo clippy`, `rustc` and `rustdoc` hand rustc the
+      // words after `--`, which managerProblem reads as rustc's options: `cargo clippy --
+      // $CLIPPY_FLAGS`, `cargo clippy -- -C "linker$u=/usr/bin/x"`. A compiler hands the words
+      // of `-Wl,`, `-Wa,` and `-Wp,` on in the same way, `gcc a.c -Wl,-rpath="$x"`, and the
+      // words after `ccache <compiler>` are that compiler's, `ccache clang -fuse-ld="$LD" a.c`.)
+      const handed = args.findIndex((w) => unmark(w) === "--");
+      // (And the word a subcommand reads by name stands behind `--` as well where installProblem
+      // and managerProblem read it there: `npm audit -- "fix$u"`, `uv pip -- "install$u" x`, `go
+      // tool -- "test2json$u" cmd`, `go run -- "pkg$v"`.)
+      const through = name === "go" ? ["tool", "run"] : name === "uv" ? ["pip"] : NPM_FAMILY.includes(name) ? ["audit"] : [];
+      if (found === undefined && handed >= 0 && args.slice(0, handed).some((w) => through.includes(unmark(w)))) {
+        const behind = args.slice(handed + 1).find((w) => MARKS.test(w));
+        if (behind !== undefined) {
+          found = unmark(behind);
+          named = true;
+        }
+      }
+      if (found === undefined && name === "cargo" && handed >= 0 && args.slice(0, handed).some((w) => ["clippy", "rustc", "rustdoc"].includes(unmark(w)))) found = riskyWord(KEYED.rustc, args.slice(handed + 1));
+      const cached = name === "ccache" && COMPILER.test(unmark(args[0] ?? ""));
+      if (found === undefined && cached) found = riskyWord(KEYED.gcc, args.slice(1));
+      if (found === undefined && (cached || (Object.hasOwn(KEYED, name) && KEYED[name] === KEYED.gcc))) {
+        const passed = args.find((w) => /^-W[lap],/.test(unmark(w)) && MARKS.test(w));
+        if (passed !== undefined) found = unmark(passed);
       }
       // An unquoted expansion bash splits can hand test/[ a `-v`/`-R` and its subscript, or
       // printf a `-v NAME` (project review 3, round 17, Opus, Sol: `test $(echo '-v a[$(id)]')`,

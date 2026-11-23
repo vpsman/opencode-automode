@@ -1897,3 +1897,143 @@ test("project review 5, round 1 (Mythos): a quoted expansion that finishes an op
     'awk -F"$s" \'{print $1}\' a',
   ]) assert.equal(await decide5(command), "allow", command);
 });
+
+test("project review 5, round 2 (Opus, Mythos): methods, files and subcommand words the checks read by name", async () => {
+  const repo6 = path.join(base, "repo6");
+  fs.mkdirSync(path.join(repo6, "sub"), { recursive: true });
+  fs.mkdirSync(path.join(repo6, "build"), { recursive: true });
+  for (const f of ["a", "b", "a.c", "w.sh", "sub/k"]) fs.writeFileSync(path.join(repo6, f), "x\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo6]);
+  const decide6 = async (command: string) => (await decideShell(guard, new SessionState(repo6), repo6, command)).effect;
+  for (const command of [
+    // 1 (Opus): every form in which gh api takes a method or a field.
+    "gh api --method=DELETE /repos/a/b",
+    "gh api -X=DELETE /repos/a/b",
+    "gh api -iX DELETE /repos/a/b",
+    "gh api /repos/a/b/issues -ftitle=x",
+    "gh api /repos/a/b/issues -Ftitle=x",
+    "gh api /repos/a/b/issues -if title=x",
+    "gh api graphql -fquery='mutation{deleteIssue(input:{issueId:\"x\"}){clientMutationId}}'",
+    "gh api -X GET /repos/a/b -X DELETE",
+    "gh api -XDELETE /repos/a/b",
+    "gh api /repos/a/b -iXDELETE",
+    "gh api /repos/a/b -X",
+    // (A method word that another option takes as its value does not make the call a GET.)
+    "gh api /repos/a/b/issues -f title=x -t -XGET",
+    "gh api /repos/a/b/issues -f title=x -q -X GET",
+    // 2 (Opus): a long option of git that names a file it reads.
+    'git blame --contents="$(printf .env)" a',
+    'git commit --file "$f"',
+    'git commit --file="$f"',
+    'git commit --fil="$f"',
+    'git tag -a v1 --file "$f"',
+    'git notes add --file="$f"',
+    'git config --file="$f" -l',
+    'git log --mailmap-file="$f"',
+    'git format-patch --signature-file="$f" -1',
+    'git format-patch --cover-letter --description-file="$f" -1 --stdout',
+    'git ls-files --exclude-from="$f"',
+    'git ls-files --exclude-per-directory="$f"',
+    'git blame --ignore-revs-file="$f" a',
+    'git add --pathspec-from-file="$f"',
+    // 3 (Mythos): a subcommand, or the word it reads by name, finished by an expansion.
+    'go tool "test2json$u" ssh host id',
+    'go tool "cg${x:-o}" -- -wrapper sh,-c,id',
+    'go tool -n "test2json$u" ssh host id',
+    'go -C sub tool "test2json$u" ssh host id',
+    'go run "example.com/x/cmd$v"',
+    'go run -race "example.com/x/cmd$v"',
+    'npm audit "fix$u" --force',
+    'npm --loglevel info audit "fix$u"',
+    'npm -s audit "fix$u"',
+    'pnpm audit "fix$u"',
+    'uv pip "install$u" evil',
+    'uv pip -q "install$u" evil',
+    'python3 -m pip "inst$u" evil',
+    'tox "e$u" -- npm install evil',
+    'tox -e a "e$u" -- npm install evil',
+    'meson "devenv$u" -C build sh -c id',
+    // (The same word behind `--`, where the checks read it too.)
+    'npm audit -- "fix$u" --force',
+    'pnpm audit -- "fix$u"',
+    'uv pip -- "install$u" evil',
+    'go tool -- "test2json$u" ssh host id',
+    'go run -- "example.com/x/cmd$v"',
+    // 4 (Mythos): the words `cargo clippy`, `rustc` and `rustdoc` hand rustc after `--`.
+    "cargo clippy -- $CLIPPY_FLAGS",
+    'cargo clippy -- -C "$x"',
+    'cargo clippy -- --emit=link -C "linker$u=/usr/bin/x"',
+    'cargo clippy --fix -- "-C$x"',
+    'cargo rustc -- -C "$x"',
+    'cargo rustdoc -- "--$x"',
+    "cargo --color never clippy -- $F",
+    // 5 (Mythos): a visible option whose value a check reads.
+    'cmake -DCMAKE_C_FLAGS="$CFLAGS" -B build',
+    'clang -fuse-ld="$LD" a.c',
+    'gcc a.c -Wl,-rpath="$x"',
+    'gcc -Wa,"$x" a.c',
+    'ccache gcc -Wl,-rpath="$x" a.c',
+    'ccache clang -fuse-ld="$LD" a.c',
+    // 6 (Mythos): make's long names by any prefix.
+    "make --dir=/etc all",
+    "make --direc /etc all",
+    "make --directory /etc all",
+    "make --mak=- all",
+    "make --fil - all",
+    // 7 (Mythos): the two files `git diff` compares outside its store, behind `--`.
+    'git diff --no-index -- a "/etc/sh${x:-adow}"',
+    'git diff --no-index a -- "$f"',
+    'git diff -- a "/etc/sh${x:-adow}"',
+    'git diff --stat -- a "$f"',
+    // (Cross-check, Sol: an option's separate value before the `--`.)
+    'git diff --src-prefix old/ -- a "../outs${x:-ide.txt}"',
+    'git diff --output out -- a "/etc/sh${x:-adow}"',
+    // (Accepted over-ask: two paths behind `--` after a revision, as git reads them by name.)
+    'git diff HEAD~1 -- "$a" "$b"',
+  ]) assert.notEqual(await decide6(command), "allow", command);
+  for (const command of [
+    "gh api /repos/a/b",
+    "gh api -X GET /x -f q=1",
+    "gh api -XGET /x -fq=1",
+    "gh api --method GET /x",
+    "gh api /x -f q=1 -X GET",
+    "gh api --paginate -X GET /search/issues -f q=x",
+    "gh api --paginate /x",
+    "gh api -H 'Accept: x' /x",
+    "gh api /x -i",
+    "gh api /x --jq '.[].name'",
+    'git commit -m "msg $x"',
+    'git log --format="%H $x"',
+    'git log --grep="$x" --author="$a"',
+    'git branch --contains="$c"',
+    'npm run test -- "$p"',
+    'cargo build -p "$c"',
+    'go test -run "Test$x" ./...',
+    "npm test",
+    "npm audit",
+    "go test ./...",
+    'go run . "arg$x"',
+    'uv run pytest "tests/$f"',
+    "tox -e py311",
+    "meson setup build",
+    "meson compile -C build",
+    'cargo test -- "$filter"',
+    'cargo run -- "$x"',
+    'npm test -- "tests/$f"',
+    "cargo clippy -- -D warnings",
+    'cargo clippy -- -W "clippy::$l"',
+    "gcc -O2 -o out a.c",
+    'gcc -DVERSION="$v" a.c',
+    "gcc -Wl,-rpath,'$ORIGIN' a.c",
+    "clang -fuse-ld=lld a.c",
+    "cmake -B build",
+    'cmake -B "build-$t"',
+    "make --dir=sub all",
+    "make --no-print-directory -C sub all",
+    "make --debug=b all",
+    // (Declined, README Known gaps: a path git reads from its own store.)
+    'git log -p -- "$f"',
+    'git diff -- "$f"',
+    'git show HEAD -- ".env$u"',
+  ]) assert.equal(await decide6(command), "allow", command);
+});

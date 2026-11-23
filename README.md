@@ -381,8 +381,12 @@ For each shell tool call:
      known to take the rest as its value, `make -j"$n"`), and an operand with an expansion
      anywhere in it where the checks read a name: an operand of git before any `--`
      (`git stash "dr$x"`, `git add "src/$f"`; a `git mv` name built at run time asks as a
-     write to a place the check cannot tell), an operand of make (`make "SHELL$v"`), the
-     script name after `npm run`, a spec after `npm view`, a `sysctl` name; `wc`, `du`,
+     write to a place the check cannot tell; behind `--`, the two files `git diff` compares
+     outside its store, `git diff --no-index -- a "$f"`, `git diff -- a "$f"`), an operand
+     of make (`make "SHELL$v"`), the script name after `npm run`, a spec after `npm view`,
+     the first two words after a package manager, `tox` or `meson` (a subcommand and the
+     word it reads: `npm audit "fix$u"`, `go tool "cg$x"`, `go test "./$d/..."`), a
+     `sysctl` name; `wc`, `du`,
      `file`, `grep` and `jq` among them, which have options that read a file of names
      (`wc -l "$f"`, `wc -l $(git ls-files)`, `du -sh "$dir"`; not behind `--`); a glob, or
      an unquoted expansion, that could match a name that begins with `-`, in a call where

@@ -2175,9 +2175,11 @@ function make(args: string[], scope: Scope): Verdict {
     // value takes the rest of the word or the next one, `make -kC /etc all`, `make -kf -`.)
     const at = /^-[^-]/.test(a) ? [...a.slice(1)].findIndex((l) => "fCIjlWo".includes(l)) + 1 : 0;
     const short = at > 0 ? [a[at], a.slice(at + 1) || args[k + 1]] : [];
-    const file = /^(--file|--makefile)$/.test(a) ? args[k + 1] : /^--(file|makefile)=/.test(a) ? a.slice(a.indexOf("=") + 1) : short[0] === "f" ? short[1] : undefined;
+    // (Round 2, Mythos: make takes a long name by any prefix, `--dir=/etc`, `--direc /etc`.)
+    const long = (...names: string[]) => (names.some((n) => longIs(a, n)) ? (a.includes("=") ? a.slice(a.indexOf("=") + 1) : args[k + 1]) : undefined);
+    const file = long("file", "makefile") ?? (short[0] === "f" ? short[1] : undefined);
     if (file !== undefined && (file === "-" || (/^\/dev\/|^\/proc\//.test(file) && file !== "/dev/null") || /[$`]/.test(file))) return classify("make reads its makefile from a stream");
-    const dir = a === "--directory" ? args[k + 1] : /^--directory=/.test(a) ? a.slice(12) : short[0] === "C" ? short[1] : undefined;
+    const dir = long("directory") ?? (short[0] === "C" ? short[1] : undefined);
     if (dir !== undefined && !isLocal(resolveWord(dir, scope), scope)) return classify("make in a directory outside the working directory");
     const m = /^([A-Za-z_.][\w.]*)\+?[:?!]?=(.*)$/s.exec(a);
     if (m && (/^(SHELL|\.SHELLFLAGS|MAKEFLAGS|MFLAGS|MAKE|MAKEFILES|MAKEFILE_LIST|\.RECIPEPREFIX)$/.test(m[1]) || !/^[\w.+,:=%@\/-]*$/.test(m[2]))) {
@@ -3714,10 +3716,25 @@ function gh(args: string[]): Verdict {
   const [group, action] = operands(args);
   if (!group) return ALLOW;
   if (group === "api") {
-    const m = args.findIndex((a) => a === "-X" || a === "--method");
-    const method = m >= 0 ? (args[m + 1] ?? "").toUpperCase() : args.find((a) => /^-X\w+$/.test(a))?.slice(2).toUpperCase();
-    const fields = args.some((a) => /^(-f|-F|--field|--raw-field|--input)(=|$)/.test(a));
-    if (method ? method !== "GET" : fields) return ask("gh api call that changes remote data");
+    // (Project review 5, round 2, Opus: every method the call names, in each form gh reads, the
+    // last one deciding (`--method=DELETE`, `-X=DELETE`, `-X GET ... -X DELETE`), and a field
+    // attached to its letter (`-ftitle=x`); any other cluster that holds one of these letters,
+    // `-iX DELETE`, `-if title=x`, is not read and asks. A method word right after an option
+    // that is not one of gh api's flags may be that option's value, `-f title=x -t -XGET`: it
+    // does not make a call with fields a GET.)
+    const methods: string[] = [];
+    let fields = false;
+    let sure = true;
+    for (const [k, a] of args.entries()) {
+      const method = a === "-X" || a === "--method" ? (args[k + 1] ?? "") : a.startsWith("--method=") ? a.slice(9) : /^-X./.test(a) ? a.slice(2).replace(/^=/, "") : undefined;
+      if (method !== undefined) {
+        methods.push(method);
+        const before = args[k - 1];
+        if (before.startsWith("-") && !before.includes("=") && !/^(-i|--include|--paginate|--slurp|--silent|--verbose)$/.test(before)) sure = false;
+      } else if (/^(-[fF].*|--(field|raw-field|input)(=.*)?)$/s.test(a)) fields = true;
+      else if (/^-[^-]/.test(a) && /[XfF]/.test(a)) return ask(`gh api ${a}: an option cluster the check does not read, which may set the method or a field`);
+    }
+    if (methods.some((m) => m.toUpperCase() !== "GET") || (fields && (!methods.length || !sure))) return ask("gh api call that changes remote data");
     return ALLOW;
   }
   if (group === "auth") return action === "status" ? ALLOW : classify("gh auth");
