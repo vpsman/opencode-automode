@@ -1623,3 +1623,137 @@ test("round 27 (Opus, Sol): a dynamic printf option after a literal -v NAME", as
     "x=src; sleep 1 & wait $!; echo hi > $x/out.txt",
   ]) assert.equal(await decide27(command), "allow", command);
 });
+
+test("round 29 (Mythos): a name set by ${NAME:=word}, and a quoted printf or wait word that is the whole option", async () => {
+  const repo29 = path.join(base, "repo29");
+  fs.mkdirSync(repo29, { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "main", repo29]);
+  const decide29 = async (command: string) => (await decideShell(guard, new SessionState(repo29), repo29, command)).effect;
+  for (const command of [
+    "x='a[$(date)]'; : \"${f:=-v $x}\"; test $f",
+    "x='a[$(date)]'; : \"${f=-v $x}\"; [ $f ]",
+    "x=$(cat g); : \"${f:-${h:=-v $x}}\"; test $h",
+    "x='a[$(date)]'; : \"${f:=-v$x}\"; printf \"$f\" x",
+    'f=$(cat g); printf "$f" x',
+    'read -r f < g; printf "$f" x',
+    'for f in $(cat g); do printf "$f" x; done',
+    'printf "$(cat g)" x',
+    'set -- "$(cat g)"; printf "$1" x',
+    'f=$(cat g); printf "${f:-x}" x',
+    'f=$(cat g); printf "-$f" x',
+    'a=-; f=$(cat g); printf "$a$f" x',
+    'x=$(cat g); printf "-va$x]" x',
+    'sleep 0 & f=$(cat g); wait -n "$f"',
+  ]) assert.notEqual(await decide29(command), "allow", command);
+  for (const command of [
+    'printf "$fmt" a b',
+    "fmt='%s\\n'; printf \"$fmt\" a",
+    'msg=$(git log -1 --format=%s); printf "$msg\\n"',
+    "msg=$(git log -1 --format=%s); printf '%s\\n' \"$msg\"",
+    'f=$(cat g); printf -- "$f" x',
+    'f=$(cat g); printf "%s$f" x',
+    'while read -r line; do printf "$line\\n"; done < g',
+    "[ -z $x ]",
+    'sleep 1 & pid=$!; wait "$pid"',
+  ]) assert.equal(await decide29(command), "allow", command);
+});
+
+test("round 30 (Opus, Sol, Mythos): a printf or wait option word passes only as one name that cannot begin with a dash", async () => {
+  const repo30 = path.join(base, "repo30");
+  fs.mkdirSync(repo30, { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "main", repo30]);
+  const decide30 = async (command: string) => (await decideShell(guard, new SessionState(repo30), repo30, command)).effect;
+  for (const command of [
+    // A (Sol): a setter behind the options of `command`, `builtin`, `time`.
+    "f=foo; command -- printf -v f '%s' '-va[$(date)]'; printf \"$f\" x",
+    "f=foo; builtin -- printf -v f '%s' '-va[$(date)]'; printf \"$f\" x",
+    "f=foo; time -p printf -v f '%s' '-va[$(date)]'; printf \"$f\" x",
+    // B (Opus, Sol): an option word held in a name.
+    'op=-vf; printf "$op" %s "$(cat g)"; printf "$f" x',
+    'f=x; op=-vf; printf "$op" %s "$(cat g)"; printf "$f" x',
+    'for op in -vf; do printf "$op" %s "$(cat g)"; done; printf "$f" x',
+    'op=-vf; printf "$op" %s "$(cat g)"; sleep 0 & wait -n "$f"',
+    "f=foo; op=-vf; printf \"$op\" '%s' '-pa[$(date)]'; sleep 0 & wait -n \"$f\"",
+    'op=-vf; command -- printf "$op" %s "$(cat g)"; printf "$f" x',
+    'op=-vf; builtin -- printf "$op" %s "$(cat g)"; printf "$f" x',
+    'op=-vf; time -p printf "$op" %s "$(cat g)"; printf "$f" x',
+    // C (Mythos): two pieces, text beside the expansion, `+=`.
+    "b='x[$(date)]'; f=-v; g='a[b]'; printf \"$f$g\" x",
+    "f=-va; f+='[b]'; printf \"$f\" x",
+    'printf "$nosuch"-va[b] x',
+    'printf "$nosuch-va[b]" x',
+    "f=-p; g='a[b]'; sleep 0 & wait -n \"$f$g\"",
+    'f=-v; f+=PATH; printf "$f" x',
+    'f=; g=-vPATH; printf "$f$g" x',
+    'wait "$nosuch"-pPATH',
+    // A `for` list the parser reads and the text does not show, and an option word after `-v NAME`.
+    'for f in {-vPATH,x}; do printf "$f" x; done',
+    'for f # c\nin -vq; do printf "$f" x; done',
+    'for \\\nf in -vq; do printf "$f" x; done',
+    'x=$(cat g); for f # c\nin $x; do sleep 0 & wait $f; done',
+    'x=$(cat g); for \\\nf in $x; do sleep 0 & wait $f; done',
+    'select f in -vq; do printf "$f" x; done',
+    'g=-vq; printf -v o "$g" y',
+    'x=$(cat g); printf -v o $x y',
+    'f=-vq; printf "${f}" x',
+    'f=-nq; sleep 0 & wait "$f"',
+  ]) assert.notEqual(await decide30(command), "allow", command);
+  for (const command of [
+    'printf "$fmt" a b',
+    "fmt='%s\\n'; printf \"$fmt\" a",
+    "fmt=%s; fmt+='\\n'; printf \"$fmt\" a",
+    'printf "%s$f" x',
+    'printf "$prefix-%s\\n" a',
+    'sleep 1 & pid=$!; wait "$pid"',
+    "wait $!",
+    'msg=$(git log -1 --format=%s); printf "$msg\\n"',
+    'while read -r line; do printf "$line\\n"; done < g',
+    "[ -z $x ]",
+    'for f in a b; do printf "$f\\n"; done',
+    'for f in a b; do printf "$f" x; done',
+    'for f in *.ts; do printf "$f\\n"; done',
+    'f=-vq; printf -- "$f" x',
+  ]) assert.equal(await decide30(command), "allow", command);
+});
+
+test("round 31 (Opus, Mythos): `$!` is no number beside other text in an option word, and a declaring builtin behind a wrapper assigns", async () => {
+  const repo31 = path.join(base, "repo31");
+  fs.mkdirSync(repo31, { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "main", repo31]);
+  const decide31 = async (command: string) => (await decideShell(guard, new SessionState(repo31), repo31, command)).effect;
+  for (const command of [
+    // 1 (Opus): `$!` is empty until the call starts a background job.
+    'printf "$!"-vf %s "$(cat g)"; printf "$f" x',
+    'printf "$!-vf" %s "$(cat g)"; printf "$f" x',
+    'printf "$!"-vf %s "$(cat g2)"; test $f',
+    'printf "-$!vf" %s "$(cat g)"; printf "$f" x',
+    'printf "$!$!"-vf %s "$(cat g)"; printf "$f" x',
+    'sleep 0 & wait "$!"-pf; printf "$f" x',
+    'wait "$!-pPATH"; ls',
+    'x=1; printf "$!"-vx %s .git; cat "$x"',
+    // 2 (Mythos): `builtin`, `command`, `time` and their options before a declaring builtin.
+    ...["builtin declare", "command declare", "command -p declare", "command -- declare", "command command declare", "time -p declare", "builtin typeset", "command typeset", "builtin readonly", "command readonly", "X=1 command declare"].map(
+      (declare) => `${declare} f=-vPATH; printf "$f" %s "$PWD/tools"; git status`,
+    ),
+    'f() { builtin local f=-vPATH; printf "$f" %s "$PWD/tools"; git status; }; f',
+    'f() { command local f=-vq; printf "$f" %s x; }; f',
+    'builtin declare p=-pPATH; sleep 0 & wait "$p"; ls',
+    'f=a; builtin declare f=-vq; printf "$f" %s x',
+    'command declare -g f=-vq; printf "$f" %s x',
+    'builtin declare f=$(cat g); printf "$f" x',
+    "builtin declare f='-v q'; test $f",
+  ]) assert.notEqual(await decide31(command), "allow", command);
+  for (const command of [
+    "wait $!",
+    'sleep 1 & wait "$!"',
+    'sleep 1 & pid=$!; wait "$pid"',
+    'printf "PID $!\\n"',
+    'printf "$$\\n"',
+    'printf "$fmt" a b',
+    'declare -r x=1; printf "$x\\n"',
+    'builtin declare f=ok; printf "$f" x',
+    "builtin echo hi",
+    "command -v git",
+    "time make",
+  ]) assert.equal(await decide31(command), "allow", command);
+});

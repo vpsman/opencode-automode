@@ -4657,7 +4657,9 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
     // (Round 25, Opus: only a word that begins with an expansion can become an option; `$!`,
     // `$$`, `$?`, `$#` are numbers.)
     // (Round 26, Opus, Sol: or a word that begins with `-` and holds an expansion, `printf "-$op"`.)
-    const dynamic = (w: string) => { const v = w.replace(/\$[!$?#]/g, ""); return /^[$`]/.test(v) || (v.startsWith("-") && /[$`]/.test(v)); };
+    // (Round 31, Opus: `$!` is empty until a background job starts, so it counts as a number only
+    // as the whole word: `printf "$!"-vf ...` is `printf -vf ...`.)
+    const dynamic = (w: string) => { const v = /^\$(?:!|\{!\})$/.test(w) ? "" : w.replace(/\$[$?#]/g, ""); return /^[$`]/.test(v) || (v.startsWith("-") && /[$`]/.test(v)); };
     if (c.argv[at] !== "printf") return rest.some(dynamic);
     // (Round 27, Opus, Sol: every word in printf's option area, `printf -v line "$op"` too.)
     for (let i = 0; i < rest.length; i++) {
