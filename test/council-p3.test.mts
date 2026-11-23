@@ -1715,3 +1715,45 @@ test("round 30 (Opus, Sol, Mythos): a printf or wait option word passes only as 
     'f=-vq; printf -- "$f" x',
   ]) assert.equal(await decide30(command), "allow", command);
 });
+
+test("round 31 (Opus, Mythos): `$!` is no number beside other text in an option word, and a declaring builtin behind a wrapper assigns", async () => {
+  const repo31 = path.join(base, "repo31");
+  fs.mkdirSync(repo31, { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "main", repo31]);
+  const decide31 = async (command: string) => (await decideShell(guard, new SessionState(repo31), repo31, command)).effect;
+  for (const command of [
+    // 1 (Opus): `$!` is empty until the call starts a background job.
+    'printf "$!"-vf %s "$(cat g)"; printf "$f" x',
+    'printf "$!-vf" %s "$(cat g)"; printf "$f" x',
+    'printf "$!"-vf %s "$(cat g2)"; test $f',
+    'printf "-$!vf" %s "$(cat g)"; printf "$f" x',
+    'printf "$!$!"-vf %s "$(cat g)"; printf "$f" x',
+    'sleep 0 & wait "$!"-pf; printf "$f" x',
+    'wait "$!-pPATH"; ls',
+    'x=1; printf "$!"-vx %s .git; cat "$x"',
+    // 2 (Mythos): `builtin`, `command`, `time` and their options before a declaring builtin.
+    ...["builtin declare", "command declare", "command -p declare", "command -- declare", "command command declare", "time -p declare", "builtin typeset", "command typeset", "builtin readonly", "command readonly", "X=1 command declare"].map(
+      (declare) => `${declare} f=-vPATH; printf "$f" %s "$PWD/tools"; git status`,
+    ),
+    'f() { builtin local f=-vPATH; printf "$f" %s "$PWD/tools"; git status; }; f',
+    'f() { command local f=-vq; printf "$f" %s x; }; f',
+    'builtin declare p=-pPATH; sleep 0 & wait "$p"; ls',
+    'f=a; builtin declare f=-vq; printf "$f" %s x',
+    'command declare -g f=-vq; printf "$f" %s x',
+    'builtin declare f=$(cat g); printf "$f" x',
+    "builtin declare f='-v q'; test $f",
+  ]) assert.notEqual(await decide31(command), "allow", command);
+  for (const command of [
+    "wait $!",
+    'sleep 1 & wait "$!"',
+    'sleep 1 & pid=$!; wait "$pid"',
+    'printf "PID $!\\n"',
+    'printf "$$\\n"',
+    'printf "$fmt" a b',
+    'declare -r x=1; printf "$x\\n"',
+    'builtin declare f=ok; printf "$f" x',
+    "builtin echo hi",
+    "command -v git",
+    "time make",
+  ]) assert.equal(await decide31(command), "allow", command);
+});

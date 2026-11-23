@@ -8663,24 +8663,43 @@ function traceProblem(cmds: Simple[]): string | undefined {
   return undefined;
 }
 
+// Where a command's program word stands: after `while`, `if`, `!`, `do`..., leading assignments,
+// and `builtin` / `command` / `time` with their options (any word that begins with `-` after one
+// of them). `assigned` is called with each leading assignment bash performs (a word after
+// `builtin` or `command` is a program's name, whatever it looks like).
+function programAt(argv: string[], assigned?: (word: string) => void): number {
+  let k = 0;
+  let wrapped = false;
+  let named = false;
+  for (; k < argv.length; k++) {
+    if (argv[k] === "builtin" || argv[k] === "command") wrapped = named = true;
+    else if (argv[k] === "time") wrapped = true;
+    else if (LOOP_KEYWORDS.has(argv[k])) wrapped = named = false;
+    else if (ASSIGN.test(argv[k])) {
+      wrapped = false;
+      if (!named) assigned?.(argv[k]);
+    } else if (!(wrapped && argv[k].startsWith("-"))) break;
+  }
+  return k;
+}
+// `$$`, `$?` and `$#` are numbers wherever they stand in an option word. `$!` is empty until the
+// call starts a background job, so it counts only as the whole word (`wait "$!"`): round 31,
+// Opus, `printf "$!"-vf ...` is `printf -vf ...`.
+const numbersGone = (w: string) => (/^\$(?:!|\{!\})$/.test(w) ? "" : w.replace(/\$[$?#]/g, ""));
+
 function collectAssigned(cmds: Simple[]): Map<string, string[]> {
   const map = new Map<string, string[]>();
   const add = (n: string, v: string) => map.set(n, [...(map.get(n) ?? []), v]);
+  const addWord = (w: string) => {
+    const m = ASSIGN.exec(w);
+    if (m) add(m[1], w.slice(m[0].length));
+  };
   for (const { argv } of cmds) {
     // (Round 24, Sol: an assignment after `then`, `do`, `!`, ...: `if true; then v='-v a[...]'; fi`.)
-    let i = 0;
-    while (i < argv.length && LOOP_KEYWORDS.has(argv[i])) i++;
-    for (; i < argv.length && ASSIGN.test(argv[i]); i++) {
-      const m = ASSIGN.exec(argv[i])!;
-      add(m[1], argv[i].slice(m[0].length));
-    }
-    const name = path.basename(argv[i] ?? "");
-    if (DECLARERS.has(name)) {
-      for (const a of argv.slice(i + 1).filter((w) => !w.startsWith("-"))) {
-        const m = ASSIGN.exec(a);
-        if (m) add(m[1], a.slice(m[0].length));
-      }
-    }
+    // (Round 31, Mythos: and a declaring builtin behind `builtin`, `command` or `time` and their
+    // options, `builtin declare f=-vPATH`, `command -p typeset f=...`.)
+    const i = programAt(argv, addWord);
+    if (DECLARERS.has(path.basename(argv[i] ?? ""))) argv.slice(i + 1).filter((w) => !w.startsWith("-")).forEach(addWord);
   }
   return map;
 }
@@ -9017,16 +9036,10 @@ function unreadNames(command: string, cmds: Simple[], cwd?: string): Set<string>
   // (Round 22, Opus: the program word comes after `while`, `if`, `!`, `do`... and `builtin`/`command`:
   // `while read v; do [ -n $v ]; done < f`.)
   const programOf = (argv: string[]): { name: string; args: string[] } => {
-    let k = 0;
     // (Round 25, Sol: and leading assignments, `LC_ALL=C printf -v v ...`.)
     // (Round 30, Sol: and the options of `command`, `builtin` and `time`, `command -- printf -v f ...`,
     // `time -p read f`. Any word that begins with `-` after one of them is skipped.)
-    let wrapped = false;
-    for (; k < argv.length; k++) {
-      if (argv[k] === "builtin" || argv[k] === "command" || argv[k] === "time") wrapped = true;
-      else if (LOOP_KEYWORDS.has(argv[k]) || ASSIGN.test(argv[k])) wrapped = false;
-      else if (!(wrapped && argv[k].startsWith("-"))) break;
-    }
+    const k = programAt(argv);
     return { name: path.basename(argv[k] ?? ""), args: argv.slice(k + 1) };
   };
   const implicit = cmds.some(({ argv }) => ["read", "select", "mapfile", "readarray", "getopts", "cd", "pushd", "popd", "coproc", "[["].includes(programOf(argv).name)) || /\bselect\s|\[\[|=~/.test(command);
@@ -9041,9 +9054,9 @@ function unreadNames(command: string, cmds: Simple[], cwd?: string): Set<string>
     // (Round 24, Sol: an option word held in a variable, `op=-vv; printf "$op" ...`, can name any
     // variable: then no name's known value is trusted.)
     // (Round 25, Opus: only a first word that begins with an expansion can turn into an option;
-    // `$!`, `$$`, `$?` and `$#` are numbers.)
+    // `$$`, `$?` and `$#` are numbers, and `$!` as the whole word: numbersGone.)
     // (Round 26, Opus, Sol: or a word that begins with `-` and holds an expansion, `printf "-$op"`.)
-    const dynamic = (w: string) => { const v = w.replace(/\$[!$?#]/g, ""); return /^[$`]/.test(v) || (v.startsWith("-") && /[$`]/.test(v)); };
+    const dynamic = (w: string) => { const v = numbersGone(w); return /^[$`]/.test(v) || (v.startsWith("-") && /[$`]/.test(v)); };
     if ((name === "printf" && printfOptionWords(args).some(dynamic)) || (name === "wait" && args.some(dynamic))) out.add("*");
     if (name === "wait") for (const t of waitTargets(args)) out.add(t.replace(/\[.*$/s, ""));
   }
@@ -9191,7 +9204,7 @@ export function expansionProblem(command: string, cwd?: string): GuardVerdict | 
               return (values ?? []).every((v) => !/^-|[$`]/.test(v.replace(/\$[!$?#]/g, ""))) && (lists ?? []).every((l) => l !== undefined && l.every((v) => LOOP_PLAIN.test(v)));
             };
             const whole = optionWords.find((a) => {
-              const w = unmark(a).replace(/\$[!$?#]/g, "");
+              const w = numbersGone(unmark(a));
               if (!(/^[$`]/.test(w) || (w.startsWith("-") && /[$`]/.test(w)))) return false;
               if (name === "printf" && w.endsWith("\\n")) return false;
               const m = /^\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))$/.exec(w);
