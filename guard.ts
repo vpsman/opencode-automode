@@ -2879,6 +2879,9 @@ function setsPositionalsIn(command: string, cmds: Simple[]): boolean {
       return at.some((p) => {
         if (c.argv[p] !== "set") return false;
         for (let j = p + 1; j < c.argv.length; j++) {
+          // (Project review 5, round 7, Sol and Opus: a lone `-` ends set's options as `--` does,
+          // and the words after it are the positionals, `set - -x -o -delete`.)
+          if (c.argv[j] === "-") return true;
           if (/^[-+]o$/.test(c.argv[j])) j++;
           else if (!/^[-+][A-Za-z]*$/.test(c.argv[j])) return true;
         }
@@ -2987,7 +2990,10 @@ export function runtimeReads(command: string, where: Located, scope: Scope, gitQ
         // where the option shows: a letter with the expansion behind it, which takes the rest of
         // its word as its value (`head -n"$n"`, round 5), or an `=` before the expansion
         // (`--header="X: $v"`, `-Dversion="$v"`).)
-        if (name !== "case" && !inert && !Object.hasOwn(KEYED, name) && word.startsWith("-") && !cmd.argv.slice(p + 1, k).includes("--")) {
+        // (Round 7, Opus: a `--` right after an option word can be that option's value, `diff -I
+        // -- "--$x" a b`; only a `--` after the program or an operand ends the options here.)
+        const ends = cmd.argv.slice(p + 1, k).some((w, j, ws) => w === "--" && !(ws[j - 1] ?? "").startsWith("-"));
+        if (name !== "case" && !inert && !Object.hasOwn(KEYED, name) && word.startsWith("-") && !ends) {
           const mark = words?.[k] ?? word.replace(/[$`]/g, `${MARK_QUOTED}$&`);
           const first = mark.search(MARKS);
           const shown = mark.slice(0, Math.max(first, 0));

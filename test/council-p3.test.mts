@@ -2301,3 +2301,22 @@ test("project review 5, round 6 (Opus, Sol, Mythos): a quoted \"$@\" is several 
     assert.doesNotMatch(await why10(command), /an option word that an expansion finishes|so its output file is not known/, command);
   }
 });
+
+test("project review 5, round 7 (Opus, Sol): `set -` sets the positionals, and a `--` that is an option's value", async () => {
+  const repo10 = path.join(base, "repo10");
+  fs.mkdirSync(repo10, { recursive: true });
+  for (const f of ["a", "b", "opt.txt"]) fs.writeFileSync(path.join(repo10, f), "x\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo10]);
+  const decide10 = async (command: string) => (await decideShell(guard, new SessionState(repo10), repo10, command)).effect;
+  for (const command of [
+    'set - -x -o -delete; find . -name "$@"',
+    'set - -x -delete; find . -name "${@:1}"',
+    'set - -R; chmod "$@" +x .',
+    'x=$(cat opt.txt); diff -I -- "--$x" a b',
+    'x=$(cat opt.txt); diff --label -- "--$x" a b',
+    'while read -r o; do diff -I -- "--$o" a b; done < opt.txt',
+  ]) assert.notEqual(await decide10(command), "allow", command);
+  for (const command of ["set -euo pipefail; ls", 'set -e; npm test -- "$@"', "diff -u a b", 'diff -I "^#" a b']) {
+    assert.equal(await decide10(command), "allow", command);
+  }
+});
