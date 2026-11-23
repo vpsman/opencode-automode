@@ -2315,8 +2315,38 @@ test("project review 5, round 7 (Opus, Sol): `set -` sets the positionals, and a
     'x=$(cat opt.txt); diff -I -- "--$x" a b',
     'x=$(cat opt.txt); diff --label -- "--$x" a b',
     'while read -r o; do diff -I -- "--$o" a b; done < opt.txt',
+    // (Round 8, Opus: the same in the option tables' reader.)
+    'rg -r -- "--pr$x" abc',
+    'x=e=../evil; rg --context-separator -- "--pr$x" abc',
+    'journalctl --output-fields -- "--cursor-fil$x" -n 1',
+    'x=$(cat f); journalctl --output-fields -- "$x" -n 1',
+    'while read -r o; do journalctl --output-fields -- "$o" -n 1; done < opt.txt',
+    'x=$(cat f); pytest --deselect -- "$x" tests',
+    'x=$(cat f); journalctl --output-fields -- a$x -n 1',
+    'x=$(cat f); pytest --deselect -- a$x tests',
+    'x=$(cat f); git log --grep -- a$x',
+    // (Third cross-check, Opus: git grep reads options after a `--` that was `-e`'s value.)
+    'x=$(cat f); git grep -e -- "$x"',
+    'x=$(cat f); git grep -f -- "$x" src',
+    'read -r x < f; git format-patch --subject-prefix -- "$x" -1',
+    'read -r x < f; git format-patch --to -- "$x" -1',
+    'read -r x < f; git log --decorate-refs -- "$x" -1',
+    'read -r x < f; git show --decorate-refs -- "$x"',
+    'read -r x < f; git log -L -- "$x"',
+    'read -r x < f; git whatchanged --decorate-refs-exclude -- "$x" -1',
+    'read -r x < f; git log -qL -- "$x"',
+    'read -r x < f; git shortlog --grep -- "$x" HEAD',
+    // (Final cross-check, Opus: git's output options behind a `--` that was a value.)
+    "git log --decorate-refs -- --output .git/config --format=%B -1",
+    "git show --decorate-refs -- --output .git/config --format=%B",
+    "git log --decorate-refs -- --output ../outside.txt -1",
+    "git format-patch --to -- -o .git/hooks -1",
+    "git format-patch --to -- --output-directory=../out -1",
+    // (Accepted over-asks: git is read bluntly after a `--` behind a long option.)
+    'git log --oneline -- "$f"',
+    'git diff --cached -- "$f"',
   ]) assert.notEqual(await decide10(command), "allow", command);
-  for (const command of ["set -euo pipefail; ls", 'set -e; npm test -- "$@"', "diff -u a b", 'diff -I "^#" a b']) {
+  for (const command of ["set -euo pipefail; ls", 'set -e; npm test -- "$@"', "diff -u a b", 'diff -I "^#" a b', "rg -n -- --foo src", 'rg -- "-foo$x" src', 'wc -l -- "$f"', 'du -sh -- "$dir"', 'git log -1 -- "$f"', 'git show HEAD -- "$f"', 'git add -A -- "$f"']) {
     assert.equal(await decide10(command), "allow", command);
   }
 });

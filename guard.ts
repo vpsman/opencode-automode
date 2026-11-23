@@ -1869,9 +1869,10 @@ export function gitWrites(args: string[]): [string, boolean][] {
   const sub = call.sub ?? "";
   const out: [string, boolean][] = [];
   const rest = call.rest;
+  // (Project review 5, round 8, Opus: not only before the first `--`, which can be an option's
+  // value, `git log --decorate-refs -- --output .git/config`; a pathspec named like these asks.)
   for (let i = 0; i < rest.length; i++) {
     const w = rest[i];
-    if (w === "--") break;
     if (w.startsWith("--") && abbreviates(w, ["--output", "--output-directory"])) {
       const dir = !"--output".startsWith(w.split("=")[0]) || w.split("=")[0].length > "--output".length;
       out.push([w.includes("=") ? w.slice(w.indexOf("=") + 1) : (rest[++i] ?? ""), dir && sub === "format-patch"]);
@@ -2955,7 +2956,7 @@ export function runtimeReads(command: string, where: Located, scope: Scope, gitQ
       if (Object.hasOwn(LIST_OPTIONS, name) && !Object.hasOwn(KEYED, name)) {
         const seen = (words ?? cmd.argv.map((w) => w.replace(/[$`]/g, `${MARK_UNQUOTED}$&`))).slice(p + 1, end);
         const safe = (w: string) => !!words && (loopUse(w, loops.get(n), cwd)?.every((v) => !v.text.startsWith("-")) ?? false);
-        const found = riskyWord({ letters: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" }, seen, safe);
+        const found = riskyWord({ letters: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" }, seen, safe, undefined, DASH_DASH[name]);
         if (found !== undefined) add("classify", `${name} ${found}: a word that can become an option once bash expands it, and ${name}'s options are checked by name`);
       }
       // (Project review 5, round 5, Mythos: bash splits an unquoted expansion into words wherever
@@ -9100,8 +9101,14 @@ const GIT_CHECKED = ["--output", "--output-directory", "--upload-pack", "--recei
 
 // The first word of `args` (marked) that can become an option of the program at run time, or
 // that holds an expansion where the program's checks read a name (`byName` is then called).
-function riskyWord(spec: Keyed, args: string[], safe?: (word: string) => boolean, byName?: () => void): string | undefined {
+// `flags`: the program's letters known to take no value (DASH_DASH): a `--` after a cluster of
+// only those (or a count, `git log -1`) is a real end of the options. `rereads`: the program can
+// read options after a `--` that was an option's value, so `named` spares nothing there. (Round 8
+// cross-checks, Opus: git grep, format-patch, log/show's `--decorate-refs` and `-qL`, shortlog's
+// revision options all do; git is read bluntly, every subcommand rereads.)
+function riskyWord(spec: Keyed, args: string[], safe?: (word: string) => boolean, byName?: () => void, flags?: string, rereads = false): string | undefined {
   let ended = false;
+  let soft = false;
   let operand = false;
   let cluster = false;
   let subs = 0;
@@ -9120,9 +9127,20 @@ function riskyWord(spec: Keyed, args: string[], safe?: (word: string) => boolean
     const maybeValue = optionBefore;
     optionBefore = false;
     if (!ended && spec.dashDash !== false && plain === "--") {
+      // (Project review 5, round 8, Opus: a `--` right after an option word can be that option's
+      // value, `rg -r -- "--pr$x" abc`: past it, a word that begins with `-` and holds an
+      // expansion is still read as a possible option.)
       ended = true;
+      const before = unmark(args[i - 1] ?? "");
+      // (Round 8 tests: `wc -l -- "$f"`, `du -sh -- "$dir"` end their options at the `--`.)
+      const flagsOnly = /^-\d+$/.test(before) || (flags !== undefined && /^-[^-]/.test(before) && !MARKS.test(args[i - 1] ?? "") && [...before.slice(1)].every((l) => flags.includes(l)));
+      soft = before !== "--" && before.startsWith("-") && !(before.startsWith("--") && before.includes("=")) && !flagsOnly;
       continue;
     }
+    // (Cross-check, Opus: a word that is only an expansion can be that option too,
+    // `journalctl --output-fields -- "$x"`; not for git, whose pathspecs follow a `--`.)
+    // (Second cross-check, Opus: and one bash splits, `-- a$x`.)
+    if (ended && soft && MARKS.test(w) && (plain.startsWith("-") || w.includes(MARK_UNQUOTED) || (w.search(MARKS) === 0 && (!spec.named || rereads))) && !safe?.(w)) return plain;
     if (ended || (spec.operandEnds && operand)) continue;
     const at = safe?.(w) ? -1 : w.search(MARKS);
     if (at < 0) {
@@ -9318,7 +9336,7 @@ export function expansionProblem(command: string, cwd?: string): GuardVerdict | 
         }
         const sub = args[i] ?? "";
         if (MARKS.test(sub)) found ??= unmark(sub);
-        found ??= riskyWord({ values: GIT_VALUES[unmark(sub)] ?? [], checked: GIT_CHECKED, letters: ["format-patch", "archive"].includes(unmark(sub)) ? "o" : "", named: true }, args.slice(i + 1), undefined, byName);
+        found ??= riskyWord({ values: GIT_VALUES[unmark(sub)] ?? [], checked: GIT_CHECKED, letters: ["format-patch", "archive"].includes(unmark(sub)) ? "o" : "", named: true }, args.slice(i + 1), undefined, byName, GIT_DASH_DASH[unmark(sub)], true);
         // (Project review 5, round 2, Mythos: the two paths of `git diff --no-index` are files
         // outside git's store, behind `--` too, and git takes that reading by itself where two
         // paths follow the options and one lies outside the repository: `git diff --no-index --
@@ -9342,7 +9360,7 @@ export function expansionProblem(command: string, cwd?: string): GuardVerdict | 
         const mod = m0 === "-m" ? unmark(args[1] ?? "") : m0.startsWith("-m") && m0.length > 2 ? m0.slice(2) : undefined;
         const rest = m0 === "-m" ? args.slice(2) : args.slice(1);
         if (mod && Object.hasOwn(KEYED, mod)) found = riskyWord(KEYED[mod], rest);
-      } else if (Object.hasOwn(KEYED, name)) found = riskyWord(KEYED[name], args, undefined, byName);
+      } else if (Object.hasOwn(KEYED, name)) found = riskyWord(KEYED[name], args, undefined, byName, DASH_DASH[name]);
       // (Project review 5, round 1, Mythos: managerProblem reads the script of `npm run` and the
       // package of `npm pack` / `npm view` by name, wherever they stand after that word, behind
       // `--` too: `npm run "en${x:-v}"`, `npm run -- "$x"`, `npm view "x${spec}"`. A visible

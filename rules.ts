@@ -3635,8 +3635,10 @@ function git(args: string[], scope: Scope): Verdict {
   }
   // Files git writes besides the work tree.
   const outputs: string[] = [];
+  // (Project review 5, round 8, Opus: every word, past a `--` too, which can be an option's value:
+  // `git format-patch --to -- -o .git/hooks -1`.)
   const valueOf = (long: string, letter?: string) =>
-    opts.flatMap((a, k) => (longIs(a, long) ? [a.includes("=") ? a.slice(a.indexOf("=") + 1) : (opts[k + 1] ?? "")] : letter && a === `-${letter}` ? [opts[k + 1] ?? ""] : letter && a.startsWith(`-${letter}`) && a.length > 2 && !a.startsWith("--") ? [a.slice(2)] : []));
+    rest.flatMap((a, k) => (longIs(a, long) ? [a.includes("=") ? a.slice(a.indexOf("=") + 1) : (rest[k + 1] ?? "")] : letter && a === `-${letter}` ? [rest[k + 1] ?? ""] : letter && a.startsWith(`-${letter}`) && a.length > 2 && !a.startsWith("--") ? [a.slice(2)] : []));
   if (["diff", "log", "show", "whatchanged", "range-diff", "format-patch", "diff-tree", "diff-files", "diff-index", "cherry"].includes(sub)) outputs.push(...valueOf("output"));
   if (sub === "format-patch") outputs.push(...valueOf("output-directory", "o"));
   if (sub === "archive") outputs.push(...valueOf("output", "o"));
