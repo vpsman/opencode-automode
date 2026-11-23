@@ -9019,7 +9019,14 @@ function unreadNames(command: string, cmds: Simple[], cwd?: string): Set<string>
   const programOf = (argv: string[]): { name: string; args: string[] } => {
     let k = 0;
     // (Round 25, Sol: and leading assignments, `LC_ALL=C printf -v v ...`.)
-    while (k < argv.length && (LOOP_KEYWORDS.has(argv[k]) || argv[k] === "builtin" || argv[k] === "command" || ASSIGN.test(argv[k]))) k++;
+    // (Round 30, Sol: and the options of `command`, `builtin` and `time`, `command -- printf -v f ...`,
+    // `time -p read f`. Any word that begins with `-` after one of them is skipped.)
+    let wrapped = false;
+    for (; k < argv.length; k++) {
+      if (argv[k] === "builtin" || argv[k] === "command" || argv[k] === "time") wrapped = true;
+      else if (LOOP_KEYWORDS.has(argv[k]) || ASSIGN.test(argv[k])) wrapped = false;
+      else if (!(wrapped && argv[k].startsWith("-"))) break;
+    }
     return { name: path.basename(argv[k] ?? ""), args: argv.slice(k + 1) };
   };
   const implicit = cmds.some(({ argv }) => ["read", "select", "mapfile", "readarray", "getopts", "cd", "pushd", "popd", "coproc", "[["].includes(programOf(argv).name)) || /\bselect\s|\[\[|=~/.test(command);
@@ -9043,8 +9050,10 @@ function unreadNames(command: string, cmds: Simple[], cwd?: string): Set<string>
   // (Round 29, Mythos: `${NAME:=word}` / `${NAME=word}` assigns too, wherever it stands in the
   // text: `: "${f:=-v $x}"; test $f`.)
   for (const m of command.matchAll(/\$\{([A-Za-z_]\w*)(?:\[[^\]]*\])?:?=/g)) out.add(m[1]);
+  const texted = new Map<string, number>();
   for (const m of command.matchAll(/\b(?:for|select)\s+([A-Za-z_]\w*)\s*(?:in\b([^;\n]*))?(?=[;\n]|\s+do\b)/g)) {
     const list = m[2];
+    texted.set(m[1], (texted.get(m[1]) ?? 0) + 1);
     if (list === undefined || /[$`'"\\]/.test(list)) out.add(m[1]);
     // (Round 21, Opus, Sol: a glob in the list takes file names, which can hold blanks: safe only
     // where each glob lists here with no match holding one, and no other command of the call may
@@ -9063,8 +9072,27 @@ function unreadNames(command: string, cmds: Simple[], cwd?: string): Set<string>
       if (!listed || listed.some((l) => l === undefined || l.some((f) => { const raw = f.replace(/^\/+/, "/"); const prefix = cwd!.replace(/\/+$/, "") + "/"; return /\s/.test(raw.startsWith(prefix) ? raw.slice(prefix.length) : raw); })) || makes) out.add(m[1]);
     }
   }
+  // (Round 30, Mythos: the text above misses a head with a comment or a line continuation in
+  // it, `for f # c` / `for \<newline>f in ...`: a `for` the parser reads and the text does not
+  // show leaves its name unread.)
+  for (const [n, lists] of loopHeads(cmds)) if (lists.length > (texted.get(n) ?? 0)) out.add(n);
   return out;
 }
+// The `for` / `select` heads of a call as the parser reads them (quotes and line continuations
+// gone, braces expanded): each name with the list words of every head that sets it, undefined
+// for a head with no `in` list of its own.
+function loopHeads(cmds: Simple[]): Map<string, (string[] | undefined)[]> {
+  const map = new Map<string, (string[] | undefined)[]>();
+  for (const { argv } of cmds) {
+    let k = 0;
+    while (k < argv.length && LOOP_KEYWORDS.has(argv[k])) k++;
+    if ((argv[k] !== "for" && argv[k] !== "select") || argv[k + 1] === undefined) continue;
+    map.set(argv[k + 1], [...(map.get(argv[k + 1]) ?? []), argv[k + 2] === "in" ? argv.slice(k + 3) : undefined]);
+  }
+  return map;
+}
+// A list word of a loop that is plain text and cannot begin with `-`: no glob, brace or tilde.
+const LOOP_PLAIN = /^[\w.,:@%+=/][\w.,:@%+=/-]*$/;
 // Programs that make no file, for the glob-loop rule above (the loop's own body included).
 const LOOP_KEYWORDS = new Set(["do", "done", "then", "else", "elif", "fi", "if", "while", "until", "{", "}", "!", "time"]);
 const LOOP_SAFE = new Set(["test", "[", "echo", "printf", "true", "false", ":", "ls", "cat", "wc", "head", "tail", "grep", "stat", "file", "du", "basename", "dirname", "wait"]);
@@ -9077,6 +9105,7 @@ export function expansionProblem(command: string, cwd?: string): GuardVerdict | 
   const seen = pairs.map(([, m]) => m);
   let unreadValues: Set<string> | undefined;
   let assignedValues: Map<string, string[]> | undefined;
+  let loopValues: Map<string, (string[] | undefined)[]> | undefined;
   for (const [n, cmd] of seen.entries()) {
     const argv = real[n].argv;
     const { at, chain } = traverse(argv);
@@ -9115,11 +9144,12 @@ export function expansionProblem(command: string, cwd?: string): GuardVerdict | 
       // output, `read`, a `for` list that is not plain words) can carry the option and its
       // operand too; and wait's `-p` the same way.)
       if (found === undefined && ["test", "[", "printf", "wait"].includes(name)) {
-        // printf takes `-v` only as its first word.
+        // printf takes `-v` among its leading option words (round 30: `printf -v x "$g" y`).
+        const optionWords = name === "printf" ? printfOptionWords(args) : args;
         // (Round 19, Sol: also an unquoted numbered parameter, `set -- '-v a[...]'; test $1`, and an
         // unquoted `${NAME<operator>...}` or `${!NAME}`, whose value the check does not compute:
         // `v='x-p PATH'; wait ${v#x}`.)
-        const positional = (name === "printf" ? args.slice(0, 1) : args).find((a) => /\$\{?[@*]/.test(unmark(a)) || UNQUOTED_COMPUTED.test(a));
+        const positional = optionWords.find((a) => /\$\{?[@*]/.test(unmark(a)) || UNQUOTED_COMPUTED.test(a));
         if (positional !== undefined) found = unmark(positional);
         else {
           // (Round 20, Opus, Sol: list what is safe, not what can set a name. An unquoted
@@ -9136,23 +9166,36 @@ export function expansionProblem(command: string, cwd?: string): GuardVerdict | 
             if (values) return values.every((v) => !/[$`\s]/.test(v.replace(/\$[!$?#]/g, "")));
             return settable(n);
           };
-          const named = (name === "printf" ? args.slice(0, 1) : args).find((a) => [...a.matchAll(UNQUOTED_NAME)].some((m) => !safeName(m[1])));
+          const named = optionWords.find((a) => [...a.matchAll(UNQUOTED_NAME)].some((m) => !safeName(m[1])));
           if (named !== undefined) found = unmark(named);
           // (Round 29, Mythos: a quoted word does not split, but it can be the whole option with
           // its name attached: `f=$(cat g); printf "$f" x` with `-va[$(id)]` in g, `wait -n "$f"`
-          // with `-pa[$(id)]`. printf's first word, or any word of wait, that begins with an
-          // expansion (or with `-` and holds one) passes only when every expansion in it is a
-          // plain `$NAME` the call gives literal values or never sets (`printf "$fmt" a`,
-          // `wait "$pid"` after `pid=$!`); a substitution, a positional or computed parameter or
-          // a name set from something no check reads goes to the model. A printf word that ends
-          // in a literal `\n` is a format whatever it begins with: no name ends that way.)
+          // with `-pa[$(id)]`. A printf word that ends in a literal `\n` is a format whatever it
+          // begins with: no name ends that way.)
+          // (Round 30, Opus, Sol, Mythos: list what cannot begin with `-`, not what is read. An
+          // option word of printf, or any word of wait, that begins with an expansion (or with `-`
+          // and holds one) passes only when the whole word is one `$NAME` / `${NAME}` and NAME
+          // cannot hold an option: the call gives it only literal values, `+=` included, none
+          // beginning with `-` (`op=-vf; printf "$op" ...`, `f=-v; f+=PATH`), a `for` gives it
+          // only plain words (`for op in -vf`), or the call never sets it and it is the
+          // environment's. Two pieces (`"$f$g"`), text beside the expansion (`"$nosuch"-va[b]`)
+          // and everything else go to the model. An option word is checked wherever it stands
+          // (`printf -v x "$g"`), and so no other printf or wait needs the "*" mark here.)
           else if (name === "printf" || name === "wait") {
-            const trusted = (n: string) => !unread.has(n) && (assigned.has(n) || settable(n));
-            const whole = (name === "printf" ? args.slice(0, 1) : args).find((a) => {
+            const loops = (loopValues ??= loopHeads(real));
+            const noOption = (n: string) => {
+              if (unread.has(n)) return false;
+              const values = assigned.get(n);
+              const lists = loops.get(n);
+              if (!values && !lists) return settable(n);
+              return (values ?? []).every((v) => !/^-|[$`]/.test(v.replace(/\$[!$?#]/g, ""))) && (lists ?? []).every((l) => l !== undefined && l.every((v) => LOOP_PLAIN.test(v)));
+            };
+            const whole = optionWords.find((a) => {
               const w = unmark(a).replace(/\$[!$?#]/g, "");
               if (!(/^[$`]/.test(w) || (w.startsWith("-") && /[$`]/.test(w)))) return false;
               if (name === "printf" && w.endsWith("\\n")) return false;
-              return /[$`]/.test(w.replace(/\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))/g, (m0, b1, b2) => (trusted(b1 ?? b2) ? "" : m0)));
+              const m = /^\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))$/.exec(w);
+              return !m || !noOption(m[1] ?? m[2]);
             });
             if (whole !== undefined) found = unmark(whole);
           }
@@ -9164,7 +9207,10 @@ export function expansionProblem(command: string, cwd?: string): GuardVerdict | 
         if (substituted !== undefined) found = unmark(substituted);
         else if (name !== "wait" && unquoted.length && args.some((a) => /\w\[/.test(unmark(a)))) found = unmark(unquoted[0]);
       }
-      if (found === undefined && name === "printf" && (args[0] ?? "").includes(MARK_UNQUOTED)) found = unmark(args[0]);
+      if (found === undefined && name === "printf") {
+        const split = printfOptionWords(args).find((a) => a.includes(MARK_UNQUOTED));
+        if (split !== undefined) found = unmark(split);
+      }
       if (found !== undefined) return { action: "classify", reason: `${name} ${found}: a word that can become an option once bash expands it, and ${name}'s options are checked by name` };
     }
   }

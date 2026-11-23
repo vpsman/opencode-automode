@@ -1657,3 +1657,61 @@ test("round 29 (Mythos): a name set by ${NAME:=word}, and a quoted printf or wai
     'sleep 1 & pid=$!; wait "$pid"',
   ]) assert.equal(await decide29(command), "allow", command);
 });
+
+test("round 30 (Opus, Sol, Mythos): a printf or wait option word passes only as one name that cannot begin with a dash", async () => {
+  const repo30 = path.join(base, "repo30");
+  fs.mkdirSync(repo30, { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "main", repo30]);
+  const decide30 = async (command: string) => (await decideShell(guard, new SessionState(repo30), repo30, command)).effect;
+  for (const command of [
+    // A (Sol): a setter behind the options of `command`, `builtin`, `time`.
+    "f=foo; command -- printf -v f '%s' '-va[$(date)]'; printf \"$f\" x",
+    "f=foo; builtin -- printf -v f '%s' '-va[$(date)]'; printf \"$f\" x",
+    "f=foo; time -p printf -v f '%s' '-va[$(date)]'; printf \"$f\" x",
+    // B (Opus, Sol): an option word held in a name.
+    'op=-vf; printf "$op" %s "$(cat g)"; printf "$f" x',
+    'f=x; op=-vf; printf "$op" %s "$(cat g)"; printf "$f" x',
+    'for op in -vf; do printf "$op" %s "$(cat g)"; done; printf "$f" x',
+    'op=-vf; printf "$op" %s "$(cat g)"; sleep 0 & wait -n "$f"',
+    "f=foo; op=-vf; printf \"$op\" '%s' '-pa[$(date)]'; sleep 0 & wait -n \"$f\"",
+    'op=-vf; command -- printf "$op" %s "$(cat g)"; printf "$f" x',
+    'op=-vf; builtin -- printf "$op" %s "$(cat g)"; printf "$f" x',
+    'op=-vf; time -p printf "$op" %s "$(cat g)"; printf "$f" x',
+    // C (Mythos): two pieces, text beside the expansion, `+=`.
+    "b='x[$(date)]'; f=-v; g='a[b]'; printf \"$f$g\" x",
+    "f=-va; f+='[b]'; printf \"$f\" x",
+    'printf "$nosuch"-va[b] x',
+    'printf "$nosuch-va[b]" x',
+    "f=-p; g='a[b]'; sleep 0 & wait -n \"$f$g\"",
+    'f=-v; f+=PATH; printf "$f" x',
+    'f=; g=-vPATH; printf "$f$g" x',
+    'wait "$nosuch"-pPATH',
+    // A `for` list the parser reads and the text does not show, and an option word after `-v NAME`.
+    'for f in {-vPATH,x}; do printf "$f" x; done',
+    'for f # c\nin -vq; do printf "$f" x; done',
+    'for \\\nf in -vq; do printf "$f" x; done',
+    'x=$(cat g); for f # c\nin $x; do sleep 0 & wait $f; done',
+    'x=$(cat g); for \\\nf in $x; do sleep 0 & wait $f; done',
+    'select f in -vq; do printf "$f" x; done',
+    'g=-vq; printf -v o "$g" y',
+    'x=$(cat g); printf -v o $x y',
+    'f=-vq; printf "${f}" x',
+    'f=-nq; sleep 0 & wait "$f"',
+  ]) assert.notEqual(await decide30(command), "allow", command);
+  for (const command of [
+    'printf "$fmt" a b',
+    "fmt='%s\\n'; printf \"$fmt\" a",
+    "fmt=%s; fmt+='\\n'; printf \"$fmt\" a",
+    'printf "%s$f" x',
+    'printf "$prefix-%s\\n" a',
+    'sleep 1 & pid=$!; wait "$pid"',
+    "wait $!",
+    'msg=$(git log -1 --format=%s); printf "$msg\\n"',
+    'while read -r line; do printf "$line\\n"; done < g',
+    "[ -z $x ]",
+    'for f in a b; do printf "$f\\n"; done',
+    'for f in a b; do printf "$f" x; done',
+    'for f in *.ts; do printf "$f\\n"; done',
+    'f=-vq; printf -- "$f" x',
+  ]) assert.equal(await decide30(command), "allow", command);
+});
