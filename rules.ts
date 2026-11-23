@@ -4719,7 +4719,10 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
   const attached = (name: string) => dynamicSetter || new RegExp(`(^|[^\\w$])-[A-Za-z]*${name}(?!\\w)`).test(setters);
   const defaulted = (name: string) => !!parsed.assigns?.has(name) || !!scope.reassigned?.has(name) || new RegExp(`\\$\\{${name}(\\[[^\\]]*\\])?:?=`).test(words) || attached(name);
   const namedOnce = (name: string) => !defaulted(name) && (words.match(new RegExp(`(^|[^$\\w{])${name}(?!\\w)`, "g")) ?? []).length === 1;
-  local.unassigned = (name: string) => !defaulted(name) && !new RegExp(`(^|[^$\\w{])${name}(?!\\w)`).test(words);
+  // (Project review 5, round 6, Mythos: a name bash sets by itself is never the environment's,
+  // whatever the call shows of it: `read -r < names.txt; column -t "$REPLY"`, `[[ .env =~ .* ]];
+  // column "$BASH_REMATCH"`, `column "$_"` after any command.)
+  local.unassigned = (name: string) => !BASH_SETS.test(name) && !defaulted(name) && !new RegExp(`(^|[^$\\w{])${name}(?!\\w)`).test(words);
   const track = depth === 0 && !parsed.grouped;
   // The patterns of the parts that decide. A prompt offers one only when it covers them all.
   const patterns = new Set<string | undefined>(parsed.opaque ? [undefined] : []);

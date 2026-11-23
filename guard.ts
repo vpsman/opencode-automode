@@ -2869,6 +2869,25 @@ export function writesNothing(cmd: Simple, gitQuiet: GitQuiet | undefined): bool
   return false;
 }
 
+// Whether a call sets the positional parameters (N3d): `set` with a word that is no option, or a
+// function, whose body gets its own. `cmds`: every command of the call, nested shells' too.
+function setsPositionalsIn(command: string, cmds: Simple[]): boolean {
+  return (
+    /(^|[\s;&|(){}])function\s|[^\s;&|()<>$`=]\s*\(\s*\)/.test(command) ||
+    cmds.some((c) => {
+      const { at } = traverse(c.argv);
+      return at.some((p) => {
+        if (c.argv[p] !== "set") return false;
+        for (let j = p + 1; j < c.argv.length; j++) {
+          if (/^[-+]o$/.test(c.argv[j])) j++;
+          else if (!/^[-+][A-Za-z]*$/.test(c.argv[j])) return true;
+        }
+        return false;
+      });
+    })
+  );
+}
+
 // Files a command is handed that bash names when it runs (round 3, finding 14): a glob or braces,
 // a variable or a substitution. Decided on the real words with the marks markExpansions() puts
 // where bash expands something, not on the rules' flattened text, where `'{print $1}'` looks like
@@ -2915,20 +2934,7 @@ export function runtimeReads(command: string, where: Located, scope: Scope, gitQ
   const arith = !!printed?.arithLed;
   const literals = new Set(printed?.literals ?? []);
   let positionals: boolean | undefined;
-  const setsPositionals = () =>
-    (positionals ??=
-      /(^|[\s;&|(){}])function\s|[^\s;&|()<>$`=]\s*\(\s*\)/.test(command) ||
-      where.cmds.some((c) => {
-        const { at } = traverse(c.argv);
-        return at.some((p) => {
-          if (c.argv[p] !== "set") return false;
-          for (let j = p + 1; j < c.argv.length; j++) {
-            if (/^[-+]o$/.test(c.argv[j])) j++;
-            else if (!/^[-+][A-Za-z]*$/.test(c.argv[j])) return true;
-          }
-          return false;
-        });
-      }));
+  const setsPositionals = () => (positionals ??= setsPositionalsIn(command, where.cmds));
   where.cmds.forEach((cmd, n) => {
     const words = marked(n);
     const globs = globbed(n);
@@ -2968,8 +2974,26 @@ export function runtimeReads(command: string, where: Located, scope: Scope, gitQ
       const inert = NAMES_ONLY.has(name) && (QUIET_BUILTINS.has(name) || READS_ONLY.has(name));
       for (let k = p + 1; k < end; k++) {
         const word = cmd.argv[k];
-        if (name !== "case" && !inert && (word.startsWith("-") || wraps || MODE_FIRST.has(name)) && unknownExpansion(word, globs?.[k], (v) => n < top && literals.has(v), n >= top || setsPositionals())) {
+        if (name !== "case" && !inert && (word.startsWith("-") || wraps || MODE_FIRST.has(name)) && unknownExpansion(word, words?.[k], (v) => n < top && literals.has(v), n >= top || setsPositionals())) {
           add("classify", `${word} holds an unquoted expansion, which bash splits into words: ${name} can get words that no check has read`);
+        }
+        // (Project review 5, round 6, Mythos: a quoted expansion makes no new word, but it can
+        // finish an option's name, and for a program with no option table (KEYED has riskyWord's
+        // reading) no check reads the name it makes: `declare "-$(echo i)" v=y` evaluates y,
+        // `patch -p1 "--out$x=AGENTS.md"`, `diff "--$x" a b` with `from-file=.env` in x. A word
+        // before any `--` that begins with `-` goes to the model where an expansion of no known
+        // value stands right after the dashes or in a long option's name; and anywhere before an
+        // `=` for the declaring builtins, whose letters are all flags (`declare -r"$x" v=y`). Not
+        // where the option shows: a letter with the expansion behind it, which takes the rest of
+        // its word as its value (`head -n"$n"`, round 5), or an `=` before the expansion
+        // (`--header="X: $v"`, `-Dversion="$v"`).)
+        if (name !== "case" && !inert && !Object.hasOwn(KEYED, name) && word.startsWith("-") && !cmd.argv.slice(p + 1, k).includes("--")) {
+          const mark = words?.[k] ?? word.replace(/[$`]/g, `${MARK_QUOTED}$&`);
+          const first = mark.search(MARKS);
+          const shown = mark.slice(0, Math.max(first, 0));
+          if (first > 0 && !shown.includes("=") && (/^--?$/.test(shown) || shown.startsWith("--") || DECLARERS.has(name)) && unknownExpansion(word, mark.replaceAll(MARK_QUOTED, MARK_UNQUOTED), (v) => n < top && literals.has(v), n >= top || setsPositionals())) {
+            add("classify", `${word} is an option word that an expansion finishes when the command runs: ${name} can get an option that no check has read`);
+          }
         }
         // Round 4, N3: a glob in any word, one that begins with `-` too, can become an option.
         // (Not the patterns of a `case`, which name no files.)
@@ -5876,7 +5900,12 @@ export function writesOf(
       } else if (name === "dd") args.filter((a) => a.startsWith("of=")).forEach((a) => add(a.slice(3), true));
       else if (name === "patch") {
         files.forEach((f) => add(f, true));
-        for (const o of getopt(args, PATCH_OPTIONS).opts) if (["-o", "--output", "-r", "--reject-file"].includes(o.name)) add(o.value, false);
+        const got = getopt(args, PATCH_OPTIONS);
+        for (const o of got.opts) if (["-o", "--output", "-r", "--reject-file"].includes(o.name)) add(o.value, false);
+        // (Project review 5, round 6, Mythos: an option the table cannot read may be the one that
+        // names the output, `patch "-$x" a`, `patch -p1 "--out$x=AGENTS.md"`: it asks, as cp's
+        // does. unnamedWrite reads the same table and has listed the write as one it cannot place.)
+        if (got.unknown) ask ??= `${name} ${got.unknown}: an option the check cannot read, so its output file is not known`;
       }
       // (Round 5: gcc's options are words of their own, `-fno-omit-frame-pointer` holds no `-o`.)
       else if (COMPILER.test(name)) args.forEach((a, i) => {
@@ -8826,14 +8855,24 @@ const unmarkAll = (w: string) => w.replace(/[\u000e\u000f\u0010]/g, "");
 // quoted heredoc bodies are copied as they are, and `$HOME` is left alone (the parser puts the
 // home directory in its place). Only marks are inserted, so the rules' parser reads the same
 // structure; the caller checks that it did. (`globs`: see MARK_GLOB.)
-export function markExpansions(s: string, depth = 0, globs = false): string {
+// (Project review 5, round 6, Opus, Sol: inside double quotes `$@`, `${@...}`, `${name[@]...}`
+// and `${!prefix@}` still make a word of each element, so they get MARK_UNQUOTED there, and
+// every check that reads an unquoted expansion as words nobody has read reads them so: `set -- x
+// -exec rm -rf .. ";"; find . -name "$@"`, `bash -c 'chmod "$@"' _ +x .git/hooks/pre-commit`. An
+// array's always; the positional parameters' where `lists` says they can hold words (the call
+// sets them, or the text is a nested shell's code: markedCommands). At the top level of a call
+// that sets none they are empty, and `"$@"` keeps MARK_QUOTED. Not in the `globs` reading, which
+// is of what bash globs: the words of a quoted list are not.)
+const AT_ARRAY = /^\$\{(?:!?[A-Za-z_]\w*\[@\]|![A-Za-z_]\w*@\})/;
+const AT_POSITIONALS = /^\$(?:@|\{@)/;
+export function markExpansions(s: string, depth = 0, globs = false, lists = false): string {
   if (depth > 6) return s;
   let out = "";
   let dq = false;
   let wordStart = true;
   let braces = 0;
   const heredocs: { delimiter: string; quoted: boolean }[] = [];
-  const sub = (open: number, end: number, mark: string) => mark + s.slice(open, open + 2) + markExpansions(s.slice(open + 2, end), depth + 1, globs) + ")";
+  const sub = (open: number, end: number, mark: string) => mark + s.slice(open, open + 2) + markExpansions(s.slice(open + 2, end), depth + 1, globs, lists) + ")";
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
     const next = s[i + 1];
@@ -8871,13 +8910,14 @@ export function markExpansions(s: string, depth = 0, globs = false): string {
     if (c === "`") {
       const end = s.indexOf("`", i + 1);
       if (end < 0) return out + s.slice(i);
-      out += (dq ? MARK_QUOTED : MARK_UNQUOTED) + "`" + markExpansions(s.slice(i + 1, end), depth + 1, globs) + "`";
+      out += (dq ? MARK_QUOTED : MARK_UNQUOTED) + "`" + markExpansions(s.slice(i + 1, end), depth + 1, globs, lists) + "`";
       i = end;
       wordStart = false;
       continue;
     }
     if (c === "$" && /[A-Za-z_{@*#?$!0-9-]/.test(next ?? "")) {
-      out += (/^\$(\{HOME\}|HOME\b)/.test(s.slice(i)) ? "" : dq ? MARK_QUOTED : MARK_UNQUOTED) + c;
+      const list = dq && !globs && (next === "{" || next === "@") && (AT_ARRAY.test(s.slice(i, i + 300)) || (lists && AT_POSITIONALS.test(s.slice(i, i + 3))));
+      out += (/^\$(\{HOME\}|HOME\b)/.test(s.slice(i)) ? "" : dq && !list ? MARK_QUOTED : MARK_UNQUOTED) + c;
       if (globs && next === "{") braces++;
       if (globs && (next === "*" || next === "?")) out += s[++i];
       wordStart = false;
@@ -8909,7 +8949,7 @@ export function markExpansions(s: string, depth = 0, globs = false): string {
         const rest = s.slice(i + 1);
         const end = new RegExp(`^\\s*${doc.delimiter.replace(/[.\-]/g, "\\$&")}\\s*$`, "m").exec(rest);
         const body = end ? rest.slice(0, end.index) : rest;
-        out += doc.quoted ? body : markBody(body, depth, globs);
+        out += doc.quoted ? body : markBody(body, depth, globs, lists);
         out += end ? end[0] : "";
         i = end ? i + end.index + end[0].length : s.length;
       }
@@ -8918,7 +8958,7 @@ export function markExpansions(s: string, depth = 0, globs = false): string {
   return out;
 }
 // An unquoted heredoc body: the parser reads only its substitutions, as commands.
-function markBody(body: string, depth: number, globs = false): string {
+function markBody(body: string, depth: number, globs = false, lists = false): string {
   let out = "";
   for (let j = 0; j < body.length; j++) {
     if (body[j] === "\\") {
@@ -8927,12 +8967,12 @@ function markBody(body: string, depth: number, globs = false): string {
     } else if (body[j] === "$" && body[j + 1] === "(") {
       const end = closeNaive(body, j + 1);
       if (end < 0) return out + body.slice(j);
-      out += "$(" + markExpansions(body.slice(j + 2, end), depth + 1, globs) + ")";
+      out += "$(" + markExpansions(body.slice(j + 2, end), depth + 1, globs, lists) + ")";
       j = end;
     } else if (body[j] === "`") {
       const end = body.indexOf("`", j + 1);
       if (end < 0) return out + body.slice(j);
-      out += "`" + markExpansions(body.slice(j + 1, end), depth + 1, globs) + "`";
+      out += "`" + markExpansions(body.slice(j + 1, end), depth + 1, globs, lists) + "`";
       j = end;
     } else out += body[j];
   }
@@ -9138,7 +9178,10 @@ function riskyWord(spec: Keyed, args: string[], safe?: (word: string) => boolean
 function markedCommands(command: string, depth = 0, globs = false): [Simple, Simple][] | undefined {
   if (depth > 4) return [];
   const real = parse(command).cmds;
-  const seen = parse(markExpansions(command, 0, globs)).cmds;
+  // (`"$@"` holds words in a nested shell's code, which gets the words after it, and wherever
+  // the call sets the positional parameters: markExpansions.)
+  const lists = depth > 0 || setsPositionalsIn(command, [...real, ...nestedBodies(real).flatMap((body) => allCommands(body, 1))]);
+  const seen = parse(markExpansions(command, 0, globs, lists)).cmds;
   const same = real.length === seen.length && real.every((c, i) => c.argv.length === seen[i].argv.length && c.argv.every((w, j) => w === (globs ? unmarkAll : unmark)(seen[i].argv[j])));
   if (!same) return undefined;
   const out = real.map((c, i): [Simple, Simple] => [c, seen[i]]);

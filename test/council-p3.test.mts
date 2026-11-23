@@ -2209,3 +2209,95 @@ test("project review 5, round 5 (Opus, Mythos): an unquoted expansion bash split
   for (const command of ["gh release -D list download v1", "gh run -n list download 5", "gh repo -u x clone o/r", "gh -R release run download 5"]) assert.ok(unseenWrites(command), command);
   for (const command of ["gh pr -R o/r list", "gh issue list -S download", "gh release view v1"]) assert.equal(unseenWrites(command), undefined, command);
 });
+
+test("project review 5, round 6 (Opus, Sol, Mythos): a quoted \"$@\" is several words, a quoted expansion that finishes an option word, and the variables bash sets itself", async () => {
+  const repo10 = path.join(base, "repo10");
+  fs.mkdirSync(repo10, { recursive: true });
+  for (const f of ["a", "b", "f", "p.diff", "names.txt", "mode"]) fs.writeFileSync(path.join(repo10, f), "x\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo10]);
+  const decide10 = async (command: string) => (await decideShell(guard, new SessionState(repo10), repo10, command)).effect;
+  for (const command of [
+    // A (Opus, Sol): `"$@"` hands the program a word for each positional parameter.
+    "bash -c 'find . -name \"$@\"' _ x -exec rm -rf .. ;",
+    'set -- x -exec touch ../pwned ";"; find . -name "$@"',
+    'set -- 777 ../x; chmod "$@" a',
+    "bash -c 'chmod \"$@\"' _ +x .git/hooks/pre-commit",
+    'set -- x --exec touch ../p; fd -e "$@"',
+    'set -- x -toolexec=./w; go test -run "$@" ./...',
+    'set -- 1 -o ../x; tree -L "$@"',
+    'set -- x --cursor-file=../x; journalctl -u "$@"',
+    'set -- 1 -C ..; ninja -j "$@"',
+    'set -- x -exec touch ../pwned ";"; find . -name "${@}"',
+    'set -- x -exec touch ../pwned ";"; find . -name "${@:1}"',
+    // (And the same list by its other spellings and settings.)
+    'set -- x -exec touch ../p ";"; find . -name "${x:-$@}"',
+    'set -- u+x ../x; chmod -- "$@"',
+    'set -- root ../x; chown "$@" a',
+    "eval 'set -- x -delete'; find . -name \"$@\"",
+    "set -- x -delete; eval 'find . -name \"$@\"'",
+    "sh -c 'find . -name \"$@\"' _ x -delete",
+    'f() { find . -name "$@"; }; f x -delete',
+    'mapfile -t a < f; find . -name "${a[@]}"',
+    'read -ra a < f; chmod "${a[@]}" a',
+    // B (Mythos): a quoted expansion that finishes an option word of a program with no option table.
+    "y='a[$(id)]'; declare \"-$(echo i)\" v=y",
+    'declare "-$(echo n)" p=PATH; p=/tmp/evil',
+    'typeset "-$opt" v=y',
+    'f() { local "-$x" v=PATH; v=/tmp; }; f',
+    'x=$(cat mode); patch "-$x" a < p.diff',
+    'patch -p1 "--$mode" < p.diff',
+    'patch -p1 "--out$x=AGENTS.md" < p.diff',
+    'x=$(echo from-file=.env); diff "--$x" a b',
+    // (The declaring builtins take flags only: an expansion behind a letter adds one.)
+    'declare -r"$(echo i)" v=y',
+    'readonly "-$x" v',
+    'patch -R"$x" a < p.diff',
+    'diff "--from-file$x" a b',
+    // C (Mythos): what bash sets by itself is not the environment's value.
+    'read -r < names.txt; column -t "$REPLY"',
+    'while read -r; do column -t "$REPLY"; done < f',
+    '[[ .env =~ .* ]]; column "$BASH_REMATCH"',
+    'column "$_"',
+    'column "$OLDPWD/config"',
+  ]) assert.notEqual(await decide10(command), "allow", command);
+  for (const command of [
+    // A: at the top level of a call that sets no positional parameters `"$@"` is empty; and a
+    // program that only prints or lists its words, or reads them behind `--`, is as before.
+    'for f in "$@"; do echo "$f"; done',
+    'npm test -- "$@"',
+    "printf '%s\\n' \"$@\"",
+    'echo "$@"',
+    'set -- a b; echo "$@"',
+    "set -- a b; printf '%s\\n' \"$@\"",
+    'set -- a b; for f in "$@"; do echo "$f"; done',
+    'set -- a b; ls -l "$@"; touch c',
+    "bash -c 'echo \"$@\"' _ a b",
+    "bash -c 'npm test -- \"$@\"' _ --watch",
+    'set -- a b; echo "$#"',
+    'echo "${#a[@]}"',
+    // (`"$*"` is one word.)
+    'set -- x; find . -name "$*"',
+    // B: the option shows, or the expansion has a value the call gives it.
+    'head -n"$n" a',
+    'cut -d"$d" -f1 a',
+    'column -t -s"$s" a',
+    'x=5; head "-$x" a',
+    'head "-$#" a',
+    'cat -- "-$x"',
+    'test "-$x" a',
+    'patch -p"$n" < p.diff',
+    "patch -p1 --dry-run < p.diff",
+    "declare -r x=1",
+    // C: a variable of the environment, and a name the call reads into.
+    "column -t a",
+    'column -t "$f"',
+    'column "$HOME/a"',
+    'read -r line < names.txt; echo "$line"',
+    'while read -r; do echo "$REPLY"; done < f',
+  ]) assert.equal(await decide10(command), "allow", command);
+  // B: these ask or go to the model for reasons of their own, as before, and not for this rule.
+  const why10 = async (command: string) => (await decideShell(guard, new SessionState(repo10), repo10, command)).reason ?? "";
+  for (const command of ['curl -H "X: $v" https://example.com', 'curl --header="X: $v" https://example.com', 'mvn -Dversion="$v" test', 'java -Dx="$y" -jar a.jar', 'declare -r x="$v"', 'f() { local v="$1"; echo "$v"; }; f a', 'diff -u a "$b"', 'diff --label="$l" a b']) {
+    assert.doesNotMatch(await why10(command), /an option word that an expansion finishes|so its output file is not known/, command);
+  }
+});
