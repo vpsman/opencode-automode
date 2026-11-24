@@ -2628,7 +2628,9 @@ test("project review 6, round 6 (Opus, Sol): a structured value's quotes and bra
     "go build -ldflags=\"-L '../lib'\" .",
     `ninja -${"v".repeat(30)}C..`,
   ]) assert.notEqual(await decide18(command), "allow", command);
-  for (const command of ['gcc -DVERSION="$v" a.c', "meson setup build \"-Dc_args=['-O2']\"", 'go test -run "TestA|TestB" ./...', 'go build -ldflags="-X main.v=1.2:3" .', "npm run build -- --mode=production"]) assert.equal(await decide18(command), "allow", command);
+  for (const command of ['gcc -DVERSION="$v" a.c', 'go test -run "TestA|TestB" ./...', 'go build -ldflags="-X main.v=1.2:3" .', "npm run build -- --mode=production"]) assert.equal(await decide18(command), "allow", command);
+  // (After review 6, the plain-spelling gate: a structured value goes to the decider.)
+  assert.notEqual(await decide18("meson setup build \"-Dc_args=['-O2']\""), "allow");
 });
 
 test("project review 6, round 7 (Opus, Sol): a `$` that is text in a structured value, escapes the check does not decode, cmake's `;` lists", async () => {
@@ -2644,7 +2646,10 @@ test("project review 6, round 7 (Opus, Sol): a `$` that is text in a structured 
     `jest --config '{"rootDir":"\\u002e\\u002e/shared"}'`,
     'cmake -S . -B build "-DCMAKE_C_FLAGS=-Icmake;-I/opt/x"',
   ]) assert.notEqual(await decide19(command), "allow", command);
-  for (const command of [`jest --config '{"testRegex":"spec$"}'`, 'go test -run "Test$" ./...', "go build -ldflags '-X main.v=$v' ."]) assert.equal(await decide19(command), "allow", command);
+  for (const command of ['go test -run "Test$" ./...']) assert.equal(await decide19(command), "allow", command);
+  // (After review 6, the plain-spelling gate: a structured value, a `$` that is text.)
+  assert.notEqual(await decide19(`jest --config '{"testRegex":"spec$"}'`), "allow");
+  assert.equal(await decide19("go build -ldflags '-X main.v=$v' ."), "allow");
 });
 
 test("project review 6, round 8 (Opus, Sol): a tool run as a Python module, a `$` that is part of a name", async () => {
@@ -2726,4 +2731,17 @@ test("project review 6, round 11 (Opus, Sol): a value walked as the kernel walks
     `cat ~${user}/.config/chromium/"Local State"`,
   ]) assert.notEqual(await decide23(command), "allow", command);
   for (const command of ["gcc -obuild/app a.c", "go test ./...", "gcc -Iinclude a.c", "patch -p1 -d sub < p.diff", "eslint ."]) assert.equal(await decide23(command), "allow", command);
+});
+
+test("after review 6: the plain-spelling gate in front of the dev tools' reading", async () => {
+  const repo24 = path.join(base, "repo24");
+  fs.mkdirSync(repo24, { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "main", repo24]);
+  const decide24 = async (command: string) => (await decideShell(guard, new SessionState(repo24), repo24, command)).effect;
+  for (const command of [
+    `jest --config '{"rootDir":"\\u002e\\u002e"}'`,
+    "meson setup build \"-Dc_args=['-I../x']\"",
+    "cargo test --manifest-path ~agent/x/Cargo.toml",
+  ]) assert.notEqual(await decide24(command), "allow", command);
+  for (const command of ['go build -ldflags="-s -w" .', 'pytest -k "not slow"', 'go test -run "TestA|TestB" ./...', 'prettier --write "src/**/*.ts"', 'eslint --rule "no-console: off" .', 'npm run test -- --grep "foo bar"', "cargo build --release --features a,b", "gcc -Wall -O2 -Wl,-z,relro -o out a.c", "gcc -Wl,-rpath,'$ORIGIN' a.c", 'go test -run "Test$" ./...', "python -m pytest 'tests/a.py::test_x[flat]'"]) assert.equal(await decide24(command), "allow", command);
 });
