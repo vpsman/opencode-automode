@@ -3059,9 +3059,10 @@ export function runtimeReads(command: string, where: Located, scope: Scope, gitQ
         const mark = words ? strip(words[k]) : undefined;
         const dynamic = mark === undefined ? /[$`]/.test(text) : MARKS.test(mark);
         if (dynamic) {
-          // (A dev tool's macro definition, `gcc -DVERSION="$v"`, names no file; its other option
+          // (A compiler's macro definition, `gcc -DVERSION="$v"`, names no file (round 6, Sol: meson's
+          // and cmake's `-D` hold flags and paths); a dev tool's other option
           // words, `eslint -c="../$f"`, `--config="$c"`, and every option of a reader may.)
-          if (!runtimeReader(name) || (!READERS.has(name) && !READ_ONLY.has(name) && /^-D/.test(word))) continue;
+          if (!runtimeReader(name) || (!READERS.has(name) && !READ_ONLY.has(name) && /^-D/.test(word) && COMPILER.test(name))) continue;
           const looped = mark !== undefined ? loopUse(mark, loops.get(n), cwd) : undefined;
           if (!looped) {
             // A loop over a glob the matcher cannot read asks, as a reader given that glob does
@@ -3093,7 +3094,7 @@ export function runtimeReads(command: string, where: Located, scope: Scope, gitQ
         const files = here?.elsewhere || (relative && cwd === undefined) || unreadableGlob(placed) ? undefined : expandWord(placed, cwd ?? "/");
         if (!files) {
           // A pattern the matcher cannot read is a verdict (round 4, finding 6).
-          if (READERS.has(name) || (runtimeReader(name) && (READ_ONLY.has(name) || !/^-D/.test(word)))) add(!/[$`]/.test(text) && unreadableGlob(text) ? "ask" : "classify", `${name} reads a file named at run time: ${word}`);
+          if (READERS.has(name) || (runtimeReader(name) && (READ_ONLY.has(name) || !/^-D/.test(word) || !COMPILER.test(name)))) add(!/[$`]/.test(text) && unreadableGlob(text) ? "ask" : "classify", `${name} reads a file named at run time: ${word}`);
           continue;
         }
         // A file called `-rf` or `--to-command=x` becomes an option once the glob is expanded.

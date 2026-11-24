@@ -4983,8 +4983,8 @@ function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: 
   if (!scope.root) return undefined;
   if (scope.cwd !== undefined && !isLocal(scope.cwd, scope)) return classify(`${name} runs in ${scope.cwd}, outside the project, where it reads that directory's code and config`);
   const pathy = (w: string) => /^(\/|~|\.)/.test(w) || w.includes("/");
-  const words: string[] = [];
-  const tails: string[] = [];
+  const words = new Set<string>();
+  const tails = new Set<string>();
   let verdict: Verdict | undefined;
   for (let [k, a] of args.entries()) {
     // (A process substitution, `-c <(echo ...)`, `-c<(...)`, reads as `$()` here, in a word with no
@@ -5003,17 +5003,22 @@ function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: 
     // first letter is held to every check; after a later one, where which letter takes the rest
     // is not known, to the protected names and links, and to the outside check where it starts
     // with `.` or `~`, or with `/` after at most two letters (`-vC/etc`; `-obuild/app` is a name).)
+    // (Round 6, Opus: and with the quotes and brackets a tool parses off a structured value,
+    // meson's `['-I../inc']`, jest's `{"rootDir":"/x"}`, pytest's `src '/x'`, split on `:` too.)
     const read = (v: string, depth: number, full: boolean, self: boolean): void => {
+      v = v.replace(/^[\[\]{}'"]+|[\[\]{}'"]+$/g, "");
       if (!v || depth > 6) return;
-      if (self) (full ? words : tails).push(v);
-      if (/[\s,]/.test(v)) for (const part of v.split(/[\s,]+/)) read(part, depth + 1, full, true);
+      if (self) (full ? words : tails).add(v);
+      if (/[\s,:]/.test(v)) for (const part of v.split(/[\s,:]+/)) read(part, depth + 1, full, true);
       if (v.includes("=")) {
         read(v.slice(v.indexOf("=") + 1), depth + 1, full, true);
         read(v.slice(v.lastIndexOf("=") + 1), depth + 1, full, true);
       }
       if (/^-[^-]/.test(v) && !/[\s,=]/.test(v.slice(0, 2))) {
+        // (A cluster of more letters than the reading follows is not read: it goes to the decider.)
+        if (/^-[A-Za-z]{24}/.test(v)) verdict ??= classify(`${name} ${v.slice(0, 40)}...: an option cluster too long for the check to read`);
         read(v.slice(2), depth + 1, full, true);
-        for (let k = 3; k < v.length && /^[A-Za-z]+$/.test(v.slice(1, k)); k++) {
+        for (let k = 3; k < Math.min(v.length, 24) && /^[A-Za-z]+$/.test(v.slice(1, k)); k++) {
           const rest = v.slice(k);
           read(rest, depth + 1, full && (/^[.~]/.test(rest) || (k <= 3 && rest[0] === "/")), true);
         }

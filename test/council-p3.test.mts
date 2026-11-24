@@ -2613,3 +2613,20 @@ test("project review 6, round 5 (Opus, Sol): an option's value that is an option
   ]) assert.notEqual(await decide17(command), "allow", command);
   for (const command of ['patch -p"$n" < p.diff', "patch -p1 -i fix.diff", 'go build -ldflags="-s -w" .', "meson setup build -Dbuildtype=release", "cmake -B build -DCMAKE_BUILD_TYPE=Release", "gcc -Wall -O2 -o out a.c"]) assert.equal(await decide17(command), "allow", command);
 });
+
+test("project review 6, round 6 (Opus, Sol): a structured value's quotes and brackets, a dev tool's -D built at run time, an overlong cluster", async () => {
+  const repo18 = path.join(base, "repo18");
+  fs.mkdirSync(repo18, { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "main", repo18]);
+  const decide18 = async (command: string) => (await decideShell(guard, new SessionState(repo18), repo18, command)).effect;
+  for (const command of [
+    'meson setup -Dc_args="-I../$(date)" build',
+    "meson setup build \"-Dc_args=['-I../inc']\"",
+    "meson setup build \"-Dc_args=['-MD','-MF','AGENTS.md']\"",
+    "jest --config '{\"rootDir\":\"/home/x/other\"}'",
+    "pytest -o \"pythonpath=src '/home/x/other'\"",
+    "go build -ldflags=\"-L '../lib'\" .",
+    `ninja -${"v".repeat(30)}C..`,
+  ]) assert.notEqual(await decide18(command), "allow", command);
+  for (const command of ['gcc -DVERSION="$v" a.c', "meson setup build \"-Dc_args=['-O2']\"", 'go test -run "TestA|TestB" ./...', 'go build -ldflags="-X main.v=1.2:3" .', "npm run build -- --mode=production"]) assert.equal(await decide18(command), "allow", command);
+});
