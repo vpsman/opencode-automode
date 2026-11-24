@@ -418,26 +418,125 @@ const SECRET_PLACES = [
 const SECRET_NAMES =
   /^(id_(rsa|dsa|ecdsa|ed25519)(_[\w.-]+)?|.+\.(pem|key|p12|pfx|jks|keystore|kdbx)|\.env(\.[\w.-]+)?|credentials\.(json|ya?ml|toml|ini|csv|xml)|secrets?\.(json|ya?ml|toml|ini|env|txt)|.*service[-_]?(account|principal).*\.json|\.(netrc|npmrc|pypirc|git-credentials|vault-token|pgpass|htpasswd)|\.(bash|zsh)_history|.*\.keychain(-db)?)$/i;
 
+const XDG_CONFIG_DIR = process.env.XDG_CONFIG_HOME || path.join(HOME, ".config");
+const XDG_DATA_DIR = process.env.XDG_DATA_HOME || path.join(HOME, ".local", "share");
+const XDG_STATE_DIR = process.env.XDG_STATE_HOME || path.join(HOME, ".local", "state");
+const XDG_CACHE_DIR = process.env.XDG_CACHE_HOME || path.join(HOME, ".cache");
+
+// Credentials sandbox.ts hides from sandboxed commands (DEFAULT_SECRET_PATHS), beside the names and
+// places below; plan() adds every file and directory under $HOME and the project that the rules
+// would ask about. (Project review 6: a read of one asks too, for the Read tool and for a shell
+// command with the sandbox off: `~/.local/share/opencode/auth.json`, `~/.claude/.credentials.json`.)
+export const SECRET_PATHS = [
+  path.join(XDG_CONFIG_DIR, "opencode"),
+  path.join(XDG_DATA_DIR, "opencode"),
+  path.join(XDG_STATE_DIR, "opencode"),
+  path.join(XDG_CONFIG_DIR, "gh"),
+  path.join(XDG_CONFIG_DIR, "glab-cli"),
+  path.join(XDG_CONFIG_DIR, "github-copilot"),
+  path.join(XDG_CONFIG_DIR, "gcloud"),
+  path.join(XDG_CONFIG_DIR, "op"),
+  path.join(XDG_CONFIG_DIR, "rclone"),
+  path.join(XDG_CONFIG_DIR, "hub"),
+  path.join(XDG_CONFIG_DIR, "git", "credentials"),
+  path.join(XDG_DATA_DIR, "keyrings"),
+  path.join(XDG_CACHE_DIR, "git", "credential"),
+  `/tmp/krb5cc_${process.getuid?.() ?? 0}`,
+  ...[
+    ".ssh",
+    ".gnupg",
+    ".password-store",
+    ".aws",
+    ".azure",
+    ".oci",
+    ".kube",
+    ".docker/config.json",
+    ".netrc",
+    ".git-credentials",
+    ".git-credential-cache",
+    ".npmrc",
+    ".pypirc",
+    ".claude/.credentials.json",
+    ".codex/auth.json",
+    ".secrets",
+    ".cargo/credentials.toml",
+    ".cargo/credentials",
+    ".vault-token",
+    ".pgpass",
+    ".my.cnf",
+    ".terraform.d/credentials.tfrc.json",
+    ".m2/settings.xml",
+    ".m2/settings-security.xml",
+    ".gradle/gradle.properties",
+    ".bash_history",
+    ".zsh_history",
+    ".sh_history",
+    ".python_history",
+    ".node_repl_history",
+    ".psql_history",
+    ".mysql_history",
+    ".sqlite_history",
+    ".rediscli_history",
+    ".lesshst",
+    ".Xauthority",
+    // Registry logins and browser profiles (cookies, saved passwords).
+    ".gem/credentials",
+    ".composer/auth.json",
+    ".mozilla",
+    ".librewolf",
+    ".zen",
+    "snap/firefox",
+    "snap/chromium",
+  ].map((p) => path.join(HOME, p)),
+  ...["composer/auth.json", "containers/auth.json", "google-chrome", "google-chrome-beta", "chromium", "BraveSoftware", "microsoft-edge", "vivaldi", "opera"].map((p) => path.join(XDG_CONFIG_DIR, p)),
+  ...["fish/fish_history", "atuin"].map((p) => path.join(XDG_DATA_DIR, p)),
+];
+
 function isSecretPath(p: string): boolean {
   const name = path.basename(p);
   // Public keys, host lists, client settings, env templates and certificates hold nothing secret.
   if (/\.pub$|^known_hosts|^authorized_keys$|^\.env\.(example|sample|template|dist|defaults?)$/i.test(name)) return false;
   if (/\/\.(ssh|aws)\/config$/.test(p)) return false;
   if (/cert|chain|public|(^|[._-])ca([._-]|$)/i.test(name) && !/priv|key/i.test(name.replace(/\.key$/i, ""))) return false;
-  return SECRET_PLACES.some((place) => place.test(p)) || SECRET_NAMES.test(name);
+  return SECRET_PLACES.some((place) => place.test(p)) || SECRET_NAMES.test(name) || SECRET_PATHS.some((d) => within(p, d));
+}
+
+// The home directory of a user by name, as bash's `~name` finds it (round 11, Opus).
+function homeOf(name: string): string | undefined {
+  try {
+    const line = fs.readFileSync("/etc/passwd", "utf8").split("\n").find((l) => l.split(":")[0] === name);
+    return line?.split(":")[5] || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// (Cross-check, Sol: a relative word with a blank is a path where it names one that is there,
+// `cat ".ssh/key with space"`; a message is no file.)
+function blankPathThere(word: string, scope: Scope): boolean {
+  const p = resolveWord(word.replace(/^[^=/]*=/, "").replace(/^@/, ""), scope);
+  return !!p && fs.existsSync(p);
 }
 
 // The credential file a shell word names, if any. Handles `--file=path`, curl's `@file` and
 // git's `rev:path`. In a command, words with spaces and URLs are text, not paths.
 function secretIn(word: string, scope: Scope, isPath = false, operand = false): string | undefined {
-  if (!isPath && (/\s/.test(word) || /^[a-z][a-z0-9+.-]*:\/\//i.test(word))) return undefined;
+  // (Project review 6, round 2, Sol: a word with a blank that begins as a path is one, `~/.config/
+  // chromium/"Local State"`.)
+  if (!isPath && ((/\s/.test(word) && !/^(\/|~)/.test(word) && !blankPathThere(word, scope)) || /^[a-z][a-z0-9+.-]*:\/\//i.test(word))) return undefined;
   // An operand (after `--`) is a path whatever it starts with (round 40, Opus: `cat -- -/../.env`).
   const text = operand ? word : word.replace(/^[^=/]*=/, "").replace(/^@/, "");
-  for (const candidate of new Set([text, text.slice(text.lastIndexOf(":") + 1)])) {
+  // (Project review 6, Opus: a value of the form `key=@file` names the file after `=@`,
+  // `gh api --field=q=@.env`.)
+  for (const candidate of new Set([text, text.slice(text.lastIndexOf(":") + 1), ...(text.includes("=@") ? [text.slice(text.lastIndexOf("=@") + 2)] : [])])) {
     // (Round 41, Mythos: a word that starts with `-` and holds a slash, `-/../.env`, is a path
     // through a directory named like an option, as an option's value or an awk operand reads it.)
     if (!candidate || (candidate.startsWith("-") && !operand && !/^-[^=]*\//.test(candidate))) continue;
     const p = resolveWord(candidate, scope);
+    // (Project review 6, round 10, Opus: `~name/rest` is a home directory's `rest`, as bash expands
+    // it, `cat ~agent/.local/share/opencode/auth.json`.)
+    const named = /^~([^/+-][^/]*)\/(.+)$/.exec(candidate);
+    if (named && [HOME, homeOf(named[1])].some((h) => h !== undefined && isSecretPath(path.join(h, named[2])))) return candidate;
     if (isSecretPath(expandHome(candidate)) || (p && (isSecretPath(p) || isSecretPath(followLinks(p, scope))))) return candidate;
   }
   return undefined;
@@ -583,7 +682,14 @@ function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope)
     ];
   }
   // `--env-file .env` hands the file to a program and shows nothing.
-  words = words.filter((w, i) => !/^--env-file(=|$)/.test(w) && words[i - 1] !== "--env-file");
+  // (Project review 6, Neon: only a dotenv file, `.env` or `.env.<name>`, and only where no word of
+  // the call is a shell or a program that prints its environment or a file: `uv run --env-file
+  // .env bash -c 'echo "$SECRET"'` shows it, `--env-file ~/.ssh/id_rsa` names another credential.)
+  const dotenv = (v: string | undefined) => v !== undefined && /(^|\/)\.env(\.[\w.-]+)?$/.test(v);
+  // (Round 1 cross-check, Opus: any program may print what it is given, `jq -n '$ENV'`, `awk
+  // 'BEGIN{print ENVIRON["S"]}'`, `make -p`: only a test run keeps the exemption.)
+  const shows = !args.some((a) => /^(pytest|vitest|jest|mocha|test)$/.test(path.basename(a))) || args.some((a) => /^(bash|sh|zsh|dash|ksh|fish|echo|printf|printenv|env|cat|jq|awk|gawk|mawk|make|python3?|node|perl|ruby)$/.test(path.basename(a)));
+  if (!shows) words = words.filter((w, i) => !(/^--env-file=/.test(w) && dotenv(w.slice(11))) && !(w === "--env-file" && dotenv(words[i + 1])) && !(words[i - 1] === "--env-file" && dotenv(w)));
   // (Round 41, Mythos: a word that starts with `-` and holds a slash is a path to the programs that
   // read it as an operand, `awk 1 -/../.env`.)
   const dashPaths = args.filter((a) => /^-[^=]*\//.test(a) && !words.includes(a));
@@ -1583,7 +1689,7 @@ export const READ_ONLY = new Set(
 );
 
 // Build, test, lint and format tools that work on the project.
-const DEV_TOOLS = new Set(
+export const DEV_TOOLS = new Set(
   `make just ninja cmake ctest meson pytest tox nox ruff mypy pyright black isort flake8 eslint
    prettier tsc vitest jest mocha rustfmt rustc gcc g++ cc c++ clang clang++ shellcheck shfmt
    stylua luacheck biome golangci-lint hadolint yamllint markdownlint ccache`.split(/\s+/),
@@ -3502,7 +3608,42 @@ function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = 
   // and rejects expanding `-t` values above. With `install -d`/`--directory`, every operand is a
   // directory to create.
   const targets = installDir ? paths : hasTarget ? (WRITERS[cmd] === "all" ? paths : []) : WRITERS[cmd] === "last" ? paths.slice(-1) : paths;
-  for (const t of targets) {
+  // (Project review 6, Sol, Opus, Neon: patch writes under the directory of `-d`, which an attached
+  // or `=` spelling hides from the operands, `-d.claude`, `--directory=.git/hooks`. Every value an
+  // option word of patch may carry is held as a place it writes: after an `=`, and after the value
+  // letter of a short cluster, `-Nd.claude`. One built at run time is judged elsewhere.)
+  const places: string[] = [];
+  if (cmd === "patch") {
+    for (let a of head) {
+      if (!a.startsWith("-") || a === "-" || a === "--") continue;
+      // (Round 5, Sol: a variable the call sets to a literal is read as it, `d=.claude; patch
+      // -d"$d"`; any other value built at run time is a place the check cannot tell.)
+      if (/[$`]/.test(a)) a = expandVars(a, scope);
+      if (/[$`]/.test(a)) {
+        // (A count built at run time, `-p"$n"`, names no place.)
+        if (!/^-[lcenuNREZTbtfsv]*[pF][^a-zA-Z]/.test(a) && !/^--(strip|fuzz)=/.test(a)) return classify(`patch ${a}: an option whose value bash builds at run time, which may name where patch writes`);
+        continue;
+      }
+      if (a.startsWith("--")) {
+        if (a.includes("=") && !/^--in/.test(a)) places.push(a.slice(a.indexOf("=") + 1));
+      } else {
+        // (Only values that may name a place: a count, `-p1`, names none.)
+        // (patch's own letters: a flag goes on to the next letter, a value letter takes the rest.)
+        // (`-i`, the patch read, names no place written: round 5, Opus.)
+        for (let k = 1; k < a.length && "lcenuNREZTbtfsv".includes(a[k]); k++) if ("pForDVBYzgdx".includes(a[k + 1] ?? "")) places.push(a.slice(k + 2));
+        if ("pForDVBYzgdx".includes(a[1])) places.push(a.slice(2));
+      }
+    }
+  }
+  // (Round 3, Sol: or a name that is there, a link into a protected place, `-dconfiglink`,
+  // `-d2026`.)
+  // (Round 11, Opus: a patch place as the kernel walks it, `-dext/..`.)
+  for (const v of places) {
+    const w = walked(v, scope);
+    if (w && protectedPlace(w, scope)) return piAsk(`${cmd} changes opencode's own files (config, AGENTS.md, CLAUDE.md, a hook manager's, .git): ${v}`);
+    if (w && !isLocal(w, scope)) return outside(`${cmd} writes outside the working directory: ${v}`, w);
+  }
+  for (const t of [...targets, ...places.filter((v) => /[/~]/.test(v) || v.startsWith(".") || (!!resolveWord(v, scope) && fs.existsSync(resolveWord(v, scope)!)))]) {
     // Copied into a directory, the files land inside it: `cp a.rs /tmp` writes /tmp/a.rs.
     const written = intoDir && t === destWord && dest && sources.length ? sources.map((s) => path.join(dest, path.basename(s))) : [resolveWord(t, scope)];
     for (const p of written) {
@@ -3559,7 +3700,12 @@ function rm(args: string[], scope: Scope): Verdict {
   let verdict = ALLOW;
   for (const t of operands(args)) {
     const p = resolveWord(t, scope);
-    const bare = BARE_GLOB.test(path.basename(t));
+    // (Project review 6, Neon, Opus: any name made only of glob characters, bracket expressions
+    // and dots matches about every entry, as `*` does: `?*`, `**`, `[!.]*`, `[a-z]*`, `*[!x]`, `./?*`.)
+    const base = path.basename(t);
+    // (Cross-check 2, Sol, Opus: a class inside the brackets, `[[:alpha:]]*`, is part of them.)
+    const unbracketed = base.replace(/\[(\^|!)?\]?(\[[:=.][^\]]*[:=.]\]|[^\]])*\]/g, "?");
+    const bare = BARE_GLOB.test(base) || (/^[*?.]+$/.test(unbracketed) && /[*?]/.test(unbracketed));
     if (maybe && p && (isRootLike(p) || (bare && isRootLike(path.dirname(p))))) {
       if (!recursive) return ask(`rm of ${t} with an option bash builds at run time, which may wipe a home or system directory`);
       return deny(`rm -r of ${t} would wipe a home or system directory`);
@@ -3683,6 +3829,9 @@ function git(args: string[], scope: Scope): Verdict {
   if (sub === "bisect" && (words[0] === "run" || (["view", "visualize"].includes(words[0] ?? "") && rest[viewAt + 1] !== undefined && !rest[viewAt + 1].startsWith("-")))) return classify(`git bisect ${words[0]} runs a command`);
   if (sub === "grep" && (opt("open-files-in-pager", "O", "eABCfm"))) return classify("git grep -O runs a pager program");
   if (sub === "reset" || sub === "clean" || sub === "restore") return ALLOW;
+  // (Project review 6, round 2, Opus: `git credential fill` prints a stored password, as `gh auth
+  // token` prints a token: a firm ask.)
+  if (sub === "credential" || sub?.startsWith("credential-")) return criticalAsk("git credential prints or changes stored passwords");
   if (sub === "config") return gitConfig(opts, rest, dir, scope);
   if (sub === "remote") return words.some((w) => ["add", "set-url", "remove", "rm", "rename"].includes(w)) ? ask("changes where git pushes and fetches") : ALLOW;
   if (sub === "reflog") return words.includes("expire") || words.includes("delete") ? ask("deletes git recovery data") : ALLOW;
@@ -3745,9 +3894,17 @@ function gh(args: string[]): Verdict {
       else if (/^-[^-]/.test(a) && /[XfF]/.test(a)) return ask(`gh api ${a}: an option cluster the check does not read, which may set the method or a field`);
     }
     if (methods.some((m) => m.toUpperCase() !== "GET") || (fields && (!methods.length || !sure))) return ask("gh api call that changes remote data");
+    // (Project review 6, Opus, Sol, Neon: a GET sends a file too, `--input f` as its body and a
+    // typed field's `@file` as a query value, `--field=q=@.env`, a spelling the credential check
+    // does not read. Any `--input`, and any `-F`/`--field` word that holds `=@`, go to the decider.)
+    if (args.some((a, k) => /^--input(=|$)/.test(a) || (/=@/.test(a) && (/^(-F|--field(=|$))/.test(a) || /^(-F|--field)$/.test(args[k - 1] ?? ""))))) return classify("gh api that sends a file's contents");
     return ALLOW;
   }
+  // (Round 2 cross-check, Opus: `gh config get oauth_token` prints the token on older gh.)
+  if (group === "config" && args.some((w) => /token/i.test(w))) return criticalAsk("gh config of a token prints or changes it");
   if (group === "auth") {
+    // (Project review 6, Opus: `gh auth token` prints the token, a firm ask like `status -t`.)
+    if (args.slice(args.indexOf("auth") + 1).some((w) => w === "token" || w === "git-credential")) return criticalAsk("gh auth token and gh auth git-credential print the GitHub token");
     if (action !== "status") return classify("gh auth");
     // (Project review 5, round 4, Opus: `-t` / `--show-token` prints the token. Only the options
     // known to print no secret pass.)
@@ -4153,6 +4310,8 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
     return worst(verdict, criticalAsk(`${name} runs as root`), inner.length ? simple(tail(inner), scope, depth + 1) : ALLOW);
   }
   if (ALWAYS_ASK[name]) return worst(verdict, (name === "su" || name === "pkexec" ? criticalAsk : ask)(`${name} ${ALWAYS_ASK[name]}`));
+  // (Round 3, Opus: git's credential helpers run as programs print stored passwords too.)
+  if (/^git-credential/.test(name)) return worst(verdict, criticalAsk(`${name} prints or changes stored passwords`));
   // (opencode-automode: a lone `-h` or `-V` is an option of many programs, hashall to a shell,
   // verbose to vim, after which they read standard input; only the programs these rules know (read
   // only, dev tools, tools with subcommands, runners, interpreters) take it as help or a version
@@ -4191,6 +4350,17 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
       const from = lead + 1;
       const k = leadingOptions(args, RUNNER_OPTIONS[name] ?? {}, from);
       if (k < 0) return worst(verdict, classify(`${name} ${RUNNERS[name]} with an option the rules do not model`));
+      // (Project review 6, Opus: the runner's own words, before the command it runs, name places
+      // too, `uv run --project .. pytest`, `uv run -p ../venv/bin/python pytest`.)
+      if (PROJECT_TOOLS.has(name)) {
+        // (Cross-check 2, Opus: one built at run time, `uv run --python="$(cat x)" pytest`, goes
+        // to the decider: no other check reads the runner's own words.)
+        const built = args.slice(0, k).find((a) => /[$`]/.test(expandVars(a, scope)));
+        if (built !== undefined) verdict = worst(verdict, classify(`${name} ${RUNNERS[name]} ${built}: a word built at run time, which may name the program or the project it runs`));
+        const own = projectToolPlaces(name, args.slice(0, k), scope, dyn);
+        if (own) verdict = worst(verdict, own);
+        if (verdict.action === "ask") return verdict;
+      }
       const inner = args.slice(k);
       return worst(verdict, inner.length ? simple(tail(inner), scope, depth + 1) : ALLOW);
     }
@@ -4236,6 +4406,12 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
     if (deletes) gone = worst(gone, deletion(r.operands.at(-1)!, scope));
     if (gone.action !== "allow") return worst(verdict, gone);
   }
+  // (Project review 6, Opus, Sol, Neon: two programs of the read-only list write a file an option
+  // names: `ss -D FILE` / `--diag` dumps raw socket data there, `fastfetch --gen-config[-force]
+  // [FILE]` writes a config, its own by default, whose commands later runs execute. Any such
+  // option asks, in any spelling: a cluster holding D, a long one by any prefix.)
+  if (name === "ss" && args.some((a) => (/^-[^-]*D/.test(a)) || (a.startsWith("--") && a.split("=")[0].length >= 3 && "--diag".startsWith(a.split("=")[0])))) return worst(verdict, ask("ss -D writes raw socket data to a file"));
+  if (name === "fastfetch" && args.some((a) => /^--gen/.test(a))) return worst(verdict, ask("fastfetch --gen-config writes a config file, which later runs read"));
   // Files written by an option (round 39, Mythos): held to the write test.
   // Long options by any prefix the tool takes (round 40, Mythos: `--cursor-fil=`).
   const optionWrites: Record<string, { short: RegExp; long: string[] }> = { journalctl: { short: /^$/, long: ["cursor-file"] }, zip: { short: /^-(O|b)$/, long: ["out", "temp-path"] }, docker: { short: /^$/, long: ["iidfile", "metadata-file"] } };
@@ -4267,6 +4443,19 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
     if (k < 0 || args.slice(0, k).some((a) => /^-[eil]/.test(a))) return worst(verdict, classify("xargs with options the rules do not model"));
     const inner = args.slice(k);
     return worst(verdict, classify("xargs"), inner.length ? simple(tail(inner, [true]), scope, depth + 1) : ALLOW);
+  }
+  // (Project review 6, Neon, Opus: `meson wrap install`, `meson subprojects download` fetch a
+  // dependency's sources; `meson subprojects foreach` runs a command.)
+  if (name === "meson" && ["wrap", "subprojects"].includes(operands(args)[0] ?? "")) verdict = worst(verdict, classify(`meson ${operands(args)[0]} fetches or changes a dependency's sources, or runs a command in each`));
+  // (Round 8, Opus: a tool run as a module, `python -m pytest`, `python3 -m ruff`, is read as
+  // the tool.)
+  if (/^python3?(\.\d+)?$/.test(name) && args[0] === "-m" && /^(pytest|unittest|ruff|mypy|black|isort|build)$/.test(args[1] ?? "")) {
+    const places = projectToolPlaces(`${name} -m ${args[1]}`, args.slice(2), scope, (k) => dyn(k + 2));
+    if (places) verdict = worst(verdict, places);
+  }
+  if (PROJECT_TOOLS.has(name)) {
+    const places = projectToolPlaces(name, args, scope, dyn);
+    if (places) verdict = worst(verdict, places);
   }
   if (name === "cd" || name === "pushd" || name === "popd") return verdict;
 
@@ -4415,6 +4604,9 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
   if (name === "docker") {
     const [group, action] = operands(args);
     if (group === "compose" || group === "buildx") return worst(verdict, classify(`docker ${group}`));
+    // (Project review 6, Neon: docker's own options before the group are read as for one word,
+    // `docker --host=ssh://prod container ls` reaches another daemon.)
+    if (group && args[0]?.startsWith("-") && leadingOptions(args, LEAD_OPTIONS.docker) < 0) return worst(verdict, classify("docker with an option before its command that the rules do not model"));
     if (group && Object.hasOwn(DOCKER_GROUPS, group)) {
       return worst(verdict, DOCKER_GROUPS[group].split(" ").includes(action) ? ALLOW : classify(`docker ${group} ${action ?? ""}`.trim()));
     }
@@ -4527,7 +4719,8 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
   }
   if (/^python3?$/.test(name) && args[0] === "-m" && PY_MODULES.has(args[1]) && !cmd.heredoc && (args[1] !== "unittest" || unittestNamesOwn(args.slice(2), scope))) return verdict;
   // `node --test`: the test runner over the project's test files, as `npm test` runs it.
-  if (name === "node" && args[0] === "--test" && !cmd.heredoc) {
+  // (Round 9, Opus: only in the project, whose test files it finds by itself: `cd .. && node --test`.)
+  if (name === "node" && args[0] === "--test" && !cmd.heredoc && scope.cwd !== undefined && isLocal(scope.cwd, scope)) {
     const k = leadingOptions(args, { long: ["test", "test-only", "test-force-exit", "experimental-test-coverage", "experimental-strip-types", "no-warnings", "enable-source-maps"], longValued: ["test-name-pattern", "test-skip-pattern", "test-concurrency", "test-timeout", "disable-warning"] });
     const reporters = args.filter((a) => /^--test-reporter(=|$)/.test(a));
     const files = k < 0 ? [] : args.slice(k);
@@ -4799,6 +4992,127 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
   }
   if (depth === 0) scope.resolvedVars = local.vars;
   return verdict.pattern && patterns.size > 1 ? { ...verdict, pattern: undefined } : verdict;
+}
+
+// Project review 6 (Sol, Opus, Neon): the build, test, lint and format tools and the package
+// managers work on the places their words name, read or written, through options no table
+// lists in full: a formatter rewrites the files it is given (`prettier --write AGENTS.md`,
+// `shfmt -w .git/hooks/pre-commit`), a build writes where `-o` says (`go build -o
+// .git/hooks/x`), a config or a module is loaded from where an option points (`jest --config
+// /dev/stdin`, `mocha --require ../x.js`, `npm test --prefix ..`, `cargo run --manifest-path
+// ../Cargo.toml`), and the project they run is the directory they start in (`cd .. && make`).
+// Bluntly, for every word, an option's value after `=` and a short option's attached path
+// included: a protected name (the plugin's, opencode's, a `.git` component) asks, and a path
+// outside the project, the temp directories and the allowed places goes to the decider, as does
+// a run in such a directory. Words built at run time are judged elsewhere (runtimeReads).
+// (Rounds 10 and 11, Sol, Opus: where the kernel's walk of a word leads, a link followed before
+// a `..` after it, `-Cext/..`, `-MFdeep/../x`, and for a file not made yet, through the parents
+// that are there, `-MFext/deps.d`. A word that starts with `/` is walked from the root.)
+function walked(raw: string, scope: Scope): string | undefined {
+  const text = expandHome(raw);
+  if (!text.startsWith("/") && scope.cwd === undefined) return undefined;
+  let at = text.startsWith("/") ? "/" : realish(scope.cwd!);
+  for (const c of text.split("/")) {
+    if (!c || c === ".") continue;
+    if (c === "..") {
+      at = path.dirname(at);
+      continue;
+    }
+    at = path.join(at, c);
+    try {
+      at = fs.realpathSync(at);
+    } catch {
+      // Not there (yet): the rest is joined as written.
+    }
+  }
+  return at;
+}
+const protectedPlace = (p: string, scope: Scope) => isGuarded(p, scope) || isPiFile(p, scope) || /(^|\/)\.git(\/|$)/.test(p);
+const PROJECT_TOOLS = new Set([...DEV_TOOLS, ..."go cargo npm npx pnpm pnpx yarn bun bunx uv uvx deno poetry pipenv pdm hatch".split(" ")]);
+function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: number) => boolean): Verdict | undefined {
+  if (!scope.root) return undefined;
+  if (scope.cwd !== undefined && !isLocal(scope.cwd, scope)) return classify(`${name} runs in ${scope.cwd}, outside the project, where it reads that directory's code and config`);
+  const pathy = (w: string) => /^(\/|~|\.)/.test(w) || w.includes("/");
+  const words = new Set<string>();
+  const tails = new Set<string>();
+  let verdict: Verdict | undefined;
+  for (let [k, a] of args.entries()) {
+    // (A process substitution, `-c <(echo ...)`, `-c<(...)`, reads as `$()` here, in a word with no
+    // expansion bash computes a name from: a file made when the command runs.)
+    if (a.includes("$()") && !dyn(k)) verdict ??= classify(`${name} reads a file made when the command runs (a process substitution)`);
+    // (A variable the call plainly sets to a literal is read as that literal, `m=../x.js; mocha
+    // --require "$m"`; any other word built at run time is judged in runtimeReads.)
+    // (Round 7, Opus: only a word bash builds at run time; a `$` that is text, a regex anchor in
+    // `jest --config '{"testRegex":"x$"}'`, is read as written.)
+    const plain = /[$`]/.test(a) ? expandVars(a, scope) : a;
+    if (/[$`]/.test(plain) && dyn(k)) continue;
+    a = plain;
+    // (Before round 8: a backstop on the word's text, whatever the reading below makes of its
+    // structure: a `.git`, `.claude` or `.opencode` component or a context file's name anywhere
+    // asks.)
+    if (/(^|[^\w.])\.(git|claude|opencode)([^\w.-]|$)/.test(a) || /(^|[^\w.-])(AGENTS|CLAUDE)\.(md|MD)|AGENTS\.override\.md/.test(a)) return ask(`${name} ${a.slice(0, 60)}: names a protected file or directory, which it may read as config or write`);
+    // (Round 7, Sol: a structured value with an escape the tool decodes, `{"rootDir":"\u002e\u002e"}`,
+    // is one the check does not read: it goes to the decider.)
+    if (/\\/.test(a) && /[{[]/.test(a)) verdict ??= classify(`${name} ${a.slice(0, 60)}: a structured value with escapes the check does not decode`);
+    // (Round 5, Opus, Sol: one reading of every value, however deep: after the first `=` and after
+    // the last (`--emit=llvm-ir=AGENTS.md`), each blank- or comma-separated part (`pytest -o
+    // "pythonpath=src ../x"`, `mocha --require=a.js,../x.js`, `gcc -Wl,-o,.git/hooks/x`), and for
+    // a part that is a short option, the rest after each of its leading letters (`-o.git/x`,
+    // `-Wp,-MFAGENTS.md`, `-Dc_args=-I../inc`, `go build -ldflags=-L../lib`). The rest after the
+    // first letter is held to every check; after a later one, where which letter takes the rest
+    // is not known, to the protected names and links, and to the outside check where it starts
+    // with `.` or `~`, or with `/` after at most two letters (`-vC/etc`; `-obuild/app` is a name).)
+    // (Round 6, Opus: and with the quotes and brackets a tool parses off a structured value,
+    // meson's `['-I../inc']`, jest's `{"rootDir":"/x"}`, pytest's `src '/x'`, split on `:` too.)
+    const read = (v: string, depth: number, full: boolean, self: boolean): void => {
+      v = v.replace(/^[\[\]{}'"]+|[\[\]{}'"]+$/g, "");
+      if (!v || depth > 6) return;
+      if (self) (full ? words : tails).add(v);
+      if (/[\s,:;]/.test(v)) for (const part of v.split(/[\s,:;]+/)) read(part, depth + 1, full, true);
+      if (v.includes("=")) {
+        read(v.slice(v.indexOf("=") + 1), depth + 1, full, true);
+        read(v.slice(v.lastIndexOf("=") + 1), depth + 1, full, true);
+      }
+      if (/^-[^-]/.test(v) && !/[\s,=]/.test(v.slice(0, 2))) {
+        // (A cluster of more letters than the reading follows is not read: it goes to the decider.)
+        if (/^-[A-Za-z]{24}/.test(v)) verdict ??= classify(`${name} ${v.slice(0, 40)}...: an option cluster too long for the check to read`);
+        read(v.slice(2), depth + 1, full, true);
+        for (let k = 3; k < Math.min(v.length, 24) && /^[A-Za-z]+$/.test(v.slice(1, k)); k++) {
+          const rest = v.slice(k);
+          read(rest, depth + 1, full && (/^[.~]/.test(rest) || (k <= 3 && rest[0] === "/")), true);
+        }
+      }
+    };
+    // (An option word itself is no place; its values are.)
+    read(a, 0, true, !a.startsWith("-"));
+  }
+  for (const t of tails) {
+    const p = resolveWord(t, scope);
+    if (!p && /^~[^/]/.test(t)) verdict ??= classify(`${name} names ${t}, a place the check cannot tell`);
+    if (p && (isGuarded(p, scope) || isPiFile(p, scope) || /(^|\/)\.git(\/|$)/.test(p))) return ask(`${name} names ${t}, a protected file or directory it may read as config or write`);
+    // (Cross-check, Sol: a tail that is a link out of the project, `ninja -vCext`.)
+    const w = t.startsWith("/") ? undefined : walked(t, scope);
+    if (w && protectedPlace(w, scope)) return ask(`${name} names ${t}, which leads to ${w}, a protected file or directory it may read as config or write`);
+    if (w && !isLocal(w, scope)) verdict ??= classify(`${name} names ${t}, outside the project through a link: a place it may load code or config from, or write`);
+  }
+  for (const word of words) {
+    const value = word.replace(/^@/, "");
+    if (!value || /^[a-z][a-z0-9+.-]*:\/\//i.test(value)) continue;
+    // (Round 8, Sol: a `$` or backtick that is text, `'../setup$.js'`, is part of the name;
+    // one the check still cannot place goes to the decider.)
+    const p = resolveWord(value, scope) ?? (scope.cwd !== undefined && /[$`]/.test(value) ? path.resolve(scope.cwd, expandHome(value)) : undefined);
+    if (!p) {
+      // (Round 9, Opus: or a `~user` path bash expands, `~agent/other`.)
+      if (pathy(value) && /[$`]|^~/.test(value)) verdict ??= classify(`${name} names ${value}, a place the check cannot tell`);
+      continue;
+    }
+    if (isGuarded(p, scope) || isPiFile(p, scope) || /(^|\/)\.git(\/|$)/.test(p)) return ask(`${name} names ${value}, a protected file or directory it may read as config or write`);
+    // (Round 2, Opus: a plain name that is a link out of the project, `go test -C ext ./...`.)
+    const w = walked(value, scope);
+    if (w && protectedPlace(w, scope)) return ask(`${name} names ${value}, which leads to ${w}, a protected file or directory it may read as config or write`);
+    if (((pathy(value) && !isLocal(p, scope)) || !isLocal(realish(p), scope) || (!!w && !isLocal(w, scope))) && p !== "/dev/null") verdict ??= classify(`${name} names ${value}, outside the project: a place it may load code or config from, or write`);
+  }
+  return verdict;
 }
 
 // The fork bomb in any spelling: a function that pipes itself into itself in the background.

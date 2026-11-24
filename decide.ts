@@ -67,7 +67,8 @@ export const DEFAULT_ASK = [
   "re:.*opencode-automode.*",
   // opencode loads project-level config, plugins and commands with no prompt; hook managers run
   // these files from git hooks. Both are read-only inside the sandbox, so a change must ask.
-  `re:(^|.*[ /=@])(${literal([...OPENCODE_CONFIG_NAMES, ...HOOK_MANAGER_FILES])})( |/|$).*`,
+  // (Project review 6, round 4, Opus: a comma separates too, `gcc -Wl,-o,opencode.json`.)
+  `re:(^|.*[ /=@,])(${literal([...OPENCODE_CONFIG_NAMES, ...HOOK_MANAGER_FILES])})( |/|,|$).*`,
   // Dumping the environment prints every secret in it.
   "printenv *",
   "env",
@@ -1961,7 +1962,9 @@ function remoteProgramOk(argv: string[]): boolean {
     if (w === "--") return false;
     if (!w.startsWith("-") || w === "-") operands.push(w);
     else if (spec.valued?.includes(w)) {
-      if (++i >= argv.length) return false;
+      // (Project review 6, Neon: a value that begins with `-` may be read as one of the program's
+      // own options by the check, `rg -g --files -g '*' TEXT /etc` searches file contents.)
+      if (++i >= argv.length || argv[i].startsWith("-")) return false;
       if (spec.values?.[w] && !spec.values[w].test(argv[i])) return false;
     } else if (spec.long?.includes(w)) continue;
     else if (w.startsWith("--")) {

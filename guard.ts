@@ -16,7 +16,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { bare, bashVerdict, compressorReading, copiesNothing, copyReading, findActions, printsOnly, sedBracketsClosed, sedReading, sortReading, sortRunsCompressor, fileVerdict, parse, readVerdict, rsyncReading, skippable, tarReading, twoOpOperands, within, yqReading, type Matcher, type Scope, type Simple } from "./rules.ts";
+import { bare, bashVerdict, compressorReading, copiesNothing, copyReading, DEV_TOOLS, findActions, printsOnly, READ_ONLY, sedBracketsClosed, sedReading, sortReading, sortRunsCompressor, fileVerdict, parse, readVerdict, rsyncReading, skippable, tarReading, twoOpOperands, within, yqReading, type Matcher, type Scope, type Simple } from "./rules.ts";
 import { gitArgs, gitEnv } from "./sandbox.ts";
 
 const HOME = os.homedir();
@@ -2110,6 +2110,13 @@ const READERS = new Set(
   `cat bat head tail less more grep egrep fgrep rg ag ack sed awk gawk cut sort uniq tr diff cmp comm nl tac rev fold paste join
    strings xxd hexdump od base64 base32 jq yq zcat xzcat bzcat zstdcat cp mv ln rsync install tar zip gzip gunzip xz unxz lzma unlzma lzcat zstd unzstd zstdmt bzip2 bunzip2 dd openssl curl wget`.split(/\s+/),
 );
+// (Project review 6, Sol, Neon: a file named at run time goes to the model for every program the
+// rules allow by name, not for a list of readers, which never ends (`shellcheck "$f"`, `black
+// --diff "$f"`, `dmesg -F "$(...)"`, `tldr --render "$(...)"`). Only those that read no file their
+// words name, or show only counts and hashes of them, are left out: names-only programs, and these.
+// (Cross-check, Opus: the test runners too are held, `mocha -r "$m"`, `jest --config "$c"`.)
+const READS_NO_FILE = new Set("true false : pwd echo printf test [ export unset set shopt local declare typeset readonly break continue return exit shift wait sleep seq kill which whereis type whoami id groups date cal uname hostname uptime printenv ps pgrep free nproc lscpu lsblk lsusb lspci lsmod findmnt locale getent dig nslookup ping ss journalctl wc sha256sum sha1sum md5sum b3sum tokei cloc".split(" "));
+const runtimeReader = (name: string) => READERS.has(name) || ((READ_ONLY.has(name) || DEV_TOOLS.has(name)) && !READS_NO_FILE.has(name) && !NAMES_ONLY.has(name));
 const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh", "source", "."]);
 const INTERPRETERS = new Set(["python", "python3", "node", "perl", "ruby", "php", "lua", "deno", "bun", "tsx", "ts-node"]);
 // Builds and test runners that run the file they are handed.
@@ -2947,6 +2954,11 @@ export function runtimeReads(command: string, where: Located, scope: Scope, gitQ
     for (const p of at) {
       const name = path.basename(cmd.argv[p]);
       const end = chain.find((q) => q > p) ?? cmd.argv.length;
+      // (Project review 6, round 9, Sol: a tool run as a Python module is the tool, `python -m
+      // pytest "../$(...).py"`, for the reads of files named at run time below.)
+      const pyModule = /^python3?(\.\d+)?$/.test(name) && cmd.argv[p + 1] === "-m" && /^(pytest|unittest|ruff|mypy|black|isort|build)$/.test(cmd.argv[p + 2] ?? "") ? cmd.argv[p + 2] : undefined;
+      const rname = pyModule ?? name;
+      const reads = (n: string) => runtimeReader(n) || !!pyModule;
       // Round 4, N3b-4: a program with an option that reads a list (LIST_OPTIONS) whose options
       // are not held by expansionProblem already: a word bash builds when the command runs can be
       // that option (`x=--files0-from=.env; wc $x`), and goes to the model as it does for tar.
@@ -3036,13 +3048,26 @@ export function runtimeReads(command: string, where: Located, scope: Scope, gitQ
             else if (here) add("ask", `${word} holds an expansion that bash splits and globs, which can match ${here}, a name here that ${name} would read as an option`);
           }
         }
+        // (Project review 6, Sol: a dev tool's short option with a value built at run time behind
+        // its letter, `eslint -c"$f"`, may name a file it loads: not a macro or a number, `-D`, `-j`,
+        // `-l`, `-O`.)
+        // (Cross-check 2, Sol, Opus: for the read-only programs past the old list too, `dmesg
+        // -F"$f"`, column's separators aside; and with an `=` after the expansion, `-c"../$f=x"`.)
+        if (word.startsWith("-") && !word.startsWith("--") && reads(rname) && !READERS.has(rname) && rname !== "column" && /^-[^DjlO$`]/.test(word)) {
+          const mark = words?.[k];
+          const value = mark === undefined ? word.slice(2) : mark.slice(2);
+          if (mark === undefined ? /[$`]/.test(value) : MARKS.test(value)) add("classify", `${name} ${word}: an option whose value bash builds at run time, which may name a file ${name} loads`);
+        }
         if (word.startsWith("-") && !word.includes("=")) continue;
         const strip = (w: string) => w.replace(/^-[^=]*=/, "").replace(/^@/, "");
         const text = strip(word);
         const mark = words ? strip(words[k]) : undefined;
         const dynamic = mark === undefined ? /[$`]/.test(text) : MARKS.test(mark);
         if (dynamic) {
-          if (!READERS.has(name)) continue;
+          // (A compiler's macro definition, `gcc -DVERSION="$v"`, names no file (round 6, Sol: meson's
+          // and cmake's `-D` hold flags and paths); a dev tool's other option
+          // words, `eslint -c="../$f"`, `--config="$c"`, and every option of a reader may.)
+          if (!reads(rname) || (!READERS.has(rname) && !READ_ONLY.has(rname) && /^-D/.test(word) && COMPILER.test(rname))) continue;
           const looped = mark !== undefined ? loopUse(mark, loops.get(n), cwd) : undefined;
           if (!looped) {
             // A loop over a glob the matcher cannot read asks, as a reader given that glob does
@@ -3074,7 +3099,7 @@ export function runtimeReads(command: string, where: Located, scope: Scope, gitQ
         const files = here?.elsewhere || (relative && cwd === undefined) || unreadableGlob(placed) ? undefined : expandWord(placed, cwd ?? "/");
         if (!files) {
           // A pattern the matcher cannot read is a verdict (round 4, finding 6).
-          if (READERS.has(name)) add(!/[$`]/.test(text) && unreadableGlob(text) ? "ask" : "classify", `${name} reads a file named at run time: ${word}`);
+          if (READERS.has(rname) || (reads(rname) && (READ_ONLY.has(rname) || !/^-D/.test(word) || !COMPILER.test(rname)))) add(!/[$`]/.test(text) && unreadableGlob(text) ? "ask" : "classify", `${name} reads a file named at run time: ${word}`);
           continue;
         }
         // A file called `-rf` or `--to-command=x` becomes an option once the glob is expanded.
@@ -3911,6 +3936,12 @@ function installProblem(manager: string, managerArgs: string[], placeOk?: (dir: 
   if (manager !== "pip" && manager !== "pip3" && manager !== "uv" && manager !== "cargo" && manager !== "go" && manager !== "gem" && sub === "audit" && managerArgs.includes("fix")) return `${manager} audit fix installs packages, which runs their install scripts`;
   if (manager === "yarn" && !sub) return "yarn without a subcommand installs packages";
   if (manager === "go" && sub === "run" && managerArgs.some((a) => a.includes("@"))) return "go run of a remote package downloads and runs it";
+  // (Project review 6, Opus, Sol, Neon: `go env -w` / `-u` writes Go's own settings file, outside
+  // the project, which every later go call reads (`GOFLAGS=-toolexec=...`); `-mod=mod` lets go
+  // fetch a module go.mod does not hold and add it, `go run -mod=mod github.com/x/y`. Any word of
+  // either, in any spelling go reads.)
+  if (manager === "go" && sub === "env" && managerArgs.some((a) => /^--?[wu](=|$)/.test(a))) return "go env -w changes Go's settings outside the project, which later go calls read";
+  if (manager === "go" && managerArgs.some((a, k) => /^--?mod=mod$/.test(a) || (/^--?mod$/.test(a) && managerArgs[k + 1] === "mod"))) return "go with -mod=mod fetches modules go.mod does not hold";
   return undefined;
 }
 
@@ -4414,6 +4445,10 @@ function managerProblem(name: string, args: string[]): string | undefined {
       // (Round 24, Mythos: `-C <dir>` after `tool` too.)
       let w = tool + 1;
       while (w < args.length && args[w].startsWith("-")) w += /^--?C$/.test(args[w]) ? 2 : 1;
+      // (Project review 6, Neon: an option there may take the next word as its value, `go tool
+      // -modfile x.mod test2json ...`, so the word read as the tool may not be it. Only `-C <dir>`
+      // and `-n` are read; any other option before the tool goes to the decider.)
+      if (args.slice(tool + 1, w).some((a, j, ws) => !/^--?(C|n)$/.test(a) && !/^--?C$/.test(ws[j - 1] ?? ""))) return "go tool with an option before the tool's name, which may take the word read as the tool";
       const which = args[w];
       const after = which === undefined ? [] : args.slice(args.indexOf(which, tool + 1) + 1);
       if (which === "test2json" && after.some((a) => !a.startsWith("-"))) return "go tool test2json runs the command after its options";
@@ -7161,6 +7196,13 @@ export function placedReads(where: Located, scope: Scope, judgeAt: (dir: string,
     for (const p of distinct.values()) {
       const v = own.length || outs.length ? judgeAt(p.real, own.length ? own.map((w) => rewrite(w, p)) : [":"], outs.map((w) => rewrite(w, p))) : undefined;
       if (v && (v.action === "ask" || v.action === "deny")) add("ask", `${v.reason} (where it runs: ${p.real})`);
+      // (Project review 6, round 2, Opus: and what the rules leave to the decider there, `(cd ..
+      // && make)`: a build tool run outside the project.)
+      // (Cross-check: only outside the project; inside it the call's own reading holds, `x=$(cd sub
+      // && pwd)`.)
+      // (Round 3, Opus: and inside it, a tool's place the rules find outside the project from
+      // there, `(cd sub && cargo build --manifest-path up/Cargo.toml)` with up a link out.)
+      else if (v?.action === "classify" && (!(scope.root && within(p.real, scope.root)) || /outside the project/.test(v.reason))) add("classify", `${v.reason} (where it runs: ${p.real})`);
       // Each such word as the file it names there, read or written, as the kernel walks it.
       for (const n of named) {
         if (n.here.elsewhere) continue;
@@ -8238,14 +8280,15 @@ const pagerRuns = (name: string, args: string[]) => (name === "tar" ? !!process.
 // them, as `fetch` is: it sends objects, and whether it may run at all is the push check's.)
 // B8-2: each of the three groups is on the list only where the repository's own configuration
 // names no program (gitConfigProblem): the groups differ in what of the user's own is read.
-const SAFE_GIT = new Set(listed("branch tag fetch push rev-parse ls-tree rev-list remote mv rm gc ls-remote merge-base show-ref symbolic-ref for-each-ref count-objects reflog"));
+const SAFE_GIT = new Set(listed("branch tag fetch push rev-parse ls-tree rev-list remote mv rm gc ls-remote merge-base show-ref symbolic-ref for-each-ref count-objects"));
 // ... that touch the work tree or the index, and so may run a clean, smudge or process filter:
 // safe where the user's own configuration names no program of the project for one either.
 // (`git stash` is one of them: see below.)
 const FILTER_GIT = new Set(listed("status add commit reset restore checkout switch"));
 // ... that show a diff, and so may also run diff.external, a diff driver's command or its
 // textconv: safe where the configuration names no program of the project for those either.
-const DIFF_GIT = new Set(listed("diff log show blame describe shortlog whatchanged"));
+// (Project review 6, Neon: `git reflog -p` is a log, and shows a diff.)
+const DIFF_GIT = new Set(listed("diff log show blame describe shortlog whatchanged reflog"));
 // The options with which `git cat-file` reads only the objects. With any other (`--textconv` and
 // `--filters` run a textconv or a smudge filter: B7-2) it is held to the user's own diff programs
 // too. (B8-2: every git command is held to the repository's own configuration, `ls-files` among
@@ -8296,11 +8339,16 @@ function safeAfterWrite(name: string, args: string[], cmd: Simple, ctx: ArgvCont
   // for a commit or a tag). `diff`: the command may also run the user's own diff programs.
   const config = (diff: boolean): true | string => (ctx.gitConfigProblem ? ctx.gitConfigProblem(cmd, args, diff) : "with a configuration the check was not given") ?? true;
   if (SAFE_GIT.has(sub)) return config(false);
-  if (FILTER_GIT.has(sub)) return config(false);
+  // (Project review 6, Neon: these show a diff too, with the user's own diff programs and
+  // textconv, `git status -v`, `git commit -v --dry-run`, `git add -p`: with an option that may
+  // show one, held to those as well.)
+  // (Cross-check, Opus: git takes a long option by a prefix, `--v`, `--pat`, `--inter`.)
+  const showsDiff = (rest: string[]) => rest.some((w) => /^-[a-zA-Z]*[vpi]/.test(w) || (w.startsWith("--") && w.split("=")[0].length >= 3 && ["--verbose", "--patch", "--interactive"].some((n) => n.startsWith(w.split("=")[0]))));
+  if (FILTER_GIT.has(sub)) return config(showsDiff(call.rest));
   if (DIFF_GIT.has(sub)) return config(true);
   // `git stash` in every form saves and restores files of the work tree (a smudge filter may
   // run); `list` and `show` print a log or a diff.
-  if (sub === "stash") return config(["list", "show"].includes(call.rest[0] ?? ""));
+  if (sub === "stash") return config(["list", "show"].includes(call.rest[0] ?? "") || showsDiff(call.rest));
   if (sub === "ls-files") return config(false);
   if (sub === "cat-file") return config(!call.rest.every((w) => !w.startsWith("-") || CAT_FILE_PLAIN.test(w)));
   if (sub === "bisect" && ["start", "reset", "good", "bad", "new", "old", "skip", "terms", "log"].includes(call.rest[0] ?? "")) return config(false);
@@ -8725,6 +8773,8 @@ export function unseenWriter(cmds: Simple[]): string | undefined {
       const [group, action] = args.slice(0, 2).some((a) => a.startsWith("-")) ? [] : words;
       if ((group === "release" || group === "run") && action === "download") return why(`gh ${group} download`, "release or the artifact");
       if (group === "repo" && action === "clone") return why("gh repo clone", "repository");
+      // (Project review 6, Neon: `gh attestation download` writes the bundles it fetches.)
+      if (group === "attestation" && action === "download") return why("gh attestation download", "attestation");
       if (group === undefined && words.some((w) => w === "download" || w === "clone")) return why("gh with an option before its action, which may be a download or a clone,", "release, the artifact or the repository");
     } else if (name === "git") {
       const call = gitCall(args);

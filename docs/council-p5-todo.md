@@ -1,4 +1,4 @@
-# opencode-automode: deferred council items (project review 5)
+# opencode-automode: deferred council items (project reviews 5 and 6)
 
 Items the review 5 council raised that were left for later sessions: hard to close precisely,
 non-blocking by CONTRIBUTING.md "Reviewing the rules", or over-asks worth relief. Each was probed
@@ -7,30 +7,58 @@ spelling.
 
 ## Possible gaps (allow where a sibling spelling asks)
 
-- Read tool: `decideRead` does not ask for files only sandbox.ts `DEFAULT_SECRET_PATHS` hides
-  (`~/.local/share/opencode/auth.json`, `~/.config/git/credentials`, `~/.claude/.credentials.json`);
-  cheap fix: ask on `isSecretPath` of the sandbox list too (Opus r1).
-- `cd .. && make`, `cd / && make`, `cd .. && go test ./...` allow while `make -C ..` asks (Opus r6;
-  same class as `npm --prefix ..`).
-- `gh auth token` goes to the model while `gh auth status -t` is a firm ask (Opus r6).
-- `gh attestation download` writes a file but is not in `unseenWriter` (sandbox off; Opus r6).
-- `gh api -X GET --input f` sends a file as a GET body; `gh api --field=q=@.env` misses the
-  credential name (`secretIn` strips one `key=`) (Opus r3, r5).
-- `patch -p1 --directory=.claude` allows while `-d .claude` asks (Mythos r6).
-- Readers in no list: `shellcheck "$f"`, `shfmt -d "$f"`, eslint/tsc/prettier/yamllint/hadolint/
-  markdownlint/tokei with a name built at run time; `dmesg -F "$(…)"`, `gcc -E -x c "./$(…)"`,
-  `tree --fromfile`, `tldr --render "$(…)"`, `black --diff`, `rustfmt --emit stdout` (Mythos r3, r4, r6).
-- `less "--$x" a`, `bat "--$x" a` in a session with no writes (Mythos r6).
-- `clang -gcc-toolchain /tmp/x` (single dash) allows; `--gcc-toolchain` asks (Mythos r3, not reproduced).
-- `go run -mod=mod pkg`, `go tool -modfile=x.mod y`, `uv run -p /tmp/x/python`, `cargo run
-  --manifest-path /other/Cargo.toml`, `go run -C /other .` (Mythos r3, not reproduced).
-- `ss -D AGENTS.md` (dump-to-file not read) (Mythos r4).
-- `rm -rf ?*`, `rm -rf **`, `rm -rf [!.]*`, `rm -rf ./?*` allow while `rm -rf *` asks (Mythos r4;
-  the project-wipe ask is for the common spelling; README promises only the root/home deny).
-- `journalctl --vacuum-time=1s`, `--rotate`, `--flush`, `--setup-keys`; `hostname foo` (need root).
-- `go env -w GOFLAGS=-toolexec=x` persists a program for later builds (Mythos r2, r3).
-- `fastfetch --command-text`, `bat --pager '…' --paging=always` (README: programs judged by name).
+Review 6 (rounds 1 to 11, see the description of its pull request) probed every item below.
+
+Closed by review 6:
+
+- Read tool and the sandbox's hidden credentials: `SECRET_PATHS` moved to rules.ts and asked on
+  for every read (Read tool and shell).
+- `cd .. && make`, `cd / && make`, `cd .. && go test ./...`: a build tool run outside the project
+  goes to the decider, in a subshell, a background job or a command substitution too.
+- `gh auth token` (and `gh auth git-credential`, `git credential*`, `gh config ... token`): firm asks.
+- `gh attestation download`: in `unseenWriter`.
+- `gh api -X GET --input f`, `--field=q=@.env`: go to the decider; `key=@file` read by the
+  credential check.
+- `patch --directory=.claude`, `-d.claude`, through a link, built at run time: read as write places.
+- Readers in no list (`shellcheck "$f"`, `black --diff "$f"`, `dmesg -F "$(...)"`, `tldr --render`,
+  ...): a file named at run time goes to the model for every program allowed by name.
+- `ss -D AGENTS.md`, `fastfetch --gen-config`: ask.
+- `rm -rf ?*`, `**`, `[!.]*`, `[[:alpha:]]*`, `./?*`: the project-wipe ask (deny beside home).
+- `go env -w GOFLAGS=...`: asks; `go run -mod=mod <remote>` asks.
+- `go run -C /other .`, `cargo run --manifest-path /other/Cargo.toml`, `uv run -p ../x/python`:
+  a place outside the project named by a dev tool or package manager goes to the decider.
+
+Still open:
+
+- `journalctl --vacuum-time=1s`, `--rotate`, `--flush`, `--setup-keys`; `hostname foo`; `ss -K`
+  (need root).
+- `clang -gcc-toolchain /tmp/x`, `uv run -p /tmp/x/python`: temp dirs count as the project's (a
+  file the session wrote there is held by the write record).
+- `fastfetch --command-text`, `bat --pager '...' --paging=always` (README: programs judged by name).
 - Committed credentials read from git history behind `--` (`git log -p -- "$f"`): README Known gap.
+
+## From review 6 (left open, or new)
+
+- **Next step, agreed with the maintainer:** flip build, test, lint and format tools and package
+  managers to an allowlist (as `unreadSpelling` does for find, tar and rsync): auto-allow only a
+  call whose every word is a flag from a short per-tool table or a plain relative path in the
+  project (no `..`, link, `$`, quote, bracket or `=` value beyond a short list), run in the
+  project; everything else to the model. Rounds 2 to 11 of review 6 found only new spellings of
+  places hidden in these tools' values (attached letters, comma lists, `=` values, structured
+  JSON/list values, links before `..`); reading more spellings does not converge. Measure with the
+  bench differential before and after, then delete `projectToolPlaces`' value reader.
+- git after a `cd` out of the project (`cd ../other && git commit -am x`, `cd .. && git status`)
+  allows, while `git -C ../other ...` goes to the decider (Opus r9; with the sandbox on the other
+  `.git` is read-only).
+- `findmnt -F "$f"` (journal-format files only), `NODE_COMPILE_CACHE` set in a session's
+  `event.env` but not in the plugin's environment, `pacman -Fy` (Neon r1, non-blocking).
+- `prettier --write "{AGENTS,README}.md"`: prettier's own brace glob (Opus r10, a reformat only).
+- Over-asks introduced by review 6 (to the model): `npm pack ..`; `gcc -I/usr/include/x`,
+  `gcc -Wl,-rpath,/usr/lib`, `cmake -DCMAKE_INSTALL_PREFIX=/usr/local` (places outside the
+  project); `markdownlint AGENTS.md`, `prettier --check AGENTS.md`; `cd /tmp && make`; `column -t
+  "$f"`; `cmake -B "build-$t"`; `uv run pytest "tests/$f"`, `pytest -k "$k"`; `uv run --env-file
+  .env python app.py` (credential ask); a jest config with a regex escape; `cd .. && python -m
+  pytest`; `mkdir -p sub; x=$(cd sub && pwd)`.
 
 ## Over-asks introduced by review 5 (to the model; relief only if common and small)
 
