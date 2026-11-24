@@ -17,7 +17,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { makeScope, readVerdict } from "./rules.ts";
+import { makeScope, readVerdict, SECRET_PATHS } from "./rules.ts";
 
 const HOME = os.homedir();
 
@@ -31,74 +31,9 @@ const XDG_DATA = process.env.XDG_DATA_HOME || path.join(HOME, ".local", "share")
 const XDG_STATE = process.env.XDG_STATE_HOME || path.join(HOME, ".local", "state");
 const XDG_CACHE = process.env.XDG_CACHE_HOME || path.join(HOME, ".cache");
 
-// Credentials hidden from sandboxed commands (reads are not otherwise restricted). This list
-// holds what the rules' own notion of a credential file (rules.ts, asked through readVerdict)
-// does not cover; plan() adds every file and directory under $HOME and the project that the
-// rules would ask about, so the two cannot drift apart.
-export const DEFAULT_SECRET_PATHS = [
-  path.join(XDG_CONFIG, "opencode"),
-  path.join(XDG_DATA, "opencode"),
-  path.join(XDG_STATE, "opencode"),
-  path.join(XDG_CONFIG, "gh"),
-  path.join(XDG_CONFIG, "glab-cli"),
-  path.join(XDG_CONFIG, "github-copilot"),
-  path.join(XDG_CONFIG, "gcloud"),
-  path.join(XDG_CONFIG, "op"),
-  path.join(XDG_CONFIG, "rclone"),
-  path.join(XDG_CONFIG, "hub"),
-  path.join(XDG_CONFIG, "git", "credentials"),
-  path.join(XDG_DATA, "keyrings"),
-  path.join(XDG_CACHE, "git", "credential"),
-  `/tmp/krb5cc_${process.getuid?.() ?? 0}`,
-  ...[
-    ".ssh",
-    ".gnupg",
-    ".password-store",
-    ".aws",
-    ".azure",
-    ".oci",
-    ".kube",
-    ".docker/config.json",
-    ".netrc",
-    ".git-credentials",
-    ".git-credential-cache",
-    ".npmrc",
-    ".pypirc",
-    ".claude/.credentials.json",
-    ".codex/auth.json",
-    ".secrets",
-    ".cargo/credentials.toml",
-    ".cargo/credentials",
-    ".vault-token",
-    ".pgpass",
-    ".my.cnf",
-    ".terraform.d/credentials.tfrc.json",
-    ".m2/settings.xml",
-    ".m2/settings-security.xml",
-    ".gradle/gradle.properties",
-    ".bash_history",
-    ".zsh_history",
-    ".sh_history",
-    ".python_history",
-    ".node_repl_history",
-    ".psql_history",
-    ".mysql_history",
-    ".sqlite_history",
-    ".rediscli_history",
-    ".lesshst",
-    ".Xauthority",
-    // Registry logins and browser profiles (cookies, saved passwords).
-    ".gem/credentials",
-    ".composer/auth.json",
-    ".mozilla",
-    ".librewolf",
-    ".zen",
-    "snap/firefox",
-    "snap/chromium",
-  ].map((p) => path.join(HOME, p)),
-  ...["composer/auth.json", "containers/auth.json", "google-chrome", "google-chrome-beta", "chromium", "BraveSoftware", "microsoft-edge", "vivaldi", "opera"].map((p) => path.join(XDG_CONFIG, p)),
-  ...["fish/fish_history", "atuin"].map((p) => path.join(XDG_DATA, p)),
-];
+// Credentials hidden from sandboxed commands: the rules' list (rules.ts SECRET_PATHS), which the
+// rules also ask about for every read, the Read tool's included (project review 6).
+export const DEFAULT_SECRET_PATHS = SECRET_PATHS;
 
 // In ~/.ssh, what a command that uses ssh may still see: never private keys.
 const SSH_VISIBLE = /^(known_hosts(\.old)?|config|authorized_keys|.*\.pub)$/;

@@ -1961,7 +1961,9 @@ function remoteProgramOk(argv: string[]): boolean {
     if (w === "--") return false;
     if (!w.startsWith("-") || w === "-") operands.push(w);
     else if (spec.valued?.includes(w)) {
-      if (++i >= argv.length) return false;
+      // (Project review 6, Neon: a value that begins with `-` may be read as one of the program's
+      // own options by the check, `rg -g --files -g '*' TEXT /etc` searches file contents.)
+      if (++i >= argv.length || argv[i].startsWith("-")) return false;
       if (spec.values?.[w] && !spec.values[w].test(argv[i])) return false;
     } else if (spec.long?.includes(w)) continue;
     else if (w.startsWith("--")) {

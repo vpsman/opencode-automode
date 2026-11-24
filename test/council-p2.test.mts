@@ -586,7 +586,10 @@ test("round 19: an escaped \\ before a line end keeps a later \$( escaped; npm s
   }
   assert.ok("ask" in canonical('echo "$\\\n$(echo "c")"'), "a $ before a line continuation still asks");
   for (const c of ["npm show github:u/r", "npm v u/r"]) assert.equal(await effect(c), "ask", c);
-  for (const c of ["npm view lodash 'versions[0]'", "npm pack .", "npm pack ..", "npm view ."]) assert.equal(await effect(c), "allow", c);
+  for (const c of ["npm view lodash 'versions[0]'", "npm pack .", "npm view ."]) assert.equal(await effect(c), "allow", c);
+  // (Project review 6: a package outside the project goes to the decider, as every place a build
+  // tool or package manager names outside it does.)
+  assert.notEqual(await effect("npm pack .."), "allow");
 });
 
 // ---- round 20 ----
