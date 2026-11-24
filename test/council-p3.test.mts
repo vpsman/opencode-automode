@@ -2702,3 +2702,28 @@ test("project review 6, round 10 (Opus, Sol): a credential named through ~user, 
   ]) assert.notEqual(await decide22(command), "allow", command);
   for (const command of ["gcc -obuild/app a.c", "gcc -MMD -MFbuild/deps.d -c a.c", `cat ~${user}/notes.txt`]) assert.equal(await decide22(command), "allow", command);
 });
+
+test("project review 6, round 11 (Opus, Sol): a value walked as the kernel walks it, a `..` after a link; ~user with blanks or `..`", async () => {
+  const top = path.join(base, "r23");
+  const repo23 = path.join(top, "repo");
+  fs.mkdirSync(repo23, { recursive: true });
+  fs.mkdirSync(path.join(top, "outside", "deep"), { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "main", repo23]);
+  fs.symlinkSync(path.join(top, "outside"), path.join(repo23, "ext"));
+  fs.symlinkSync(path.join(top, "outside", "deep"), path.join(repo23, "deep"));
+  fs.mkdirSync(path.join(repo23, ".git", "hooks"), { recursive: true });
+  fs.symlinkSync(".git/hooks", path.join(repo23, "hk"));
+  const decide23 = async (command: string) => (await decideShell(guard, new SessionState(repo23), repo23, command)).effect;
+  const user = os.userInfo().username;
+  for (const command of [
+    "make -Cext/..",
+    "go test -Cext/.. ./...",
+    "eslint -cext/../x.js .",
+    "mocha -r a.js,ext/../x.js",
+    "patch -p1 -dext/.. < p.diff",
+    "gcc -MFhk/../config a.c",
+    "gcc -MMD -MFdeep/../deps.d -c a.c",
+    `cat ~${user}/.config/chromium/"Local State"`,
+  ]) assert.notEqual(await decide23(command), "allow", command);
+  for (const command of ["gcc -obuild/app a.c", "go test ./...", "gcc -Iinclude a.c", "patch -p1 -d sub < p.diff", "eslint ."]) assert.equal(await decide23(command), "allow", command);
+});
