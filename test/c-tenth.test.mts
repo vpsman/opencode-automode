@@ -698,3 +698,38 @@ test("r4 27: --gpg-sign abbreviated after --no-gpg-sign signs, and asks; --no-gp
     assert.match(d.sandboxBreaks("git commit --gpg-si=ABCD -m x", r, session) ?? "", SIGNS);
     assert.doesNotMatch(d.sandboxBreaks("git commit --no-gpg -m x", r, session) ?? "", SIGNS);
   }));
+
+// ---- After review 6: config read by its text before git is asked ----
+
+test("a core.hooksPath git reads is still found when the config is read by its text first: any case, a linked worktree's common directory, an include, your own config", () =>
+  fixture((r, g) => {
+    commit(r);
+    const hooksOf = (gitDir: string) => gitReadsElsewhere(gitDir).hooks;
+    // Nothing set: nothing found.
+    assert.deepEqual(hooksOf(path.join(r, ".git")), []);
+    // Written by hand, in a case git takes.
+    fs.appendFileSync(path.join(r, ".git", "config"), "[CORE]\n\tHOOKSPATH = hk1\n");
+    assert.ok(hooksOf(path.join(r, ".git")).includes(path.join(r, "hk1")), hooksOf(path.join(r, ".git")).join(", "));
+    // A linked worktree's admin directory reads the common directory's config.
+    g("worktree", "add", "-q", `${r}-wt`);
+    const admin = path.join(r, ".git", "worktrees", path.basename(`${r}-wt`));
+    assert.ok(hooksOf(admin).some((h) => h.endsWith("/hk1")), hooksOf(admin).join(", "));
+    g("worktree", "remove", "--force", `${r}-wt`);
+    // Set only in a file the config includes.
+    g("config", "--unset", "core.hooksPath");
+    write(path.join(r, "inc.cfg"), "[core]\n\thooksPath = hk2\n");
+    fs.appendFileSync(path.join(r, ".git", "config"), "[Include]\n\tpath = ../inc.cfg\n");
+    assert.ok(hooksOf(path.join(r, ".git")).includes(path.join(r, "hk2")), hooksOf(path.join(r, ".git")).join(", "));
+    // Set in your own config.
+    g("config", "--unset", "include.path");
+    assert.deepEqual(hooksOf(path.join(r, ".git")), []);
+    const own = process.env.GIT_CONFIG_GLOBAL!;
+    const before = fs.existsSync(own) ? fs.readFileSync(own) : undefined;
+    try {
+      fs.appendFileSync(own, "[core]\n\thooksPath = hk3\n");
+      assert.ok(hooksOf(path.join(r, ".git")).includes(path.join(r, "hk3")), hooksOf(path.join(r, ".git")).join(", "));
+    } finally {
+      if (before === undefined) fs.rmSync(own, { force: true });
+      else fs.writeFileSync(own, before);
+    }
+  }));

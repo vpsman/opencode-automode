@@ -498,7 +498,12 @@ function isSecretPath(p: string): boolean {
   if (/\.pub$|^known_hosts|^authorized_keys$|^\.env\.(example|sample|template|dist|defaults?)$/i.test(name)) return false;
   if (/\/\.(ssh|aws)\/config$/.test(p)) return false;
   if (/cert|chain|public|(^|[._-])ca([._-]|$)/i.test(name) && !/priv|key/i.test(name.replace(/\.key$/i, ""))) return false;
-  return SECRET_PLACES.some((place) => place.test(p)) || SECRET_NAMES.test(name) || SECRET_PATHS.some((d) => within(p, d));
+  if (SECRET_PLACES.some((place) => place.test(p)) || SECRET_NAMES.test(name)) return true;
+  // By prefix, on the resolved text: the sandbox's walk asks this of every dotfile it meets, and
+  // `within` (path.relative) against each of these paths made a walk of a large tree miss its
+  // time limit.
+  const at = path.resolve(p);
+  return SECRET_PATHS.some((d) => at === d || at.startsWith(d + "/"));
 }
 
 // The home directory of a user by name, as bash's `~name` finds it (round 11, Opus).
