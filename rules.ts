@@ -523,6 +523,10 @@ function secretIn(word: string, scope: Scope, isPath = false, operand = false): 
     // through a directory named like an option, as an option's value or an awk operand reads it.)
     if (!candidate || (candidate.startsWith("-") && !operand && !/^-[^=]*\//.test(candidate))) continue;
     const p = resolveWord(candidate, scope);
+    // (Project review 6, round 10, Opus: `~name/rest` is a home directory's `rest`, as bash expands
+    // it, `cat ~agent/.local/share/opencode/auth.json`.)
+    const named = /^~[^/+-][^/]*\/(.+)$/.exec(candidate);
+    if (named && isSecretPath(path.join(HOME, named[1]))) return candidate;
     if (isSecretPath(expandHome(candidate)) || (p && (isSecretPath(p) || isSecretPath(followLinks(p, scope))))) return candidate;
   }
   return undefined;
@@ -4985,6 +4989,16 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
 // included: a protected name (the plugin's, opencode's, a `.git` component) asks, and a path
 // outside the project, the temp directories and the allowed places goes to the decider, as does
 // a run in such a directory. Words built at run time are judged elsewhere (runtimeReads).
+// (Round 10, Sol: a place inside the project by its name that leads out of it through a link
+// there now: the place itself, or for a file not made yet, its nearest parent that is there,
+// `gcc -MFext/deps.d` with ext a link out.)
+function linkedOut(p: string, scope: Scope): boolean {
+  if (!scope.root) return false;
+  for (let at = p; at !== path.dirname(at) && within(at, scope.root); at = path.dirname(at)) {
+    if (fs.existsSync(at)) return !isLocal(realish(at), scope);
+  }
+  return false;
+}
 const PROJECT_TOOLS = new Set([...DEV_TOOLS, ..."go cargo npm npx pnpm pnpx yarn bun bunx uv uvx deno poetry pipenv pdm hatch".split(" ")]);
 function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: number) => boolean): Verdict | undefined {
   if (!scope.root) return undefined;
@@ -5048,7 +5062,7 @@ function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: 
     if (!p && /^~[^/]/.test(t)) verdict ??= classify(`${name} names ${t}, a place the check cannot tell`);
     if (p && (isGuarded(p, scope) || isPiFile(p, scope) || /(^|\/)\.git(\/|$)/.test(p))) return ask(`${name} names ${t}, a protected file or directory it may read as config or write`);
     // (Cross-check, Sol: a tail that is a link out of the project, `ninja -vCext`.)
-    if (p && fs.existsSync(p) && !isLocal(realish(p), scope)) verdict ??= classify(`${name} names ${t}, outside the project through a link: a place it may load code or config from, or write`);
+    if (p && linkedOut(scope.cwd !== undefined ? path.resolve(scope.cwd, expandHome(t)) : p, scope)) verdict ??= classify(`${name} names ${t}, outside the project through a link: a place it may load code or config from, or write`);
   }
   for (const w of words) {
     const value = w.replace(/^@/, "");
@@ -5063,7 +5077,7 @@ function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: 
     }
     if (isGuarded(p, scope) || isPiFile(p, scope) || /(^|\/)\.git(\/|$)/.test(p)) return ask(`${name} names ${value}, a protected file or directory it may read as config or write`);
     // (Round 2, Opus: a plain name that is a link out of the project, `go test -C ext ./...`.)
-    if (((pathy(value) && !isLocal(p, scope)) || !isLocal(realish(p), scope)) && p !== "/dev/null") verdict ??= classify(`${name} names ${value}, outside the project: a place it may load code or config from, or write`);
+    if (((pathy(value) && !isLocal(p, scope)) || !isLocal(realish(p), scope) || (scope.cwd !== undefined && linkedOut(path.resolve(scope.cwd, expandHome(value)), scope))) && p !== "/dev/null") verdict ??= classify(`${name} names ${value}, outside the project: a place it may load code or config from, or write`);
   }
   return verdict;
 }

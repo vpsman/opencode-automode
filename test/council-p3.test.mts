@@ -2682,3 +2682,23 @@ test("project review 6, round 9 (Opus, Sol): a Python module's files named at ru
   ]) assert.notEqual(await decide21(command), "allow", command);
   for (const command of ["node --test", "python -m pytest", "python -m pytest tests/"]) assert.equal(await decide21(command), "allow", command);
 });
+
+test("project review 6, round 10 (Opus, Sol): a credential named through ~user, a new file under a link out of the project", async () => {
+  const repo22 = path.join(base, "repo22");
+  const outside = path.join(base, "outside22");
+  fs.mkdirSync(repo22, { recursive: true });
+  fs.mkdirSync(outside, { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "main", repo22]);
+  fs.symlinkSync(outside, path.join(repo22, "ext"));
+  const decide22 = async (command: string) => (await decideShell(guard, new SessionState(repo22), repo22, command)).effect;
+  const user = os.userInfo().username;
+  for (const command of [
+    `cat ~${user}/.local/share/opencode/auth.json`,
+    `cat ~${user}/.claude/.credentials.json`,
+    "cat ~root/.ssh/id_rsa",
+    "gcc -MMD -MFext/deps.d -c a.c",
+    "gcc -MMD -Wp,-MFext/deps.d -c a.c",
+    "clang -MJext/compile.json -c a.c",
+  ]) assert.notEqual(await decide22(command), "allow", command);
+  for (const command of ["gcc -obuild/app a.c", "gcc -MMD -MFbuild/deps.d -c a.c", `cat ~${user}/notes.txt`]) assert.equal(await decide22(command), "allow", command);
+});
