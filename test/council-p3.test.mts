@@ -2556,3 +2556,25 @@ test("project review 6, round 2 (Opus, Sol): a build tool run outside the projec
   assert.notEqual(await decide15('cat ".ssh/key with space"'), "allow");
   for (const command of ["(cd sub && ls)", "(cd .. && ls)", "x=$(cd sub && pwd)", "make", "go test ./...", "npm test", "pytest tests", 'grep "foo bar" sub', 'git commit -m "fix ~/x and more"']) assert.equal(await decide15(command), "allow", command);
 });
+
+test("project review 6, round 3 (Opus, Sol): a link out of the project reached from a subshell, patch through a link, comma lists", async () => {
+  const repo16 = path.join(base, "repo16");
+  fs.mkdirSync(path.join(repo16, "sub"), { recursive: true });
+  fs.mkdirSync(path.join(repo16, ".claude"), { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "main", repo16]);
+  fs.symlinkSync("../..", path.join(repo16, "sub", "up"));
+  fs.symlinkSync(".claude", path.join(repo16, "configlink"));
+  const decide16 = async (command: string) => (await decideShell(guard, new SessionState(repo16), repo16, command)).effect;
+  for (const command of [
+    "(cd sub && cargo build --manifest-path up/Cargo.toml)",
+    "x=$(cd sub && cargo build --manifest-path up/Cargo.toml)",
+    "(cd sub && eslint -c up/x.js .)",
+    "(cd sub && ninja -vCup)",
+    "patch -p1 --directory=configlink < c.patch",
+    "patch -p1 -dconfiglink < c.patch",
+    "mocha --require=test/setup.js,../x.js",
+    "mocha -r test/setup.js,../x.js",
+    "git-credential-store get",
+  ]) assert.notEqual(await decide16(command), "allow", command);
+  for (const command of ["patch -p1 -dsub < c.patch", "cargo build --features a,b", "gcc -Wl,-rpath,/usr/lib a.c", "x=$(cd sub && pwd)", "(cd sub && make)", "(cd sub && npm test)"]) assert.equal(await decide16(command), "allow", command);
+});

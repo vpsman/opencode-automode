@@ -7194,7 +7194,9 @@ export function placedReads(where: Located, scope: Scope, judgeAt: (dir: string,
       // && make)`: a build tool run outside the project.)
       // (Cross-check: only outside the project; inside it the call's own reading holds, `x=$(cd sub
       // && pwd)`.)
-      else if (v?.action === "classify" && !(scope.root && within(p.real, scope.root))) add("classify", `${v.reason} (where it runs: ${p.real})`);
+      // (Round 3, Opus: and inside it, a tool's place the rules find outside the project from
+      // there, `(cd sub && cargo build --manifest-path up/Cargo.toml)` with up a link out.)
+      else if (v?.action === "classify" && (!(scope.root && within(p.real, scope.root)) || /outside the project/.test(v.reason))) add("classify", `${v.reason} (where it runs: ${p.real})`);
       // Each such word as the file it names there, read or written, as the kernel walks it.
       for (const n of named) {
         if (n.here.elsewhere) continue;

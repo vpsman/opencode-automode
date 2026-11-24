@@ -3612,7 +3612,8 @@ function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = 
       }
     }
   }
-  for (const t of [...targets, ...places.filter((v) => /[/~]/.test(v) || v.startsWith("."))]) {
+  // (Round 3, Sol: or a name that is there, a link into a protected place, `-dconfiglink`.)
+  for (const t of [...targets, ...places.filter((v) => /[/~]/.test(v) || v.startsWith(".") || (!/^\d+$/.test(v) && !!resolveWord(v, scope) && fs.existsSync(resolveWord(v, scope)!)))]) {
     // Copied into a directory, the files land inside it: `cp a.rs /tmp` writes /tmp/a.rs.
     const written = intoDir && t === destWord && dest && sources.length ? sources.map((s) => path.join(dest, path.basename(s))) : [resolveWord(t, scope)];
     for (const p of written) {
@@ -4279,6 +4280,8 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
     return worst(verdict, criticalAsk(`${name} runs as root`), inner.length ? simple(tail(inner), scope, depth + 1) : ALLOW);
   }
   if (ALWAYS_ASK[name]) return worst(verdict, (name === "su" || name === "pkexec" ? criticalAsk : ask)(`${name} ${ALWAYS_ASK[name]}`));
+  // (Round 3, Opus: git's credential helpers run as programs print stored passwords too.)
+  if (/^git-credential/.test(name)) return worst(verdict, criticalAsk(`${name} prints or changes stored passwords`));
   // (opencode-automode: a lone `-h` or `-V` is an option of many programs, hashall to a shell,
   // verbose to vim, after which they read standard input; only the programs these rules know (read
   // only, dev tools, tools with subcommands, runners, interpreters) take it as help or a version
@@ -4984,7 +4987,8 @@ function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: 
     a = plain;
     // (After the first `=` and after the last, `--emit=llvm-ir=AGENTS.md`.)
     // (Cross-check, Opus: and each blank-separated part, `pytest -o "pythonpath=src ../x"`.)
-    const valued = (w: string) => [w.slice(w.indexOf("=") + 1), w.slice(w.lastIndexOf("=") + 1)].flatMap((v) => [v, ...v.split(/\s+/)]).filter(Boolean);
+    // (Round 3, Opus: and each comma-separated part, `mocha --require=a.js,../x.js`.)
+    const valued = (w: string) => [w.slice(w.indexOf("=") + 1), w.slice(w.lastIndexOf("=") + 1)].flatMap((v) => [v, ...v.split(/[\s,]+/)]).filter(Boolean);
     if (a.startsWith("-") && a.includes("=")) words.push(...valued(a));
     if (a.startsWith("-") && !a.startsWith("--") && a.length > 2) {
       // (The rest of a short option word after its letter, `-o.git/x`, `-oAGENTS.md`; and after
@@ -4999,7 +5003,7 @@ function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: 
         if (/^[.~]/.test(a.slice(k)) || (k <= 3 && a[k] === "/")) words.push(a.slice(k));
       }
     } else if (!a.startsWith("-")) {
-      words.push(a);
+      words.push(a, ...(a.includes(",") ? a.split(",").filter(Boolean) : []));
       // (Round 2, Sol: an option's value of the form `key=place`, `pytest -o pythonpath=../x`.)
       if (a.includes("=")) words.push(...valued(a));
     }
