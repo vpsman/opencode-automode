@@ -5029,6 +5029,7 @@ function walked(raw: string, scope: Scope): string | undefined {
 }
 const protectedPlace = (p: string, scope: Scope) => isGuarded(p, scope) || isPiFile(p, scope) || /(^|\/)\.git(\/|$)/.test(p);
 const PROJECT_TOOLS = new Set([...DEV_TOOLS, ..."go cargo npm npx pnpm pnpx yarn bun bunx uv uvx deno poetry pipenv pdm hatch".split(" ")]);
+const plainSpelling = (w: string) => !/['"\\]/.test(w) && !/(^|[=:,])~(?!\/)/.test(w);
 function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: number) => boolean): Verdict | undefined {
   if (!scope.root) return undefined;
   if (scope.cwd !== undefined && !isLocal(scope.cwd, scope)) return classify(`${name} runs in ${scope.cwd}, outside the project, where it reads that directory's code and config`);
@@ -5047,6 +5048,14 @@ function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: 
     const plain = /[$`]/.test(a) ? expandVars(a, scope) : a;
     if (/[$`]/.test(plain) && dyn(k)) continue;
     a = plain;
+    // (After review 6, a gate in front of the reading below, meant to be temporary: a word in a
+    // spelling that is not plain goes to the decider whatever the reading would make of it.
+    // Not plain: a quote left inside a value, a backslash, a `~user`: the structured values and
+    // escapes rounds 6 to 11 of review 6 kept finding in new forms (`-Dc_args=['-I../x']`,
+    // `--config '{"rootDir":".."}'`, `\u002e`, `~agent/x`). Blanks, `|`, parentheses, brackets
+    // and a `$` that is text pass (`-ldflags="-s -w"`, `-k "not slow"`, `test_x[flat]`,
+    // `-rpath,'$ORIGIN'`, `-run "Test$"`). Delete this gate once the reading covers them.)
+    if (!plainSpelling(a)) verdict ??= classify(`${name} ${a.slice(0, 60)}: a spelling the check does not read in full`);
     // (Before round 8: a backstop on the word's text, whatever the reading below makes of its
     // structure: a `.git`, `.claude` or `.opencode` component or a context file's name anywhere
     // asks.)
