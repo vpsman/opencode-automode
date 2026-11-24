@@ -4997,6 +4997,9 @@ function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: 
     const plain = /[$`]/.test(a) ? expandVars(a, scope) : a;
     if (/[$`]/.test(plain) && dyn(k)) continue;
     a = plain;
+    // (Before round 8: a backstop on the word's text, whatever the reading below makes of its
+    // structure: a `.git` component or a context file's name anywhere asks.)
+    if (/(^|[^\w.])\.git([^\w.-]|$)/.test(a) || /(^|[^\w.-])(AGENTS|CLAUDE)\.(md|MD)|AGENTS\.override\.md/.test(a)) return ask(`${name} ${a.slice(0, 60)}: names a protected file or directory, which it may read as config or write`);
     // (Round 7, Sol: a structured value with an escape the tool decodes, `{"rootDir":"\u002e\u002e"}`,
     // is one the check does not read: it goes to the decider.)
     if (/\\/.test(a) && /[{[]/.test(a)) verdict ??= classify(`${name} ${a.slice(0, 60)}: a structured value with escapes the check does not decode`);
