@@ -501,10 +501,19 @@ function isSecretPath(p: string): boolean {
   return SECRET_PLACES.some((place) => place.test(p)) || SECRET_NAMES.test(name) || SECRET_PATHS.some((d) => within(p, d));
 }
 
+// (Cross-check, Sol: a relative word with a blank is a path where it names one that is there,
+// `cat ".ssh/key with space"`; a message is no file.)
+function blankPathThere(word: string, scope: Scope): boolean {
+  const p = resolveWord(word.replace(/^[^=/]*=/, "").replace(/^@/, ""), scope);
+  return !!p && fs.existsSync(p);
+}
+
 // The credential file a shell word names, if any. Handles `--file=path`, curl's `@file` and
 // git's `rev:path`. In a command, words with spaces and URLs are text, not paths.
 function secretIn(word: string, scope: Scope, isPath = false, operand = false): string | undefined {
-  if (!isPath && (/\s/.test(word) || /^[a-z][a-z0-9+.-]*:\/\//i.test(word))) return undefined;
+  // (Project review 6, round 2, Sol: a word with a blank that begins as a path is one, `~/.config/
+  // chromium/"Local State"`.)
+  if (!isPath && ((/\s/.test(word) && !/^(\/|~\/)/.test(word) && !blankPathThere(word, scope)) || /^[a-z][a-z0-9+.-]*:\/\//i.test(word))) return undefined;
   // An operand (after `--`) is a path whatever it starts with (round 40, Opus: `cat -- -/../.env`).
   const text = operand ? word : word.replace(/^[^=/]*=/, "").replace(/^@/, "");
   // (Project review 6, Opus: a value of the form `key=@file` names the file after `=@`,
@@ -3789,6 +3798,9 @@ function git(args: string[], scope: Scope): Verdict {
   if (sub === "bisect" && (words[0] === "run" || (["view", "visualize"].includes(words[0] ?? "") && rest[viewAt + 1] !== undefined && !rest[viewAt + 1].startsWith("-")))) return classify(`git bisect ${words[0]} runs a command`);
   if (sub === "grep" && (opt("open-files-in-pager", "O", "eABCfm"))) return classify("git grep -O runs a pager program");
   if (sub === "reset" || sub === "clean" || sub === "restore") return ALLOW;
+  // (Project review 6, round 2, Opus: `git credential fill` prints a stored password, as `gh auth
+  // token` prints a token: a firm ask.)
+  if (sub === "credential" || sub?.startsWith("credential-")) return criticalAsk("git credential prints or changes stored passwords");
   if (sub === "config") return gitConfig(opts, rest, dir, scope);
   if (sub === "remote") return words.some((w) => ["add", "set-url", "remove", "rm", "rename"].includes(w)) ? ask("changes where git pushes and fetches") : ALLOW;
   if (sub === "reflog") return words.includes("expire") || words.includes("delete") ? ask("deletes git recovery data") : ALLOW;
@@ -3857,9 +3869,11 @@ function gh(args: string[]): Verdict {
     if (args.some((a, k) => /^--input(=|$)/.test(a) || (/=@/.test(a) && (/^(-F|--field(=|$))/.test(a) || /^(-F|--field)$/.test(args[k - 1] ?? ""))))) return classify("gh api that sends a file's contents");
     return ALLOW;
   }
+  // (Round 2 cross-check, Opus: `gh config get oauth_token` prints the token on older gh.)
+  if (group === "config" && args.some((w) => /token/i.test(w))) return criticalAsk("gh config of a token prints or changes it");
   if (group === "auth") {
     // (Project review 6, Opus: `gh auth token` prints the token, a firm ask like `status -t`.)
-    if (action === "token" || args.slice(args.indexOf("auth") + 1).includes("token")) return criticalAsk("gh auth token prints the GitHub token");
+    if (args.slice(args.indexOf("auth") + 1).some((w) => w === "token" || w === "git-credential")) return criticalAsk("gh auth token and gh auth git-credential print the GitHub token");
     if (action !== "status") return classify("gh auth");
     // (Project review 5, round 4, Opus: `-t` / `--show-token` prints the token. Only the options
     // known to print no secret pass.)
@@ -4960,16 +4974,18 @@ function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: 
   const tails: string[] = [];
   let verdict: Verdict | undefined;
   for (let [k, a] of args.entries()) {
-    // (A process substitution, `-c <(echo ...)`, reads as `$()` here, a word with no expansion
-    // bash computes a name from: a file made when the command runs.)
-    if (/(^|=)\$\(\)$/.test(a) && !dyn(k)) verdict ??= classify(`${name} reads a file made when the command runs (a process substitution)`);
+    // (A process substitution, `-c <(echo ...)`, `-c<(...)`, reads as `$()` here, in a word with no
+    // expansion bash computes a name from: a file made when the command runs.)
+    if (a.includes("$()") && !dyn(k)) verdict ??= classify(`${name} reads a file made when the command runs (a process substitution)`);
     // (A variable the call plainly sets to a literal is read as that literal, `m=../x.js; mocha
     // --require "$m"`; any other word built at run time is judged in runtimeReads.)
     const plain = /[$`]/.test(a) ? expandVars(a, scope) : a;
     if (/[$`]/.test(plain)) continue;
     a = plain;
     // (After the first `=` and after the last, `--emit=llvm-ir=AGENTS.md`.)
-    if (a.startsWith("-") && a.includes("=")) words.push(a.slice(a.indexOf("=") + 1), a.slice(a.lastIndexOf("=") + 1));
+    // (Cross-check, Opus: and each blank-separated part, `pytest -o "pythonpath=src ../x"`.)
+    const valued = (w: string) => [w.slice(w.indexOf("=") + 1), w.slice(w.lastIndexOf("=") + 1)].flatMap((v) => [v, ...v.split(/\s+/)]).filter(Boolean);
+    if (a.startsWith("-") && a.includes("=")) words.push(...valued(a));
     if (a.startsWith("-") && !a.startsWith("--") && a.length > 2) {
       // (The rest of a short option word after its letter, `-o.git/x`, `-oAGENTS.md`; and after
       // each further leading letter, held only to the protected names, `-kC.git`: which letter
@@ -4982,11 +4998,17 @@ function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: 
         // `/` after at most two letters, `-vC/etc` (`-obuild/app` is an output name).)
         if (/^[.~]/.test(a.slice(k)) || (k <= 3 && a[k] === "/")) words.push(a.slice(k));
       }
-    } else if (!a.startsWith("-")) words.push(a);
+    } else if (!a.startsWith("-")) {
+      words.push(a);
+      // (Round 2, Sol: an option's value of the form `key=place`, `pytest -o pythonpath=../x`.)
+      if (a.includes("=")) words.push(...valued(a));
+    }
   }
   for (const t of tails) {
     const p = resolveWord(t, scope);
     if (p && (isGuarded(p, scope) || isPiFile(p, scope) || /(^|\/)\.git(\/|$)/.test(p))) return ask(`${name} names ${t}, a protected file or directory it may read as config or write`);
+    // (Cross-check, Sol: a tail that is a link out of the project, `ninja -vCext`.)
+    if (p && fs.existsSync(p) && !isLocal(realish(p), scope)) verdict ??= classify(`${name} names ${t}, outside the project through a link: a place it may load code or config from, or write`);
   }
   for (const w of words) {
     const value = w.replace(/^@/, "");
@@ -4994,7 +5016,8 @@ function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: 
     const p = resolveWord(value, scope);
     if (!p) continue;
     if (isGuarded(p, scope) || isPiFile(p, scope) || /(^|\/)\.git(\/|$)/.test(p)) return ask(`${name} names ${value}, a protected file or directory it may read as config or write`);
-    if (pathy(value) && p !== "/dev/null" && !isLocal(p, scope)) verdict ??= classify(`${name} names ${value}, outside the project: a place it may load code or config from, or write`);
+    // (Round 2, Opus: a plain name that is a link out of the project, `go test -C ext ./...`.)
+    if (((pathy(value) && !isLocal(p, scope)) || !isLocal(realish(p), scope)) && p !== "/dev/null") verdict ??= classify(`${name} names ${value}, outside the project: a place it may load code or config from, or write`);
   }
   return verdict;
 }

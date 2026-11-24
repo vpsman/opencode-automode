@@ -7190,6 +7190,11 @@ export function placedReads(where: Located, scope: Scope, judgeAt: (dir: string,
     for (const p of distinct.values()) {
       const v = own.length || outs.length ? judgeAt(p.real, own.length ? own.map((w) => rewrite(w, p)) : [":"], outs.map((w) => rewrite(w, p))) : undefined;
       if (v && (v.action === "ask" || v.action === "deny")) add("ask", `${v.reason} (where it runs: ${p.real})`);
+      // (Project review 6, round 2, Opus: and what the rules leave to the decider there, `(cd ..
+      // && make)`: a build tool run outside the project.)
+      // (Cross-check: only outside the project; inside it the call's own reading holds, `x=$(cd sub
+      // && pwd)`.)
+      else if (v?.action === "classify" && !(scope.root && within(p.real, scope.root))) add("classify", `${v.reason} (where it runs: ${p.real})`);
       // Each such word as the file it names there, read or written, as the kernel walks it.
       for (const n of named) {
         if (n.here.elsewhere) continue;

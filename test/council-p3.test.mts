@@ -2519,3 +2519,40 @@ test("project review 6, round 1 (Sol, Neon): the Read tool and the sandbox's hid
   assert.notEqual(await at(`ssh lab "rg -g --files -g '*' SECRET /etc"`), "allow");
   assert.equal(await at(`ssh lab "rg --files /etc"`), "allow");
 });
+
+test("project review 6, round 2 (Opus, Sol): a build tool run outside the project from a subshell, a link out of it, attached process substitutions, values of key=place, paths with blanks", async () => {
+  const repo15 = path.join(base, "repo15");
+  const outside = path.join(base, "outside15");
+  fs.mkdirSync(path.join(repo15, "sub"), { recursive: true });
+  fs.mkdirSync(outside, { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "main", repo15]);
+  fs.symlinkSync(outside, path.join(repo15, "ext"));
+  const decide15 = async (command: string) => (await decideShell(guard, new SessionState(repo15), repo15, command)).effect;
+  for (const command of [
+    "(cd .. && make)",
+    "( cd ..; go test ./... )",
+    "true | (cd .. && make)",
+    "x=$(cd .. && go vet ./...)",
+    "cd .. && make &",
+    "go test -C ext ./...",
+    "uv run --project ext pytest",
+    "ninja -C ext",
+    "eslint -c<(echo x) .",
+    "mocha -r<(echo x)",
+    "pytest -o pythonpath=../external",
+    "pytest -o pythonpath=.git/hooks",
+    'cat ~/.config/chromium/"Local State"',
+    "git credential fill",
+    "gh auth git-credential get",
+    // Cross-check (Opus, Sol).
+    "ninja -vCext",
+    'pytest -o "pythonpath=src ../external"',
+    'pytest -o "testpaths=tests ext"',
+    "git credential-store get",
+    "gh config get oauth_token",
+  ]) assert.notEqual(await decide15(command), "allow", command);
+  fs.mkdirSync(path.join(repo15, ".ssh"), { recursive: true });
+  fs.writeFileSync(path.join(repo15, ".ssh", "key with space"), "x\n");
+  assert.notEqual(await decide15('cat ".ssh/key with space"'), "allow");
+  for (const command of ["(cd sub && ls)", "(cd .. && ls)", "x=$(cd sub && pwd)", "make", "go test ./...", "npm test", "pytest tests", 'grep "foo bar" sub', 'git commit -m "fix ~/x and more"']) assert.equal(await decide15(command), "allow", command);
+});
