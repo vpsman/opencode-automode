@@ -189,10 +189,16 @@ describe("normal work inside the project", () => {
     fs.writeFileSync(path.join(bin, "git"), `#!/bin/sh\ncase " $* " in ${pattern} esac\nexec '${gitExe}' "$@"\n`, { mode: 0o755 });
     const before = process.env.PATH;
     process.env.PATH = `${bin}:${before}`;
+    // git is asked only about a config that names the key (configAsk in sandbox.ts): this one does,
+    // in a comment.
+    const config = path.join(repo, ".git", "config");
+    const text = fs.readFileSync(config, "utf8");
+    fs.appendFileSync(config, "# core.hooksPath\n");
     try {
       assert.match(planFor("git status").problem ?? "", /hooksPath|hooks path/);
     } finally {
       process.env.PATH = before;
+      fs.writeFileSync(config, text);
     }
   });
   test("writes work for ordinary commands", () => {

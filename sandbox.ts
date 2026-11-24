@@ -350,7 +350,9 @@ function scanRoot(root: string, skip: Set<string>, secrets: boolean): Found {
       return;
     }
     const names = new Set(list.map((e) => e.name));
-    const here = realpath(dir);
+    // Below a root that is its own real path, every directory the walk enters is one too: it
+    // goes only into entries that are directories, never into links.
+    const here = rootReal ? dir : realpath(dir);
     // The same three names inside a git directory are a submodule's git directory, whose top is
     // the work tree its pointer file is in. Outside one they are a bare repository, which is its
     // own top, or the git directory of a work tree elsewhere, which is not: `core.bare` tells
@@ -439,6 +441,7 @@ function scanRoot(root: string, skip: Set<string>, secrets: boolean): Found {
   // (round 4, finding 30, sixth pass): without it `.git` would be a bare repository and its
   // own top again.
   const context = gitContext(root);
+  const rootReal = realpath(root) === root;
   visit(root, context.veiled, false, context.inGit);
   for (const dir of standalone) {
     // "false" is the git directory of a work tree. True or unset is a top of its own, as every
@@ -627,6 +630,54 @@ function configured(gitDir: string | undefined, key: string, problems: string[],
   return value;
 }
 
+// Whether git must be asked about a config file, or its text already says that `word` is in no
+// key or section of it. Section and key names can be neither escaped nor split across lines, so
+// a file that sets core.hooksPath holds `hookspath`, and one that includes another holds
+// `include`, in some mix of cases. That reading is taken only for a file every line of which is
+// in a plain form git parses: blank, a comment, a section header with at most a plain subsection,
+// a key inside a section with a value that has no quote, backslash or control character. A
+// file that is not there holds nothing. One that cannot be read here, is not a plain file, is
+// large, or has any other line is asked about as before: git then says whether it can read it
+// (a file it cannot parse is a problem). (Asking git for every repository the walk found was
+// most of a plan's time in a tree of many checkouts.)
+const PLAIN_CONFIG_LINE = /^[ \t]*(?:[#;].*|\[[A-Za-z0-9.-]+(?: "[^"\\\x00-\x1f]*")?\][ \t]*(?:[#;].*)?|([A-Za-z][A-Za-z0-9-]*)[ \t]*(?:=[^"\\\x00-\x08\x0a-\x1f]*)?)?\r?$/;
+function configAsk(file: string, word: RegExp): boolean {
+  let text: string;
+  try {
+    const st = fs.statSync(file);
+    if (!st.isFile() || st.size > 1 << 20) return true;
+    text = fs.readFileSync(file, "latin1");
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    return code !== "ENOENT" && code !== "ENOTDIR";
+  }
+  if (word.test(text)) return true;
+  let inSection = false;
+  for (const line of text.split("\n")) {
+    const m = PLAIN_CONFIG_LINE.exec(line);
+    if (!m) return true;
+    if (m[1] !== undefined && !inSection) return true;
+    if (/^[ \t]*\[/.test(line)) inSection = true;
+  }
+  return false;
+}
+
+// The config files git reads in the repository whose git directory is `gitDir`: the system's,
+// your own, the common directory's and the git directory's own. Undefined when the common
+// directory cannot be told.
+function configFilesOf(gitDir: string): string[] | undefined {
+  const files = [...(systemGitConfig() === undefined ? [] : [systemGitConfig()!]), ...globalGitConfigs(), path.join(gitDir, "config"), path.join(gitDir, "config.worktree")];
+  let common: string;
+  try {
+    common = fs.readFileSync(path.join(gitDir, "commondir"), "utf8").trim();
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    return code === "ENOENT" || code === "ENOTDIR" ? files : undefined;
+  }
+  if (!common) return undefined;
+  return [...files, path.join(located(common.startsWith("/") ? common : `${gitDir}/${common}`), "config")];
+}
+
 // The core.hooksPath git uses in a repository (`receiving`: when it receives a push); undefined
 // when none is set or it could not be read (`problems` then says so).
 function hooksPathOf(gitDir: string, problems: string[], receiving = false): string | undefined {
@@ -637,6 +688,9 @@ function hooksPathOf(gitDir: string, problems: string[], receiving = false): str
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
   }
+  // No file git reads there names the key or includes another: it is not set (configAsk).
+  const files = configFilesOf(gitDir);
+  if (files && !files.some((file) => configAsk(file, /hookspath|include/i))) return undefined;
   return configured(gitDir, "core.hooksPath", problems, receiving) ?? undefined;
 }
 
@@ -669,6 +723,8 @@ function includeTree(configFile: string, problems: string[], seen = new Set<stri
   const key = `${realpath(configFile)}\0${conditional}`;
   if (depth > GIT_INCLUDE_DEPTH || !fs.existsSync(configFile) || seen.has(key)) return [];
   seen.add(key);
+  // A plain file with no `include` in it includes nothing (configAsk).
+  if (!configAsk(configFile, /include/i)) return [];
   const out: { file: string; conditional: boolean }[] = [];
   const listed = gitRun(["config", "--file", configFile, "--null", "--type=path", "--get-regexp", "^include(if\\..*)?\\.path$"]);
   // 1: no such key.
