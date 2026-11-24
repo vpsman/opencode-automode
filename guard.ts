@@ -2954,6 +2954,11 @@ export function runtimeReads(command: string, where: Located, scope: Scope, gitQ
     for (const p of at) {
       const name = path.basename(cmd.argv[p]);
       const end = chain.find((q) => q > p) ?? cmd.argv.length;
+      // (Project review 6, round 9, Sol: a tool run as a Python module is the tool, `python -m
+      // pytest "../$(...).py"`, for the reads of files named at run time below.)
+      const pyModule = /^python3?(\.\d+)?$/.test(name) && cmd.argv[p + 1] === "-m" && /^(pytest|unittest|ruff|mypy|black|isort|build)$/.test(cmd.argv[p + 2] ?? "") ? cmd.argv[p + 2] : undefined;
+      const rname = pyModule ?? name;
+      const reads = (n: string) => runtimeReader(n) || !!pyModule;
       // Round 4, N3b-4: a program with an option that reads a list (LIST_OPTIONS) whose options
       // are not held by expansionProblem already: a word bash builds when the command runs can be
       // that option (`x=--files0-from=.env; wc $x`), and goes to the model as it does for tar.
@@ -3048,7 +3053,7 @@ export function runtimeReads(command: string, where: Located, scope: Scope, gitQ
         // `-l`, `-O`.)
         // (Cross-check 2, Sol, Opus: for the read-only programs past the old list too, `dmesg
         // -F"$f"`, column's separators aside; and with an `=` after the expansion, `-c"../$f=x"`.)
-        if (word.startsWith("-") && !word.startsWith("--") && runtimeReader(name) && !READERS.has(name) && name !== "column" && /^-[^DjlO$`]/.test(word)) {
+        if (word.startsWith("-") && !word.startsWith("--") && reads(rname) && !READERS.has(rname) && rname !== "column" && /^-[^DjlO$`]/.test(word)) {
           const mark = words?.[k];
           const value = mark === undefined ? word.slice(2) : mark.slice(2);
           if (mark === undefined ? /[$`]/.test(value) : MARKS.test(value)) add("classify", `${name} ${word}: an option whose value bash builds at run time, which may name a file ${name} loads`);
@@ -3062,7 +3067,7 @@ export function runtimeReads(command: string, where: Located, scope: Scope, gitQ
           // (A compiler's macro definition, `gcc -DVERSION="$v"`, names no file (round 6, Sol: meson's
           // and cmake's `-D` hold flags and paths); a dev tool's other option
           // words, `eslint -c="../$f"`, `--config="$c"`, and every option of a reader may.)
-          if (!runtimeReader(name) || (!READERS.has(name) && !READ_ONLY.has(name) && /^-D/.test(word) && COMPILER.test(name))) continue;
+          if (!reads(rname) || (!READERS.has(rname) && !READ_ONLY.has(rname) && /^-D/.test(word) && COMPILER.test(rname))) continue;
           const looped = mark !== undefined ? loopUse(mark, loops.get(n), cwd) : undefined;
           if (!looped) {
             // A loop over a glob the matcher cannot read asks, as a reader given that glob does
@@ -3094,7 +3099,7 @@ export function runtimeReads(command: string, where: Located, scope: Scope, gitQ
         const files = here?.elsewhere || (relative && cwd === undefined) || unreadableGlob(placed) ? undefined : expandWord(placed, cwd ?? "/");
         if (!files) {
           // A pattern the matcher cannot read is a verdict (round 4, finding 6).
-          if (READERS.has(name) || (runtimeReader(name) && (READ_ONLY.has(name) || !/^-D/.test(word) || !COMPILER.test(name)))) add(!/[$`]/.test(text) && unreadableGlob(text) ? "ask" : "classify", `${name} reads a file named at run time: ${word}`);
+          if (READERS.has(rname) || (reads(rname) && (READ_ONLY.has(rname) || !/^-D/.test(word) || !COMPILER.test(rname)))) add(!/[$`]/.test(text) && unreadableGlob(text) ? "ask" : "classify", `${name} reads a file named at run time: ${word}`);
           continue;
         }
         // A file called `-rf` or `--to-command=x` becomes an option once the glob is expanded.

@@ -2665,3 +2665,20 @@ test("project review 6, round 8 (Opus, Sol): a tool run as a Python module, a `$
   ]) assert.notEqual(await decide20(command), "allow", command);
   for (const command of ["python -m pytest", "python3 -m pytest tests -q", "python -m mypy src", "python -m black --check .", "eslint .claude-plugin/"]) assert.equal(await decide20(command), "allow", command);
 });
+
+test("project review 6, round 9 (Opus, Sol): a Python module's files named at run time, ~user places, node --test outside the project", async () => {
+  const repo21 = path.join(base, "repo21");
+  fs.mkdirSync(repo21, { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "main", repo21]);
+  const decide21 = async (command: string) => (await decideShell(guard, new SessionState(repo21), repo21, command)).effect;
+  for (const command of [
+    'python -m pytest "../$(date).py"',
+    'python -m black --config "../$(date).toml" .',
+    "cargo test --manifest-path ~root/other/Cargo.toml",
+    "go test -C ~root/other ./...",
+    "ninja -C~root/b",
+    "cd .. && node --test",
+    "(cd .. && node --test)",
+  ]) assert.notEqual(await decide21(command), "allow", command);
+  for (const command of ["node --test", "python -m pytest", "python -m pytest tests/"]) assert.equal(await decide21(command), "allow", command);
+});

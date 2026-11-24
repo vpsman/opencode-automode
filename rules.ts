@@ -4699,7 +4699,8 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
   }
   if (/^python3?$/.test(name) && args[0] === "-m" && PY_MODULES.has(args[1]) && !cmd.heredoc && (args[1] !== "unittest" || unittestNamesOwn(args.slice(2), scope))) return verdict;
   // `node --test`: the test runner over the project's test files, as `npm test` runs it.
-  if (name === "node" && args[0] === "--test" && !cmd.heredoc) {
+  // (Round 9, Opus: only in the project, whose test files it finds by itself: `cd .. && node --test`.)
+  if (name === "node" && args[0] === "--test" && !cmd.heredoc && scope.cwd !== undefined && isLocal(scope.cwd, scope)) {
     const k = leadingOptions(args, { long: ["test", "test-only", "test-force-exit", "experimental-test-coverage", "experimental-strip-types", "no-warnings", "enable-source-maps"], longValued: ["test-name-pattern", "test-skip-pattern", "test-concurrency", "test-timeout", "disable-warning"] });
     const reporters = args.filter((a) => /^--test-reporter(=|$)/.test(a));
     const files = k < 0 ? [] : args.slice(k);
@@ -5044,6 +5045,7 @@ function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: 
   }
   for (const t of tails) {
     const p = resolveWord(t, scope);
+    if (!p && /^~[^/]/.test(t)) verdict ??= classify(`${name} names ${t}, a place the check cannot tell`);
     if (p && (isGuarded(p, scope) || isPiFile(p, scope) || /(^|\/)\.git(\/|$)/.test(p))) return ask(`${name} names ${t}, a protected file or directory it may read as config or write`);
     // (Cross-check, Sol: a tail that is a link out of the project, `ninja -vCext`.)
     if (p && fs.existsSync(p) && !isLocal(realish(p), scope)) verdict ??= classify(`${name} names ${t}, outside the project through a link: a place it may load code or config from, or write`);
@@ -5055,7 +5057,8 @@ function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: 
     // one the check still cannot place goes to the decider.)
     const p = resolveWord(value, scope) ?? (scope.cwd !== undefined && /[$`]/.test(value) ? path.resolve(scope.cwd, expandHome(value)) : undefined);
     if (!p) {
-      if (pathy(value) && /[$`]/.test(value)) verdict ??= classify(`${name} names ${value}, a place the check cannot tell`);
+      // (Round 9, Opus: or a `~user` path bash expands, `~agent/other`.)
+      if (pathy(value) && /[$`]|^~/.test(value)) verdict ??= classify(`${name} names ${value}, a place the check cannot tell`);
       continue;
     }
     if (isGuarded(p, scope) || isPiFile(p, scope) || /(^|\/)\.git(\/|$)/.test(p)) return ask(`${name} names ${value}, a protected file or directory it may read as config or write`);
