@@ -4427,6 +4427,12 @@ function commandRead(cmd: Simple, scope: Scope, depth: number): Verdict {
   // (Project review 6, Neon, Opus: `meson wrap install`, `meson subprojects download` fetch a
   // dependency's sources; `meson subprojects foreach` runs a command.)
   if (name === "meson" && ["wrap", "subprojects"].includes(operands(args)[0] ?? "")) verdict = worst(verdict, classify(`meson ${operands(args)[0]} fetches or changes a dependency's sources, or runs a command in each`));
+  // (Round 8, Opus: a tool run as a module, `python -m pytest`, `python3 -m ruff`, is read as
+  // the tool.)
+  if (/^python3?(\.\d+)?$/.test(name) && args[0] === "-m" && /^(pytest|unittest|ruff|mypy|black|isort|build)$/.test(args[1] ?? "")) {
+    const places = projectToolPlaces(`${name} -m ${args[1]}`, args.slice(2), scope, (k) => dyn(k + 2));
+    if (places) verdict = worst(verdict, places);
+  }
   if (PROJECT_TOOLS.has(name)) {
     const places = projectToolPlaces(name, args, scope, dyn);
     if (places) verdict = worst(verdict, places);
@@ -4998,8 +5004,9 @@ function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: 
     if (/[$`]/.test(plain) && dyn(k)) continue;
     a = plain;
     // (Before round 8: a backstop on the word's text, whatever the reading below makes of its
-    // structure: a `.git` component or a context file's name anywhere asks.)
-    if (/(^|[^\w.])\.git([^\w.-]|$)/.test(a) || /(^|[^\w.-])(AGENTS|CLAUDE)\.(md|MD)|AGENTS\.override\.md/.test(a)) return ask(`${name} ${a.slice(0, 60)}: names a protected file or directory, which it may read as config or write`);
+    // structure: a `.git`, `.claude` or `.opencode` component or a context file's name anywhere
+    // asks.)
+    if (/(^|[^\w.])\.(git|claude|opencode)([^\w.-]|$)/.test(a) || /(^|[^\w.-])(AGENTS|CLAUDE)\.(md|MD)|AGENTS\.override\.md/.test(a)) return ask(`${name} ${a.slice(0, 60)}: names a protected file or directory, which it may read as config or write`);
     // (Round 7, Sol: a structured value with an escape the tool decodes, `{"rootDir":"\u002e\u002e"}`,
     // is one the check does not read: it goes to the decider.)
     if (/\\/.test(a) && /[{[]/.test(a)) verdict ??= classify(`${name} ${a.slice(0, 60)}: a structured value with escapes the check does not decode`);
@@ -5044,8 +5051,13 @@ function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: 
   for (const w of words) {
     const value = w.replace(/^@/, "");
     if (!value || /^[a-z][a-z0-9+.-]*:\/\//i.test(value)) continue;
-    const p = resolveWord(value, scope);
-    if (!p) continue;
+    // (Round 8, Sol: a `$` or backtick that is text, `'../setup$.js'`, is part of the name;
+    // one the check still cannot place goes to the decider.)
+    const p = resolveWord(value, scope) ?? (scope.cwd !== undefined && /[$`]/.test(value) ? path.resolve(scope.cwd, expandHome(value)) : undefined);
+    if (!p) {
+      if (pathy(value) && /[$`]/.test(value)) verdict ??= classify(`${name} names ${value}, a place the check cannot tell`);
+      continue;
+    }
     if (isGuarded(p, scope) || isPiFile(p, scope) || /(^|\/)\.git(\/|$)/.test(p)) return ask(`${name} names ${value}, a protected file or directory it may read as config or write`);
     // (Round 2, Opus: a plain name that is a link out of the project, `go test -C ext ./...`.)
     if (((pathy(value) && !isLocal(p, scope)) || !isLocal(realish(p), scope)) && p !== "/dev/null") verdict ??= classify(`${name} names ${value}, outside the project: a place it may load code or config from, or write`);

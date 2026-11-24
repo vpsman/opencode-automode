@@ -2646,3 +2646,22 @@ test("project review 6, round 7 (Opus, Sol): a `$` that is text in a structured 
   ]) assert.notEqual(await decide19(command), "allow", command);
   for (const command of [`jest --config '{"testRegex":"spec$"}'`, 'go test -run "Test$" ./...', "go build -ldflags '-X main.v=$v' ."]) assert.equal(await decide19(command), "allow", command);
 });
+
+test("project review 6, round 8 (Opus, Sol): a tool run as a Python module, a `$` that is part of a name", async () => {
+  const repo20 = path.join(base, "repo20");
+  fs.mkdirSync(repo20, { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "main", repo20]);
+  const decide20 = async (command: string) => (await decideShell(guard, new SessionState(repo20), repo20, command)).effect;
+  for (const command of [
+    "cd .. && python -m pytest",
+    "(cd .. && python3 -m pytest -q)",
+    "python -m pytest -o pythonpath=../lib",
+    "python -m ruff check --config AGENTS.md .",
+    "python -m pytest --rootdir=.git",
+    "uv run python -m pytest ../other/tests",
+    "python -m unittest discover -s ..",
+    "prettier --write '.claude/settings$.json'",
+    "mocha --require '../setup$.js'",
+  ]) assert.notEqual(await decide20(command), "allow", command);
+  for (const command of ["python -m pytest", "python3 -m pytest tests -q", "python -m mypy src", "python -m black --check .", "eslint .claude-plugin/"]) assert.equal(await decide20(command), "allow", command);
+});
