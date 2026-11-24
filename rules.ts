@@ -3600,15 +3600,24 @@ function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = 
   // letter of a short cluster, `-Nd.claude`. One built at run time is judged elsewhere.)
   const places: string[] = [];
   if (cmd === "patch") {
-    for (const a of head) {
-      if (!a.startsWith("-") || a === "-" || a === "--" || /[$`]/.test(a)) continue;
+    for (let a of head) {
+      if (!a.startsWith("-") || a === "-" || a === "--") continue;
+      // (Round 5, Sol: a variable the call sets to a literal is read as it, `d=.claude; patch
+      // -d"$d"`; any other value built at run time is a place the check cannot tell.)
+      if (/[$`]/.test(a)) a = expandVars(a, scope);
+      if (/[$`]/.test(a)) {
+        // (A count built at run time, `-p"$n"`, names no place.)
+        if (!/^-[lcenuNREZTbtfsv]*[pF][^a-zA-Z]/.test(a) && !/^--(strip|fuzz)=/.test(a)) return classify(`patch ${a}: an option whose value bash builds at run time, which may name where patch writes`);
+        continue;
+      }
       if (a.startsWith("--")) {
-        if (a.includes("=")) places.push(a.slice(a.indexOf("=") + 1));
+        if (a.includes("=") && !/^--in/.test(a)) places.push(a.slice(a.indexOf("=") + 1));
       } else {
         // (Only values that may name a place: a count, `-p1`, names none.)
         // (patch's own letters: a flag goes on to the next letter, a value letter takes the rest.)
-        for (let k = 1; k < a.length && "lcenuNREZTbtfsv".includes(a[k]); k++) if ("pFiorDVBYzgdx".includes(a[k + 1] ?? "")) places.push(a.slice(k + 2));
-        if ("pFiorDVBYzgdx".includes(a[1])) places.push(a.slice(2));
+        // (`-i`, the patch read, names no place written: round 5, Opus.)
+        for (let k = 1; k < a.length && "lcenuNREZTbtfsv".includes(a[k]); k++) if ("pForDVBYzgdx".includes(a[k + 1] ?? "")) places.push(a.slice(k + 2));
+        if ("pForDVBYzgdx".includes(a[1])) places.push(a.slice(2));
       }
     }
   }
@@ -4969,9 +4978,6 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
 // included: a protected name (the plugin's, opencode's, a `.git` component) asks, and a path
 // outside the project, the temp directories and the allowed places goes to the decider, as does
 // a run in such a directory. Words built at run time are judged elsewhere (runtimeReads).
-// The parts of a comma list, and for a part that is an option, its value: after an `=`, after its
-// letter, or the whole of a long one's.
-const commaParts = (v: string): string[] => (v.includes(",") ? v.split(",").filter(Boolean).flatMap((p) => (p.startsWith("-") ? [...(p.includes("=") ? [p.slice(p.indexOf("=") + 1)] : []), ...(p.startsWith("--") ? [] : [p.slice(2)])] : [p])) : []);
 const PROJECT_TOOLS = new Set([...DEV_TOOLS, ..."go cargo npm npx pnpm pnpx yarn bun bunx uv uvx deno poetry pipenv pdm hatch".split(" ")]);
 function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: number) => boolean): Verdict | undefined {
   if (!scope.root) return undefined;
@@ -4989,30 +4995,32 @@ function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: 
     const plain = /[$`]/.test(a) ? expandVars(a, scope) : a;
     if (/[$`]/.test(plain)) continue;
     a = plain;
-    // (After the first `=` and after the last, `--emit=llvm-ir=AGENTS.md`.)
-    // (Cross-check, Opus: and each blank-separated part, `pytest -o "pythonpath=src ../x"`.)
-    // (Round 3, Opus: and each comma-separated part, `mocha --require=a.js,../x.js`.)
-    const valued = (w: string) => [w.slice(w.indexOf("=") + 1), w.slice(w.lastIndexOf("=") + 1)].flatMap((v) => [v, ...v.split(/[\s,]+/)]).filter(Boolean);
-    if (a.startsWith("-") && a.includes("=")) words.push(...valued(a));
-    if (a.startsWith("-") && !a.startsWith("--") && a.length > 2) {
-      // (The rest of a short option word after its letter, `-o.git/x`, `-oAGENTS.md`; and after
-      // each further leading letter, held only to the protected names, `-kC.git`: which letter
-      // takes the rest is not known.)
-      // (Round 4, Opus, Sol: the rest split on commas, each part an option of its own, as gcc's
-      // `-Wl,-o,.git/hooks/x`, `-Wl,-L../lib`, `-Wl,@../args` and mocha's `-ra.js,../x.js` read it.)
-      words.push(a.slice(2), ...commaParts(a.slice(2)));
-      for (let k = 3; k < a.length && /^[A-Za-z]+$/.test(a.slice(1, k)); k++) {
-        tails.push(a.slice(k), ...commaParts(a.slice(k)));
-        // (Cross-check 2, Opus: a place after a later letter of a cluster, `ninja -vC..`, `shfmt
-        // -lw../x.sh`, is held to the outside check too: one that starts with `.` or `~`, or with
-        // `/` after at most two letters, `-vC/etc` (`-obuild/app` is an output name).)
-        if (/^[.~]/.test(a.slice(k)) || (k <= 3 && a[k] === "/")) words.push(a.slice(k));
+    // (Round 5, Opus, Sol: one reading of every value, however deep: after the first `=` and after
+    // the last (`--emit=llvm-ir=AGENTS.md`), each blank- or comma-separated part (`pytest -o
+    // "pythonpath=src ../x"`, `mocha --require=a.js,../x.js`, `gcc -Wl,-o,.git/hooks/x`), and for
+    // a part that is a short option, the rest after each of its leading letters (`-o.git/x`,
+    // `-Wp,-MFAGENTS.md`, `-Dc_args=-I../inc`, `go build -ldflags=-L../lib`). The rest after the
+    // first letter is held to every check; after a later one, where which letter takes the rest
+    // is not known, to the protected names and links, and to the outside check where it starts
+    // with `.` or `~`, or with `/` after at most two letters (`-vC/etc`; `-obuild/app` is a name).)
+    const read = (v: string, depth: number, full: boolean, self: boolean): void => {
+      if (!v || depth > 6) return;
+      if (self) (full ? words : tails).push(v);
+      if (/[\s,]/.test(v)) for (const part of v.split(/[\s,]+/)) read(part, depth + 1, full, true);
+      if (v.includes("=")) {
+        read(v.slice(v.indexOf("=") + 1), depth + 1, full, true);
+        read(v.slice(v.lastIndexOf("=") + 1), depth + 1, full, true);
       }
-    } else if (!a.startsWith("-")) {
-      words.push(a, ...(a.includes(",") ? a.split(",").filter(Boolean) : []));
-      // (Round 2, Sol: an option's value of the form `key=place`, `pytest -o pythonpath=../x`.)
-      if (a.includes("=")) words.push(...valued(a));
-    }
+      if (/^-[^-]/.test(v) && !/[\s,=]/.test(v.slice(0, 2))) {
+        read(v.slice(2), depth + 1, full, true);
+        for (let k = 3; k < v.length && /^[A-Za-z]+$/.test(v.slice(1, k)); k++) {
+          const rest = v.slice(k);
+          read(rest, depth + 1, full && (/^[.~]/.test(rest) || (k <= 3 && rest[0] === "/")), true);
+        }
+      }
+    };
+    // (An option word itself is no place; its values are.)
+    read(a, 0, true, !a.startsWith("-"));
   }
   for (const t of tails) {
     const p = resolveWord(t, scope);

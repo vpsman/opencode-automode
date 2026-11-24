@@ -2595,3 +2595,21 @@ test("project review 6, round 3 (Opus, Sol): a link out of the project reached f
   ]) assert.notEqual(await decide16(command), "allow", command);
   for (const command of ["gcc -Wall -Wextra a.c", "gcc -Wl,--as-needed -O2 a.c", "gcc -Wl,-rpath,'$ORIGIN' a.c", "patch -p1 < c.patch"]) assert.equal(await decide16(command), "allow", command);
 });
+
+test("project review 6, round 5 (Opus, Sol): an option's value that is an option with its value attached, at any depth; patch's places built at run time", async () => {
+  const repo17 = path.join(base, "repo17");
+  fs.mkdirSync(repo17, { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "main", repo17]);
+  const decide17 = async (command: string) => (await decideShell(guard, new SessionState(repo17), repo17, command)).effect;
+  for (const command of [
+    "gcc -E -Wp,-M,-MFAGENTS.md x.c",
+    "gcc -c x.c -Wp,-include../m.h",
+    "gcc -c x.c -MD -Wp,-MF.git/hooks/pre-commit",
+    "meson setup build -Dc_args=-I../inc",
+    "cmake -B build -DCMAKE_C_FLAGS=-I../inc",
+    "go build -ldflags=-L../lib .",
+    'd=.claude; patch -p1 -d"$d" < c.patch',
+    'patch -p1 --directory="$d" < c.patch',
+  ]) assert.notEqual(await decide17(command), "allow", command);
+  for (const command of ['patch -p"$n" < p.diff', "patch -p1 -i fix.diff", 'go build -ldflags="-s -w" .', "meson setup build -Dbuildtype=release", "cmake -B build -DCMAKE_BUILD_TYPE=Release", "gcc -Wall -O2 -o out a.c"]) assert.equal(await decide17(command), "allow", command);
+});
