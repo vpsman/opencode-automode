@@ -4992,9 +4992,14 @@ function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: 
     if (a.includes("$()") && !dyn(k)) verdict ??= classify(`${name} reads a file made when the command runs (a process substitution)`);
     // (A variable the call plainly sets to a literal is read as that literal, `m=../x.js; mocha
     // --require "$m"`; any other word built at run time is judged in runtimeReads.)
+    // (Round 7, Opus: only a word bash builds at run time; a `$` that is text, a regex anchor in
+    // `jest --config '{"testRegex":"x$"}'`, is read as written.)
     const plain = /[$`]/.test(a) ? expandVars(a, scope) : a;
-    if (/[$`]/.test(plain)) continue;
+    if (/[$`]/.test(plain) && dyn(k)) continue;
     a = plain;
+    // (Round 7, Sol: a structured value with an escape the tool decodes, `{"rootDir":"\u002e\u002e"}`,
+    // is one the check does not read: it goes to the decider.)
+    if (/\\/.test(a) && /[{[]/.test(a)) verdict ??= classify(`${name} ${a.slice(0, 60)}: a structured value with escapes the check does not decode`);
     // (Round 5, Opus, Sol: one reading of every value, however deep: after the first `=` and after
     // the last (`--emit=llvm-ir=AGENTS.md`), each blank- or comma-separated part (`pytest -o
     // "pythonpath=src ../x"`, `mocha --require=a.js,../x.js`, `gcc -Wl,-o,.git/hooks/x`), and for
@@ -5009,7 +5014,7 @@ function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: 
       v = v.replace(/^[\[\]{}'"]+|[\[\]{}'"]+$/g, "");
       if (!v || depth > 6) return;
       if (self) (full ? words : tails).add(v);
-      if (/[\s,:]/.test(v)) for (const part of v.split(/[\s,:]+/)) read(part, depth + 1, full, true);
+      if (/[\s,:;]/.test(v)) for (const part of v.split(/[\s,:;]+/)) read(part, depth + 1, full, true);
       if (v.includes("=")) {
         read(v.slice(v.indexOf("=") + 1), depth + 1, full, true);
         read(v.slice(v.lastIndexOf("=") + 1), depth + 1, full, true);

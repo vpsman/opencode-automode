@@ -2630,3 +2630,19 @@ test("project review 6, round 6 (Opus, Sol): a structured value's quotes and bra
   ]) assert.notEqual(await decide18(command), "allow", command);
   for (const command of ['gcc -DVERSION="$v" a.c', "meson setup build \"-Dc_args=['-O2']\"", 'go test -run "TestA|TestB" ./...', 'go build -ldflags="-X main.v=1.2:3" .', "npm run build -- --mode=production"]) assert.equal(await decide18(command), "allow", command);
 });
+
+test("project review 6, round 7 (Opus, Sol): a `$` that is text in a structured value, escapes the check does not decode, cmake's `;` lists", async () => {
+  const repo19 = path.join(base, "repo19");
+  fs.mkdirSync(repo19, { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "main", repo19]);
+  const decide19 = async (command: string) => (await decideShell(guard, new SessionState(repo19), repo19, command)).effect;
+  for (const command of [
+    `jest --config '{"rootDir":".git/hooks","testRegex":"x$"}'`,
+    `jest --config '{"rootDir":"..","testRegex":"x$"}'`,
+    "meson setup build '-Dc_args=-I../inc -DV=$v'",
+    "go build -ldflags '-X main.v=$v -L ../lib' ./...",
+    `jest --config '{"rootDir":"\\u002e\\u002e/shared"}'`,
+    'cmake -S . -B build "-DCMAKE_C_FLAGS=-Icmake;-I/opt/x"',
+  ]) assert.notEqual(await decide19(command), "allow", command);
+  for (const command of [`jest --config '{"testRegex":"spec$"}'`, 'go test -run "Test$" ./...', "go build -ldflags '-X main.v=$v' ."]) assert.equal(await decide19(command), "allow", command);
+});
