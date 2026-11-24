@@ -3612,8 +3612,9 @@ function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = 
       }
     }
   }
-  // (Round 3, Sol: or a name that is there, a link into a protected place, `-dconfiglink`.)
-  for (const t of [...targets, ...places.filter((v) => /[/~]/.test(v) || v.startsWith(".") || (!/^\d+$/.test(v) && !!resolveWord(v, scope) && fs.existsSync(resolveWord(v, scope)!)))]) {
+  // (Round 3, Sol: or a name that is there, a link into a protected place, `-dconfiglink`,
+  // `-d2026`.)
+  for (const t of [...targets, ...places.filter((v) => /[/~]/.test(v) || v.startsWith(".") || (!!resolveWord(v, scope) && fs.existsSync(resolveWord(v, scope)!)))]) {
     // Copied into a directory, the files land inside it: `cp a.rs /tmp` writes /tmp/a.rs.
     const written = intoDir && t === destWord && dest && sources.length ? sources.map((s) => path.join(dest, path.basename(s))) : [resolveWord(t, scope)];
     for (const p of written) {
@@ -4968,6 +4969,9 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
 // included: a protected name (the plugin's, opencode's, a `.git` component) asks, and a path
 // outside the project, the temp directories and the allowed places goes to the decider, as does
 // a run in such a directory. Words built at run time are judged elsewhere (runtimeReads).
+// The parts of a comma list, and for a part that is an option, its value: after an `=`, after its
+// letter, or the whole of a long one's.
+const commaParts = (v: string): string[] => (v.includes(",") ? v.split(",").filter(Boolean).flatMap((p) => (p.startsWith("-") ? [...(p.includes("=") ? [p.slice(p.indexOf("=") + 1)] : []), ...(p.startsWith("--") ? [] : [p.slice(2)])] : [p])) : []);
 const PROJECT_TOOLS = new Set([...DEV_TOOLS, ..."go cargo npm npx pnpm pnpx yarn bun bunx uv uvx deno poetry pipenv pdm hatch".split(" ")]);
 function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: number) => boolean): Verdict | undefined {
   if (!scope.root) return undefined;
@@ -4994,9 +4998,11 @@ function projectToolPlaces(name: string, args: string[], scope: Scope, dyn: (k: 
       // (The rest of a short option word after its letter, `-o.git/x`, `-oAGENTS.md`; and after
       // each further leading letter, held only to the protected names, `-kC.git`: which letter
       // takes the rest is not known.)
-      words.push(a.slice(2));
+      // (Round 4, Opus, Sol: the rest split on commas, each part an option of its own, as gcc's
+      // `-Wl,-o,.git/hooks/x`, `-Wl,-L../lib`, `-Wl,@../args` and mocha's `-ra.js,../x.js` read it.)
+      words.push(a.slice(2), ...commaParts(a.slice(2)));
       for (let k = 3; k < a.length && /^[A-Za-z]+$/.test(a.slice(1, k)); k++) {
-        tails.push(a.slice(k));
+        tails.push(a.slice(k), ...commaParts(a.slice(k)));
         // (Cross-check 2, Opus: a place after a later letter of a cluster, `ninja -vC..`, `shfmt
         // -lw../x.sh`, is held to the outside check too: one that starts with `.` or `~`, or with
         // `/` after at most two letters, `-vC/etc` (`-obuild/app` is an output name).)

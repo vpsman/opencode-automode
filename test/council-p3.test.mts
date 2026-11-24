@@ -2576,5 +2576,22 @@ test("project review 6, round 3 (Opus, Sol): a link out of the project reached f
     "mocha -r test/setup.js,../x.js",
     "git-credential-store get",
   ]) assert.notEqual(await decide16(command), "allow", command);
-  for (const command of ["patch -p1 -dsub < c.patch", "cargo build --features a,b", "gcc -Wl,-rpath,/usr/lib a.c", "x=$(cd sub && pwd)", "(cd sub && make)", "(cd sub && npm test)"]) assert.equal(await decide16(command), "allow", command);
+  for (const command of ["patch -p1 -dsub < c.patch", "cargo build --features a,b", "gcc -Wl,-z,relro a.c", "x=$(cd sub && pwd)", "(cd sub && make)", "(cd sub && npm test)"]) assert.equal(await decide16(command), "allow", command);
+  // Round 4 (Opus, Sol): a comma list after a short option's letter, each part an option of its
+  // own; a patch directory named by a number. (`-Wl,-rpath,/usr/lib` goes to the decider now,
+  // as `-I/usr/include` does.)
+  fs.symlinkSync(".claude", path.join(repo16, "2026"));
+  for (const command of [
+    "gcc -Wl,-L,../lib x.c",
+    "gcc -Wl,-L../lib x.c",
+    "gcc -Wp,-include,../m.h x.c",
+    "gcc -Wl,@../args x.c",
+    "gcc -Wl,-o,.git/hooks/pre-commit x.c",
+    "gcc -Wl,-o,opencode.json x.c",
+    "clang++ -Wl,-o,AGENTS.md x.c",
+    "mocha -rtest/setup.js,../x.js",
+    "patch -p1 -d2026 < c.patch",
+    "patch -p1 --directory=2026 < c.patch",
+  ]) assert.notEqual(await decide16(command), "allow", command);
+  for (const command of ["gcc -Wall -Wextra a.c", "gcc -Wl,--as-needed -O2 a.c", "gcc -Wl,-rpath,'$ORIGIN' a.c", "patch -p1 < c.patch"]) assert.equal(await decide16(command), "allow", command);
 });

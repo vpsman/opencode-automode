@@ -67,7 +67,8 @@ export const DEFAULT_ASK = [
   "re:.*opencode-automode.*",
   // opencode loads project-level config, plugins and commands with no prompt; hook managers run
   // these files from git hooks. Both are read-only inside the sandbox, so a change must ask.
-  `re:(^|.*[ /=@])(${literal([...OPENCODE_CONFIG_NAMES, ...HOOK_MANAGER_FILES])})( |/|$).*`,
+  // (Project review 6, round 4, Opus: a comma separates too, `gcc -Wl,-o,opencode.json`.)
+  `re:(^|.*[ /=@,])(${literal([...OPENCODE_CONFIG_NAMES, ...HOOK_MANAGER_FILES])})( |/|,|$).*`,
   // Dumping the environment prints every secret in it.
   "printenv *",
   "env",
